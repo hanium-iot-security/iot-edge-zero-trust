@@ -22,6 +22,8 @@ build/
 *.db
 *.sqlite
 *.sqlite3
+backend/data/*
+!backend/data/.gitkeep
 *.log
 logs/
 
@@ -36,4 +38,3 @@ models/*.onnx
 Thumbs.db
 .idea/
 .vscode/
-
