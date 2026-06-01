@@ -11,6 +11,7 @@
 | `DEVICE_ID_MISMATCH` | topic device_id와 payload device_id가 모두 존재하지만 서로 다름 |
 | `UNKNOWN_DEVICE` | `devices`에 등록되지 않은 device_id |
 
+`MALFORMED_PAYLOAD`는 깨진 JSON 또는 `device_id` 필수 필드가 누락된 payload가 10초 window 기준 3회 이상 발생하면 기록합니다.
 `UNKNOWN_DEVICE`는 점수를 적용할 등록 기기가 없으므로 Trust Score 계산 대상이 아닙니다.
 
 TODO: 위 기준을 사용해 `edge/detection/rule_detector.py`의 실제 판정 함수를 구현합니다.

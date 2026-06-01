@@ -17,6 +17,11 @@
 - `tests/samples/malformed_payload.txt`를 publish합니다.
 - `MALFORMED_PAYLOAD`가 발생해야 합니다.
 
+## Device ID 누락 Payload
+
+- `iot/esp32_01/sensor`로 `{"temperature":25.3}`를 publish합니다.
+- JSON 문법은 유효하지만 `device_id` 필수 필드가 없으므로 `MALFORMED_PAYLOAD`가 발생해야 합니다.
+
 ## Device ID 불일치
 
 - `iot/esp32_01/sensor`로 publish하되 payload의 `device_id`는 `esp32_99`로 보냅니다.
