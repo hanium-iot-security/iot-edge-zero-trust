@@ -89,8 +89,9 @@ Edge 진입점 실행:
 ```bash
 python edge/mqtt/subscriber.py
 python edge/features/collect_feature_logs.py
-python edge/detection/detection_event_writer.py
 ```
+
+탐지 및 Trust Score 실행 진입점은 구현 단계에서 확정합니다. 실제 진입점이 정해지면 `edge/scripts/run_detector.sh` 또는 `edge/detection/rule_detector.py` 기준으로 갱신합니다.
 
 FastAPI 실행:
 
@@ -132,6 +133,7 @@ GET /api/isolation/history
 | `detection_events` | Rule 및 AI 탐지 이벤트 |
 | `isolation_history` | Trust Score로 발생한 격리 action |
 
+실제 SQLite DB 파일은 기본적으로 `backend/data/iot_security.db`에 생성됩니다. 이 파일은 Git에 포함하지 않습니다.
 실행 가능한 schema는 `db/migrations/001_init.sql`입니다.
 
 ## 8. 규칙 기반 탐지 기준

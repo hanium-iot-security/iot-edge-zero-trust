@@ -12,9 +12,10 @@ python db/create_tables.py
 python db/seed_devices.py
 python edge/mqtt/subscriber.py
 python edge/features/collect_feature_logs.py
-python edge/detection/detection_event_writer.py
 uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+탐지 및 Trust Score 실행 진입점은 구현 단계에서 확정합니다.
 
 Windows 가상환경 활성화:
 
