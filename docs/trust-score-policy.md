@@ -14,6 +14,17 @@ Trust Score 처리는 `edge/trust`에서 실행합니다.
 격리 조건: trust_score < 30
 ```
 
+격리 상태와 격리 이력 action은 다음처럼 구분합니다.
+
+```txt
+status: isolated
+action: ISOLATED
+```
+
+`devices.status`는 현재 기기 상태이므로 소문자 `isolated`를 사용합니다.
+`isolation_history.action`은 격리 이력 action 코드이므로 대문자 `ISOLATED`를 사용합니다.
+향후 격리 해제 기능을 추가하면 action 값으로 `RELEASED`를 사용할 수 있습니다.
+
 환경 변수:
 
 ```env

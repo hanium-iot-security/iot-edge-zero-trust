@@ -163,6 +163,11 @@ flooding 공격 스크립트 이름은 DB event type이 아닙니다. DB에는 `
 격리 기준: trust_score < 30
 ```
 
+```txt
+Device status: normal, warning, danger, isolated
+isolation_history.action: ISOLATED
+```
+
 같은 feature window에서 여러 이벤트가 발생하면 가장 큰 감점 하나만 반영합니다.
 
 ## 10. 공격 시나리오

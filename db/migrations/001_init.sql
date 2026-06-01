@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS detection_events (
 CREATE TABLE IF NOT EXISTS isolation_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     device_id TEXT NOT NULL,
-    action TEXT NOT NULL DEFAULT 'isolate',
+    action TEXT NOT NULL DEFAULT 'ISOLATED',
     reason TEXT,
     trust_score INTEGER,
     trigger_event_id INTEGER,

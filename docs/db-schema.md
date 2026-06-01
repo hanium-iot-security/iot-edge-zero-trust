@@ -82,10 +82,13 @@ PRAGMA busy_timeout = 5000;
 | --- | --- | --- |
 | id | INTEGER | primary key autoincrement |
 | device_id | TEXT | 대상 기기 |
-| action | TEXT | 기본값 `isolate` |
+| action | TEXT | 격리 이력 action 코드, 기본값 `ISOLATED` |
 | reason | TEXT | 격리 이유 |
 | trust_score | INTEGER | action 당시 점수 |
 | trigger_event_id | INTEGER | action을 유발한 이벤트 |
 | created_at | DATETIME | 생성 시각, 기본 current timestamp |
 
-TODO: 수동 또는 자동 격리 해제 기능을 추가하면 `release`를 action 값으로 사용합니다.
+`devices.status`는 현재 기기 상태를 나타내므로 `isolated`를 사용합니다.
+`isolation_history.action`은 격리 이력에 저장되는 action 코드이므로 `ISOLATED`를 사용합니다.
+
+TODO: 향후 격리 해제 기능을 추가하면 `RELEASED`를 action 값으로 사용할 수 있습니다.
