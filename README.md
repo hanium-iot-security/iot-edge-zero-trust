@@ -110,17 +110,21 @@ uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
 ```txt
 GET /api/health
 GET /api/dashboard/summary
-GET /api/dashboard/recent
 GET /api/devices
 GET /api/devices/{device_id}
-GET /api/devices/{device_id}/features
-GET /api/devices/{device_id}/events
 GET /api/mqtt-logs
 GET /api/feature-logs
 GET /api/detection-events
 GET /api/trust-score/summary
 GET /api/trust-score/{device_id}/history
 GET /api/isolation/history
+```
+
+기기별 feature/event 조회는 중복 endpoint를 만들지 않고 query parameter로 처리합니다.
+
+```txt
+/api/feature-logs?device_id=esp32_01
+/api/detection-events?device_id=esp32_01
 ```
 
 ## 7. DB schema 요약

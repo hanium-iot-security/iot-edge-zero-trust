@@ -7,11 +7,8 @@
 ```txt
 GET /api/health
 GET /api/dashboard/summary
-GET /api/dashboard/recent
 GET /api/devices
 GET /api/devices/{device_id}
-GET /api/devices/{device_id}/features
-GET /api/devices/{device_id}/events
 GET /api/mqtt-logs
 GET /api/feature-logs
 GET /api/detection-events
@@ -20,11 +17,18 @@ GET /api/trust-score/{device_id}/history
 GET /api/isolation/history
 ```
 
+MVP에서는 중복 endpoint를 줄이기 위해 기기별 feature/event 조회는 query parameter 방식으로 처리합니다.
+
+```txt
+/api/feature-logs?device_id=esp32_01
+/api/detection-events?device_id=esp32_01
+```
+
+최근 MQTT 로그, feature 로그, 탐지 이벤트를 한 번에 묶어 반환하는 `/api/dashboard/recent`는 MVP 필수 API에서 제외하고, 프론트엔드에서 필요한 API를 각각 호출합니다.
+
 기본 조회 예시:
 
-```http
-GET /api/mqtt-logs?device_id=esp32_01&limit=100
-```
+예: `/api/mqtt-logs?device_id=esp32_01&limit=100`
 
 ## Health 응답
 
