@@ -30,7 +30,9 @@ GET /api/mqtt-logs?device_id=esp32_01&limit=100
 
 ```json
 {
-  "status": "ok"
+  "status": "ok",
+  "db_connected": true,
+  "server_time": "2026-05-26 14:35:00"
 }
 ```
 

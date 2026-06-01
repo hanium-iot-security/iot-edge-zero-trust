@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from .config import settings
@@ -23,6 +23,18 @@ def _ensure_sqlite_parent(database_url: str) -> None:
 
 _ensure_sqlite_parent(settings.database_url)
 engine = create_engine(settings.database_url, connect_args=_sqlite_connect_args(settings.database_url))
+
+
+if settings.database_url.startswith("sqlite"):
+
+    @event.listens_for(engine, "connect")
+    def set_sqlite_pragma(dbapi_conn, _) -> None:
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.close()
+
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 

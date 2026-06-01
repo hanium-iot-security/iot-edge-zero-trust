@@ -34,6 +34,18 @@ ISOLATION_THRESHOLD=30
 
 같은 window 규칙: 하나의 feature window에서 여러 detection event가 발생하면 가장 큰 감점만 적용합니다. 나머지 event는 `applied_to_score = 0`으로 유지합니다.
 
+이벤트별 Trust Score 변화량은 `severity`가 아니라 `event_type` 기준으로 고정합니다. `severity`는 API와 대시보드 표시용으로 사용합니다.
+
+| event_type | score_delta | 비고 |
+| --- | ---: | --- |
+| `DEVICE_ID_MISMATCH` | -25 | 기기 신원 불일치 |
+| `ABNORMAL_PUBLISH_RATE` | -20 | 과도한 publish 또는 짧은 메시지 간격 |
+| `ABNORMAL_TOPIC` | -20 | 허용되지 않은 topic 접근 |
+| `LARGE_PAYLOAD` | -15 | payload 크기 초과 |
+| `AI_ANOMALY` | -15 | Isolation Forest 이상 탐지 |
+| `MALFORMED_PAYLOAD` | -10 | 깨진 JSON 또는 필수 필드 누락 |
+| `UNKNOWN_DEVICE` | 0 | Trust Score 계산 대상 아님 |
+
 예시:
 
 ```txt
