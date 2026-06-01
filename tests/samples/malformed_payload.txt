@@ -1,0 +1,1 @@
+{"device_id": "esp32_01", "temperature":

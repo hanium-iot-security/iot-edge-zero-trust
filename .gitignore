@@ -12,6 +12,8 @@ node_modules/
 dist/
 build/
 .vite/
+frontend/node_modules/
+frontend/dist/
 
 # Environment
 .env
@@ -24,14 +26,23 @@ build/
 *.sqlite3
 backend/data/*
 !backend/data/.gitkeep
+data/**/*
+!data/**/
+!data/**/.gitkeep
+data/**/*.csv
+data/**/*.jsonl
 *.log
 logs/
 
 # ML artifacts
+ai/models/*.pkl
+ai/models/*.joblib
+ai/models/*.onnx
 models/*.pkl
 models/*.joblib
 models/*.onnx
-!models/.gitkeep
+!ai/models/.gitkeep
+ai/notebooks/.ipynb_checkpoints/
 
 # OS / editor
 .DS_Store

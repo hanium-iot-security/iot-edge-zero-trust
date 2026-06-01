@@ -1,19 +1,13 @@
-# Raspberry Pi Setup
+# Raspberry Pi 설정
 
-## Role
+권장 환경:
 
-Raspberry Pi is the edge gateway for the MVP.
+- Raspberry Pi OS 64-bit
+- Python 3.11+
+- 프로젝트 가상환경
+- `apt`로 설치한 Mosquitto broker
 
-It can run:
-
-- Mosquitto MQTT Broker
-- FastAPI backend
-- SQLite local database
-- MQTT subscriber worker
-- Feature extraction worker
-- Rule-based and AI anomaly detection
-
-## Install Mosquitto
+## Mosquitto
 
 ```bash
 sudo apt update
@@ -22,36 +16,43 @@ sudo systemctl enable mosquitto
 sudo systemctl start mosquitto
 ```
 
-## Test MQTT
-
-Terminal 1:
-
-```bash
-mosquitto_sub -h localhost -t 'devices/+/telemetry'
-```
-
-Terminal 2:
-
-```bash
-mosquitto_pub -h localhost -t 'devices/esp32-001/telemetry' -m '{"device_id":"esp32-001","temperature":25.3}'
-```
-
-## Run Backend
-
-```bash
-cd backend
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-## SQLite
-
-Default DB path:
+## MQTT Topic
 
 ```txt
-backend/data/iot_security.db
+구독: iot/+/sensor
+예시: iot/esp32_01/sensor
 ```
 
-The `.db` file is generated locally and should not be committed.
+## MQTT 테스트
+
+```bash
+mosquitto_sub -h localhost -t 'iot/+/sensor'
+mosquitto_pub -h localhost -t 'iot/esp32_01/sensor' -m '{"device_id":"esp32_01","temperature":25.3}'
+```
+
+## Python 설정
+
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+Windows:
+
+```powershell
+venv\Scripts\activate
+```
+
+## 데이터베이스
+
+```bash
+python db/create_tables.py
+python db/seed_devices.py
+```
+
+## 백엔드
+
+```bash
+uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
+```

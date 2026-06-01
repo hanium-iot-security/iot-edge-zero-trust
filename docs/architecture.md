@@ -1,66 +1,36 @@
-# Architecture
+# 아키텍처
 
-## MVP Flow
-
-```txt
-ESP32
-  -> Raspberry Pi
-  -> Mosquitto MQTT Broker
-  -> Python MQTT Subscriber
-  -> SQLite mqtt_logs
-  -> 10 second feature window
-  -> SQLite feature_logs
-  -> rule-based detection / Isolation Forest
-  -> SQLite detection_events
-  -> trust score update
-  -> device isolation status
-  -> FastAPI
-  -> React dashboard
-```
-
-## Edge Gateway
-
-Raspberry Pi is the MVP edge gateway.
-
-Responsibilities:
-
-- Run Mosquitto MQTT Broker.
-- Run FastAPI backend.
-- Store local logs in SQLite.
-- Run MQTT subscriber and feature extraction workers.
-- Run rule-based detection and Isolation Forest inference.
-- Update Trust Score and device isolation status.
-
-## Backend Modules
+## 경계
 
 ```txt
-app/main.py                 # FastAPI entrypoint
-app/core/                   # config and common settings
-app/db/                     # SQLite connection/session
-app/models/                 # ORM models
-app/schemas/                # API request/response schemas
-app/routers/                # API endpoints
-app/services/               # detection, trust score, isolation logic
-app/workers/                # MQTT subscriber, feature extraction worker
-data/                       # local SQLite database file
+ESP32가 iot/{device_id}/sensor로 publish
+  -> Mosquitto
+  -> edge worker
+  -> SQLite
+  -> FastAPI 조회 API
+  -> React + Vite dashboard 예정
 ```
 
-## Scope Split
+## Edge 계층
 
-MVP:
+`edge/`는 Raspberry Pi에서 실행되는 판단 로직을 담당합니다.
 
-1. MQTT traffic collection from ESP32.
-2. SQLite log storage.
-3. 10 second feature window generation.
-4. Rule-based attack detection.
-5. Isolation Forest anomaly detection.
-6. Trust Score and isolation status.
-7. React dashboard API integration.
+- `iot/+/sensor` MQTT 구독
+- topic 및 payload 검증
+- 10초 feature window 생성
+- rule-based 탐지
+- Isolation Forest 추론
+- Trust Score 변경
+- isolation history 저장
 
-Future expansion:
+## 백엔드 계층
 
-- Packet capture beyond MQTT.
-- eBPF-based kernel monitoring.
-- Software Defined Perimeter.
-- Advanced model optimization for edge devices.
+`backend/`는 `/api` 아래에 FastAPI 조회 API를 제공합니다. 백엔드 service 파일은 `*_query_service.py`로 이름을 맞춰, 탐지나 Trust Score 계산 로직이 backend에 중복되지 않도록 합니다.
 
+## 데이터 계층
+
+SQLite schema는 `db/migrations/001_init.sql`에 둡니다. 생성된 DB 파일은 `backend/data/iot_security.db`에 위치하며 Git에 올리지 않습니다.
+
+## 프론트엔드 계층
+
+`frontend/`는 React + Vite 기반 대시보드를 위한 예약 구조입니다. JavaScript 또는 TypeScript 사용 여부는 프론트 담당자와 협의한 뒤 확정합니다.

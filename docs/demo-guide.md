@@ -1,0 +1,46 @@
+# Demo Guide
+
+## 목표
+
+정상 MQTT 수집, feature 생성, 탐지, Trust Score 감소, 격리, 대시보드 API 조회 흐름을 보여줍니다.
+
+## 명령어
+
+```bash
+sudo systemctl start mosquitto
+python db/create_tables.py
+python db/seed_devices.py
+python edge/mqtt/subscriber.py
+python edge/features/collect_feature_logs.py
+python edge/detection/detection_event_writer.py
+uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Windows 가상환경 활성화:
+
+```powershell
+venv\Scripts\activate
+```
+
+프론트엔드:
+
+현재 `frontend/`는 예약 구조만 유지합니다. JavaScript 또는 TypeScript 사용 여부를 확정한 뒤 `frontend/README.md` 기준으로 Vite 스캐폴딩을 생성합니다.
+
+## MQTT 확인
+
+```bash
+mosquitto_sub -h localhost -t 'iot/+/sensor'
+mosquitto_pub -h localhost -t 'iot/esp32_01/sensor' -m '{"device_id":"esp32_01","temperature":25.3}'
+```
+
+## 시연 순서
+
+1. Mosquitto를 시작합니다.
+2. `esp32_01`이 들어간 DB를 생성하고 seed합니다.
+3. FastAPI를 실행하고 `/api/health`를 확인합니다.
+4. 구현된 edge worker를 실행합니다.
+5. 정상 telemetry를 `iot/esp32_01/sensor`로 publish합니다.
+6. `attacks/`의 공격 스크립트 하나를 실행합니다.
+7. `detection_events.event_type`을 확인합니다.
+8. Trust Score와 `devices.status`를 확인합니다.
+9. `trust_score < 30`이 되면 `isolation_history`를 확인합니다.
