@@ -176,36 +176,98 @@ isolation_history.action: ISOLATED
 
 ## 10. 공격 시나리오
 
+MVP에서는 실제 악성코드 기반 공격이 아니라, MQTT 통신 행위 기반의 통제 가능한 공격 시나리오를 사용한다.
+
+각 공격 스크립트는 Raspberry Pi의 Mosquitto Broker로 비정상 MQTT 메시지를 publish한다.  
+수신 메시지는 우선 `mqtt_logs`에 저장한다. Rule 기준을 충족하거나 정책 위반이 확인된 경우 `detection_events`에 기록한다. 등록된 기기 기준으로 10초 window 집계가 가능한 메시지만 `feature_logs`에 반영한다.
+
+| 공격 시나리오 | 스크립트 | 저장 event_type | 탐지 기준 |
+| --- | --- | --- | --- |
+| Flooding Attack | `attacks/flooding_attack.py` | `ABNORMAL_PUBLISH_RATE` | 10초 동안 `publish_count > 15` 또는 `min_message_interval < 1.0` |
+| Large Payload Attack | `attacks/large_payload_attack.py` | `LARGE_PAYLOAD` | `max_payload_size > 5120` bytes |
+| Malformed Payload Attack | `attacks/malformed_payload_attack.py` | `MALFORMED_PAYLOAD` | 깨진 JSON 또는 `device_id` 누락 payload 3회 이상 |
+| Abnormal Topic Attack | `attacks/abnormal_topic_attack.py` | `ABNORMAL_TOPIC` | 허용되지 않은 topic 형식 3회 이상 |
+| Unknown Device Attack | `attacks/unknown_device_attack.py` | `UNKNOWN_DEVICE` | 등록되지 않은 `device_id` 사용 |
+| Device ID Mismatch Attack | `attacks/device_id_mismatch_attack.py` | `DEVICE_ID_MISMATCH` | topic의 device_id와 payload의 device_id 불일치 |
+
+`UNKNOWN_DEVICE`는 등록 기기의 Trust Score 감점 대상이 아니라, 미등록 기기 접근 이벤트로 기록하고 즉시 차단 또는 메시지 무시 처리한다.
+
+`DEVICE_ID_MISMATCH`는 topic과 payload의 device_id가 모두 존재하지만 서로 다른 경우에만 적용한다. 단, 미등록 device_id가 포함된 경우에는 `UNKNOWN_DEVICE`를 우선 적용한다.
+
+공격 스크립트 실행 방법과 옵션은 각 파일 구현 후 README 또는 `docs/test-scenarios.md`에 추가한다.
+
+## 11. Git 브랜치 운영 규칙
+
+현재 원격 저장소의 기본 브랜치는 `develop`이며, MVP 개발은 `develop`을 기준으로 진행한다.
+
+원격 저장소 기준 `main` 브랜치는 현재 사용하지 않는다.  
+MVP가 시연 가능한 안정 버전이 되었을 때 `develop`을 기준으로 `main`을 생성하거나 갱신하고, 이후 `main`은 제출, 시연, 릴리즈용 안정 브랜치로 관리한다.
+
+브랜치 운영 기준은 다음과 같다.
+
 ```txt
-attacks/flooding_attack.py
-attacks/large_payload_attack.py
-attacks/malformed_payload_attack.py
-attacks/abnormal_topic_attack.py
-attacks/unknown_device_attack.py
-attacks/device_id_mismatch_attack.py
+develop
+- 현재 기본 개발 브랜치
+- 각 기능 브랜치에서 작업한 내용을 PR로 통합하는 기준 브랜치
+
+main
+- MVP 완성 후 사용 예정
+- 시연/제출/릴리즈용 안정 브랜치
+- MVP 완성 시 v1.0.0-mvp 태그를 함께 생성 예정
+
+feature/woomin-mqtt-feature-api
+- MQTT 수집, 10초 window feature 추출, FastAPI 기본 API 작업
+
+feature/sunwoo-rule-attack
+- Rule-based 탐지 로직 및 MQTT 공격 시나리오 스크립트 작업
+
+feature/jongmin-ai-detector
+- Isolation Forest 학습, 모델 저장, AI 이상 탐지 추론 작업
+
+feature/hyunsu-trust-isolation-api
+- Trust Score 계산, 기기 상태 변경, 격리 이력, 관련 API 작업
+
+feature/soyou-dashboard
+- React 대시보드 UI 및 API 연동 작업
+
+docs/project-docs
+- 코드 변경 없이 README, API 명세, DB 명세, 공격 시나리오, 시연 흐름 등 공통 문서만 크게 정리할 때 필요 시 생성
 ```
 
-## 11. Git 브랜치
+기능 구현과 직접 관련된 문서 수정은 해당 `feature/*` 브랜치에서 함께 수정할 수 있다.
+
+예를 들어 Rule 탐지 코드를 수정하면서 공격 시나리오 문서를 함께 수정하거나, FastAPI API를 추가하면서 API 명세를 함께 수정하는 방식은 허용한다.
+
+단, README 전체 구조 변경이나 공통 문서 대규모 정리는 충돌 방지를 위해 작업 전에 팀원들에게 공유한 뒤 진행한다.
+
+기본 작업 흐름은 다음과 같다.
 
 ```txt
-main
-develop
-feature/woomin-mqtt-feature-api
-feature/sunwoo-rule-attack
-feature/jongmin-ai-detector
-feature/hyunsu-trust-isolation-api
-feature/soyou-dashboard
-docs/project-docs
+1. develop 브랜치 최신화
+2. 본인 담당 feature 브랜치 생성
+3. 기능 구현 및 관련 문서 수정
+4. commit / push
+5. Pull Request 생성
+6. 리뷰 후 develop에 merge
+7. MVP 안정화 후 main 생성 또는 갱신 및 태그 부여
 ```
 
 ## 12. Commit Message 규칙
 
+커밋 메시지는 아래 형식을 사용한다.
+
 ```txt
-feat: 새로운 기능 추가
-fix: 버그 수정
-docs: 문서 수정
-refactor: 코드 구조 개선
-test: 테스트 코드 추가
-chore: 설정 파일 수정
-style: 코드 포맷 수정
+type: 작업 내용 요약
 ```
+
+사용 가능한 type은 다음과 같다.
+
+| type | 의미 | 예시 |
+| --- | --- | --- |
+| `feat` | 새로운 기능 추가 | `feat: MQTT subscriber DB 저장 기능 추가` |
+| `fix` | 버그 수정 또는 명세 불일치 수정 | `fix: feature window 중복 저장 오류 수정` |
+| `docs` | 문서 수정 | `docs: Git 브랜치 운영 규칙 보강` |
+| `refactor` | 동작 변경 없는 코드 구조 개선 | `refactor: detection service 모듈 분리` |
+| `test` | 테스트 코드 추가 또는 수정 | `test: mqtt_logs 저장 테스트 추가` |
+| `chore` | 설정, 패키지, 빌드 관련 작업 | `chore: requirements.txt 패키지 추가` |
+| `style` | 포맷팅, 들여쓰기 등 동작 변화 없는 수정 | `style: 코드 포맷 정리` |
