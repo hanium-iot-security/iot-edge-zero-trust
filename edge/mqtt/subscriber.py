@@ -63,7 +63,7 @@ def build_mqtt_log_row(
         error_parts.append("invalid_topic")
     if not is_json_valid:
         error_parts.append("invalid_payload")
-    if strict_topic_device_id and payload_device_id and strict_topic_device_id != payload_device_id:
+    if topic_device_id_candidate and payload_device_id and topic_device_id_candidate != payload_device_id:
         error_parts.append("device_id_mismatch")
 
     return {

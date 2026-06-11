@@ -39,6 +39,15 @@ def test_build_mqtt_log_row_uses_topic_candidate_when_payload_has_no_device_id()
     assert row["error_message"] == "invalid_topic, invalid_payload"
 
 
+def test_build_mqtt_log_row_marks_mismatch_from_topic_candidate() -> None:
+    row = build_mqtt_log_row("iot/esp32_01/control", '{"device_id":"esp32_02"}')
+
+    assert row["device_id"] == "esp32_01"
+    assert row["is_json_valid"] == 1
+    assert row["is_topic_valid"] == 0
+    assert row["error_message"] == "invalid_topic, device_id_mismatch"
+
+
 def test_collect_feature_windows_completed_windows_only(db_session) -> None:
     device_id = "test_feature_01"
     cleanup_device(db_session, device_id)
