@@ -56,7 +56,7 @@ PRAGMA busy_timeout = 5000;
 | min_message_interval | REAL | 최소 메시지 간격, 초 단위 |
 | topic_count | INTEGER | 고유 topic 수 |
 | abnormal_topic_count | INTEGER | 비정상 topic 수 |
-| malformed_payload_count | INTEGER | JSON 파싱 실패 수 |
+| malformed_payload_count | INTEGER | 깨진 JSON 또는 `device_id` 필수 필드 누락 payload 수 |
 
 `feature_logs`는 `(device_id, window_start, window_end)` 조합을 unique key로 가집니다.
 

@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     mqtt_host: str = "localhost"
     mqtt_port: int = 1883
     mqtt_normal_topic: str = "iot/+/sensor"
+    mqtt_subscribe_topic: str = "iot/+/sensor"
     feature_window_seconds: int = 10
     initial_trust_score: int = 100
     isolation_threshold: int = 30
