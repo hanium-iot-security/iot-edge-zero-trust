@@ -7,6 +7,29 @@
 - 프로젝트 가상환경
 - `apt`로 설치한 Mosquitto broker
 
+## 네트워크 정보
+
+| 항목 | 값 |
+| --- | --- |
+| 공유기 관리자 주소 | `http://192.168.0.1` |
+| Raspberry Pi hostname | `iot-gateway` |
+| Raspberry Pi username | `pi` |
+| Raspberry Pi 고정 IP | `192.168.0.20` |
+| MQTT Broker 주소 | `192.168.0.20` |
+| MQTT Port | `1883` |
+| FastAPI 주소 | `http://192.168.0.20:8000` |
+| 정상 MQTT Topic | `iot/esp32_01/sensor` |
+
+Raspberry Pi 내부에서 subscriber를 실행할 때는 Mosquitto가 같은 장비에서 실행되므로 `MQTT_HOST=localhost`를 사용할 수 있습니다. Windows PC나 ESP32처럼 외부 장비에서 broker에 접근할 때는 `192.168.0.20`을 사용합니다.
+
+SSH 접속 예시:
+
+```bash
+ssh pi@192.168.0.20
+```
+
+비밀번호는 Git에 기록하지 않고 팀 내부에서 별도로 공유합니다.
+
 ## Mosquitto
 
 ```bash
