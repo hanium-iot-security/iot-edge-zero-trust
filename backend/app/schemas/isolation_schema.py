@@ -15,4 +15,4 @@ class IsolationHistoryItem(BaseModel):
 
 class IsolationHistoryListResponse(BaseModel):
     items: list[IsolationHistoryItem]
-    count: int
+    total: int

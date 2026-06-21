@@ -19,4 +19,4 @@ class DetectionEventItem(BaseModel):
 
 class DetectionEventListResponse(BaseModel):
     items: list[DetectionEventItem]
-    count: int
+    total: int

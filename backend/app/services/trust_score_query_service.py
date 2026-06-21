@@ -14,7 +14,7 @@ def list_trust_score_summary(
     offset: int = 0,
 ) -> dict:
     params = {"limit": limit, "offset": offset}
-    count = db.execute(text("SELECT COUNT(*) FROM devices")).scalar_one()
+    total = db.execute(text("SELECT COUNT(*) FROM devices")).scalar_one()
     rows = db.execute(
         text(
             """
@@ -31,7 +31,7 @@ def list_trust_score_summary(
         params,
     ).mappings().all()
 
-    return {"items": _rows_to_dicts(rows), "count": int(count)}
+    return {"items": _rows_to_dicts(rows), "total": int(total)}
 
 
 def list_trust_score_history(
@@ -40,29 +40,25 @@ def list_trust_score_history(
     limit: int = 100,
     offset: int = 0,
 ) -> dict:
-    device_exists = db.execute(
-        text("SELECT COUNT(*) FROM devices WHERE device_id = :device_id"),
-        {"device_id": device_id},
-    ).scalar_one()
-    if int(device_exists) == 0:
-        return {"device_id": device_id, "items": [], "count": 0}
-
-    params = {
-        "device_id": device_id,
-        "limit": limit,
-        "offset": offset,
-    }
-    count = db.execute(
+    device = db.execute(
         text(
             """
-            SELECT COUNT(*)
-            FROM detection_events
+            SELECT trust_score, status
+            FROM devices
             WHERE device_id = :device_id
-              AND applied_to_score = 1
             """
         ),
-        params,
-    ).scalar_one()
+        {"device_id": device_id},
+    ).mappings().one_or_none()
+    if device is None:
+        return {
+            "device_id": device_id,
+            "current_score": None,
+            "current_status": None,
+            "items": [],
+            "total": 0,
+        }
+
     rows = db.execute(
         text(
             """
@@ -78,11 +74,29 @@ def list_trust_score_history(
             FROM detection_events
             WHERE device_id = :device_id
               AND applied_to_score = 1
-            ORDER BY detected_at DESC, id DESC
-            LIMIT :limit OFFSET :offset
+            ORDER BY detected_at ASC, id ASC
             """
         ),
-        params,
+        {"device_id": device_id},
     ).mappings().all()
 
-    return {"device_id": device_id, "items": _rows_to_dicts(rows), "count": int(count)}
+    score = 100
+    history: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        score_before = score
+        score = max(0, score_before + int(item["score_delta"]))
+        item["score_before"] = score_before
+        item["score_after"] = score
+        history.append(item)
+
+    history.reverse()
+    paginated_history = history[offset : offset + limit]
+
+    return {
+        "device_id": device_id,
+        "current_score": int(device["trust_score"]),
+        "current_status": device["status"],
+        "items": paginated_history,
+        "total": len(history),
+    }

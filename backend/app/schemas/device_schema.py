@@ -14,4 +14,4 @@ class DeviceItem(BaseModel):
 
 class DeviceListResponse(BaseModel):
     items: list[DeviceItem]
-    count: int
+    total: int

@@ -12,7 +12,7 @@ class TrustScoreSummaryItem(BaseModel):
 
 class TrustScoreSummaryResponse(BaseModel):
     items: list[TrustScoreSummaryItem]
-    count: int
+    total: int
 
 
 class TrustScoreHistoryItem(BaseModel):
@@ -21,6 +21,8 @@ class TrustScoreHistoryItem(BaseModel):
     detector_type: str
     severity: str | None = None
     score_delta: int
+    score_before: int
+    score_after: int
     applied_to_score: int
     detected_at: str | None = None
     description: str | None = None
@@ -28,5 +30,7 @@ class TrustScoreHistoryItem(BaseModel):
 
 class TrustScoreHistoryResponse(BaseModel):
     device_id: str
+    current_score: int | None
+    current_status: str | None
     items: list[TrustScoreHistoryItem]
-    count: int
+    total: int

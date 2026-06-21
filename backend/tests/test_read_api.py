@@ -183,7 +183,7 @@ def test_devices_endpoint_lists_seeded_device(api_client) -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert body["count"] == 2
+    assert body["total"] == 2
     assert body["items"][0]["device_id"] == "esp32_01"
     assert body["items"][0]["trust_score"] == 80
 
@@ -196,29 +196,61 @@ def test_devices_status_filter(api_client) -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert body["count"] == 1
+    assert body["total"] == 1
     assert body["items"][0]["device_id"] == "esp32_01"
 
 
-def test_detection_events_endpoint_and_applied_filter(api_client) -> None:
+def test_device_detail_returns_device(api_client) -> None:
+    client, db_path = api_client
+    seed_api_rows(db_path)
+
+    response = client.get("/api/devices/esp32_01")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["device_id"] == "esp32_01"
+    assert body["ip_address"] == "192.168.0.21"
+    assert body["status"] == "normal"
+    assert body["trust_score"] == 80
+
+
+def test_device_detail_unknown_device_returns_404(api_client) -> None:
+    client, db_path = api_client
+    seed_api_rows(db_path)
+
+    response = client.get("/api/devices/unknown_device")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Device not found"
+
+
+def test_detection_events_endpoint_and_filters(api_client) -> None:
     client, db_path = api_client
     seed_api_rows(db_path)
 
     response = client.get("/api/detection-events")
+    severity_response = client.get(
+        "/api/detection-events",
+        params={"severity": "high"},
+    )
     applied_response = client.get(
         "/api/detection-events",
         params={"applied_to_score": 1},
     )
 
     assert response.status_code == 200
+    assert severity_response.status_code == 200
     assert applied_response.status_code == 200
     body = response.json()
+    severity_body = severity_response.json()
     applied_body = applied_response.json()
-    assert body["count"] == 2
+    assert body["total"] == 2
     assert body["items"][0]["event_type"] == "AI_ANOMALY"
     assert body["items"][0]["score_delta"] == -15
     assert body["items"][0]["applied_to_score"] == 0
-    assert applied_body["count"] == 1
+    assert severity_body["total"] == 1
+    assert severity_body["items"][0]["severity"] == "high"
+    assert applied_body["total"] == 1
     assert applied_body["items"][0]["event_type"] == "ABNORMAL_PUBLISH_RATE"
     assert applied_body["items"][0]["score_delta"] == -20
 
@@ -226,6 +258,32 @@ def test_detection_events_endpoint_and_applied_filter(api_client) -> None:
 def test_dashboard_summary_counts_rows(api_client) -> None:
     client, db_path = api_client
     seed_api_rows(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO detection_events (
+                device_id,
+                detector_type,
+                event_type,
+                severity,
+                score_delta,
+                applied_to_score,
+                description,
+                detected_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "unknown_01",
+                "RULE",
+                "UNKNOWN_DEVICE",
+                "high",
+                0,
+                0,
+                "unknown device",
+                "2026-05-11 10:00:12",
+            ),
+        )
 
     response = client.get("/api/dashboard/summary")
 
@@ -234,10 +292,13 @@ def test_dashboard_summary_counts_rows(api_client) -> None:
     assert body["total_devices"] == 2
     assert body["normal_devices"] == 1
     assert body["isolated_devices"] == 1
-    assert body["total_detection_events"] == 2
-    assert body["unapplied_detection_events"] == 1
+    assert body["total_detection_events"] == 3
+    assert body["unapplied_detection_events"] == 2
     assert body["total_isolation_events"] == 1
-    assert len(body["latest_detection_events"]) == 2
+    assert body["recent_events_count"] == 3
+    assert body["unknown_device_count"] == 1
+    assert isinstance(body["last_updated"], str)
+    assert len(body["latest_detection_events"]) == 3
     assert len(body["latest_isolation_events"]) == 1
 
 
@@ -249,7 +310,7 @@ def test_trust_score_summary_returns_current_device_scores(api_client) -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert body["count"] == 2
+    assert body["total"] == 2
     assert body["items"][0]["device_id"] == "esp32_02"
     assert body["items"][0]["trust_score"] == 20
     assert body["items"][1]["device_id"] == "esp32_01"
@@ -265,9 +326,76 @@ def test_trust_score_history_returns_only_applied_events(api_client) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["device_id"] == "esp32_01"
-    assert body["count"] == 1
+    assert body["current_score"] == 80
+    assert body["current_status"] == "normal"
+    assert body["total"] == 1
     assert body["items"][0]["event_type"] == "ABNORMAL_PUBLISH_RATE"
+    assert body["items"][0]["score_before"] == 100
+    assert body["items"][0]["score_after"] == 80
     assert body["items"][0]["applied_to_score"] == 1
+
+
+def test_trust_score_history_calculates_before_pagination(api_client) -> None:
+    client, db_path = api_client
+    seed_api_rows(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO detection_events (
+                device_id,
+                detector_type,
+                event_type,
+                severity,
+                score_delta,
+                applied_to_score,
+                description,
+                detected_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "esp32_01",
+                "AI",
+                "AI_ANOMALY",
+                "medium",
+                -15,
+                1,
+                "applied ai anomaly",
+                "2026-05-11 10:00:12",
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE devices
+            SET trust_score = 65, status = 'warning'
+            WHERE device_id = 'esp32_01'
+            """
+        )
+
+    latest_response = client.get(
+        "/api/trust-score/esp32_01/history",
+        params={"limit": 1, "offset": 0},
+    )
+    older_response = client.get(
+        "/api/trust-score/esp32_01/history",
+        params={"limit": 1, "offset": 1},
+    )
+
+    assert latest_response.status_code == 200
+    assert older_response.status_code == 200
+    latest_body = latest_response.json()
+    older_body = older_response.json()
+    assert latest_body["current_score"] == 65
+    assert latest_body["current_status"] == "warning"
+    assert latest_body["total"] == 2
+    assert len(latest_body["items"]) == 1
+    assert latest_body["items"][0]["event_type"] == "AI_ANOMALY"
+    assert latest_body["items"][0]["score_before"] == 80
+    assert latest_body["items"][0]["score_after"] == 65
+    assert older_body["total"] == 2
+    assert older_body["items"][0]["event_type"] == "ABNORMAL_PUBLISH_RATE"
+    assert older_body["items"][0]["score_before"] == 100
+    assert older_body["items"][0]["score_after"] == 80
 
 
 def test_trust_score_history_unknown_device_returns_empty(api_client) -> None:
@@ -278,7 +406,13 @@ def test_trust_score_history_unknown_device_returns_empty(api_client) -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert body == {"device_id": "unknown_device", "items": [], "count": 0}
+    assert body == {
+        "device_id": "unknown_device",
+        "current_score": None,
+        "current_status": None,
+        "items": [],
+        "total": 0,
+    }
 
 
 def test_isolation_history_returns_rows(api_client) -> None:
@@ -289,7 +423,7 @@ def test_isolation_history_returns_rows(api_client) -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert body["count"] == 1
+    assert body["total"] == 1
     assert body["items"][0]["device_id"] == "esp32_02"
     assert body["items"][0]["action"] == "ISOLATED"
     assert body["items"][0]["trust_score"] == 20
@@ -303,6 +437,6 @@ def test_limit_and_offset_work_on_devices_endpoint(api_client) -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert body["count"] == 2
+    assert body["total"] == 2
     assert len(body["items"]) == 1
     assert body["items"][0]["device_id"] == "esp32_02"

@@ -14,20 +14,20 @@ def list_devices(
     limit: int = 100,
     offset: int = 0,
 ) -> dict:
-    where_clauses: list[str] = []
-    params: dict[str, str | int] = {
+    params: dict[str, str | int | None] = {
+        "status": status,
         "limit": limit,
         "offset": offset,
     }
 
-    if status is not None:
-        where_clauses.append("status = :status")
-        params["status"] = status
-
-    where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-
-    count = db.execute(
-        text(f"SELECT COUNT(*) FROM devices{where_sql}"),
+    total = db.execute(
+        text(
+            """
+            SELECT COUNT(*)
+            FROM devices
+            WHERE (:status IS NULL OR status = :status)
+            """
+        ),
         params,
     ).scalar_one()
     rows = db.execute(
@@ -41,7 +41,7 @@ def list_devices(
                 last_seen_at,
                 created_at
             FROM devices
-            {where_sql}
+            WHERE (:status IS NULL OR status = :status)
             ORDER BY device_id ASC
             LIMIT :limit OFFSET :offset
             """
@@ -49,4 +49,25 @@ def list_devices(
         params,
     ).mappings().all()
 
-    return {"items": _rows_to_dicts(rows), "count": int(count)}
+    return {"items": _rows_to_dicts(rows), "total": int(total)}
+
+
+def get_device(db: Session, device_id: str) -> dict | None:
+    row = db.execute(
+        text(
+            """
+            SELECT
+                device_id,
+                ip_address,
+                status,
+                trust_score,
+                last_seen_at,
+                created_at
+            FROM devices
+            WHERE device_id = :device_id
+            """
+        ),
+        {"device_id": device_id},
+    ).mappings().one_or_none()
+
+    return dict(row) if row is not None else None
