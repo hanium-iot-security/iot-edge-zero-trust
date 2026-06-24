@@ -1,40 +1,16 @@
-# Frontend 예약 구조
+# React + Vite
 
-프론트엔드는 React + Vite 기반 대시보드로 구현할 예정입니다. JavaScript 또는 TypeScript 사용 여부는 아직 확정하지 않았으며, 프론트 담당자와 협의한 뒤 결정합니다.
+This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
 
-## 스캐폴딩 방법
+Currently, two official plugins are available:
 
-JavaScript로 확정하는 경우:
+- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
 
-```bash
-npm create vite@latest frontend -- --template react
-```
+## React Compiler
 
-TypeScript로 확정하는 경우:
+The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
 
-```bash
-npm create vite@latest frontend -- --template react-ts
-```
+## Expanding the Oxlint configuration
 
-## 폴더 역할
-
-```txt
-src/api         FastAPI 호출 함수
-src/pages       Dashboard, Devices, Logs, Events, Isolation 화면
-src/components  공통 UI 컴포넌트
-src/styles      전역 스타일
-```
-
-React Dashboard는 FastAPI API를 호출해서 기기 상태, MQTT 로그, feature 로그, 탐지 이벤트, Trust Score, 격리 이력을 표시합니다.
-
-## 이전 임시 스캐폴딩 참고
-
-이전에 임시로 만든 프론트엔드 스캐폴딩은 React + Vite + TypeScript 기반이었습니다. 기술 선택이 확정되지 않았으므로 해당 파일들은 제거했습니다.
-
-참고할 값:
-
-```env
-VITE_API_BASE_URL=http://localhost:8000/api
-```
-
-이전 임시 API client는 `/api/health`를 호출하는 `getHealth()` 함수만 포함했습니다.
+If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
