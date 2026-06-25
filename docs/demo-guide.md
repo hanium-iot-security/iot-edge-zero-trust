@@ -37,7 +37,7 @@ mosquitto_pub -h localhost -t 'iot/esp32_01/sensor' -m '{"device_id":"esp32_01",
 ## 시연 순서
 
 1. Mosquitto를 시작합니다.
-2. `esp32_01`이 들어간 DB를 생성하고 seed합니다.
+2. `esp32_01`, `esp32_02`가 들어간 DB를 생성하고 seed합니다.
 3. FastAPI를 실행하고 `/api/health`를 확인합니다.
 4. 구현된 edge worker를 실행합니다.
 5. 정상 telemetry를 `iot/esp32_01/sensor`로 publish합니다.
