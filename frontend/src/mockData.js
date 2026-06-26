@@ -4,7 +4,7 @@ export const mockSummary = {
   warning_devices: 0,
   danger_devices: 0,
   isolated_devices: 1,
-  recent_events_count: 2,
+  recent_events_count: 3,
   unknown_device_count: 1,
   last_updated: "2026-05-26 14:35:10",
 };
@@ -24,7 +24,7 @@ export const mockDevices = {
       status: "isolated",
       trust_score: 25,
       last_seen_at: "2026-05-26 14:29:50",
-    }
+    },
   ],
   total: 2,
 };
@@ -66,6 +66,7 @@ export const mockFeatureLogs = {
       publish_count: 2,
       avg_payload_size: 57.5,
       max_payload_size: 82,
+      avg_message_interval: 2.4,
       min_message_interval: 4.8,
     },
     {
@@ -75,6 +76,7 @@ export const mockFeatureLogs = {
       publish_count: 18,
       avg_payload_size: 60,
       max_payload_size: 90,
+      avg_message_interval: 0.8,
       min_message_interval: 0.5,
     },
   ],
@@ -105,8 +107,19 @@ export const mockEvents = {
       description: "미등록 기기 접근",
       detected_at: "2026-05-26 14:35:05",
     },
+    {
+      id: 11,
+      device_id: "esp32_02",
+      detector_type: "AI",
+      event_type: "AI_ANOMALY",
+      severity: "high",
+      score_delta: -15,
+      applied_to_score: 1,
+      description: "Isolation Forest 기반 이상 탐지",
+      detected_at: "2026-05-26 14:35:08",
+    },
   ],
-  total: 2,
+  total: 3,
 };
 
 export const mockIsolationHistory = {
@@ -119,6 +132,24 @@ export const mockIsolationHistory = {
       trust_score: 25,
       trigger_event_id: 9,
       created_at: "2026-05-26 14:35:10",
+    },
+  ],
+  total: 1,
+};
+
+export const mockTrustScoreSummary = {
+  items: [
+    {
+      device_id: "esp32_01",
+      trust_score: 100,
+      status: "normal",
+      last_seen_at: "2026-05-26 14:30:10",
+    },
+    {
+      device_id: "esp32_02",
+      trust_score: 25,
+      status: "isolated",
+      last_seen_at: "2026-05-26 14:29:50",
     },
   ],
 };

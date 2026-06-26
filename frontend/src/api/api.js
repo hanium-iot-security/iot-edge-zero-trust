@@ -6,45 +6,64 @@ import {
   mockFeatureLogs,
   mockEvents,
   mockIsolationHistory,
+  mockTrustScoreSummary,
 } from "../mockData";
 
-const API_BASE_URL = "http://192.168.0.20:8000";
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL || "http://localhost:8000/api";
 
-// 백엔드 완성 전에는 true, 실제 FastAPI 연결할 때 false
-const USE_MOCK = true;
+const USE_MOCK = import.meta.env.VITE_USE_MOCK === "true";
 
-export async function getSummary() {
-  if (USE_MOCK) return mockSummary;
-  const res = await axios.get(`${API_BASE_URL}/api/dashboard/summary`);
+async function request(path, mockData) {
+  if (USE_MOCK) {
+    console.log("[MOCK]", path);
+    return mockData;
+  }
+
+  const res = await axios.get(`${API_BASE_URL}${path}`);
+  console.log("[API]", path, res.data);
   return res.data;
 }
 
-export async function getDevices() {
-  if (USE_MOCK) return mockDevices;
-  const res = await axios.get(`${API_BASE_URL}/api/devices`);
-  return res.data;
+export function getSummary() {
+  return request("/dashboard/summary", mockSummary);
 }
 
-export async function getMqttLogs() {
-  if (USE_MOCK) return mockMqttLogs;
-  const res = await axios.get(`${API_BASE_URL}/api/mqtt-logs?limit=10`);
-  return res.data;
+export function getDevices() {
+  return request("/devices", mockDevices);
 }
 
-export async function getFeatureLogs() {
-  if (USE_MOCK) return mockFeatureLogs;
-  const res = await axios.get(`${API_BASE_URL}/api/feature-logs?limit=10`);
-  return res.data;
+export function getIsolatedDevices() {
+  return request("/devices?status=isolated", {
+    items: mockDevices.items.filter((device) => device.status === "isolated"),
+    total: mockDevices.items.filter((device) => device.status === "isolated").length,
+  });
 }
 
-export async function getEvents() {
-  if (USE_MOCK) return mockEvents;
-  const res = await axios.get(`${API_BASE_URL}/api/detection-events?limit=10`);
-  return res.data;
+export function getMqttLogs() {
+  return request("/mqtt-logs?limit=10", mockMqttLogs);
 }
 
-export async function getIsolationHistory() {
-  if (USE_MOCK) return mockIsolationHistory;
-  const res = await axios.get(`${API_BASE_URL}/api/isolation/history`);
-  return res.data;
+export function getFeatureLogs() {
+  return request("/feature-logs?limit=10", mockFeatureLogs);
+}
+
+export function getEvents() {
+  return request("/detection-events?limit=10", mockEvents);
+}
+
+export function getIsolationHistory() {
+  return request("/isolation/history", mockIsolationHistory);
+}
+
+export function getTrustScoreSummary() {
+  return request("/trust-score/summary", mockTrustScoreSummary);
+}
+
+export function getTrustScoreHistory(deviceId) {
+  return request(`/trust-score/${deviceId}/history?limit=50`, {
+    device_id: deviceId,
+    current_score: null,
+    items: [],
+  });
 }
