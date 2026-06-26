@@ -20,7 +20,7 @@ PRAGMA busy_timeout = 5000;
 
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |
-| device_id | TEXT | primary key, 기본 seed `esp32_01` |
+| device_id | TEXT | primary key, 기본 seed `esp32_01`, `esp32_02` |
 | ip_address | TEXT | 기기 IP |
 | status | TEXT | `normal`, `warning`, `danger`, `isolated` |
 | trust_score | INTEGER | 기본값 `100` |
