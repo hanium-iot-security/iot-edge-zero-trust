@@ -26,8 +26,8 @@ def _rand_str(length: int = 4) -> str:
 
 
 def _large_payload(device_id: str) -> bytes:
-    """5 KB 초과 payload — 4가지 subtype 중 랜덤."""
-    subtype = random.choice(["buffer_overflow", "data_exfiltration", "fuzzing", "binary"])
+    """5 KB 초과 valid JSON payload — 3가지 subtype 중 랜덤."""
+    subtype = random.choice(["buffer_overflow", "data_exfiltration", "binary"])
 
     if subtype == "buffer_overflow":
         size = random.randint(10240, 131072)
@@ -37,10 +37,6 @@ def _large_payload(device_id: str) -> bytes:
         size = random.randint(5121, 51200)
         b64  = ''.join(random.choices(string.ascii_letters + string.digits + '+/=', k=size - 60))
         body = json.dumps({"device_id": device_id, "data": b64})
-
-    elif subtype == "fuzzing":
-        size = random.randint(5121, 65536)
-        body = ''.join(random.choices(string.printable, k=size))
 
     else:  # binary
         size = random.randint(5121, 20480)
@@ -53,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="MQTT Large Payload Attack (LARGE_PAYLOAD)")
     p.add_argument("--host",      default=BROKER_HOST)
     p.add_argument("--port",      default=BROKER_PORT,                      type=int)
-    p.add_argument("--device_id", default=random.choice(REGISTERED_DEVICES))
+    p.add_argument("--device_id", default="esp32_02")
     p.add_argument("--count",     default=3,                                type=int,   help="보낼 메시지 수")
     p.add_argument("--interval",  default=4.5,                              type=float, help="메시지 간격(초)")
     return p.parse_args()

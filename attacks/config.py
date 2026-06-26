@@ -17,7 +17,7 @@ BROKER_PORT = settings.mqtt_port
 KEEPALIVE   = 60
 
 # 등록된 기기 목록 (db/seed_devices.py와 동기화)
-REGISTERED_DEVICES = ["esp32_01", "esp32_02", "esp32_03"]
+REGISTERED_DEVICES = ["esp32_01", "esp32_02"]
 
 # 정상 topic 템플릿 — settings.mqtt_normal_topic 패턴 기준
 # "iot/+/sensor" → 실제 publish 시 + 자리에 device_id 대입
@@ -27,15 +27,14 @@ NORMAL_TOPIC_TPL = "iot/{device_id}/sensor"
 MALICIOUS_TOPICS = [
     "admin/system/control",
     "test/hack",
-    "$SYS/broker/clients/total",
-    "$SYS/broker/uptime",
     "iot/unknown/sensor",
     "cmd/exec",
     "device/update/firmware",
     "backdoor/shell",
     "../../../etc/passwd",
-    "iot/#",
-    "iot/+/cmd",
+    "iot/esp32_02/cmd",
+    "iot/esp32_02/admin",
+    "iot/esp32_02/debug",
     "mgmt/reset",
     "factory/reset",
     "ota/update",

@@ -22,13 +22,9 @@ import paho.mqtt.client as mqtt
 from attacks.config import BROKER_HOST, BROKER_PORT, KEEPALIVE, REGISTERED_DEVICES
 
 # subscriber의 is_telemetry_topic() 기준으로 False가 되는 topic 패턴
+# publish topic에 wildcard(#, +)는 subscribe filter 전용이므로 제외
+# broker reserved topic($SYS/...)은 Mosquitto에서 publish 제한될 수 있으므로 제외
 _ABNORMAL_TOPIC_POOL = [
-    # 시스템 topic 접근
-    "$SYS/broker/clients/total",
-    "$SYS/broker/clients/connected",
-    "$SYS/broker/messages/sent",
-    "$SYS/broker/uptime",
-    "$SYS/broker/version",
     # 명령어 실행 topic
     "cmd/exec",
     "device/update/firmware",
@@ -38,15 +34,14 @@ _ABNORMAL_TOPIC_POOL = [
     "admin/system/control",
     "backdoor/shell",
     "debug/console",
+    # 등록 기기의 비정상 경로
+    "iot/esp32_02/cmd",
+    "iot/esp32_02/admin",
+    "iot/esp32_02/debug",
     # path traversal
     "../../../sensor",
     "iot/../admin/control",
     "iot/%2e%2e/admin",
-    # 와일드카드 삽입
-    "iot/#",
-    "#",
-    "+/+/sensor",
-    "iot/+/cmd",
     # 형식 불일치
     "test/hack",
 ]
@@ -60,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="MQTT Abnormal Topic Attack (ABNORMAL_TOPIC)")
     p.add_argument("--host",      default=BROKER_HOST)
     p.add_argument("--port",      default=BROKER_PORT,                      type=int)
-    p.add_argument("--device_id", default=random.choice(REGISTERED_DEVICES),
+    p.add_argument("--device_id", default="esp32_02",
                    help="payload에 넣을 device_id (등록된 기기)")
     p.add_argument("--count",     default=5,                                type=int,   help="보낼 메시지 수 (≥3 권장)")
     p.add_argument("--interval",  default=1.5,                              type=float)

@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="MQTT Flooding Attack (ABNORMAL_PUBLISH_RATE)")
     p.add_argument("--host",      default=BROKER_HOST)
     p.add_argument("--port",      default=BROKER_PORT,                      type=int)
-    p.add_argument("--device_id", default=random.choice(REGISTERED_DEVICES))
+    p.add_argument("--device_id", default="esp32_02")
     p.add_argument("--count",     default=30,                               type=int,   help="10초 안에 보낼 메시지 수")
     p.add_argument("--interval",  default=0.2,                              type=float, help="메시지 간격(초)")
     return p.parse_args()

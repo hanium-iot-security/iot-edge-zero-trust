@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="MQTT Malformed Payload Attack (MALFORMED_PAYLOAD)")
     p.add_argument("--host",      default=BROKER_HOST)
     p.add_argument("--port",      default=BROKER_PORT,                      type=int)
-    p.add_argument("--device_id", default=random.choice(REGISTERED_DEVICES))
+    p.add_argument("--device_id", default="esp32_02")
     p.add_argument("--count",     default=5,                                type=int,   help="보낼 깨진 메시지 수 (≥3 권장)")
     p.add_argument("--interval",  default=1.5,                              type=float, help="메시지 간격(초)")
     return p.parse_args()
