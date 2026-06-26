@@ -69,10 +69,12 @@ def _fake_device_id() -> str:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="MQTT Unknown Device Attack (UNKNOWN_DEVICE)")
-    p.add_argument("--host",     default=BROKER_HOST)
-    p.add_argument("--port",     default=BROKER_PORT, type=int)
-    p.add_argument("--count",    default=4,           type=int,   help="보낼 메시지 수")
-    p.add_argument("--interval", default=2.0,         type=float)
+    p.add_argument("--host",           default=BROKER_HOST)
+    p.add_argument("--port",           default=BROKER_PORT, type=int)
+    p.add_argument("--count",          default=4,           type=int,   help="보낼 메시지 수")
+    p.add_argument("--interval",       default=2.0,         type=float)
+    p.add_argument("--abnormal-topic", action="store_true",
+                   help="abnormal topic과 unknown device를 조합하는 케이스 (별도 시나리오)")
     return p.parse_args()
 
 
@@ -85,14 +87,16 @@ def main() -> None:
 
     print(f"[UnknownDevice] 미등록 device_id로 MQTT publish")
     print(f"  탐지 조건: device_id가 devices 테이블에 없음 → 즉시 차단")
+    if args.abnormal_topic:
+        print(f"  모드: abnormal topic 조합 (subscriber 미수신 가능)")
     print()
 
     for i in range(args.count):
         fake_id = _fake_device_id()
-        topic   = random.choice([
-            NORMAL_TOPIC_TPL.format(device_id=fake_id),
-            random.choice(_ABNORMAL_TOPICS),
-        ])
+        if args.abnormal_topic:
+            topic = random.choice(_ABNORMAL_TOPICS)
+        else:
+            topic = NORMAL_TOPIC_TPL.format(device_id=fake_id)
         payload = json.dumps({"device_id": fake_id})
         result  = client.publish(topic, payload, qos=0)
         print(f"  [{i+1}/{args.count}] device_id={fake_id!r} topic={topic!r} (mid={result.mid})")

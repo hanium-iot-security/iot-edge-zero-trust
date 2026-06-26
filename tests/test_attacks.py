@@ -82,6 +82,22 @@ class TestLargePayloadAttack:
             data = json.loads(payload.decode("utf-8"))
             assert data.get("device_id") == "esp32_01", "device_id 필드 누락 또는 불일치"
 
+    def test_each_subtype_exceeds_5120_bytes_at_minimum_size(self):
+        """subtype별 randint 최솟값에서도 payload가 5120 bytes를 초과하는지 확인."""
+        from unittest.mock import patch
+        device_id = "esp32_02"
+        min_sizes = {
+            "buffer_overflow":   10240,
+            "data_exfiltration": 5121,
+            "binary":            5121,
+        }
+        for subtype, min_size in min_sizes.items():
+            with patch("random.choice", return_value=subtype), \
+                 patch("random.randint", return_value=min_size):
+                payload = _large_payload(device_id)
+            assert len(payload) > 5120, \
+                f"subtype={subtype!r} min_size={min_size} → payload {len(payload)} bytes <= 5120"
+
 
 # ── malformed_payload_attack ──────────────────────────────────────────────────
 
@@ -158,6 +174,15 @@ class TestUnknownDeviceAttack:
             fake_id = _fake_device_id()
             assert isinstance(fake_id, str)
             assert len(fake_id) > 0
+
+    def test_default_topic_is_normal_telemetry(self):
+        """기본 동작에서 fake_id는 정상 telemetry topic 형식으로 publish해야 합니다.
+        abnormal topic은 --abnormal-topic 플래그 사용 시에만 동작합니다."""
+        for _ in range(20):
+            fake_id = _fake_device_id()
+            topic = NORMAL_TOPIC_TPL.format(device_id=fake_id)
+            assert is_telemetry_topic(topic), \
+                f"기본 topic이 telemetry 형식이 아님: {topic!r}"
 
 
 # ── device_id_mismatch_attack ─────────────────────────────────────────────────

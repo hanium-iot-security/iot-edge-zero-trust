@@ -35,7 +35,7 @@ def _large_payload(device_id: str) -> bytes:
 
     elif subtype == "data_exfiltration":
         size = random.randint(5121, 51200)
-        b64  = ''.join(random.choices(string.ascii_letters + string.digits + '+/=', k=size - 60))
+        b64  = ''.join(random.choices(string.ascii_letters + string.digits + '+/=', k=size))
         body = json.dumps({"device_id": device_id, "data": b64})
 
     else:  # binary
