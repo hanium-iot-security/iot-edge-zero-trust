@@ -194,7 +194,16 @@ MVP에서는 실제 악성코드 기반 공격이 아니라, MQTT 통신 행위 
 
 `DEVICE_ID_MISMATCH`는 topic과 payload의 device_id가 모두 존재하지만 서로 다른 경우에만 적용한다. 단, 미등록 device_id가 포함된 경우에는 `UNKNOWN_DEVICE`를 우선 적용한다.
 
-공격 스크립트 실행 방법과 옵션은 각 파일 구현 후 README 또는 `docs/test-scenarios.md`에 추가한다.
+**Abnormal Topic 테스트 시 subscriber 구독 범위 설정**
+
+`admin/system/control`, `cmd/exec` 등 비정상 topic은 subscriber가 `iot/+/sensor`만 구독하면 수신되지 않아 탐지가 동작하지 않는다.  
+Abnormal Topic 공격 테스트 시에는 `.env`에 아래 설정을 적용해야 한다.
+
+```env
+MQTT_SUBSCRIBE_TOPIC=#
+```
+
+기본값(`iot/+/sensor`)은 정상 운영 구독 범위이며, 통합 테스트 완료 후 되돌린다.
 
 ## 11. Git 브랜치 운영 규칙
 
