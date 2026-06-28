@@ -91,7 +91,13 @@ python edge/mqtt/subscriber.py
 python edge/features/collect_feature_logs.py
 ```
 
-탐지 및 Trust Score 실행 진입점은 구현 단계에서 확정합니다. 실제 진입점이 정해지면 `edge/scripts/run_detector.sh` 또는 `edge/detection/rule_detector.py` 기준으로 갱신합니다.
+탐지 및 Trust Score 실행:
+
+```bash
+python -m edge.detection.run_rule_detector
+python -m edge.detection.run_ai_detector
+python -m edge.trust.run_trust_score_update
+```
 
 FastAPI 실행:
 
