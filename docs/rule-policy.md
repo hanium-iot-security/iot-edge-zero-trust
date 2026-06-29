@@ -14,4 +14,21 @@
 `MALFORMED_PAYLOAD`는 깨진 JSON 또는 `device_id` 필수 필드가 누락된 payload가 10초 window 기준 3회 이상 발생하면 기록합니다.
 `UNKNOWN_DEVICE`는 점수를 적용할 등록 기기가 없으므로 Trust Score 계산 대상이 아닙니다.
 
-TODO: 위 기준을 사용해 `edge/detection/rule_detector.py`의 실제 판정 함수를 구현합니다.
+## 판정 우선순위
+
+`UNKNOWN_DEVICE`는 `DEVICE_ID_MISMATCH`보다 우선합니다. topic 또는 payload 중 하나라도 미등록 기기이면 `UNKNOWN_DEVICE`로 처리합니다.
+
+## 이벤트 저장 기준
+
+| 이벤트 분류 | 참조 ID |
+| --- | --- |
+| Feature 기반 (`ABNORMAL_PUBLISH_RATE`, `LARGE_PAYLOAD`, `MALFORMED_PAYLOAD`, `ABNORMAL_TOPIC`) | `feature_log_id` |
+| MQTT 원본 기반 (`UNKNOWN_DEVICE`, `DEVICE_ID_MISMATCH`) | `mqtt_log_id` |
+| AI 탐지 (`AI_ANOMALY`) | `feature_log_id` |
+
+탐지 실행:
+
+```bash
+python -m edge.detection.run_rule_detector
+python -m edge.detection.run_ai_detector
+```

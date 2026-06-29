@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.config import settings
 from backend.app.database import SessionLocal
-from edge.features.feature_utils import parse_payload_json, payload_size
+from edge.features.feature_utils import extract_payload_device_id, payload_size
 from edge.mqtt.topic_utils import (
     extract_device_id_candidate_from_topic,
     extract_device_id_from_topic,
@@ -34,24 +34,13 @@ def _decode_payload(payload: str | bytes) -> str:
     return payload
 
 
-def _payload_device_id(parsed_payload: Any) -> str | None:
-    if not isinstance(parsed_payload, dict):
-        return None
-
-    device_id = parsed_payload.get("device_id")
-    if isinstance(device_id, str) and device_id.strip():
-        return device_id.strip()
-    return None
-
-
 def build_mqtt_log_row(
     topic: str,
     payload: str | bytes,
     received_at: datetime | None = None,
 ) -> dict[str, Any]:
     payload_text = _decode_payload(payload)
-    parsed_payload = parse_payload_json(payload)
-    payload_device_id = _payload_device_id(parsed_payload)
+    payload_device_id = extract_payload_device_id(payload)
     strict_topic_device_id = extract_device_id_from_topic(topic)
     topic_device_id_candidate = extract_device_id_candidate_from_topic(topic)
     is_topic_valid = is_telemetry_topic(topic)
