@@ -72,7 +72,7 @@ PRAGMA busy_timeout = 5000;
 | event_type | TEXT | MVP event type |
 | severity | TEXT | 심각도 |
 | score_delta | INTEGER | Trust Score 감점값 |
-| applied_to_score | INTEGER | `0` 또는 `1` |
+| applied_to_score | INTEGER | Trust Score updater 처리 완료 여부. `1`이면 처리 완료를 의미하며, `isolated` 이후 이벤트는 정책상 `score_delta = 0`으로 마감될 수 있음 |
 | description | TEXT | 사람이 읽을 설명 |
 | detected_at | DATETIME | 탐지 시각, 기본 current timestamp |
 

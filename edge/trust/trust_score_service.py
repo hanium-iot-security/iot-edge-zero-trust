@@ -179,6 +179,30 @@ def _apply_representative_event(
     score_delta = score_delta_for_event(event_type)
     previous_score = int(device["trust_score"])
     previous_status = device["status"]
+
+    if previous_status == ISOLATED_STATUS:
+        connection.execute(
+            """
+            UPDATE detection_events
+            SET applied_to_score = 1, score_delta = 0
+            WHERE id = ?
+            """,
+            (event_id,),
+        )
+
+        return TrustScoreChange(
+            event_id=event_id,
+            feature_log_id=representative["feature_log_id"],
+            device_id=device_id,
+            event_type=event_type,
+            score_delta=0,
+            previous_score=previous_score,
+            new_score=previous_score,
+            previous_status=previous_status,
+            new_status=previous_status,
+            isolation_recorded=False,
+        )
+
     new_score = apply_score_delta(previous_score, score_delta)
     new_status = status_for_trust_score(new_score)
     isolation_recorded = (

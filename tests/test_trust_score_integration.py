@@ -366,20 +366,28 @@ def test_distinct_mismatch_messages_score_individually_and_isolate(
     fresh_db.expire_all()
 
     assert isolated_update.applied_event_count == 1
-    assert _device_state(fresh_db, "esp32_01") == (0, "isolated")
+    assert isolated_update.changes[0].score_delta == 0
+    assert isolated_update.changes[0].previous_score == 25
+    assert isolated_update.changes[0].new_score == 25
+    assert isolated_update.changes[0].previous_status == "isolated"
+    assert isolated_update.changes[0].new_status == "isolated"
+    assert isolated_update.changes[0].isolation_recorded is False
+    assert _device_state(fresh_db, "esp32_01") == (25, "isolated")
     assert fresh_db.execute(
         text("SELECT COUNT(*) FROM isolation_history")
     ).scalar_one() == 1
-    assert fresh_db.execute(
+    fourth_event = fresh_db.execute(
         text(
             """
-            SELECT applied_to_score
+            SELECT applied_to_score, score_delta
             FROM detection_events
             WHERE mqtt_log_id = :mqtt_log_id
             """
         ),
         {"mqtt_log_id": fourth_mqtt_id},
-    ).scalar_one() == 1
+    ).mappings().one()
+    assert fourth_event["applied_to_score"] == 1
+    assert fourth_event["score_delta"] == 0
 
     device = api_client.get("/api/devices/esp32_01").json()
     events = api_client.get(
@@ -393,17 +401,22 @@ def test_distinct_mismatch_messages_score_individually_and_isolate(
         params={"device_id": "esp32_01"},
     ).json()
 
-    assert device["trust_score"] == 0
+    assert device["trust_score"] == 25
     assert device["status"] == "isolated"
     assert events["total"] == 4
-    assert all(item["score_delta"] == -25 for item in events["items"])
+    mismatch_deltas = [
+        item["score_delta"]
+        for item in sorted(events["items"], key=lambda item: item["id"])
+    ]
+    assert mismatch_deltas == [-25, -25, -25, 0]
     assert all(item["applied_to_score"] == 1 for item in events["items"])
     assert next(
         item for item in summary["items"] if item["device_id"] == "esp32_01"
-    )["trust_score"] == 0
+    )["trust_score"] == 25
     assert history["total"] == 4
     assert history["items"][0]["score_before"] == 25
-    assert history["items"][0]["score_after"] == 0
+    assert history["items"][0]["score_after"] == 25
+    assert history["items"][0]["score_delta"] == 0
     assert isolation["total"] == 1
     assert isolation["items"][0]["trust_score"] == 25
 

@@ -220,3 +220,36 @@ def test_score_below_30_isolates_device_and_records_history(tmp_path: Path) -> N
     assert history["reason"] == "Trust Score below threshold"
     assert history["trust_score"] == 10
     assert history["trigger_event_id"] == event_id
+
+
+def test_already_isolated_device_does_not_lose_more_score(tmp_path: Path) -> None:
+    db_path = create_test_db(tmp_path)
+    seed_device(db_path, trust_score=10, status="isolated")
+    feature_log_id = insert_feature_log(db_path)
+    event_id = insert_detection_event(
+        db_path,
+        DEVICE_ID_MISMATCH,
+        feature_log_id=feature_log_id,
+    )
+
+    result = update_trust_scores(db_path)
+
+    device = fetch_one(db_path, "SELECT trust_score, status FROM devices")
+    event = fetch_one(
+        db_path,
+        "SELECT applied_to_score, score_delta FROM detection_events WHERE id = ?",
+        (event_id,),
+    )
+    history_count = fetch_one(db_path, "SELECT COUNT(*) AS count FROM isolation_history")
+    assert result.applied_event_count == 1
+    assert result.changes[0].score_delta == 0
+    assert result.changes[0].previous_score == 10
+    assert result.changes[0].new_score == 10
+    assert result.changes[0].previous_status == "isolated"
+    assert result.changes[0].new_status == "isolated"
+    assert result.changes[0].isolation_recorded is False
+    assert device["trust_score"] == 10
+    assert device["status"] == "isolated"
+    assert event["applied_to_score"] == 1
+    assert event["score_delta"] == 0
+    assert history_count["count"] == 0

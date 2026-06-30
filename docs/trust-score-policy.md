@@ -34,6 +34,18 @@ ISOLATION_THRESHOLD=30
 
 같은 window 규칙: 하나의 feature window에서 여러 detection event가 발생하면 가장 큰 감점만 적용합니다. 나머지 event는 `applied_to_score = 0`으로 유지합니다.
 
+## 격리 이후 Trust Score 정책
+
+MVP에서는 기기가 `isolated` 상태가 된 이후 추가 보안 이벤트가 발생하더라도 Trust Score를 추가 감점하지 않습니다.
+
+추가 이벤트는 `detection_events`에 계속 저장하여 이상 행위 추적성은 유지하되, `devices.trust_score`는 최초 격리 시점의 점수로 고정합니다.
+
+`isolation_history`는 최초로 `isolated` 상태에 진입한 시점에만 1회 저장합니다.
+
+이미 `isolated`인 기기의 후속 대표 이벤트는 Trust Score updater에서 처리 완료로 보고 `applied_to_score = 1`, `score_delta = 0`으로 마감합니다.
+
+격리 해제, 재격리, cooldown, 일정 시간 내 감점 제한, window 기반 묶기 정책은 MVP 이후 고도화 항목으로 분리합니다.
+
 이벤트별 Trust Score 변화량은 `severity`가 아니라 `event_type` 기준으로 고정합니다. `severity`는 API와 대시보드 표시용으로 사용합니다.
 
 | event_type | score_delta | 비고 |
