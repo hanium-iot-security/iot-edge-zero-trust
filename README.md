@@ -286,3 +286,10 @@ type: 작업 내용 요약
 | `test` | 테스트 코드 추가 또는 수정 | `test: mqtt_logs 저장 테스트 추가` |
 | `chore` | 설정, 패키지, 빌드 관련 작업 | `chore: requirements.txt 패키지 추가` |
 | `style` | 포맷팅, 들여쓰기 등 동작 변화 없는 수정 | `style: 코드 포맷 정리` |
+
+## MVP E2E Test
+
+실제 Raspberry Pi + ESP32 기반 MVP E2E 테스트 절차와 결과는 아래 문서를 참고합니다.
+
+- [MVP E2E 테스트 가이드](docs/mvp-e2e-test-guide.md)
+- [MVP E2E 테스트 결과 - 2026-07-02](docs/mvp-e2e-test-results-2026-07-02.md)
