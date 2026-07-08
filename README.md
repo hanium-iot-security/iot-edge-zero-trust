@@ -20,7 +20,7 @@ ESP32 -> iot/{device_id}/sensor
   -> edge/trust 점수 및 격리 정책
   -> devices / isolation_history
   -> FastAPI /api/*
-  -> React + Vite dashboard 예정
+  -> React + Vite Dashboard
 ```
 
 기본 MQTT 값:
@@ -41,7 +41,7 @@ ai/          Isolation Forest export/train/predict 스크립트
 db/          SQLite schema, create, seed, reset 스크립트
 data/        학습 데이터와 export 데이터
 tests/       backend/integration 테스트와 작은 샘플
-frontend/    React + Vite 대시보드 예약 구조
+frontend/    React + Vite 대시보드
 docs/        아키텍처, API, DB, 정책, 시나리오 문서
 infra/       Mosquitto 참고 설정
 firmware/    ESP32 펌웨어 자리
@@ -56,7 +56,7 @@ firmware/    ESP32 펌웨어 자리
 | AI 모델 학습과 추론 | `ai`, `edge/detection/ai_detector.py` |
 | Trust Score와 격리 | `edge/trust` |
 | API와 대시보드 데이터 조회 | `backend/app/routers`, `backend/app/services` |
-| 대시보드 UI 예정 | `frontend` |
+| 대시보드 UI | `frontend` |
 | 문서와 시연 흐름 | `docs`, `README.md` |
 
 ## 5. 실행 방법
@@ -105,9 +105,20 @@ FastAPI 실행:
 uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-프론트엔드:
+프론트엔드 실행:
 
-현재 `frontend/`는 예약 구조만 유지합니다. JavaScript 또는 TypeScript 사용 여부를 확정한 뒤 `frontend/README.md` 기준으로 Vite 스캐폴딩을 생성합니다.
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+실제 API 기반으로 실행할 때는 `frontend/.env`에서 아래 값을 사용합니다.
+
+```env
+VITE_API_BASE_URL=http://127.0.0.1:8000/api
+VITE_USE_MOCK=false
+```
 
 ## 6. API 목록
 

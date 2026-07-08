@@ -31,7 +31,13 @@ venv\Scripts\activate
 
 프론트엔드:
 
-현재 `frontend/`는 예약 구조만 유지합니다. JavaScript 또는 TypeScript 사용 여부를 확정한 뒤 `frontend/README.md` 기준으로 Vite 스캐폴딩을 생성합니다.
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+실제 API 기반 시연 시 `frontend/.env`에서 `VITE_USE_MOCK=false`로 설정합니다.
 
 ## MQTT 확인
 

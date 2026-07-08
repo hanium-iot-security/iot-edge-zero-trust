@@ -340,6 +340,8 @@ Feature Graph가 더 가시성 있게 표시되도록 화면 구성 개선
 
 ### 11.3 isolated 이후 Trust Score 추가 감점 정책 확인 필요
 
+> 최신 `develop` 기준으로는 이후 PR에서 격리 이후 Trust Score 추가 감점 방지 정책이 반영되었습니다. 이 섹션은 2026-06-29 로컬 통합 테스트 당시 발견한 이슈 기록입니다.
+
 현재 결과에서는 `isolated` 이후에도 추가 이벤트가 반영되어 현재 Trust Score가 더 낮아질 수 있음을 확인했다.
 
 예시:
@@ -406,23 +408,19 @@ React Dashboard에서 실제 장비 데이터 표시
 3. Feature Graph 가시성 개선
 ```
 
-### 12.3 Trust Score 정책 정리
+### 12.3 Trust Score 정책 반영 기록
 
-격리 이후 추가 감점 정책은 MVP 기준으로 명확히 정리할 필요가 있다.
+> 최신 `develop` 기준으로는 격리 이후 추가 감점 방지 정책이 반영되었습니다. 이미 `isolated` 상태인 기기의 후속 대표 이벤트는 추가 감점 없이 처리 완료 상태로 마감됩니다.
 
-현재 선택 가능한 정책:
+현재 반영된 정책:
 
 ```txt
-정책 A:
-격리 이후에도 추가 이벤트는 Trust Score에 반영한다.
-단, isolation_history는 최초 격리 시점에만 1회 저장한다.
-
-정책 B:
-격리 이후에는 detection_events만 저장하고 Trust Score 추가 감점은 중단한다.
+격리 이후에는 후속 대표 이벤트를 추가 감점하지 않는다.
+이미 isolated 상태인 기기의 후속 대표 이벤트는 applied_to_score=1, score_delta=0으로 마감한다.
 isolation_history는 최초 격리 시점에만 1회 저장한다.
 ```
 
-MVP 안정성을 고려하면 현재 구현은 유지하되, 정책 설명을 문서화하고 고도화 단계에서 cooldown/window 묶기 정책을 검토하는 방식이 가능하다.
+해당 정책은 MVP 안정성을 위해 반영되었으며, 고도화 단계에서는 cooldown/window 묶기 정책을 추가로 검토할 수 있다.
 
 ## 13. 결론
 
@@ -443,4 +441,4 @@ MQTT 수집
 
 따라서 로컬 기준으로는 6/28~6/29 모듈 연결 단계가 완료된 것으로 판단한다.
 
-향후 통합 작업은 실제 Raspberry Pi + ESP32 기반 E2E 검증, Dashboard 표시 개선, Trust Score 격리 이후 정책 정리이다.
+향후 통합 작업은 실제 Raspberry Pi + ESP32 기반 E2E 검증과 Dashboard 표시 개선이다. Trust Score 격리 이후 추가 감점 방지 정책은 이후 PR에서 반영되었다.
