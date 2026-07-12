@@ -129,6 +129,7 @@ Trust Score update 실행 후 `detection_events.applied_to_score` 값이 갱신�
 - 반영된 이벤트는 `applied_to_score=1`로 변경되었다.
 - `UNKNOWN_DEVICE`는 등록 기기 Trust Score 감점 대상이 아니므로 `score_delta=0`으로 처리된다.
 - 동일 feature window에서 이미 다른 이벤트가 점수에 반영된 경우 일부 이벤트는 `Applied=no` 상태로 남을 수 있다.
+- 이미 `isolated` 상태인 기기의 후속 대표 이벤트는 추가 감점 없이 처리 완료 상태로 마감된다.
 - Trust Score가 30 미만이 된 기기는 `isolated` 상태로 변경된다.
 - `isolation_history`는 최초 격리 시점의 이력을 저장한다.
 
@@ -174,7 +175,7 @@ Detection Events Page에서 `AI_ANOMALY`, `DEVICE_ID_MISMATCH` 이벤트가 표�
 
 Trust Score update 이후 일부 이벤트는 점수에 반영되지 않고 `Applied=no` 상태로 남을 수 있다.
 
-예를 들어 `UNKNOWN_DEVICE`는 등록 기기의 Trust Score 감점 대상이 아니므로 `score_delta=0`으로 처리된다. 또한 동일 feature window에서 이미 다른 이벤트가 점수에 반영된 경우 일부 이벤트는 `Applied=no` 상태로 남을 수 있다.
+예를 들어 `UNKNOWN_DEVICE`는 등록 기기의 Trust Score 감점 대상이 아니므로 `score_delta=0`으로 처리된다. 또한 동일 feature window에서 이미 다른 이벤트가 점수에 반영된 경우 일부 이벤트는 `Applied=no` 상태로 남을 수 있다. 이미 `isolated` 상태인 기기의 후속 대표 이벤트도 추가 감점 없이 처리 완료 상태로 마감될 수 있다.
 
 현재 Dashboard에서는 `score_delta=0` 또는 `Applied=no`가 된 사유가 직접 표시되지 않아 테스트 결과 해석이 어려울 수 있다.
 

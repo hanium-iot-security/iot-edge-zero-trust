@@ -8,7 +8,7 @@ ESP32가 iot/{device_id}/sensor로 publish
   -> edge worker
   -> SQLite
   -> FastAPI 조회 API
-  -> React + Vite dashboard 예정
+  -> React + Vite Dashboard
 ```
 
 ## Edge 계층
@@ -33,4 +33,4 @@ SQLite schema는 `db/migrations/001_init.sql`에 둡니다. 생성된 DB 파일�
 
 ## 프론트엔드 계층
 
-`frontend/`는 React + Vite 기반 대시보드를 위한 예약 구조입니다. JavaScript 또는 TypeScript 사용 여부는 프론트 담당자와 협의한 뒤 확정합니다.
+`frontend/`는 React + Vite 기반 대시보드입니다. FastAPI의 `/api` 조회 API를 호출해 기기 상태, MQTT 로그, feature 로그, 탐지 이벤트, Trust Score, 격리 이력을 표시합니다.

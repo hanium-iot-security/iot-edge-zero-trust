@@ -258,6 +258,8 @@ ORDER BY id;
 
 동일 feature window에서 이미 다른 이벤트가 점수에 반영된 경우 일부 이벤트는 `Applied=no` 상태로 남을 수 있다.
 
+이미 `isolated` 상태인 기기의 후속 대표 이벤트는 추가 감점 없이 처리 완료 상태로 마감될 수 있다.
+
 ## FastAPI 실행
 
 Raspberry Pi에서 FastAPI를 실행한다.
