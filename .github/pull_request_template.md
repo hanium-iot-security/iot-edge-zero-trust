@@ -1,24 +1,70 @@
+<!-- 실제로 확인한 항목만 [x]로 표시합니다. 미실행 항목은 체크하지 말고 사유를 작성합니다. -->
+
+## PR 개요
+
+- Phase:
+- 담당 역할:
+- 관련 Issue / 세부계획:
+- 의존 PR:
+- Merge 순서:
+
 ## 작업 내용
 
 -
 
-## 테스트 방법
+## 제외 범위
 
+- 이 PR에서 구현하지 않은 항목:
 -
 
 ## 영향 범위
 
-- DB 변경: 있음 / 없음
-- API 변경: 있음 / 없음
-- Frontend 영향: 있음 / 없음
+- DB / Migration: 있음 / 없음
+- API 계약: 있음 / 없음
+- Frontend: 있음 / 없음
+- Raspberry Pi / systemd / Network: 있음 / 없음
+- 환경변수: 있음 / 없음
+- 기존 MQTT 기능: 있음 / 없음
+
+## 주요 계약 변경
+
+- 변경 전:
+- 변경 후:
+- 하위 호환성:
+- Rollback 또는 복구 방법:
+
+## 검증 결과
+
+| 환경 | 실행 명령 또는 시나리오 | 결과 |
+| --- | --- | --- |
+| Local |  |  |
+| Raspberry Pi |  |  |
+| Frontend |  |  |
+
+## 미실행 검증 및 사유
+
+-
+
+## 리뷰 요청 사항
+
+- 리뷰어가 중점적으로 확인할 내용:
+-
 
 ## 체크리스트
 
-- [ ] DB schema 변경 시 `docs/db-schema.md`와 `db/migrations/`를 함께 수정했습니다.
-- [ ] API 변경 시 `docs/api-spec.md`를 함께 수정했습니다.
-- [ ] MVP 상수 변경 시 `README.md`, `docs/`, `.env.example`, DB schema를 함께 확인했습니다.
-- [ ] Raspberry Pi 실행 방식 또는 Mosquitto 설정 영향 여부를 확인했습니다.
-- [ ] `backend`에는 탐지/Trust Score 판단 로직을 넣지 않았고, 실제 판단 로직은 `edge` 기준으로 유지했습니다.
-- [ ] 실제 DB 파일, 모델 파일, 수집 데이터 파일, `.env`가 Git에 포함되지 않았는지 확인했습니다.
+- [ ] 담당 역할과 Phase 범위만 변경했습니다.
+- [ ] 실제 실행한 테스트만 검증 결과에 기록했습니다.
+- [ ] 기존 MQTT 테스트와 기능의 회귀 여부를 확인했습니다.
+- [ ] DB 변경 시 Migration, 중복 실행, 기존 데이터 보존을 확인했습니다.
+- [ ] API 변경 시 `docs/api-spec.md`, Mock 및 Frontend 영향을 확인했습니다.
+- [ ] DB 구조 변경 시 `docs/db-schema.md`를 함께 수정했습니다.
+- [ ] MQTT Topic, Device ID, 상태값, Event Type 변경 시 관련 문서를 함께 확인했습니다.
+- [ ] 판단 로직은 `edge`에 두고 `backend`는 조회 API 역할을 유지했습니다.
+- [ ] 실제 DB, `.env`, 비밀정보, 모델 및 대용량 수집 데이터가 포함되지 않았습니다.
+- [ ] 대표 pcap은 테스트에 필요한 최소 크기와 비식별 정보만 포함합니다.
+- [ ] Raspberry Pi 변경 시 실행·중지·재시작·로그·복구 방법을 확인했습니다.
+- [ ] Timestamp 변경 시 내부 UTC와 Dashboard KST 기준을 확인했습니다.
 
 ## 스크린샷 또는 로그
+
+-
