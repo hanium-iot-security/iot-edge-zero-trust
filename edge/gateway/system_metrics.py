@@ -18,6 +18,7 @@ class CpuTimes:
 @dataclass(frozen=True)
 class InterfaceSnapshot:
     interface_name: str
+    exists: bool
     is_up: bool
     ip_address: str | None
     rx_bytes: int | None
@@ -109,11 +110,13 @@ class LinuxSystemMetricsReader:
         return None
 
     def _read_interface_safely(self, interface_name: str) -> InterfaceSnapshot:
+        interface_root = self._sys_root / "class" / "net" / interface_name
         try:
             return self._read_interface(interface_name)
         except (OSError, ValueError):
             return InterfaceSnapshot(
                 interface_name=interface_name,
+                exists=interface_root.exists(),
                 is_up=False,
                 ip_address=None,
                 rx_bytes=None,
@@ -131,6 +134,7 @@ class LinuxSystemMetricsReader:
             ip_address = None
         return InterfaceSnapshot(
             interface_name=interface_name,
+            exists=True,
             is_up=is_up,
             ip_address=ip_address,
             rx_bytes=rx_bytes,

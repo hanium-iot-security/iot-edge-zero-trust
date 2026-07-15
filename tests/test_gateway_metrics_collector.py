@@ -48,6 +48,7 @@ def build_snapshot(
         interfaces={
             "internal_lan": InterfaceSnapshot(
                 interface_name="eth0",
+                exists=True,
                 is_up=True,
                 ip_address="192.168.0.20",
                 rx_bytes=internal_rx,
@@ -55,6 +56,7 @@ def build_snapshot(
             ),
             "usb_lan": InterfaceSnapshot(
                 interface_name="eth1",
+                exists=False,
                 is_up=False,
                 ip_address=None,
                 rx_bytes=None,
@@ -72,7 +74,6 @@ def test_first_sample_keeps_interval_cpu_and_network_rates_unknown() -> None:
         ),
         clock=SequenceClock(collected_at),
         interface_names={"internal_lan": "eth0", "usb_lan": "eth1"},
-        max_sample_interval_seconds=30,
     )
 
     sample = collector.collect()
@@ -82,6 +83,7 @@ def test_first_sample_keeps_interval_cpu_and_network_rates_unknown() -> None:
     assert sample.cpu_percent is None
     assert sample.memory_percent == 40.0
     assert sample.disk_percent == 25.0
+    assert sample.disk_total_mb == 20.0
     assert sample.disk_used_mb == 5.0
     assert sample.temperature_c == 48.5
     assert sample.interface_metrics["internal_lan"].rx_bytes_per_sec is None
@@ -98,7 +100,6 @@ def test_second_sample_uses_actual_elapsed_time_for_cpu_and_network_rates() -> N
         ),
         clock=SequenceClock(started_at, started_at + timedelta(seconds=10.5)),
         interface_names={"internal_lan": "eth0", "usb_lan": "eth1"},
-        max_sample_interval_seconds=30,
     )
 
     collector.collect()
@@ -123,7 +124,6 @@ def test_counter_reset_invalidates_rates_and_becomes_the_next_baseline() -> None
             started_at + timedelta(seconds=20),
         ),
         interface_names={"internal_lan": "eth0", "usb_lan": "eth1"},
-        max_sample_interval_seconds=30,
     )
 
     collector.collect()
@@ -136,6 +136,50 @@ def test_counter_reset_invalidates_rates_and_becomes_the_next_baseline() -> None
     assert recovered_sample.interface_metrics["internal_lan"].tx_bytes_per_sec == 100.0
 
 
+def test_tx_counter_decrease_invalidates_both_network_rates() -> None:
+    started_at = datetime(2026, 7, 15, 0, 0, 10, tzinfo=timezone.utc)
+    collector = GatewayMetricsCollector(
+        reader=SequenceReader(
+            build_snapshot(cpu_total=1_000, cpu_idle=400, internal_rx=1_000, internal_tx=8_000),
+            build_snapshot(cpu_total=1_200, cpu_idle=500, internal_rx=2_000, internal_tx=100),
+        ),
+        clock=SequenceClock(started_at, started_at + timedelta(seconds=10)),
+        interface_names={"internal_lan": "eth0", "usb_lan": "eth1"},
+    )
+
+    collector.collect()
+    sample = collector.collect()
+
+    assert sample.interface_metrics["internal_lan"].rx_bytes_per_sec is None
+    assert sample.interface_metrics["internal_lan"].tx_bytes_per_sec is None
+
+
+@pytest.mark.parametrize("elapsed_seconds", [0, -1])
+def test_non_positive_elapsed_time_invalidates_cpu_and_network_deltas(
+    elapsed_seconds: int,
+) -> None:
+    started_at = datetime(2026, 7, 15, 0, 0, 10, tzinfo=timezone.utc)
+    collector = GatewayMetricsCollector(
+        reader=SequenceReader(
+            build_snapshot(cpu_total=1_000, cpu_idle=400, internal_rx=1_000, internal_tx=2_000),
+            build_snapshot(cpu_total=1_200, cpu_idle=500, internal_rx=2_000, internal_tx=3_000),
+        ),
+        clock=SequenceClock(
+            started_at,
+            started_at + timedelta(seconds=elapsed_seconds),
+        ),
+        interface_names={"internal_lan": "eth0", "usb_lan": "eth1"},
+    )
+
+    collector.collect()
+    sample = collector.collect()
+
+    assert sample.sample_interval_seconds == elapsed_seconds
+    assert sample.cpu_percent is None
+    assert sample.interface_metrics["internal_lan"].rx_bytes_per_sec is None
+    assert sample.interface_metrics["internal_lan"].tx_bytes_per_sec is None
+
+
 def test_down_or_missing_interface_does_not_stop_system_metric_collection() -> None:
     started_at = datetime(2026, 7, 15, 0, 0, 10, tzinfo=timezone.utc)
     first = build_snapshot(cpu_total=1_000, cpu_idle=400, internal_rx=1_000, internal_tx=2_000)
@@ -146,38 +190,39 @@ def test_down_or_missing_interface_does_not_stop_system_metric_collection() -> N
         reader=SequenceReader(first, second),
         clock=SequenceClock(started_at, started_at + timedelta(seconds=10)),
         interface_names={"internal_lan": "eth0", "usb_lan": "eth1"},
-        max_sample_interval_seconds=30,
     )
 
     collector.collect()
     sample = collector.collect()
 
     assert sample.memory_percent == 40.0
+    assert sample.interface_metrics["internal_lan"].exists is True
     assert sample.interface_metrics["internal_lan"].is_up is False
     assert sample.interface_metrics["internal_lan"].rx_bytes_per_sec is None
     assert sample.interface_metrics["usb_lan"].interface_name == "eth1"
+    assert sample.interface_metrics["usb_lan"].exists is False
     assert sample.interface_metrics["usb_lan"].is_up is False
     assert sample.interface_metrics["usb_lan"].rx_bytes is None
 
 
-def test_interval_over_maximum_keeps_actual_interval_but_invalidates_deltas() -> None:
+def test_long_interval_uses_actual_elapsed_time_for_deltas() -> None:
     started_at = datetime(2026, 7, 15, 0, 0, 10, tzinfo=timezone.utc)
     collector = GatewayMetricsCollector(
         reader=SequenceReader(
             build_snapshot(cpu_total=1_000, cpu_idle=400, internal_rx=1_000, internal_tx=2_000),
-            build_snapshot(cpu_total=1_200, cpu_idle=500, internal_rx=2_000, internal_tx=3_000),
+            build_snapshot(cpu_total=1_200, cpu_idle=500, internal_rx=4_100, internal_tx=3_550),
         ),
         clock=SequenceClock(started_at, started_at + timedelta(seconds=31)),
         interface_names={"internal_lan": "eth0", "usb_lan": "eth1"},
-        max_sample_interval_seconds=30,
     )
 
     collector.collect()
     sample = collector.collect()
 
     assert sample.sample_interval_seconds == 31.0
-    assert sample.cpu_percent is None
-    assert sample.interface_metrics["internal_lan"].rx_bytes_per_sec is None
+    assert sample.cpu_percent == 50.0
+    assert sample.interface_metrics["internal_lan"].rx_bytes_per_sec == 100.0
+    assert sample.interface_metrics["internal_lan"].tx_bytes_per_sec == 50.0
 
 
 def test_collected_at_is_converted_to_utc_and_naive_clock_is_rejected() -> None:
@@ -188,7 +233,6 @@ def test_collected_at_is_converted_to_utc_and_naive_clock_is_rejected() -> None:
         ),
         clock=SequenceClock(datetime(2026, 7, 15, 9, 0, 10, tzinfo=kst)),
         interface_names={"internal_lan": "eth0"},
-        max_sample_interval_seconds=30,
     )
     naive_collector = GatewayMetricsCollector(
         reader=SequenceReader(
@@ -196,7 +240,6 @@ def test_collected_at_is_converted_to_utc_and_naive_clock_is_rejected() -> None:
         ),
         clock=SequenceClock(datetime(2026, 7, 15, 0, 0, 10)),
         interface_names={"internal_lan": "eth0"},
-        max_sample_interval_seconds=30,
     )
 
     assert collector.collect().collected_at == datetime(2026, 7, 15, 0, 0, 10, tzinfo=timezone.utc)
@@ -209,17 +252,14 @@ def test_gateway_metrics_config_reads_defaults_and_environment_overrides() -> No
     configured = GatewayMetricsConfig.from_env(
         {
             "GATEWAY_METRICS_INTERVAL_SECONDS": "5",
-            "GATEWAY_METRICS_MAX_SAMPLE_INTERVAL_SECONDS": "20",
             "INTERNAL_LAN_INTERFACE": "enp1s0",
             "USB_LAN_INTERFACE": "enx001122",
         }
     )
 
     assert defaults.interval_seconds == 10
-    assert defaults.max_sample_interval_seconds == 30
     assert defaults.interface_names == {"internal_lan": "eth0", "usb_lan": "eth1"}
     assert configured.interval_seconds == 5
-    assert configured.max_sample_interval_seconds == 20
     assert configured.interface_names == {"internal_lan": "enp1s0", "usb_lan": "enx001122"}
 
 
@@ -256,7 +296,35 @@ def test_linux_reader_keeps_collecting_when_optional_interface_is_missing(tmp_pa
     assert snapshot.disk_total_bytes == 100_000
     assert snapshot.disk_used_bytes == 25_000
     assert snapshot.temperature_c == 48.5
+    assert snapshot.interfaces["internal_lan"].exists is True
     assert snapshot.interfaces["internal_lan"].ip_address == "192.168.0.20"
     assert snapshot.interfaces["internal_lan"].rx_bytes == 12_000
+    assert snapshot.interfaces["usb_lan"].exists is False
     assert snapshot.interfaces["usb_lan"].is_up is False
     assert snapshot.interfaces["usb_lan"].rx_bytes is None
+
+
+def test_linux_reader_keeps_collecting_when_temperature_file_is_missing(tmp_path) -> None:
+    proc_root = tmp_path / "proc"
+    sys_root = tmp_path / "sys"
+    proc_root.mkdir()
+    sys_root.mkdir()
+    (proc_root / "stat").write_text(
+        "cpu  100 20 30 400 50 0 0 0 7 3\n",
+        encoding="utf-8",
+    )
+    (proc_root / "meminfo").write_text(
+        "MemTotal:       1000 kB\nMemAvailable:    600 kB\n",
+        encoding="utf-8",
+    )
+    reader = LinuxSystemMetricsReader(
+        proc_root=proc_root,
+        sys_root=sys_root,
+        disk_path=tmp_path,
+        disk_usage=lambda _path: SimpleNamespace(total=100_000, used=25_000),
+    )
+
+    snapshot = reader.read({})
+
+    assert snapshot.temperature_c is None
+    assert snapshot.memory_total_bytes == 1_024_000

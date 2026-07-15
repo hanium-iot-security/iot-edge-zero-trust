@@ -11,6 +11,7 @@ from edge.gateway.system_metrics import InterfaceSnapshot, SystemMetricsReader, 
 @dataclass(frozen=True)
 class InterfaceMetrics:
     interface_name: str
+    exists: bool
     is_up: bool
     ip_address: str | None
     rx_bytes: int | None
@@ -26,6 +27,7 @@ class GatewayMetricsSample:
     cpu_percent: float | None
     memory_percent: float
     disk_percent: float
+    disk_total_mb: float
     disk_used_mb: float
     temperature_c: float | None
     interface_metrics: Mapping[str, InterfaceMetrics]
@@ -34,15 +36,12 @@ class GatewayMetricsSample:
 @dataclass(frozen=True)
 class GatewayMetricsConfig:
     interval_seconds: float = 10.0
-    max_sample_interval_seconds: float = 30.0
     internal_lan_interface: str = "eth0"
     usb_lan_interface: str = "eth1"
 
     def __post_init__(self) -> None:
         if self.interval_seconds <= 0:
             raise ValueError("interval_seconds must be positive")
-        if self.max_sample_interval_seconds <= 0:
-            raise ValueError("max_sample_interval_seconds must be positive")
         if not self.internal_lan_interface.strip():
             raise ValueError("internal_lan_interface must not be empty")
         if not self.usb_lan_interface.strip():
@@ -60,9 +59,6 @@ class GatewayMetricsConfig:
         values = os.environ if env is None else env
         return cls(
             interval_seconds=float(values.get("GATEWAY_METRICS_INTERVAL_SECONDS", "10")),
-            max_sample_interval_seconds=float(
-                values.get("GATEWAY_METRICS_MAX_SAMPLE_INTERVAL_SECONDS", "30")
-            ),
             internal_lan_interface=values.get("INTERNAL_LAN_INTERFACE", "eth0"),
             usb_lan_interface=values.get("USB_LAN_INTERFACE", "eth1"),
         )
@@ -75,15 +71,10 @@ class GatewayMetricsCollector:
         reader: SystemMetricsReader,
         clock: Callable[[], datetime],
         interface_names: Mapping[str, str],
-        max_sample_interval_seconds: float,
     ) -> None:
-        if max_sample_interval_seconds <= 0:
-            raise ValueError("max_sample_interval_seconds must be positive")
-
         self._reader = reader
         self._clock = clock
         self._interface_names = dict(interface_names)
-        self._max_sample_interval_seconds = max_sample_interval_seconds
         self._previous: tuple[datetime, SystemSnapshot] | None = None
 
     def collect(self) -> GatewayMetricsSample:
@@ -94,7 +85,7 @@ class GatewayMetricsCollector:
 
         snapshot = self._reader.read(self._interface_names)
         interval = self._sample_interval(collected_at)
-        valid_interval = interval is not None and 0 < interval <= self._max_sample_interval_seconds
+        valid_interval = interval is not None and interval > 0
 
         previous_snapshot = self._previous[1] if self._previous is not None else None
         interfaces = {
@@ -115,6 +106,7 @@ class GatewayMetricsCollector:
                 snapshot.memory_total_bytes,
             ),
             disk_percent=self._percent(snapshot.disk_used_bytes, snapshot.disk_total_bytes),
+            disk_total_mb=snapshot.disk_total_bytes / (1024 * 1024),
             disk_used_mb=snapshot.disk_used_bytes / (1024 * 1024),
             temperature_c=snapshot.temperature_c,
             interface_metrics=interfaces,
@@ -168,6 +160,7 @@ class GatewayMetricsCollector:
 
         return InterfaceMetrics(
             interface_name=current.interface_name,
+            exists=current.exists,
             is_up=current.is_up,
             ip_address=current.ip_address,
             rx_bytes=current.rx_bytes,
@@ -184,6 +177,8 @@ class GatewayMetricsCollector:
     ) -> bool:
         if interval is None or interval <= 0 or previous is None:
             return False
+        if not current.exists or not previous.exists:
+            return False
         if not current.is_up or not previous.is_up:
             return False
         if None in (current.rx_bytes, current.tx_bytes, previous.rx_bytes, previous.tx_bytes):
@@ -196,6 +191,7 @@ class GatewayMetricsCollector:
     def _missing_interface(interface_name: str) -> InterfaceSnapshot:
         return InterfaceSnapshot(
             interface_name=interface_name,
+            exists=False,
             is_up=False,
             ip_address=None,
             rx_bytes=None,
