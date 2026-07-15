@@ -29,7 +29,7 @@ ESP32가 iot/{device_id}/sensor로 publish
 
 ## 데이터 계층
 
-SQLite schema는 `db/migrations/001_init.sql`에 둡니다. 생성된 DB 파일은 `backend/data/iot_security.db`에 위치하며 Git에 올리지 않습니다.
+SQLite schema는 `db/migrations/`와 `db/migration_runner.py`로 관리합니다. 생성된 DB 파일은 `backend/data/iot_security.db`에 위치하며 Git에 올리지 않습니다.
 
 ## 프론트엔드 계층
 
