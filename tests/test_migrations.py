@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import sqlite3
 
 import pytest
@@ -59,6 +60,84 @@ def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
 
 def _column_names(connection: sqlite3.Connection, table_name: str) -> set[str]:
     return {row["name"] for row in connection.execute(f"PRAGMA table_info({table_name})")}
+
+
+def _insert_gateway_metric(
+    connection: sqlite3.Connection,
+    **overrides,
+) -> None:
+    values = {
+        "collected_at": "2026-07-16T10:00:00Z",
+        "sample_interval_seconds": None,
+        "cpu_percent": None,
+        "memory_percent": 40.0,
+        "disk_percent": 25.0,
+        "disk_used_mb": 512.0,
+        "network_rx_bytes": None,
+        "network_tx_bytes": None,
+        "temperature_c": None,
+        "interface_metrics_json": json.dumps(_interface_metrics()),
+    }
+    values.update(overrides)
+    connection.execute(
+        """
+        INSERT INTO gateway_metrics (
+            collected_at,
+            sample_interval_seconds,
+            cpu_percent,
+            memory_percent,
+            disk_percent,
+            disk_used_mb,
+            network_rx_bytes,
+            network_tx_bytes,
+            temperature_c,
+            interface_metrics_json
+        )
+        VALUES (
+            :collected_at,
+            :sample_interval_seconds,
+            :cpu_percent,
+            :memory_percent,
+            :disk_percent,
+            :disk_used_mb,
+            :network_rx_bytes,
+            :network_tx_bytes,
+            :temperature_c,
+            :interface_metrics_json
+        )
+        """,
+        values,
+    )
+
+
+def _interface_metrics(
+    *,
+    internal_rate: float | None = None,
+    usb_exists: bool = False,
+    usb_is_up: bool = False,
+) -> dict:
+    return {
+        "internal_lan": {
+            "interface_name": "eth0",
+            "exists": True,
+            "is_up": True,
+            "ip_address": "192.168.0.20",
+            "rx_bytes": 124000000,
+            "tx_bytes": 36000000,
+            "rx_bytes_per_sec": internal_rate,
+            "tx_bytes_per_sec": internal_rate,
+        },
+        "usb_lan": {
+            "interface_name": "eth1",
+            "exists": usb_exists,
+            "is_up": usb_is_up,
+            "ip_address": None,
+            "rx_bytes": None,
+            "tx_bytes": None,
+            "rx_bytes_per_sec": None,
+            "tx_bytes_per_sec": None,
+        },
+    }
 
 
 def test_runner_applies_new_database_in_order(tmp_path: Path) -> None:
@@ -428,6 +507,391 @@ def test_failed_002_migration_can_be_retried_after_fix(tmp_path: Path) -> None:
         ).fetchone()["count"] == 1
 
 
+def test_gateway_metrics_schema_matches_phase_contract(tmp_path: Path) -> None:
+    db_path = tmp_path / "gateway-schema.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+
+    expected_columns = {
+        "id",
+        "collected_at",
+        "sample_interval_seconds",
+        "cpu_percent",
+        "memory_percent",
+        "disk_percent",
+        "disk_used_mb",
+        "network_rx_bytes",
+        "network_tx_bytes",
+        "temperature_c",
+        "interface_metrics_json",
+        "created_at",
+    }
+    removed_columns = {
+        "capture_interface",
+        "active_session_count",
+        "ready_segment_count",
+        "processed_segment_count",
+        "failed_segment_count",
+        "details_json",
+        "disk_total_mb",
+    }
+
+    with connect_database(db_path) as connection:
+        columns = _column_names(connection, "gateway_metrics")
+        assert expected_columns <= columns
+        assert not removed_columns & columns
+
+
+def test_gateway_metrics_accepts_pr14_sample_shapes_and_json_round_trip(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "gateway-samples.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+
+    first_sample = _interface_metrics(internal_rate=None)
+    second_sample = _interface_metrics(internal_rate=100.0)
+    long_interval_sample = _interface_metrics(internal_rate=None)
+    down_sample = _interface_metrics(internal_rate=None, usb_exists=True, usb_is_up=False)
+
+    with connect_database(db_path) as connection:
+        _insert_gateway_metric(
+            connection,
+            collected_at="2026-07-16T10:00:00Z",
+            sample_interval_seconds=None,
+            cpu_percent=None,
+            memory_percent=40.0,
+            disk_percent=25.0,
+            disk_used_mb=5.0,
+            network_rx_bytes=None,
+            network_tx_bytes=None,
+            temperature_c=None,
+            interface_metrics_json=json.dumps(first_sample),
+        )
+        _insert_gateway_metric(
+            connection,
+            collected_at="2026-07-16T10:00:10.500000Z",
+            sample_interval_seconds=10.5,
+            cpu_percent=75.0,
+            memory_percent=41.0,
+            disk_percent=25.5,
+            disk_used_mb=5.1,
+            temperature_c=48.5,
+            interface_metrics_json=json.dumps(second_sample),
+        )
+        _insert_gateway_metric(
+            connection,
+            collected_at="2026-07-16T10:00:41.500000Z",
+            sample_interval_seconds=31.0,
+            cpu_percent=50.0,
+            memory_percent=42.0,
+            disk_percent=26.0,
+            disk_used_mb=None,
+            interface_metrics_json=json.dumps(long_interval_sample),
+        )
+        _insert_gateway_metric(
+            connection,
+            collected_at="2026-07-16T10:00:52Z",
+            sample_interval_seconds=0,
+            cpu_percent=None,
+            memory_percent=43.0,
+            disk_percent=27.0,
+            disk_used_mb=None,
+            interface_metrics_json=json.dumps(down_sample),
+        )
+
+        rows = connection.execute(
+            """
+            SELECT collected_at, sample_interval_seconds, cpu_percent,
+                   disk_used_mb, network_rx_bytes, network_tx_bytes,
+                   temperature_c, interface_metrics_json
+            FROM gateway_metrics
+            ORDER BY id
+            """
+        ).fetchall()
+
+        first_json = json.loads(rows[0]["interface_metrics_json"])
+        assert rows[0]["sample_interval_seconds"] is None
+        assert rows[0]["cpu_percent"] is None
+        assert rows[0]["network_rx_bytes"] is None
+        assert rows[0]["network_tx_bytes"] is None
+        assert rows[0]["temperature_c"] is None
+        assert first_json["internal_lan"]["interface_name"] == "eth0"
+        assert first_json["internal_lan"]["exists"] is True
+        assert first_json["internal_lan"]["rx_bytes"] == 124000000
+        assert first_json["internal_lan"]["rx_bytes_per_sec"] is None
+        assert first_json["usb_lan"]["interface_name"] == "eth1"
+        assert first_json["usb_lan"]["exists"] is False
+        assert first_json["usb_lan"]["is_up"] is False
+        assert first_json["usb_lan"]["ip_address"] is None
+
+        second_json = json.loads(rows[1]["interface_metrics_json"])
+        assert rows[1]["sample_interval_seconds"] == 10.5
+        assert rows[1]["cpu_percent"] == 75.0
+        assert second_json["internal_lan"]["rx_bytes_per_sec"] == 100.0
+        assert second_json["internal_lan"]["tx_bytes_per_sec"] == 100.0
+
+        long_interval_json = json.loads(rows[2]["interface_metrics_json"])
+        assert rows[2]["sample_interval_seconds"] == 31.0
+        assert rows[2]["disk_used_mb"] is None
+        assert long_interval_json["internal_lan"]["rx_bytes_per_sec"] is None
+        assert long_interval_json["internal_lan"]["tx_bytes_per_sec"] is None
+
+        down_json = json.loads(rows[3]["interface_metrics_json"])
+        assert rows[3]["sample_interval_seconds"] == 0
+        assert down_json["usb_lan"]["exists"] is True
+        assert down_json["usb_lan"]["is_up"] is False
+
+
+def test_gateway_metrics_constraints(tmp_path: Path) -> None:
+    db_path = tmp_path / "gateway-constraints.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+
+    failing_values = [
+        {"memory_percent": -0.1},
+        {"memory_percent": 100.1},
+        {"disk_percent": -0.1},
+        {"disk_percent": 100.1},
+        {"cpu_percent": -0.1},
+        {"cpu_percent": 100.1},
+        {"disk_used_mb": -1.0},
+        {"network_rx_bytes": -1},
+        {"network_tx_bytes": -1},
+        {"collected_at": None},
+        {"memory_percent": None},
+        {"disk_percent": None},
+        {"interface_metrics_json": None},
+    ]
+
+    with connect_database(db_path) as connection:
+        for values in failing_values:
+            with pytest.raises(sqlite3.IntegrityError):
+                _insert_gateway_metric(connection, **values)
+
+        _insert_gateway_metric(
+            connection,
+            sample_interval_seconds=None,
+            cpu_percent=None,
+            disk_used_mb=None,
+            network_rx_bytes=None,
+            network_tx_bytes=None,
+            temperature_c=None,
+        )
+        _insert_gateway_metric(
+            connection,
+            collected_at="2026-07-16T10:00:01Z",
+            sample_interval_seconds=-1,
+            cpu_percent=None,
+        )
+
+        assert connection.execute(
+            "SELECT COUNT(*) AS count FROM gateway_metrics"
+        ).fetchone()["count"] == 2
+
+
+def test_detector_checkpoints_schema_and_key_contract(tmp_path: Path) -> None:
+    db_path = tmp_path / "detector-checkpoints.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+
+    with connect_database(db_path) as connection:
+        columns = _column_names(connection, "detector_checkpoints")
+        assert {
+            "detector_name",
+            "source_table",
+            "last_processed_id",
+            "last_completed_window_end",
+            "updated_at",
+        } <= columns
+        assert not {"id", "checkpoint_key", "last_processed_at"} & columns
+
+        connection.execute(
+            """
+            INSERT INTO detector_checkpoints (
+                detector_name,
+                source_table,
+                last_processed_id,
+                last_completed_window_end
+            )
+            VALUES ('packet_rule', 'packet_feature', 10, '2026-07-16T10:00:10Z')
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO detector_checkpoints (
+                    detector_name,
+                    source_table
+                )
+                VALUES ('packet_rule', 'packet_feature')
+                """
+            )
+        connection.execute(
+            """
+            INSERT INTO detector_checkpoints (
+                detector_name,
+                source_table
+            )
+            VALUES ('packet_rule', 'mqtt_feature')
+            """
+        )
+
+
+def test_trust_score_history_schema_and_window_contract(tmp_path: Path) -> None:
+    db_path = tmp_path / "trust-score-history.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+
+    with connect_database(db_path) as connection:
+        columns = _column_names(connection, "trust_score_history")
+        assert {
+            "id",
+            "device_id",
+            "analysis_window_start",
+            "analysis_window_end",
+            "previous_score",
+            "calculated_delta",
+            "capped_delta",
+            "actual_delta",
+            "new_score",
+            "representative_event_ids_json",
+            "policy_version",
+            "created_at",
+        } <= columns
+        assert not {
+            "packet_feature_log_id",
+            "detection_event_id",
+            "score_before",
+            "score_delta",
+            "score_after",
+            "status_before",
+            "status_after",
+            "reason",
+        } & columns
+
+        connection.execute(
+            """
+            INSERT INTO devices (device_id, status, trust_score)
+            VALUES ('esp32_01', 'danger', 35)
+            """
+        )
+        event_ids_json = json.dumps([31, 34])
+        connection.execute(
+            """
+            INSERT INTO trust_score_history (
+                device_id,
+                analysis_window_start,
+                analysis_window_end,
+                previous_score,
+                calculated_delta,
+                capped_delta,
+                actual_delta,
+                new_score,
+                representative_event_ids_json,
+                policy_version
+            )
+            VALUES ('esp32_01', '2026-07-16T10:00:00Z',
+                    '2026-07-16T10:00:10Z', 50, -40, -25, -15, 35, ?, 'v1')
+            """,
+            (event_ids_json,),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO trust_score_history (
+                    device_id,
+                    analysis_window_start,
+                    analysis_window_end,
+                    previous_score,
+                    calculated_delta,
+                    capped_delta,
+                    actual_delta,
+                    new_score,
+                    representative_event_ids_json,
+                    policy_version
+                )
+                VALUES ('esp32_01', '2026-07-16T10:00:00Z',
+                        '2026-07-16T10:00:10Z', 35, -10, -10, -10, 25, '[]', 'v1')
+                """
+            )
+        connection.execute(
+            """
+            INSERT INTO trust_score_history (
+                device_id,
+                analysis_window_start,
+                analysis_window_end,
+                previous_score,
+                calculated_delta,
+                capped_delta,
+                actual_delta,
+                new_score,
+                representative_event_ids_json,
+                policy_version
+            )
+            VALUES ('esp32_01', '2026-07-16T10:00:10Z',
+                    '2026-07-16T10:00:20Z', 35, 0, 0, 0, 35, '[]', 'v1')
+            """
+        )
+
+        for column_name in ("previous_score", "new_score"):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO trust_score_history (
+                        device_id,
+                        analysis_window_start,
+                        analysis_window_end,
+                        previous_score,
+                        calculated_delta,
+                        capped_delta,
+                        actual_delta,
+                        new_score,
+                        representative_event_ids_json,
+                        policy_version
+                    )
+                    VALUES ('esp32_01', '2026-07-16T11:00:00Z',
+                            '2026-07-16T11:00:10Z',
+                            {101 if column_name == 'previous_score' else 50},
+                            0, 0, 0,
+                            {101 if column_name == 'new_score' else 50},
+                            '[]', 'v1')
+                    """
+                )
+
+        for values in (
+            {"representative_event_ids_json": None, "policy_version": "v1"},
+            {"representative_event_ids_json": "[]", "policy_version": None},
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO trust_score_history (
+                        device_id,
+                        analysis_window_start,
+                        analysis_window_end,
+                        previous_score,
+                        calculated_delta,
+                        capped_delta,
+                        actual_delta,
+                        new_score,
+                        representative_event_ids_json,
+                        policy_version
+                    )
+                    VALUES ('esp32_01', '2026-07-16T12:00:00Z',
+                            '2026-07-16T12:00:10Z',
+                            50, 0, 0, 0, 50,
+                            :representative_event_ids_json,
+                            :policy_version)
+                    """,
+                    values,
+                )
+
+        stored_json = connection.execute(
+            """
+            SELECT representative_event_ids_json
+            FROM trust_score_history
+            WHERE analysis_window_start = '2026-07-16T10:00:00Z'
+            """
+        ).fetchone()["representative_event_ids_json"]
+        assert json.loads(stored_json) == [31, 34]
+
+
 def test_packet_gateway_schema_constraints(tmp_path: Path) -> None:
     db_path = tmp_path / "constraints.db"
     apply_migrations(db_path, MIGRATIONS_DIR)
@@ -606,12 +1070,16 @@ def test_packet_gateway_schema_constraints(tmp_path: Path) -> None:
                 device_id,
                 analysis_window_start,
                 analysis_window_end,
-                score_before,
-                score_delta,
-                score_after
+                previous_score,
+                calculated_delta,
+                capped_delta,
+                actual_delta,
+                new_score,
+                representative_event_ids_json,
+                policy_version
             )
             VALUES ('esp32_01', '2026-07-16T10:00:00Z',
-                    '2026-07-16T10:00:10Z', 50, -25, 25)
+                    '2026-07-16T10:00:10Z', 50, -25, -25, -25, 25, '[1]', 'v1')
             """
         )
 
@@ -619,15 +1087,19 @@ def test_packet_gateway_schema_constraints(tmp_path: Path) -> None:
             connection.execute(
                 """
                 INSERT INTO trust_score_history (
-                    device_id,
-                    analysis_window_start,
-                    analysis_window_end,
-                    score_before,
-                    score_delta,
-                    score_after
+                device_id,
+                analysis_window_start,
+                analysis_window_end,
+                    previous_score,
+                    calculated_delta,
+                    capped_delta,
+                    actual_delta,
+                    new_score,
+                    representative_event_ids_json,
+                    policy_version
                 )
                 VALUES ('esp32_01', '2026-07-16T10:00:00Z',
-                        '2026-07-16T10:00:10Z', 25, 0, 25)
+                        '2026-07-16T10:00:10Z', 25, 0, 0, 0, 25, '[]', 'v1')
                 """
             )
 
@@ -744,6 +1216,25 @@ def test_firewall_rules_status_and_active_unique_contract(tmp_path: Path) -> Non
     apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
+        columns = _column_names(connection, "firewall_rules")
+        assert {
+            "id",
+            "device_id",
+            "source_ip",
+            "protocol",
+            "dest_port",
+            "action",
+            "reason",
+            "trigger_event_id",
+            "status",
+            "last_error",
+            "applied_at",
+            "released_at",
+            "created_at",
+            "updated_at",
+        } <= columns
+        assert not {"subject_ip", "port", "requested_at"} & columns
+
         for offset, status in enumerate(("PENDING", "APPLIED", "FAILED", "REMOVED")):
             connection.execute(
                 """
@@ -755,7 +1246,7 @@ def test_firewall_rules_status_and_active_unique_contract(tmp_path: Path) -> Non
                 )
                 VALUES (?, 'tcp', ?, ?)
                 """,
-                (f"192.168.0.{10 + offset}", 1883 + offset, status),
+                (f"192.168.0.{10 + offset}", 1883, status),
             )
 
         for status in ("ACTIVE", "RELEASED", "UNKNOWN"):
@@ -771,6 +1262,31 @@ def test_firewall_rules_status_and_active_unique_contract(tmp_path: Path) -> Non
                     VALUES ('192.168.0.200', 'tcp', 1883, ?)
                     """,
                     (status,),
+                )
+
+        for values in (
+            {"protocol": "TCP", "dest_port": 1883, "action": "DROP", "status": "PENDING"},
+            {"protocol": "udp", "dest_port": 1883, "action": "DROP", "status": "PENDING"},
+            {"protocol": "tcp", "dest_port": 8883, "action": "DROP", "status": "PENDING"},
+            {"protocol": "tcp", "dest_port": 1883, "action": "ACCEPT", "status": "PENDING"},
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO firewall_rules (
+                        source_ip,
+                        protocol,
+                        dest_port,
+                        action,
+                        status
+                    )
+                    VALUES ('192.168.0.201',
+                            :protocol,
+                            :dest_port,
+                            :action,
+                            :status)
+                    """,
+                    values,
                 )
 
         connection.execute(
@@ -824,19 +1340,6 @@ def test_firewall_rules_status_and_active_unique_contract(tmp_path: Path) -> Non
             """
             INSERT INTO firewall_rules (source_ip, protocol, dest_port, status)
             VALUES ('192.168.0.33', 'tcp', 1883, 'PENDING')
-            """
-        )
-
-        connection.execute(
-            """
-            INSERT INTO firewall_rules (source_ip, protocol, dest_port, status)
-            VALUES ('192.168.0.34', 'tcp', 1883, 'APPLIED')
-            """
-        )
-        connection.execute(
-            """
-            INSERT INTO firewall_rules (source_ip, protocol, dest_port, status)
-            VALUES ('192.168.0.34', 'tcp', 8000, 'PENDING')
             """
         )
 

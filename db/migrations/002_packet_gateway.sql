@@ -68,53 +68,47 @@ CREATE TABLE IF NOT EXISTS packet_feature_logs (
 
 CREATE TABLE IF NOT EXISTS gateway_metrics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    collected_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    capture_interface TEXT,
-    active_session_count INTEGER NOT NULL DEFAULT 0
-        CHECK(active_session_count >= 0),
-    ready_segment_count INTEGER NOT NULL DEFAULT 0
-        CHECK(ready_segment_count >= 0),
-    processed_segment_count INTEGER NOT NULL DEFAULT 0
-        CHECK(processed_segment_count >= 0),
-    failed_segment_count INTEGER NOT NULL DEFAULT 0
-        CHECK(failed_segment_count >= 0),
-    details_json TEXT,
+    collected_at DATETIME NOT NULL,
+    sample_interval_seconds REAL,
+    cpu_percent REAL
+        CHECK(cpu_percent IS NULL OR cpu_percent BETWEEN 0 AND 100),
+    memory_percent REAL NOT NULL CHECK(memory_percent BETWEEN 0 AND 100),
+    disk_percent REAL NOT NULL CHECK(disk_percent BETWEEN 0 AND 100),
+    disk_used_mb REAL CHECK(disk_used_mb IS NULL OR disk_used_mb >= 0),
+    network_rx_bytes INTEGER
+        CHECK(network_rx_bytes IS NULL OR network_rx_bytes >= 0),
+    network_tx_bytes INTEGER
+        CHECK(network_tx_bytes IS NULL OR network_tx_bytes >= 0),
+    temperature_c REAL,
+    interface_metrics_json TEXT NOT NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS detector_checkpoints (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
     detector_name TEXT NOT NULL,
-    checkpoint_key TEXT NOT NULL,
+    source_table TEXT NOT NULL,
     last_processed_id INTEGER,
-    last_processed_at DATETIME,
+    last_completed_window_end DATETIME,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(detector_name, checkpoint_key)
+    PRIMARY KEY (detector_name, source_table)
 );
 
 CREATE TABLE IF NOT EXISTS trust_score_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     device_id TEXT NOT NULL,
-    packet_feature_log_id INTEGER,
-    detection_event_id INTEGER,
     analysis_window_start DATETIME NOT NULL,
     analysis_window_end DATETIME NOT NULL,
-    score_before INTEGER NOT NULL CHECK(score_before BETWEEN 0 AND 100),
-    score_delta INTEGER NOT NULL,
-    score_after INTEGER NOT NULL CHECK(score_after BETWEEN 0 AND 100),
-    status_before TEXT,
-    status_after TEXT,
-    reason TEXT,
+    previous_score INTEGER NOT NULL CHECK(previous_score BETWEEN 0 AND 100),
+    calculated_delta INTEGER NOT NULL,
+    capped_delta INTEGER NOT NULL,
+    actual_delta INTEGER NOT NULL,
+    new_score INTEGER NOT NULL CHECK(new_score BETWEEN 0 AND 100),
+    representative_event_ids_json TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (device_id)
         REFERENCES devices(device_id)
         ON DELETE RESTRICT,
-    FOREIGN KEY (packet_feature_log_id)
-        REFERENCES packet_feature_logs(id)
-        ON DELETE SET NULL,
-    FOREIGN KEY (detection_event_id)
-        REFERENCES detection_events(id)
-        ON DELETE SET NULL,
     UNIQUE(device_id, analysis_window_start, analysis_window_end),
     CHECK(analysis_window_end > analysis_window_start)
 );
@@ -123,14 +117,13 @@ CREATE TABLE IF NOT EXISTS firewall_rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     device_id TEXT,
     source_ip TEXT NOT NULL,
-    protocol TEXT NOT NULL DEFAULT 'TCP',
-    dest_port INTEGER NOT NULL CHECK(dest_port BETWEEN 1 AND 65535),
-    action TEXT NOT NULL DEFAULT 'DROP',
+    protocol TEXT NOT NULL DEFAULT 'tcp' CHECK(protocol = 'tcp'),
+    dest_port INTEGER NOT NULL DEFAULT 1883 CHECK(dest_port = 1883),
+    action TEXT NOT NULL DEFAULT 'DROP' CHECK(action = 'DROP'),
     status TEXT NOT NULL DEFAULT 'PENDING'
         CHECK(status IN ('PENDING', 'APPLIED', 'FAILED', 'REMOVED')),
     reason TEXT,
     trigger_event_id INTEGER,
-    requested_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     applied_at DATETIME,
     released_at DATETIME,
     last_error TEXT,
@@ -189,9 +182,6 @@ CREATE INDEX IF NOT EXISTS idx_detection_events_incident_family_detected_at
 
 CREATE INDEX IF NOT EXISTS idx_detection_events_subject_ip_detected_at
     ON detection_events(subject_ip, detected_at);
-
-CREATE INDEX IF NOT EXISTS idx_trust_score_history_event
-    ON trust_score_history(detection_event_id);
 
 CREATE INDEX IF NOT EXISTS idx_trust_score_history_window
     ON trust_score_history(analysis_window_start, analysis_window_end);

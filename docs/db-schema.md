@@ -184,19 +184,26 @@ Packet segment에서 추출한 peer/direction별 feature row입니다.
 
 ## gateway_metrics
 
-Gateway 상태 metric 저장용 테이블입니다. 이번 단계에서는 구조만 생성하고 row 생성 로직은 구현하지 않습니다.
+Gateway 시스템 자원 metric 저장용 테이블입니다. 기본 수집 주기는 10초이며, 실제 sample 간격은 `sample_interval_seconds`에 저장합니다. 이번 단계에서는 구조만 생성하고 Collector, Repository, API는 구현하지 않습니다.
 
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |
 | id | INTEGER | primary key autoincrement |
-| collected_at | DATETIME | metric 수집 시각 |
-| capture_interface | TEXT | capture interface |
-| active_session_count | INTEGER | 활성 session 수 |
-| ready_segment_count | INTEGER | READY segment 수 |
-| processed_segment_count | INTEGER | PROCESSED segment 수 |
-| failed_segment_count | INTEGER | FAILED segment 수 |
-| details_json | TEXT | 추가 metric JSON |
+| collected_at | DATETIME | Collector가 생성한 UTC metric 수집 시각 |
+| sample_interval_seconds | REAL | 실제 sample 간격. 최초 sample 또는 유효한 이전 sample이 없으면 NULL 가능 |
+| cpu_percent | REAL | CPU 사용률. 최초 sample 또는 비정상 delta에서는 NULL 가능 |
+| memory_percent | REAL | Memory 사용률 |
+| disk_percent | REAL | Disk 사용률 |
+| disk_used_mb | REAL | Disk 사용량 MB, 선택 필드 |
+| network_rx_bytes | INTEGER | 선택적 top-level RX byte 합계 |
+| network_tx_bytes | INTEGER | 선택적 top-level TX byte 합계 |
+| temperature_c | REAL | 온도. 센서 미지원 또는 읽기 실패 시 NULL 가능 |
+| interface_metrics_json | TEXT | 역할별 interface metric JSON |
 | created_at | DATETIME | 생성 시각 |
+
+`interface_metrics_json`은 `internal_lan`, `usb_lan` 같은 역할명을 top-level key로 사용합니다. 실제 인터페이스 이름, 존재 여부, UP/DOWN 상태, IP, 누적 RX/TX, RX/TX bytes/sec는 JSON 객체에 저장합니다. 최초 sample, missing/down interface, counter reset, 비정상 delta에서는 JSON 내부 rate가 NULL일 수 있습니다. 후속 FastAPI 단계에서 이 JSON을 객체로 파싱할 예정입니다.
+
+PR #14 Gateway Metrics Collector의 `GatewayMetricsSample`은 `collected_at`, `sample_interval_seconds`, `cpu_percent`, `memory_percent`, `disk_percent`, `disk_used_mb`, `temperature_c`, `interface_metrics`를 이 테이블에 저장할 수 있습니다. `disk_total_mb`는 현재 DB/API 계약에 없으므로 저장 컬럼으로 추가하지 않습니다.
 
 ## detector_checkpoints
 
@@ -204,33 +211,31 @@ Detector별 처리 지점을 저장하기 위한 Phase 4용 테이블입니다. 
 
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |
-| id | INTEGER | primary key autoincrement |
 | detector_name | TEXT | detector 이름 |
-| checkpoint_key | TEXT | checkpoint key |
+| source_table | TEXT | detector 입력 source table |
 | last_processed_id | INTEGER | 마지막 처리 row id |
-| last_processed_at | DATETIME | 마지막 처리 시각 |
+| last_completed_window_end | DATETIME | 마지막 완료 window 종료 시각 |
 | updated_at | DATETIME | 수정 시각 |
 
-`(detector_name, checkpoint_key)`는 중복될 수 없습니다.
+`(detector_name, source_table)`은 primary key입니다. Checkpoint 대상 이름은 향후 확장을 막지 않도록 DB CHECK로 고정하지 않습니다.
 
 ## trust_score_history
 
-Phase 4용 Trust Score window history 테이블입니다. 이번 단계에서는 row를 자동 생성하지 않으며, 기존 `GET /api/trust-score/{device_id}/history`는 계속 `detection_events`를 원본으로 사용합니다.
+Phase 4용 Trust Score window history 테이블입니다. Window별 실제 점수 변화 결과를 저장하기 위한 구조입니다. 이번 단계에서는 row를 자동 생성하지 않으며, 기존 `GET /api/trust-score/{device_id}/history`는 계속 `detection_events`를 원본으로 사용합니다.
 
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |
 | id | INTEGER | primary key autoincrement |
 | device_id | TEXT | 대상 기기 |
-| packet_feature_log_id | INTEGER | 관련 packet feature row |
-| detection_event_id | INTEGER | 관련 detection event |
 | analysis_window_start | DATETIME | 분석 window 시작 |
 | analysis_window_end | DATETIME | 분석 window 종료 |
-| score_before | INTEGER | 적용 전 Trust Score |
-| score_delta | INTEGER | 변화량 |
-| score_after | INTEGER | 적용 후 Trust Score |
-| status_before | TEXT | 적용 전 상태 |
-| status_after | TEXT | 적용 후 상태 |
-| reason | TEXT | 변경 사유 |
+| previous_score | INTEGER | 적용 전 Trust Score |
+| calculated_delta | INTEGER | 계산된 총 변화량 |
+| capped_delta | INTEGER | 정책 cap 적용 후 변화량 |
+| actual_delta | INTEGER | 실제 적용된 변화량 |
+| new_score | INTEGER | 적용 후 Trust Score |
+| representative_event_ids_json | TEXT | 대표 detection event id JSON 배열 |
+| policy_version | TEXT | Trust Score 정책 version |
 | created_at | DATETIME | 생성 시각 |
 
 `(device_id, analysis_window_start, analysis_window_end)`는 중복될 수 없습니다.
@@ -244,17 +249,16 @@ Phase 4용 firewall 요청/상태 테이블입니다. 이번 단계에서는 row
 | id | INTEGER | primary key autoincrement |
 | device_id | TEXT | 대상 기기 |
 | source_ip | TEXT | 차단 대상 IP |
-| protocol | TEXT | protocol, 기본 `TCP` |
-| dest_port | INTEGER | destination port |
-| action | TEXT | firewall action, 기본 `DROP` |
+| protocol | TEXT | protocol, 기본 `tcp`, 1차 계약은 `tcp`만 허용 |
+| dest_port | INTEGER | destination port, 1차 계약은 `1883`만 허용 |
+| action | TEXT | firewall action, 1차 계약은 `DROP`만 허용 |
 | status | TEXT | `PENDING`, `APPLIED`, `FAILED`, `REMOVED` |
 | reason | TEXT | 요청 사유 |
 | trigger_event_id | INTEGER | 관련 detection event |
-| requested_at | DATETIME | 요청 시각 |
 | applied_at | DATETIME | 적용 시각 |
 | released_at | DATETIME | 해제 시각 |
 | last_error | TEXT | 마지막 오류 메시지 |
-| created_at | DATETIME | 생성 시각 |
+| created_at | DATETIME | 요청 생성 시각 |
 | updated_at | DATETIME | 수정 시각 |
 
 `PENDING`, `APPLIED` 상태에서는 `(source_ip, protocol, dest_port)` 조합이 중복될 수 없습니다.
@@ -274,7 +278,6 @@ Phase 4용 firewall 요청/상태 테이블입니다. 이번 단계에서는 row
 | `idx_detection_events_packet_feature_log_id` | packet feature 기반 detection event 조회 |
 | `idx_detection_events_incident_family_detected_at` | incident family별 event 조회 |
 | `idx_detection_events_subject_ip_detected_at` | subject IP별 event 조회 |
-| `idx_trust_score_history_event` | event 기반 Trust Score history 조회 |
 | `idx_trust_score_history_window` | window 기반 Trust Score history 조회 |
 | `idx_firewall_rules_status` | firewall status 조회 |
 | `idx_firewall_rules_source_ip` | source IP별 firewall rule 조회 |
