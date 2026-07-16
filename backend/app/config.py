@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     mqtt_port: int = 1883
     mqtt_normal_topic: str = "iot/+/sensor"
     mqtt_subscribe_topic: str = "iot/+/sensor"
+    capture_interface_ip: str = ""
     feature_window_seconds: int = 10
     initial_trust_score: int = 100
     isolation_threshold: int = 30
