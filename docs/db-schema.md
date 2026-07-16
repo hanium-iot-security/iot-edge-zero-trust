@@ -154,7 +154,7 @@ pcap segment 파일 단위입니다. Window는 `[window_start, window_end)` 반�
 | updated_at | DATETIME | 수정 시각 |
 
 `file_name`과 `(capture_interface, window_start, window_end)`는 중복될 수 없습니다.
-`window_start`, `window_end`는 SQLite 날짜 함수로 파싱 가능한 UTC 시각이어야 하며, `window_end`는 `window_start`로부터 정확히 10초 후여야 합니다.
+`window_start`, `window_end`는 정수 초 UTC 경계의 `YYYY-MM-DDTHH:MM:SSZ` 형식이어야 하며, `window_end`는 `window_start`로부터 정확히 10초 후여야 합니다. 소수점 이하 초가 포함된 시각은 저장하지 않습니다.
 
 ## packet_feature_logs
 
@@ -181,7 +181,7 @@ Packet segment에서 추출한 peer/direction별 feature row입니다.
 | capture_scope | TEXT | capture scope |
 | created_at | DATETIME | 생성 시각 |
 
-`(capture_segment_id, peer_ip, direction)`은 중복될 수 없습니다. `window_start`, `window_end`는 SQLite 날짜 함수로 파싱 가능한 UTC 시각이어야 하며, feature window는 정확히 10초여야 합니다. 격리 상태 기기의 feature 저장을 막는 DB 제약은 두지 않습니다.
+`(capture_segment_id, peer_ip, direction)`은 중복될 수 없습니다. `window_start`, `window_end`는 정수 초 UTC 경계의 `YYYY-MM-DDTHH:MM:SSZ` 형식이어야 하며, feature window는 정확히 10초여야 합니다. 소수점 이하 초가 포함된 시각은 저장하지 않습니다. 격리 상태 기기의 feature 저장을 막는 DB 제약은 두지 않습니다.
 
 ## gateway_metrics
 

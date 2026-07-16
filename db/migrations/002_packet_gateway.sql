@@ -47,6 +47,11 @@ CREATE TABLE IF NOT EXISTS packet_capture_segments (
         ON DELETE RESTRICT,
     UNIQUE(capture_interface, window_start, window_end),
     CHECK(
+        window_start GLOB
+            '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        AND window_end GLOB
+            '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        AND
         unixepoch(window_start) IS NOT NULL
         AND unixepoch(window_end) IS NOT NULL
         AND unixepoch(window_end) - unixepoch(window_start) = 10
@@ -81,6 +86,11 @@ CREATE TABLE IF NOT EXISTS packet_feature_logs (
         ON DELETE RESTRICT,
     UNIQUE(capture_segment_id, peer_ip, direction),
     CHECK(
+        window_start GLOB
+            '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        AND window_end GLOB
+            '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+        AND
         unixepoch(window_start) IS NOT NULL
         AND unixepoch(window_end) IS NOT NULL
         AND unixepoch(window_end) - unixepoch(window_start) = 10
