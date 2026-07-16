@@ -21,6 +21,8 @@ DEFAULT_DEVICES = [
 
 def main() -> None:
     with sqlite3.connect(DB_PATH) as connection:
+        connection.execute("PRAGMA foreign_keys = ON;")
+        connection.execute("PRAGMA busy_timeout = 5000;")
         for device in DEFAULT_DEVICES:
             connection.execute(
                 """

@@ -153,9 +153,16 @@ GET /api/isolation/history
 | `feature_logs` | 10초 트래픽 feature window |
 | `detection_events` | Rule 및 AI 탐지 이벤트 |
 | `isolation_history` | Trust Score로 발생한 격리 action |
+| `packet_capture_sessions` | Packet capture session |
+| `packet_capture_segments` | pcap segment window |
+| `packet_feature_logs` | Packet 기반 feature window |
+| `gateway_metrics` | Gateway metric |
+| `detector_checkpoints` | Detector 처리 지점 |
+| `trust_score_history` | Phase 4용 Trust Score window history |
+| `firewall_rules` | Phase 4용 firewall rule 상태 |
 
 실제 SQLite DB 파일은 기본적으로 `backend/data/iot_security.db`에 생성됩니다. 이 파일은 Git에 포함하지 않습니다.
-실행 가능한 schema는 `db/migrations/001_init.sql`입니다.
+실행 가능한 schema는 `db/migrations/`와 `db/migration_runner.py`로 관리합니다.
 
 ## 8. 규칙 기반 탐지 기준
 

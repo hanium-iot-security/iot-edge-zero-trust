@@ -1,18 +1,22 @@
 from pathlib import Path
-import sqlite3
 
+try:
+    from db.migration_runner import DB_PATH, apply_migrations
+except ModuleNotFoundError:  # pragma: no cover - direct script execution
+    from migration_runner import DB_PATH, apply_migrations
 
-DB_PATH = Path("backend/data/iot_security.db")
-SCHEMA_PATH = Path("db/migrations/001_init.sql")
+DEFAULT_DB_PATH = Path("backend/data/iot_security.db")
 
 
 def main() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DB_PATH) as connection:
-        connection.execute("PRAGMA journal_mode=WAL;")
-        connection.execute("PRAGMA busy_timeout = 5000;")
-        connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
-    print(f"SQLite 테이블을 생성했습니다: {DB_PATH}")
+    db_path = DB_PATH if DB_PATH else DEFAULT_DB_PATH
+    result = apply_migrations(db_path)
+    print(
+        f"SQLite migration을 적용했습니다: {db_path} "
+        f"(applied={result.applied_versions}, "
+        f"skipped={result.skipped_versions}, "
+        f"baselined={result.baselined_versions})"
+    )
 
 
 if __name__ == "__main__":
