@@ -7,12 +7,15 @@ import {
   mockEvents,
   mockIsolationHistory,
   mockTrustScoreSummary,
+  mockPacketFeatureLogs,
+  mockGatewayMetrics,
 } from "../mockData";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL || "http://localhost:8000/api";
 
-const USE_MOCK = import.meta.env.VITE_USE_MOCK === "true";
+const USE_MOCK =
+  import.meta.env.VITE_USE_MOCK === "true";
 
 async function request(path, mockData) {
   if (USE_MOCK) {
@@ -20,9 +23,11 @@ async function request(path, mockData) {
     return mockData;
   }
 
-  const res = await axios.get(`${API_BASE_URL}${path}`);
-  console.log("[API]", path, res.data);
-  return res.data;
+  const response = await axios.get(`${API_BASE_URL}${path}`);
+
+  console.log("[API]", path, response.data);
+
+  return response.data;
 }
 
 export function getSummary() {
@@ -34,9 +39,13 @@ export function getDevices() {
 }
 
 export function getIsolatedDevices() {
+  const isolatedDevices = mockDevices.items.filter(
+    (device) => device.status === "isolated"
+  );
+
   return request("/devices?status=isolated", {
-    items: mockDevices.items.filter((device) => device.status === "isolated"),
-    total: mockDevices.items.filter((device) => device.status === "isolated").length,
+    items: isolatedDevices,
+    total: isolatedDevices.length,
   });
 }
 
@@ -53,17 +62,53 @@ export function getEvents() {
 }
 
 export function getIsolationHistory() {
-  return request("/isolation/history", mockIsolationHistory);
+  return request(
+    "/isolation/history",
+    mockIsolationHistory
+  );
 }
 
 export function getTrustScoreSummary() {
-  return request("/trust-score/summary", mockTrustScoreSummary);
+  return request(
+    "/trust-score/summary",
+    mockTrustScoreSummary
+  );
 }
 
 export function getTrustScoreHistory(deviceId) {
-  return request(`/trust-score/${deviceId}/history?limit=50`, {
-    device_id: deviceId,
-    current_score: null,
-    items: [],
-  });
+  return request(
+    `/trust-score/${deviceId}/history?limit=50`,
+    {
+      device_id: deviceId,
+      current_score: null,
+      items: [],
+    }
+  );
+}
+
+export function getPacketFeatureLogs() {
+  return request(
+    "/packet-feature-logs?limit=100&offset=0",
+    mockPacketFeatureLogs
+  );
+}
+
+export function getGatewayMetrics() {
+  const refreshedMockGatewayMetrics = {
+    ...mockGatewayMetrics,
+    items: (mockGatewayMetrics.items || []).map(
+      (item, index) =>
+        index === 0
+          ? {
+              ...item,
+              collected_at: new Date().toISOString(),
+            }
+          : item
+    ),
+  };
+
+  return request(
+    "/gateway-metrics?limit=1",
+    refreshedMockGatewayMetrics
+  );
 }
