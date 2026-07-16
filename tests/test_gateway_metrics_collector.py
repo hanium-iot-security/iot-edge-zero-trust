@@ -73,7 +73,7 @@ def test_first_sample_keeps_interval_cpu_and_network_rates_unknown() -> None:
             build_snapshot(cpu_total=1_000, cpu_idle=400, internal_rx=1_000, internal_tx=2_000)
         ),
         clock=SequenceClock(collected_at),
-        interface_names={"internal_lan": "eth0", "usb_lan": "eth1"},
+        config=GatewayMetricsConfig(),
     )
 
     sample = collector.collect()
@@ -99,7 +99,7 @@ def test_second_sample_uses_actual_elapsed_time_for_cpu_and_network_rates() -> N
             build_snapshot(cpu_total=1_200, cpu_idle=450, internal_rx=2_050, internal_tx=2_525),
         ),
         clock=SequenceClock(started_at, started_at + timedelta(seconds=10.5)),
-        interface_names={"internal_lan": "eth0", "usb_lan": "eth1"},
+        config=GatewayMetricsConfig(),
     )
 
     collector.collect()
@@ -123,7 +123,7 @@ def test_counter_reset_invalidates_rates_and_becomes_the_next_baseline() -> None
             started_at + timedelta(seconds=10),
             started_at + timedelta(seconds=20),
         ),
-        interface_names={"internal_lan": "eth0", "usb_lan": "eth1"},
+        config=GatewayMetricsConfig(),
     )
 
     collector.collect()
@@ -144,7 +144,7 @@ def test_tx_counter_decrease_invalidates_both_network_rates() -> None:
             build_snapshot(cpu_total=1_200, cpu_idle=500, internal_rx=2_000, internal_tx=100),
         ),
         clock=SequenceClock(started_at, started_at + timedelta(seconds=10)),
-        interface_names={"internal_lan": "eth0", "usb_lan": "eth1"},
+        config=GatewayMetricsConfig(),
     )
 
     collector.collect()
@@ -154,30 +154,54 @@ def test_tx_counter_decrease_invalidates_both_network_rates() -> None:
     assert sample.interface_metrics["internal_lan"].tx_bytes_per_sec is None
 
 
-@pytest.mark.parametrize("elapsed_seconds", [0, -1])
-def test_non_positive_elapsed_time_invalidates_cpu_and_network_deltas(
-    elapsed_seconds: int,
-) -> None:
+def test_zero_elapsed_time_is_preserved_and_invalidates_cpu_and_network_deltas() -> None:
     started_at = datetime(2026, 7, 15, 0, 0, 10, tzinfo=timezone.utc)
     collector = GatewayMetricsCollector(
         reader=SequenceReader(
             build_snapshot(cpu_total=1_000, cpu_idle=400, internal_rx=1_000, internal_tx=2_000),
             build_snapshot(cpu_total=1_200, cpu_idle=500, internal_rx=2_000, internal_tx=3_000),
         ),
-        clock=SequenceClock(
-            started_at,
-            started_at + timedelta(seconds=elapsed_seconds),
-        ),
-        interface_names={"internal_lan": "eth0", "usb_lan": "eth1"},
+        clock=SequenceClock(started_at, started_at),
+        config=GatewayMetricsConfig(),
     )
 
     collector.collect()
     sample = collector.collect()
 
-    assert sample.sample_interval_seconds == elapsed_seconds
+    assert sample.sample_interval_seconds == 0
     assert sample.cpu_percent is None
     assert sample.interface_metrics["internal_lan"].rx_bytes_per_sec is None
     assert sample.interface_metrics["internal_lan"].tx_bytes_per_sec is None
+
+
+def test_negative_elapsed_time_is_unknown_and_next_sample_recovers() -> None:
+    started_at = datetime(2026, 7, 15, 0, 0, 10, tzinfo=timezone.utc)
+    collector = GatewayMetricsCollector(
+        reader=SequenceReader(
+            build_snapshot(cpu_total=1_000, cpu_idle=400, internal_rx=1_000, internal_tx=2_000),
+            build_snapshot(cpu_total=1_200, cpu_idle=500, internal_rx=2_000, internal_tx=3_000),
+            build_snapshot(cpu_total=1_400, cpu_idle=600, internal_rx=3_000, internal_tx=3_500),
+        ),
+        clock=SequenceClock(
+            started_at,
+            started_at - timedelta(seconds=1),
+            started_at + timedelta(seconds=9),
+        ),
+        config=GatewayMetricsConfig(),
+    )
+
+    collector.collect()
+    negative_interval_sample = collector.collect()
+    recovered_sample = collector.collect()
+
+    assert negative_interval_sample.sample_interval_seconds is None
+    assert negative_interval_sample.cpu_percent is None
+    assert negative_interval_sample.interface_metrics["internal_lan"].rx_bytes_per_sec is None
+    assert negative_interval_sample.interface_metrics["internal_lan"].tx_bytes_per_sec is None
+    assert recovered_sample.sample_interval_seconds == 10.0
+    assert recovered_sample.cpu_percent == 50.0
+    assert recovered_sample.interface_metrics["internal_lan"].rx_bytes_per_sec == 100.0
+    assert recovered_sample.interface_metrics["internal_lan"].tx_bytes_per_sec == 50.0
 
 
 def test_down_or_missing_interface_does_not_stop_system_metric_collection() -> None:
@@ -189,7 +213,7 @@ def test_down_or_missing_interface_does_not_stop_system_metric_collection() -> N
     collector = GatewayMetricsCollector(
         reader=SequenceReader(first, second),
         clock=SequenceClock(started_at, started_at + timedelta(seconds=10)),
-        interface_names={"internal_lan": "eth0", "usb_lan": "eth1"},
+        config=GatewayMetricsConfig(),
     )
 
     collector.collect()
@@ -205,24 +229,133 @@ def test_down_or_missing_interface_does_not_stop_system_metric_collection() -> N
     assert sample.interface_metrics["usb_lan"].rx_bytes is None
 
 
-def test_long_interval_uses_actual_elapsed_time_for_deltas() -> None:
+def test_down_interface_counter_becomes_baseline_for_next_up_sample() -> None:
+    started_at = datetime(2026, 7, 15, 0, 0, 10, tzinfo=timezone.utc)
+    first = build_snapshot(
+        cpu_total=1_000,
+        cpu_idle=400,
+        internal_rx=1_000,
+        internal_tx=2_000,
+    )
+    down = build_snapshot(
+        cpu_total=1_200,
+        cpu_idle=500,
+        internal_rx=1_500,
+        internal_tx=2_500,
+    )
+    down = replace(
+        down,
+        interfaces={
+            **down.interfaces,
+            "internal_lan": replace(down.interfaces["internal_lan"], is_up=False),
+        },
+    )
+    recovered = build_snapshot(
+        cpu_total=1_400,
+        cpu_idle=600,
+        internal_rx=2_500,
+        internal_tx=3_000,
+    )
+    collector = GatewayMetricsCollector(
+        reader=SequenceReader(first, down, recovered),
+        clock=SequenceClock(
+            started_at,
+            started_at + timedelta(seconds=10),
+            started_at + timedelta(seconds=20),
+        ),
+        config=GatewayMetricsConfig(),
+    )
+
+    collector.collect()
+    down_sample = collector.collect()
+    recovered_sample = collector.collect()
+
+    assert down_sample.interface_metrics["internal_lan"].rx_bytes_per_sec is None
+    assert down_sample.interface_metrics["internal_lan"].tx_bytes_per_sec is None
+    assert recovered_sample.interface_metrics["internal_lan"].rx_bytes_per_sec == 100.0
+    assert recovered_sample.interface_metrics["internal_lan"].tx_bytes_per_sec == 50.0
+
+
+def test_long_interval_invalidates_network_rates_and_next_sample_recovers() -> None:
     started_at = datetime(2026, 7, 15, 0, 0, 10, tzinfo=timezone.utc)
     collector = GatewayMetricsCollector(
         reader=SequenceReader(
             build_snapshot(cpu_total=1_000, cpu_idle=400, internal_rx=1_000, internal_tx=2_000),
             build_snapshot(cpu_total=1_200, cpu_idle=500, internal_rx=4_100, internal_tx=3_550),
+            build_snapshot(cpu_total=1_400, cpu_idle=600, internal_rx=5_100, internal_tx=4_050),
         ),
-        clock=SequenceClock(started_at, started_at + timedelta(seconds=31)),
-        interface_names={"internal_lan": "eth0", "usb_lan": "eth1"},
+        clock=SequenceClock(
+            started_at,
+            started_at + timedelta(seconds=31),
+            started_at + timedelta(seconds=41),
+        ),
+        config=GatewayMetricsConfig(interval_seconds=10.0),
+    )
+
+    collector.collect()
+    long_interval_sample = collector.collect()
+    recovered_sample = collector.collect()
+
+    assert long_interval_sample.sample_interval_seconds == 31.0
+    assert long_interval_sample.cpu_percent == 50.0
+    assert long_interval_sample.interface_metrics["internal_lan"].rx_bytes_per_sec is None
+    assert long_interval_sample.interface_metrics["internal_lan"].tx_bytes_per_sec is None
+    assert recovered_sample.sample_interval_seconds == 10.0
+    assert recovered_sample.interface_metrics["internal_lan"].rx_bytes_per_sec == 100.0
+    assert recovered_sample.interface_metrics["internal_lan"].tx_bytes_per_sec == 50.0
+
+
+def test_network_rates_remain_valid_at_three_times_the_configured_interval() -> None:
+    started_at = datetime(2026, 7, 15, 0, 0, 10, tzinfo=timezone.utc)
+    collector = GatewayMetricsCollector(
+        reader=SequenceReader(
+            build_snapshot(cpu_total=1_000, cpu_idle=400, internal_rx=1_000, internal_tx=2_000),
+            build_snapshot(cpu_total=1_200, cpu_idle=500, internal_rx=4_000, internal_tx=3_500),
+        ),
+        clock=SequenceClock(started_at, started_at + timedelta(seconds=30)),
+        config=GatewayMetricsConfig(interval_seconds=10.0),
     )
 
     collector.collect()
     sample = collector.collect()
 
-    assert sample.sample_interval_seconds == 31.0
-    assert sample.cpu_percent == 50.0
+    assert sample.sample_interval_seconds == 30.0
     assert sample.interface_metrics["internal_lan"].rx_bytes_per_sec == 100.0
     assert sample.interface_metrics["internal_lan"].tx_bytes_per_sec == 50.0
+
+
+@pytest.mark.parametrize(
+    ("elapsed_seconds", "expected_rx_rate"),
+    [(15.0, 100.0), (15.001, None)],
+)
+def test_network_rate_limit_scales_with_the_configured_interval(
+    elapsed_seconds: float,
+    expected_rx_rate: float | None,
+) -> None:
+    started_at = datetime(2026, 7, 15, 0, 0, 10, tzinfo=timezone.utc)
+    collector = GatewayMetricsCollector(
+        reader=SequenceReader(
+            build_snapshot(cpu_total=1_000, cpu_idle=400, internal_rx=1_000, internal_tx=2_000),
+            build_snapshot(
+                cpu_total=1_200,
+                cpu_idle=500,
+                internal_rx=1_000 + int(elapsed_seconds * 100),
+                internal_tx=2_000 + int(elapsed_seconds * 50),
+            ),
+        ),
+        clock=SequenceClock(started_at, started_at + timedelta(seconds=elapsed_seconds)),
+        config=GatewayMetricsConfig(interval_seconds=5.0),
+    )
+
+    collector.collect()
+    sample = collector.collect()
+
+    if expected_rx_rate is None:
+        assert sample.interface_metrics["internal_lan"].rx_bytes_per_sec is None
+    else:
+        assert sample.interface_metrics["internal_lan"].rx_bytes_per_sec == pytest.approx(
+            expected_rx_rate
+        )
 
 
 def test_collected_at_is_converted_to_utc_and_naive_clock_is_rejected() -> None:
@@ -232,14 +365,14 @@ def test_collected_at_is_converted_to_utc_and_naive_clock_is_rejected() -> None:
             build_snapshot(cpu_total=1_000, cpu_idle=400, internal_rx=1_000, internal_tx=2_000)
         ),
         clock=SequenceClock(datetime(2026, 7, 15, 9, 0, 10, tzinfo=kst)),
-        interface_names={"internal_lan": "eth0"},
+        config=GatewayMetricsConfig(),
     )
     naive_collector = GatewayMetricsCollector(
         reader=SequenceReader(
             build_snapshot(cpu_total=1_000, cpu_idle=400, internal_rx=1_000, internal_tx=2_000)
         ),
         clock=SequenceClock(datetime(2026, 7, 15, 0, 0, 10)),
-        interface_names={"internal_lan": "eth0"},
+        config=GatewayMetricsConfig(),
     )
 
     assert collector.collect().collected_at == datetime(2026, 7, 15, 0, 0, 10, tzinfo=timezone.utc)
@@ -261,6 +394,14 @@ def test_gateway_metrics_config_reads_defaults_and_environment_overrides() -> No
     assert defaults.interface_names == {"internal_lan": "eth0", "usb_lan": "eth1"}
     assert configured.interval_seconds == 5
     assert configured.interface_names == {"internal_lan": "enp1s0", "usb_lan": "enx001122"}
+
+
+@pytest.mark.parametrize("interval_seconds", [float("nan"), float("inf")])
+def test_gateway_metrics_config_rejects_non_finite_intervals(
+    interval_seconds: float,
+) -> None:
+    with pytest.raises(ValueError, match="finite and positive"):
+        GatewayMetricsConfig(interval_seconds=interval_seconds)
 
 
 def test_linux_reader_keeps_collecting_when_optional_interface_is_missing(tmp_path) -> None:

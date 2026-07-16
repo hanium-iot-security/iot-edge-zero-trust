@@ -3,9 +3,13 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from math import isfinite
 import os
 
 from edge.gateway.system_metrics import InterfaceSnapshot, SystemMetricsReader, SystemSnapshot
+
+
+_NETWORK_RATE_VALID_INTERVAL_MULTIPLIER = 3
 
 
 @dataclass(frozen=True)
@@ -40,8 +44,8 @@ class GatewayMetricsConfig:
     usb_lan_interface: str = "eth1"
 
     def __post_init__(self) -> None:
-        if self.interval_seconds <= 0:
-            raise ValueError("interval_seconds must be positive")
+        if not isfinite(self.interval_seconds) or self.interval_seconds <= 0:
+            raise ValueError("interval_seconds must be finite and positive")
         if not self.internal_lan_interface.strip():
             raise ValueError("internal_lan_interface must not be empty")
         if not self.usb_lan_interface.strip():
@@ -70,11 +74,14 @@ class GatewayMetricsCollector:
         *,
         reader: SystemMetricsReader,
         clock: Callable[[], datetime],
-        interface_names: Mapping[str, str],
+        config: GatewayMetricsConfig,
     ) -> None:
         self._reader = reader
         self._clock = clock
-        self._interface_names = dict(interface_names)
+        self._interface_names = config.interface_names
+        self._max_valid_interval_seconds = (
+            config.interval_seconds * _NETWORK_RATE_VALID_INTERVAL_MULTIPLIER
+        )
         self._previous: tuple[datetime, SystemSnapshot] | None = None
 
     def collect(self) -> GatewayMetricsSample:
@@ -86,13 +93,16 @@ class GatewayMetricsCollector:
         snapshot = self._reader.read(self._interface_names)
         interval = self._sample_interval(collected_at)
         valid_interval = interval is not None and interval > 0
+        valid_network_interval = (
+            interval is not None and 0 < interval <= self._max_valid_interval_seconds
+        )
 
         previous_snapshot = self._previous[1] if self._previous is not None else None
         interfaces = {
             role: self._build_interface_metrics(
                 current=snapshot.interfaces.get(role) or self._missing_interface(interface_name),
                 previous=(previous_snapshot.interfaces.get(role) if previous_snapshot is not None else None),
-                interval=interval if valid_interval else None,
+                interval=interval if valid_network_interval else None,
             )
             for role, interface_name in self._interface_names.items()
         }
@@ -117,7 +127,8 @@ class GatewayMetricsCollector:
     def _sample_interval(self, collected_at: datetime) -> float | None:
         if self._previous is None:
             return None
-        return (collected_at - self._previous[0]).total_seconds()
+        interval = (collected_at - self._previous[0]).total_seconds()
+        return interval if interval >= 0 else None
 
     @staticmethod
     def _percent(used: int, total: int) -> float:
@@ -179,7 +190,7 @@ class GatewayMetricsCollector:
             return False
         if not current.exists or not previous.exists:
             return False
-        if not current.is_up or not previous.is_up:
+        if not current.is_up:
             return False
         if None in (current.rx_bytes, current.tx_bytes, previous.rx_bytes, previous.tx_bytes):
             return False
