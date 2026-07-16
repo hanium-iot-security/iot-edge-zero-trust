@@ -69,7 +69,11 @@ CREATE TABLE IF NOT EXISTS packet_feature_logs (
 CREATE TABLE IF NOT EXISTS gateway_metrics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     collected_at DATETIME NOT NULL,
-    sample_interval_seconds REAL,
+    sample_interval_seconds REAL
+        CHECK(
+            sample_interval_seconds IS NULL
+            OR sample_interval_seconds >= 0
+        ),
     cpu_percent REAL
         CHECK(cpu_percent IS NULL OR cpu_percent BETWEEN 0 AND 100),
     memory_percent REAL NOT NULL CHECK(memory_percent BETWEEN 0 AND 100),

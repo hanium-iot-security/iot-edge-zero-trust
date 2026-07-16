@@ -655,6 +655,7 @@ def test_gateway_metrics_constraints(tmp_path: Path) -> None:
         {"disk_used_mb": -1.0},
         {"network_rx_bytes": -1},
         {"network_tx_bytes": -1},
+        {"sample_interval_seconds": -1},
         {"collected_at": None},
         {"memory_percent": None},
         {"disk_percent": None},
@@ -678,7 +679,7 @@ def test_gateway_metrics_constraints(tmp_path: Path) -> None:
         _insert_gateway_metric(
             connection,
             collected_at="2026-07-16T10:00:01Z",
-            sample_interval_seconds=-1,
+            sample_interval_seconds=0,
             cpu_percent=None,
         )
 
