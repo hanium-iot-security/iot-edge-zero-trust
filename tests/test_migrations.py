@@ -25,6 +25,15 @@ def _legacy_001_db(tmp_path: Path) -> Path:
     return db_path
 
 
+def _legacy_db_from_schema(tmp_path: Path, name: str, schema_sql: str) -> Path:
+    db_path = tmp_path / name
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON;")
+        connection.execute("PRAGMA busy_timeout = 5000;")
+        connection.executescript(schema_sql)
+    return db_path
+
+
 def _write_project_migrations(migrations_dir: Path) -> None:
     migrations_dir.mkdir()
     for migration_file in MIGRATIONS_DIR.glob("*.sql"):
@@ -110,6 +119,79 @@ def _insert_gateway_metric(
     )
 
 
+def _insert_packet_capture_session(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str = "11111111-1111-4111-8111-111111111111",
+    started_at: str = "2026-07-16T10:00:00Z",
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO packet_capture_sessions (
+            session_id,
+            capture_interface,
+            started_at
+        )
+        VALUES (?, 'wlan0', ?)
+        """,
+        (session_id, started_at),
+    )
+    return int(cursor.lastrowid)
+
+
+def _insert_packet_capture_segment(
+    connection: sqlite3.Connection,
+    *,
+    capture_session_id: int,
+    file_name: str = "segment-001.pcap",
+    window_start: str = "2026-07-16T10:00:00Z",
+    window_end: str = "2026-07-16T10:00:10Z",
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO packet_capture_segments (
+            capture_session_id,
+            file_name,
+            capture_interface,
+            window_start,
+            window_end
+        )
+        VALUES (?, ?, 'wlan0', ?, ?)
+        """,
+        (capture_session_id, file_name, window_start, window_end),
+    )
+    return int(cursor.lastrowid)
+
+
+def _insert_packet_feature_log(
+    connection: sqlite3.Connection,
+    *,
+    capture_segment_id: int,
+    peer_ip: str = "10.0.0.8",
+    direction: str = "INBOUND",
+    window_start: str = "2026-07-16T10:00:00Z",
+    window_end: str = "2026-07-16T10:00:10Z",
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO packet_feature_logs (
+            capture_segment_id,
+            peer_ip,
+            direction,
+            window_start,
+            window_end,
+            packet_count,
+            total_bytes,
+            avg_packet_size,
+            max_packet_size
+        )
+        VALUES (?, ?, ?, ?, ?, 1, 60, 60.0, 60)
+        """,
+        (capture_segment_id, peer_ip, direction, window_start, window_end),
+    )
+    return int(cursor.lastrowid)
+
+
 def _interface_metrics(
     *,
     internal_rate: float | None = None,
@@ -151,6 +233,147 @@ def test_runner_applies_new_database_in_order(tmp_path: Path) -> None:
         assert _migration_versions(connection) == [1, 2]
         assert _table_exists(connection, "packet_capture_sessions")
         assert _table_exists(connection, "trust_score_history")
+
+
+def test_missing_migration_directory_fails_before_touching_db(tmp_path: Path) -> None:
+    db_path = tmp_path / "missing-dir.db"
+    migrations_dir = tmp_path / "missing-migrations"
+
+    with pytest.raises(MigrationError, match="does not exist"):
+        apply_migrations(db_path, migrations_dir)
+
+    assert not db_path.exists()
+
+
+def test_migration_path_must_be_directory(tmp_path: Path) -> None:
+    db_path = tmp_path / "path-file.db"
+    migrations_dir = tmp_path / "migrations.sql"
+    migrations_dir.write_text("CREATE TABLE should_not_run (id INTEGER);", encoding="utf-8")
+
+    with pytest.raises(MigrationError, match="not a directory"):
+        apply_migrations(db_path, migrations_dir)
+
+
+def test_empty_migration_directory_fails(tmp_path: Path) -> None:
+    db_path = tmp_path / "empty-dir.db"
+    migrations_dir = tmp_path / "migrations"
+    migrations_dir.mkdir()
+
+    with pytest.raises(MigrationError, match="No migration SQL files"):
+        apply_migrations(db_path, migrations_dir)
+
+
+def test_migration_versions_must_start_at_one(tmp_path: Path) -> None:
+    db_path = tmp_path / "missing-001.db"
+    migrations_dir = tmp_path / "migrations"
+    migrations_dir.mkdir()
+    (migrations_dir / "002_packet_gateway.sql").write_text(
+        "CREATE TABLE only_version_two (id INTEGER PRIMARY KEY);",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MigrationError, match="Missing migration version: 1"):
+        apply_migrations(db_path, migrations_dir)
+
+
+def test_migration_versions_must_be_contiguous(tmp_path: Path) -> None:
+    db_path = tmp_path / "missing-002.db"
+    migrations_dir = tmp_path / "migrations"
+    migrations_dir.mkdir()
+    (migrations_dir / "001_init.sql").write_text(
+        "CREATE TABLE version_one (id INTEGER PRIMARY KEY);",
+        encoding="utf-8",
+    )
+    (migrations_dir / "003_next.sql").write_text(
+        "CREATE TABLE version_three (id INTEGER PRIMARY KEY);",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MigrationError, match="Missing migration version: 2"):
+        apply_migrations(db_path, migrations_dir)
+
+
+def test_invalid_migration_file_name_fails(tmp_path: Path) -> None:
+    db_path = tmp_path / "invalid-name.db"
+    migrations_dir = tmp_path / "migrations"
+    migrations_dir.mkdir()
+    (migrations_dir / "001-init.sql").write_text(
+        "CREATE TABLE invalid_name (id INTEGER PRIMARY KEY);",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MigrationError, match="Invalid migration file name"):
+        apply_migrations(db_path, migrations_dir)
+
+
+def test_duplicate_migration_version_fails(tmp_path: Path) -> None:
+    db_path = tmp_path / "duplicate-version.db"
+    migrations_dir = tmp_path / "migrations"
+    migrations_dir.mkdir()
+    (migrations_dir / "001_init.sql").write_text(
+        "CREATE TABLE first_version (id INTEGER PRIMARY KEY);",
+        encoding="utf-8",
+    )
+    (migrations_dir / "001_duplicate.sql").write_text(
+        "CREATE TABLE duplicate_version (id INTEGER PRIMARY KEY);",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MigrationError, match="Duplicate migration version: 1"):
+        apply_migrations(db_path, migrations_dir)
+
+
+def test_empty_migration_file_fails(tmp_path: Path) -> None:
+    db_path = tmp_path / "empty-file.db"
+    migrations_dir = tmp_path / "migrations"
+    migrations_dir.mkdir()
+    (migrations_dir / "001_empty.sql").write_text(
+        """
+        -- comment only
+
+        -- still no executable SQL
+        """,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MigrationError, match="no executable SQL"):
+        apply_migrations(db_path, migrations_dir)
+
+
+def test_applied_migration_record_requires_matching_sql_file(tmp_path: Path) -> None:
+    db_path = tmp_path / "missing-applied-file.db"
+    migrations_dir = tmp_path / "migrations"
+    migrations_dir.mkdir()
+    (migrations_dir / "001_init.sql").write_text(
+        "CREATE TABLE version_one (id INTEGER PRIMARY KEY);",
+        encoding="utf-8",
+    )
+    (migrations_dir / "002_packet_gateway.sql").write_text(
+        "CREATE TABLE version_two (id INTEGER PRIMARY KEY);",
+        encoding="utf-8",
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO schema_migrations (version, name) VALUES (?, ?)",
+            [(1, "init"), (2, "packet_gateway"), (3, "future_change")],
+        )
+
+    with pytest.raises(MigrationError, match="3"):
+        apply_migrations(db_path, migrations_dir)
+
+    with connect_database(db_path) as connection:
+        assert _migration_versions(connection) == [1, 2, 3]
+        assert not _table_exists(connection, "version_one")
+        assert not _table_exists(connection, "version_two")
 
 
 def test_partial_legacy_db_is_not_baselined_or_auto_repaired(
@@ -252,6 +475,71 @@ def test_legacy_db_missing_required_columns_is_not_baselined(
         assert not _table_exists(connection, "schema_migrations")
         assert not _table_exists(connection, "packet_capture_sessions")
         assert "trust_score" not in _column_names(connection, "devices")
+
+
+def test_legacy_db_column_pk_mismatch_is_not_baselined(tmp_path: Path) -> None:
+    schema_sql = SCHEMA_PATH.read_text(encoding="utf-8").replace(
+        "device_id TEXT PRIMARY KEY,",
+        "device_id TEXT,",
+        1,
+    )
+    db_path = _legacy_db_from_schema(tmp_path, "pk-mismatch.db", schema_sql)
+
+    with pytest.raises(MigrationError, match="devices.device_id.*pk=1"):
+        apply_migrations(db_path, MIGRATIONS_DIR)
+
+    with connect_database(db_path) as connection:
+        assert not _table_exists(connection, "schema_migrations")
+        assert not _table_exists(connection, "packet_capture_sessions")
+
+
+def test_legacy_db_column_type_mismatch_is_not_baselined(tmp_path: Path) -> None:
+    schema_sql = SCHEMA_PATH.read_text(encoding="utf-8").replace(
+        "trust_score INTEGER NOT NULL DEFAULT 100",
+        "trust_score TEXT NOT NULL DEFAULT 100",
+        1,
+    )
+    db_path = _legacy_db_from_schema(tmp_path, "type-mismatch.db", schema_sql)
+
+    with pytest.raises(MigrationError, match="devices.trust_score.*type=INTEGER"):
+        apply_migrations(db_path, MIGRATIONS_DIR)
+
+    with connect_database(db_path) as connection:
+        assert not _table_exists(connection, "schema_migrations")
+        assert not _table_exists(connection, "packet_capture_sessions")
+
+
+def test_legacy_db_notnull_mismatch_is_not_baselined(tmp_path: Path) -> None:
+    schema_sql = SCHEMA_PATH.read_text(encoding="utf-8").replace(
+        "topic TEXT NOT NULL,",
+        "topic TEXT,",
+        1,
+    )
+    db_path = _legacy_db_from_schema(tmp_path, "notnull-mismatch.db", schema_sql)
+
+    with pytest.raises(MigrationError, match="mqtt_logs.topic.*notnull=1"):
+        apply_migrations(db_path, MIGRATIONS_DIR)
+
+    with connect_database(db_path) as connection:
+        assert not _table_exists(connection, "schema_migrations")
+        assert not _table_exists(connection, "packet_capture_sessions")
+
+
+def test_legacy_db_missing_feature_unique_is_not_baselined(tmp_path: Path) -> None:
+    schema_sql = SCHEMA_PATH.read_text(encoding="utf-8").replace(
+        """malformed_payload_count INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(device_id, window_start, window_end)""",
+        "malformed_payload_count INTEGER NOT NULL DEFAULT 0",
+        1,
+    )
+    db_path = _legacy_db_from_schema(tmp_path, "missing-unique.db", schema_sql)
+
+    with pytest.raises(MigrationError, match="missing_unique_constraints"):
+        apply_migrations(db_path, MIGRATIONS_DIR)
+
+    with connect_database(db_path) as connection:
+        assert not _table_exists(connection, "schema_migrations")
+        assert not _table_exists(connection, "packet_capture_sessions")
 
 
 def test_runner_applies_only_002_to_existing_001_db_and_preserves_rows(
@@ -891,6 +1179,111 @@ def test_trust_score_history_schema_and_window_contract(tmp_path: Path) -> None:
             """
         ).fetchone()["representative_event_ids_json"]
         assert json.loads(stored_json) == [31, 34]
+
+
+def test_packet_session_id_requires_strict_uuid_v4(tmp_path: Path) -> None:
+    db_path = tmp_path / "session-uuid.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+
+    valid_session_ids = [
+        "11111111-1111-4111-8111-111111111111",
+        "AAAAAAAA-AAAA-4AAA-BAAA-AAAAAAAAAAAA",
+    ]
+    invalid_session_ids = [
+        "11111111-1111-3111-8111-111111111111",
+        "11111111-1111-4111-7111-111111111111",
+        "11111111-1111-4111-8111-11111111111",
+        "111111111111-4111-8111-111111111111",
+        "zzzzzzzz-zzzz-4zzz-8zzz-zzzzzzzzzzzz",
+    ]
+
+    with connect_database(db_path) as connection:
+        for index, session_id in enumerate(valid_session_ids):
+            _insert_packet_capture_session(
+                connection,
+                session_id=session_id,
+                started_at=f"2026-07-16T10:00:0{index}Z",
+            )
+
+        for index, session_id in enumerate(invalid_session_ids):
+            with pytest.raises(sqlite3.IntegrityError):
+                _insert_packet_capture_session(
+                    connection,
+                    session_id=session_id,
+                    started_at=f"2026-07-16T10:01:0{index}Z",
+                )
+
+
+def test_packet_capture_segment_window_must_be_exactly_ten_seconds(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "segment-window.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+
+    invalid_windows = [
+        ("segment-009.pcap", "2026-07-16T10:00:20Z", "2026-07-16T10:00:29Z"),
+        ("segment-011.pcap", "2026-07-16T10:00:30Z", "2026-07-16T10:00:41Z"),
+        ("segment-020.pcap", "2026-07-16T10:00:50Z", "2026-07-16T10:01:10Z"),
+        ("segment-bad.pcap", "not-a-date", "2026-07-16T10:01:20Z"),
+        ("segment-before.pcap", "2026-07-16T10:01:30Z", "2026-07-16T10:01:20Z"),
+    ]
+
+    with connect_database(db_path) as connection:
+        capture_session_id = _insert_packet_capture_session(connection)
+        _insert_packet_capture_segment(
+            connection,
+            capture_session_id=capture_session_id,
+            file_name="segment-010.pcap",
+            window_start="2026-07-16T10:00:00Z",
+            window_end="2026-07-16T10:00:10Z",
+        )
+
+        for file_name, window_start, window_end in invalid_windows:
+            with pytest.raises(sqlite3.IntegrityError):
+                _insert_packet_capture_segment(
+                    connection,
+                    capture_session_id=capture_session_id,
+                    file_name=file_name,
+                    window_start=window_start,
+                    window_end=window_end,
+                )
+
+
+def test_packet_feature_window_must_be_exactly_ten_seconds(tmp_path: Path) -> None:
+    db_path = tmp_path / "feature-window.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+
+    invalid_windows = [
+        ("10.0.0.9", "2026-07-16T10:00:20Z", "2026-07-16T10:00:29Z"),
+        ("10.0.0.10", "2026-07-16T10:00:30Z", "2026-07-16T10:00:41Z"),
+        ("10.0.0.11", "2026-07-16T10:00:50Z", "2026-07-16T10:01:10Z"),
+        ("10.0.0.12", "not-a-date", "2026-07-16T10:01:20Z"),
+        ("10.0.0.13", "2026-07-16T10:01:30Z", "2026-07-16T10:01:20Z"),
+    ]
+
+    with connect_database(db_path) as connection:
+        capture_session_id = _insert_packet_capture_session(connection)
+        capture_segment_id = _insert_packet_capture_segment(
+            connection,
+            capture_session_id=capture_session_id,
+        )
+        _insert_packet_feature_log(
+            connection,
+            capture_segment_id=capture_segment_id,
+            peer_ip="10.0.0.8",
+            window_start="2026-07-16T10:00:00Z",
+            window_end="2026-07-16T10:00:10Z",
+        )
+
+        for peer_ip, window_start, window_end in invalid_windows:
+            with pytest.raises(sqlite3.IntegrityError):
+                _insert_packet_feature_log(
+                    connection,
+                    capture_segment_id=capture_segment_id,
+                    peer_ip=peer_ip,
+                    window_start=window_start,
+                    window_end=window_end,
+                )
 
 
 def test_packet_gateway_schema_constraints(tmp_path: Path) -> None:

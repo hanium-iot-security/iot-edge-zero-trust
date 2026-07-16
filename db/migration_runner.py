@@ -20,62 +20,42 @@ LEGACY_001_TABLES = {
     "detection_events",
     "isolation_history",
 }
-LEGACY_001_REQUIRED_COLUMNS = {
+LEGACY_001_COLUMN_SIGNATURES = {
     "devices": {
-        "device_id",
-        "ip_address",
-        "status",
-        "trust_score",
-        "last_seen_at",
-        "created_at",
+        "device_id": {"type": "TEXT", "pk": 1},
+        "status": {"type": "TEXT", "notnull": 1},
+        "trust_score": {"type": "INTEGER", "notnull": 1},
     },
     "mqtt_logs": {
-        "id",
-        "device_id",
-        "topic",
-        "payload",
-        "payload_size",
-        "received_at",
-        "is_json_valid",
-        "is_topic_valid",
-        "error_message",
+        "id": {"type": "INTEGER", "pk": 1},
+        "topic": {"type": "TEXT", "notnull": 1},
+        "is_json_valid": {"type": "INTEGER", "notnull": 1},
+        "is_topic_valid": {"type": "INTEGER", "notnull": 1},
     },
     "feature_logs": {
-        "id",
-        "device_id",
-        "window_start",
-        "window_end",
-        "publish_count",
-        "avg_payload_size",
-        "max_payload_size",
-        "avg_message_interval",
-        "min_message_interval",
-        "topic_count",
-        "abnormal_topic_count",
-        "malformed_payload_count",
+        "id": {"type": "INTEGER", "pk": 1},
+        "device_id": {"type": "TEXT", "notnull": 1},
+        "window_start": {"type": "DATETIME", "notnull": 1},
+        "window_end": {"type": "DATETIME", "notnull": 1},
+        "publish_count": {"type": "INTEGER", "notnull": 1},
     },
     "detection_events": {
-        "id",
-        "device_id",
-        "feature_log_id",
-        "mqtt_log_id",
-        "detector_type",
-        "event_type",
-        "severity",
-        "score_delta",
-        "applied_to_score",
-        "description",
-        "detected_at",
+        "id": {"type": "INTEGER", "pk": 1},
+        "detector_type": {"type": "TEXT", "notnull": 1},
+        "event_type": {"type": "TEXT", "notnull": 1},
+        "score_delta": {"type": "INTEGER", "notnull": 1},
+        "applied_to_score": {"type": "INTEGER", "notnull": 1},
     },
     "isolation_history": {
-        "id",
-        "device_id",
-        "action",
-        "reason",
-        "trust_score",
-        "trigger_event_id",
-        "created_at",
+        "id": {"type": "INTEGER", "pk": 1},
+        "device_id": {"type": "TEXT", "notnull": 1},
+        "action": {"type": "TEXT", "notnull": 1},
     },
+}
+LEGACY_001_UNIQUE_CONSTRAINTS = {
+    "feature_logs": [
+        ("device_id", "window_start", "window_end"),
+    ],
 }
 
 logger = logging.getLogger(__name__)
@@ -104,6 +84,8 @@ class Legacy001Inspection:
     existing_tables: set[str]
     missing_tables: set[str]
     missing_columns: dict[str, set[str]]
+    column_definition_mismatches: dict[str, list[str]] = field(default_factory=dict)
+    missing_unique_constraints: dict[str, list[tuple[str, ...]]] = field(default_factory=dict)
 
     @property
     def is_empty(self) -> bool:
@@ -111,7 +93,12 @@ class Legacy001Inspection:
 
     @property
     def is_complete(self) -> bool:
-        return not self.missing_tables and not self.missing_columns
+        return (
+            not self.missing_tables
+            and not self.missing_columns
+            and not self.column_definition_mismatches
+            and not self.missing_unique_constraints
+        )
 
 
 def connect_database(db_path: str | Path = DB_PATH) -> sqlite3.Connection:
@@ -127,13 +114,23 @@ def connect_database(db_path: str | Path = DB_PATH) -> sqlite3.Connection:
 
 
 def discover_migrations(migrations_dir: str | Path = MIGRATIONS_DIR) -> list[Migration]:
+    migrations_path = Path(migrations_dir)
+    if not migrations_path.exists():
+        raise MigrationError(f"Migration directory does not exist: {migrations_path}")
+    if not migrations_path.is_dir():
+        raise MigrationError(f"Migration path is not a directory: {migrations_path}")
+
+    sql_paths = sorted(migrations_path.glob("*.sql"))
+    if not sql_paths:
+        raise MigrationError(f"No migration SQL files found: {migrations_path}")
+
     migrations: list[Migration] = []
     seen_versions: set[int] = set()
 
-    for path in Path(migrations_dir).glob("*.sql"):
+    for path in sql_paths:
         match = MIGRATION_FILE_PATTERN.match(path.name)
         if match is None:
-            continue
+            raise MigrationError(f"Invalid migration file name: {path.name}")
 
         version = int(match.group("version"))
         if version in seen_versions:
@@ -147,7 +144,13 @@ def discover_migrations(migrations_dir: str | Path = MIGRATIONS_DIR) -> list[Mig
             )
         )
 
-    return sorted(migrations, key=lambda migration: migration.version)
+    sorted_migrations = sorted(migrations, key=lambda migration: migration.version)
+    for expected_version, migration in enumerate(sorted_migrations, start=1):
+        if migration.version != expected_version:
+            raise MigrationError(f"Missing migration version: {expected_version}")
+        _validate_migration_has_statements(migration)
+
+    return sorted_migrations
 
 
 def apply_migrations(
@@ -164,6 +167,7 @@ def apply_migrations(
 
         _ensure_schema_migrations_table(connection)
         applied_versions = _fetch_applied_versions(connection)
+        _validate_applied_migration_files_present(applied_versions, migrations)
         applied_versions.update(
             _baseline_legacy_001_if_needed(
                 connection,
@@ -210,6 +214,19 @@ def _fetch_applied_versions(connection: sqlite3.Connection) -> set[int]:
     return {int(row["version"]) for row in rows}
 
 
+def _validate_applied_migration_files_present(
+    applied_versions: set[int],
+    migrations: list[Migration],
+) -> None:
+    migration_versions = {migration.version for migration in migrations}
+    missing_applied_versions = sorted(applied_versions - migration_versions)
+    if missing_applied_versions:
+        raise MigrationError(
+            "Applied migration files are missing from the current branch: "
+            f"{missing_applied_versions}"
+        )
+
+
 def _baseline_legacy_001_if_needed(
     connection: sqlite3.Connection,
     migrations: list[Migration],
@@ -252,24 +269,111 @@ def _inspect_legacy_001_schema(connection: sqlite3.Connection) -> Legacy001Inspe
     existing_tables = {row["name"] for row in rows}
     missing_tables = LEGACY_001_TABLES - existing_tables
     missing_columns: dict[str, set[str]] = {}
+    column_definition_mismatches: dict[str, list[str]] = {}
+    missing_unique_constraints: dict[str, list[tuple[str, ...]]] = {}
 
     for table_name in sorted(existing_tables):
-        existing_columns = _column_names(connection, table_name)
-        required_columns = LEGACY_001_REQUIRED_COLUMNS[table_name]
+        column_rows = _column_info_by_name(connection, table_name)
+        existing_columns = set(column_rows)
+        required_columns = set(LEGACY_001_COLUMN_SIGNATURES[table_name])
         table_missing_columns = required_columns - existing_columns
         if table_missing_columns:
             missing_columns[table_name] = table_missing_columns
+        table_mismatches = _column_signature_mismatches(
+            table_name,
+            column_rows,
+            table_missing_columns,
+        )
+        if table_mismatches:
+            column_definition_mismatches[table_name] = table_mismatches
+
+        for unique_columns in LEGACY_001_UNIQUE_CONSTRAINTS.get(table_name, []):
+            if not _has_unique_constraint(connection, table_name, unique_columns):
+                missing_unique_constraints.setdefault(table_name, []).append(unique_columns)
 
     return Legacy001Inspection(
         existing_tables=existing_tables,
         missing_tables=missing_tables,
         missing_columns=missing_columns,
+        column_definition_mismatches=column_definition_mismatches,
+        missing_unique_constraints=missing_unique_constraints,
     )
 
 
+def _column_info_by_name(
+    connection: sqlite3.Connection,
+    table_name: str,
+) -> dict[str, sqlite3.Row]:
+    rows = connection.execute(f"PRAGMA table_info({_quote_identifier(table_name)})").fetchall()
+    return {row["name"]: row for row in rows}
+
+
 def _column_names(connection: sqlite3.Connection, table_name: str) -> set[str]:
-    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    rows = connection.execute(f"PRAGMA table_info({_quote_identifier(table_name)})").fetchall()
     return {row["name"] for row in rows}
+
+
+def _column_signature_mismatches(
+    table_name: str,
+    column_rows: dict[str, sqlite3.Row],
+    missing_columns: set[str],
+) -> list[str]:
+    mismatches: list[str] = []
+    for column_name, expected_signature in LEGACY_001_COLUMN_SIGNATURES[table_name].items():
+        if column_name in missing_columns:
+            continue
+
+        row = column_rows[column_name]
+        expected_type = expected_signature.get("type")
+        if expected_type is not None:
+            actual_type = _normalize_sqlite_type(row["type"])
+            if actual_type != expected_type:
+                mismatches.append(
+                    f"{table_name}.{column_name} expected type={expected_type} "
+                    f"actual type={actual_type or '<empty>'}"
+                )
+
+        expected_notnull = expected_signature.get("notnull")
+        if expected_notnull is not None and int(row["notnull"]) != expected_notnull:
+            mismatches.append(
+                f"{table_name}.{column_name} expected notnull={expected_notnull} "
+                f"actual notnull={int(row['notnull'])}"
+            )
+
+        expected_pk = expected_signature.get("pk")
+        if expected_pk is not None and int(row["pk"]) != expected_pk:
+            mismatches.append(
+                f"{table_name}.{column_name} expected pk={expected_pk} "
+                f"actual pk={int(row['pk'])}"
+            )
+
+    return mismatches
+
+
+def _normalize_sqlite_type(column_type: str | None) -> str:
+    return (column_type or "").strip().upper()
+
+
+def _has_unique_constraint(
+    connection: sqlite3.Connection,
+    table_name: str,
+    expected_columns: tuple[str, ...],
+) -> bool:
+    indexes = connection.execute(f"PRAGMA index_list({_quote_identifier(table_name)})").fetchall()
+    for index in indexes:
+        if int(index["unique"]) != 1:
+            continue
+        columns = connection.execute(
+            f"PRAGMA index_info({_quote_identifier(index['name'])})"
+        ).fetchall()
+        indexed_columns = tuple(column["name"] for column in columns)
+        if indexed_columns == expected_columns:
+            return True
+    return False
+
+
+def _quote_identifier(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
 
 
 def _format_legacy_001_error(inspection: Legacy001Inspection) -> str:
@@ -282,6 +386,19 @@ def _format_legacy_001_error(inspection: Legacy001Inspection) -> str:
             for table_name, columns in sorted(inspection.missing_columns.items())
         }
         parts.append(f"missing_columns={missing_columns}")
+    if inspection.column_definition_mismatches:
+        parts.append(
+            "column_definition_mismatches="
+            f"{dict(sorted(inspection.column_definition_mismatches.items()))}"
+        )
+    if inspection.missing_unique_constraints:
+        missing_unique_constraints = {
+            table_name: [list(columns) for columns in constraints]
+            for table_name, constraints in sorted(
+                inspection.missing_unique_constraints.items()
+            )
+        }
+        parts.append(f"missing_unique_constraints={missing_unique_constraints}")
     return " ".join(parts)
 
 
@@ -307,6 +424,18 @@ def _apply_single_migration(connection: sqlite3.Connection, migration: Migration
         raise MigrationError(
             f"Failed to apply migration {migration.version:03d}_{migration.name}: {exc}"
         ) from exc
+
+
+def _validate_migration_has_statements(migration: Migration) -> None:
+    try:
+        statements = list(_iter_sql_statements(migration.path.read_text(encoding="utf-8")))
+    except MigrationError as exc:
+        raise MigrationError(f"{migration.path.name}: {exc}") from exc
+
+    if not statements:
+        raise MigrationError(
+            f"Migration file has no executable SQL statements: {migration.path.name}"
+        )
 
 
 def _iter_sql_statements(sql_script: str):

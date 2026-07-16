@@ -1,7 +1,20 @@
 CREATE TABLE IF NOT EXISTS packet_capture_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL UNIQUE
-        CHECK(session_id GLOB '????????-????-4???-[89aAbB]???-????????????'),
+        CHECK(
+            length(session_id) = 36
+            AND substr(session_id, 9, 1) = '-'
+            AND substr(session_id, 14, 1) = '-'
+            AND substr(session_id, 19, 1) = '-'
+            AND substr(session_id, 24, 1) = '-'
+            AND substr(session_id, 1, 8) NOT GLOB '*[^0-9A-Fa-f]*'
+            AND substr(session_id, 10, 4) NOT GLOB '*[^0-9A-Fa-f]*'
+            AND substr(session_id, 15, 4) NOT GLOB '*[^0-9A-Fa-f]*'
+            AND substr(session_id, 20, 4) NOT GLOB '*[^0-9A-Fa-f]*'
+            AND substr(session_id, 25, 12) NOT GLOB '*[^0-9A-Fa-f]*'
+            AND substr(session_id, 15, 1) = '4'
+            AND lower(substr(session_id, 20, 1)) IN ('8', '9', 'a', 'b')
+        ),
     capture_interface TEXT NOT NULL,
     started_at DATETIME NOT NULL,
     first_window_start DATETIME,
@@ -33,7 +46,11 @@ CREATE TABLE IF NOT EXISTS packet_capture_segments (
         REFERENCES packet_capture_sessions(id)
         ON DELETE RESTRICT,
     UNIQUE(capture_interface, window_start, window_end),
-    CHECK(window_end > window_start)
+    CHECK(
+        unixepoch(window_start) IS NOT NULL
+        AND unixepoch(window_end) IS NOT NULL
+        AND unixepoch(window_end) - unixepoch(window_start) = 10
+    )
 );
 
 CREATE TABLE IF NOT EXISTS packet_feature_logs (
@@ -63,7 +80,11 @@ CREATE TABLE IF NOT EXISTS packet_feature_logs (
         REFERENCES packet_capture_segments(id)
         ON DELETE RESTRICT,
     UNIQUE(capture_segment_id, peer_ip, direction),
-    CHECK(window_end > window_start)
+    CHECK(
+        unixepoch(window_start) IS NOT NULL
+        AND unixepoch(window_end) IS NOT NULL
+        AND unixepoch(window_end) - unixepoch(window_start) = 10
+    )
 );
 
 CREATE TABLE IF NOT EXISTS gateway_metrics (

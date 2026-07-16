@@ -122,7 +122,7 @@ Packet capture session 단위입니다. DB 내부 join에는 `id`를 사용하�
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |
 | id | INTEGER | primary key autoincrement |
-| session_id | TEXT | UUIDv4 문자열, unique |
+| session_id | TEXT | 엄격한 UUIDv4 문자열, unique. 16진수 문자, version 4, RFC variant를 DB에서 검증 |
 | capture_interface | TEXT | capture interface |
 | started_at | DATETIME | capture 시작 시각 |
 | first_window_start | DATETIME | 첫 10초 window 시작 |
@@ -154,6 +154,7 @@ pcap segment 파일 단위입니다. Window는 `[window_start, window_end)` 반�
 | updated_at | DATETIME | 수정 시각 |
 
 `file_name`과 `(capture_interface, window_start, window_end)`는 중복될 수 없습니다.
+`window_start`, `window_end`는 SQLite 날짜 함수로 파싱 가능한 UTC 시각이어야 하며, `window_end`는 `window_start`로부터 정확히 10초 후여야 합니다.
 
 ## packet_feature_logs
 
@@ -180,7 +181,7 @@ Packet segment에서 추출한 peer/direction별 feature row입니다.
 | capture_scope | TEXT | capture scope |
 | created_at | DATETIME | 생성 시각 |
 
-`(capture_segment_id, peer_ip, direction)`은 중복될 수 없습니다. 격리 상태 기기의 feature 저장을 막는 DB 제약은 두지 않습니다.
+`(capture_segment_id, peer_ip, direction)`은 중복될 수 없습니다. `window_start`, `window_end`는 SQLite 날짜 함수로 파싱 가능한 UTC 시각이어야 하며, feature window는 정확히 10초여야 합니다. 격리 상태 기기의 feature 저장을 막는 DB 제약은 두지 않습니다.
 
 ## gateway_metrics
 
@@ -190,7 +191,7 @@ Gateway 시스템 자원 metric 저장용 테이블입니다. 기본 수집 주�
 | --- | --- | --- |
 | id | INTEGER | primary key autoincrement |
 | collected_at | DATETIME | Collector가 생성한 UTC metric 수집 시각 |
-| sample_interval_seconds | REAL | 실제 sample 간격. 최초 sample 또는 유효한 이전 sample이 없으면 NULL 가능 |
+| sample_interval_seconds | REAL | 실제 sample 간격. 최초 sample 또는 유효한 이전 sample이 없으면 NULL 가능. 저장 값은 0 이상이어야 하며 음수는 거부 |
 | cpu_percent | REAL | CPU 사용률. 최초 sample 또는 비정상 delta에서는 NULL 가능 |
 | memory_percent | REAL | Memory 사용률 |
 | disk_percent | REAL | Disk 사용률 |
