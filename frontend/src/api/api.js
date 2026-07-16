@@ -7,12 +7,15 @@ import {
   mockEvents,
   mockIsolationHistory,
   mockTrustScoreSummary,
+  mockPacketFeatureLogs,
+  mockGatewayMetrics,
 } from "../mockData";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL || "http://localhost:8000/api";
 
 const USE_MOCK = import.meta.env.VITE_USE_MOCK === "true";
+
 
 async function request(path, mockData) {
   if (USE_MOCK) {
@@ -66,4 +69,18 @@ export function getTrustScoreHistory(deviceId) {
     current_score: null,
     items: [],
   });
+}
+
+export function getPacketFeatureLogs() {
+  return request(
+    "/packet-feature-logs?limit=100&offset=0",
+    mockPacketFeatureLogs
+  );
+}
+
+export function getGatewayMetrics() {
+  return request(
+    "/gateway-metrics?limit=1",
+    mockGatewayMetrics
+  );
 }
