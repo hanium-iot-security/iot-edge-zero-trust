@@ -6,9 +6,11 @@ from .routers import (
     detection_events,
     devices,
     feature_logs,
+    gateway_metrics,
     health,
     isolation,
     mqtt_logs,
+    packet_feature_logs,
     trust_score,
 )
 
@@ -30,6 +32,8 @@ app.include_router(dashboard.router, prefix="/api")
 app.include_router(devices.router, prefix="/api")
 app.include_router(mqtt_logs.router, prefix="/api")
 app.include_router(feature_logs.router, prefix="/api")
+app.include_router(packet_feature_logs.router, prefix="/api")
+app.include_router(gateway_metrics.router, prefix="/api")
 app.include_router(detection_events.router, prefix="/api")
 app.include_router(trust_score.router, prefix="/api")
 app.include_router(isolation.router, prefix="/api")
