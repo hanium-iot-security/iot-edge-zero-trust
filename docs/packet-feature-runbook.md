@@ -113,12 +113,31 @@ python -m edge.features.export_packet_features \
 
 ### cron으로 주기적 실행
 
+```bash
+# 로그 디렉터리 사전 생성
+mkdir -p /home/pi/iot-edge-zero-trust/data/logs
+```
+
 ```cron
-# 1분마다 Extractor 실행
-* * * * * cd /home/pi/iot-edge-zero-trust && python -m edge.features.run_packet_feature_extractor >> logs/extractor.log 2>&1
+# 1분마다 Extractor 실행 (가상환경 Python 사용)
+* * * * * cd /home/pi/iot-edge-zero-trust && venv/bin/python -m edge.features.run_packet_feature_extractor >> data/logs/extractor.log 2>&1
 ```
 
 fcntl 기반 lock이 중복 실행을 방지하므로 짧은 간격으로 등록해도 안전합니다.
+
+### 동명 파일 충돌 (수동 조치 필요)
+
+`data/pcap/processed/` 또는 `data/pcap/failed/`에 이름은 같지만 내용이 다른 파일이 있을 때, `_move_pcap`은 기존 파일을 보존하고 `FileExistsError`를 발생시킵니다. `reconcile_orphaned_files`도 이 경우 **자동 복구를 시도하지 않습니다.**
+
+로그에 `충돌 — 수동 조치가 필요합니다`가 출력되면 두 파일을 모두 보존하면서 이동합니다:
+
+```bash
+# 기존 파일을 타임스탬프 접미사로 백업 후 ready 파일을 이동
+mv data/pcap/processed/seg.pcap data/pcap/processed/seg.pcap.bak-$(date +%s)
+mv data/pcap/ready/seg.pcap data/pcap/processed/
+```
+
+내용이 다른 파일이므로 ready 파일을 임의로 삭제하지 않습니다. 두 파일을 비교한 뒤 불필요한 것을 판단하여 수동으로 제거하세요.
 
 ### DB에서 처리 결과 확인
 

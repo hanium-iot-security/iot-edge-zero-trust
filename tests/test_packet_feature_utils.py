@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import csv
+import io
+import socket
+import struct
 from datetime import datetime
 from pathlib import Path
 
+import dpkt
 import pytest
 
 from edge.features.packet_feature_utils import (
@@ -26,6 +30,45 @@ from edge.features.packet_feature_utils import (
     parse_pcap,
     resolve_device_id,
 )
+
+# ---------------------------------------------------------------------------
+# pcap 빌더 헬퍼 (실제 절단 테스트용)
+# ---------------------------------------------------------------------------
+
+def _eth_ip_tcp_bytes(
+    src: str = "192.168.0.10",
+    dst: str = "192.168.0.20",
+    payload: int = 20,
+) -> bytes:
+    tcp = dpkt.tcp.TCP(sport=50000, dport=1883, flags=0x02, data=b"\x00" * payload)
+    ip = dpkt.ip.IP(
+        src=socket.inet_aton(src),
+        dst=socket.inet_aton(dst),
+        p=dpkt.ip.IP_PROTO_TCP,
+        data=tcp,
+    )
+    eth = dpkt.ethernet.Ethernet(
+        dst=b"\xff\xff\xff\xff\xff\xff",
+        src=b"\x00\x00\x00\x00\x00\x01",
+        type=dpkt.ethernet.ETH_TYPE_IP,
+        data=ip,
+    )
+    return bytes(eth)
+
+
+def _make_pcap_bytes(n: int = 1) -> bytes:
+    """n개의 정상 Ethernet/IP/TCP 패킷을 포함한 pcap 바이트를 반환한다."""
+    buf = io.BytesIO()
+    writer = dpkt.pcap.Writer(buf)
+    for _ in range(n):
+        writer.writepkt(_eth_ip_tcp_bytes())
+    return buf.getvalue()
+
+
+def _first_record_caplen(pcap_bytes: bytes) -> int:
+    """pcap 바이트에서 첫 번째 record의 caplen을 반환한다."""
+    return struct.unpack("<I", pcap_bytes[32:36])[0]
+
 
 PI_IP = "192.168.0.20"
 ESP_IP = "192.168.0.10"
@@ -96,6 +139,66 @@ class TestParsePcap:
         with pytest.raises(PcapParseError):
             parse_pcap(empty)
 
+    # --- 실제 pcap 절단 테스트 ---
+
+    def test_truncated_body_only_record_raises_pcap_parse_error(
+        self, tmp_path: Path
+    ) -> None:
+        """레코드 1개, body가 잘리면 PcapParseError (PartialPcapError 아님)."""
+        pcap_bytes = _make_pcap_bytes(1)
+        truncated = tmp_path / "trunc.pcap"
+        truncated.write_bytes(pcap_bytes[:-5])  # body 끝 5바이트 제거
+        with pytest.raises(PcapParseError) as exc_info:
+            parse_pcap(truncated)
+        assert not isinstance(exc_info.value, PartialPcapError)
+
+    def test_truncated_body_second_record_raises_partial_pcap_error(
+        self, tmp_path: Path
+    ) -> None:
+        """정상 레코드 1개 + 두 번째 body 잘림 → PartialPcapError."""
+        pcap_bytes = _make_pcap_bytes(2)
+        truncated = tmp_path / "trunc.pcap"
+        truncated.write_bytes(pcap_bytes[:-5])  # 두 번째 record body 끝 5바이트 제거
+        with pytest.raises(PartialPcapError):
+            parse_pcap(truncated)
+
+    def test_truncated_header_first_record_raises_pcap_parse_error(
+        self, tmp_path: Path
+    ) -> None:
+        """첫 번째 Record Header 잘림 → PcapParseError (PartialPcapError 아님)."""
+        pcap_bytes = _make_pcap_bytes(1)
+        # global header(24) 다음 Record Header를 8바이트만 남기고 자름
+        truncated = tmp_path / "trunc.pcap"
+        truncated.write_bytes(pcap_bytes[:24 + 8])
+        with pytest.raises(PcapParseError) as exc_info:
+            parse_pcap(truncated)
+        assert not isinstance(exc_info.value, PartialPcapError)
+
+    def test_truncated_header_second_record_raises_partial_pcap_error(
+        self, tmp_path: Path
+    ) -> None:
+        """정상 레코드 1개 + 두 번째 Record Header 잘림 → PartialPcapError."""
+        pcap_bytes = _make_pcap_bytes(2)
+        caplen1 = _first_record_caplen(pcap_bytes)
+        second_hdr_start = 24 + 16 + caplen1
+        # 두 번째 Record Header를 8바이트만 남기고 자름
+        truncated = tmp_path / "trunc.pcap"
+        truncated.write_bytes(pcap_bytes[:second_hdr_start + 8])
+        with pytest.raises(PartialPcapError):
+            parse_pcap(truncated)
+
+    def test_truncated_body_various_sizes(self, tmp_path: Path) -> None:
+        """1·5·20·50바이트 절단 모두 PartialPcapError를 발생시킨다."""
+        pcap_bytes = _make_pcap_bytes(2)
+        for cut in (1, 5, 20, 50):
+            trunc_bytes = pcap_bytes[:-cut]
+            if len(trunc_bytes) <= 24 + 16:
+                continue  # 너무 짧아 global header까지 잘리는 경우 제외
+            p = tmp_path / f"trunc_{cut}.pcap"
+            p.write_bytes(trunc_bytes)
+            with pytest.raises(PartialPcapError):
+                parse_pcap(p)
+
     def test_non_ethernet_datalink_raises_unsupported_format(self, tmp_path: Path) -> None:
         """Ethernet(DLT=1)이 아닌 pcap은 UnsupportedPcapFormat을 발생시킨다."""
         import dpkt
@@ -138,8 +241,8 @@ class TestParsePcap:
         pcap_path = tmp_path / "partial_corrupt.pcap"
         with open(pcap_path, "wb") as f:
             writer = dpkt.pcap.Writer(f)
-            writer.writepkt(b"\x00" * 14)  # 패킷 1
-            writer.writepkt(b"\x00" * 14)  # 패킷 2
+            writer.writepkt(_eth_ip_tcp_bytes())  # 정상 IP 패킷
+            writer.writepkt(_eth_ip_tcp_bytes())  # mock으로 실패시킬 패킷
 
         call_count = [0]
         original = dpkt.ethernet.Ethernet

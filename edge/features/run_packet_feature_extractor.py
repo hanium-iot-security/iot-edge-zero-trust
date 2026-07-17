@@ -164,6 +164,12 @@ def reconcile_orphaned_files(
                 moved += 1
                 logger.info("reconcile: %s → failed/", pcap_file.name)
             # READY: 건드리지 않음
+        except FileExistsError:
+            logger.error(
+                "reconcile: %s 충돌 — 동명 파일의 내용이 다릅니다. "
+                "수동 조치가 필요합니다 (자동 복구 불가).",
+                pcap_file.name,
+            )
         except OSError:
             logger.error(
                 "reconcile: %s 이동 실패, 다음 실행 시 재시도됩니다.", pcap_file.name

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import calendar
 import csv
+import struct
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,12 @@ INBOUND = "INBOUND"
 OUTBOUND = "OUTBOUND"
 MQTT_PORT = 1883
 TCP_SYN = 0x02
+
+# pcap 파일 구조 상수
+PCAP_GLOBAL_HEADER_SIZE = 24   # magic + version + zone + sigfigs + snaplen + network
+PCAP_RECORD_HEADER_SIZE = 16   # ts_sec + ts_usec + caplen + orig_len
+PCAP_MAGIC_LE = 0xa1b2c3d4    # little-endian pcap (표준)
+PCAP_MAGIC_BE = 0xd4c3b2a1    # big-endian pcap
 
 
 class PcapParseError(Exception):
@@ -75,12 +82,43 @@ def parse_pcap(path: Path) -> list[ParsedPacket]:
                     f"(Ethernet=1만 지원): {path}"
                 )
 
+            # dpkt.pcap.Reader는 caplen보다 짧은 body도 오류 없이 반환한다.
+            # Record Header 잘림·Body 잘림을 직접 감지하기 위해
+            # global header 이후를 raw bytes로 읽어 각 record의 완결성을 검증한다.
+            f.seek(0)
+            magic_le = struct.unpack("<I", f.read(4))[0]
+            endian = "<" if magic_le == PCAP_MAGIC_LE else ">"
+            f.seek(PCAP_GLOBAL_HEADER_SIZE)
+
             total_records = 0
+            valid_records = 0  # Ethernet 파싱까지 성공한 record 수 (ARP/IPv6 포함)
             parse_errors = 0
-            for ts, buf in reader:
+
+            while True:
+                hdr_raw = f.read(PCAP_RECORD_HEADER_SIZE)
+                if not hdr_raw:
+                    break  # 정상 EOF
+                if len(hdr_raw) < PCAP_RECORD_HEADER_SIZE:
+                    # Record Header 잘림
+                    parse_errors += 1
+                    break
+
+                ts_sec, ts_usec, caplen, _orig_len = struct.unpack(
+                    f"{endian}IIII", hdr_raw
+                )
+                body = f.read(caplen)
                 total_records += 1
+
+                if len(body) < caplen:
+                    # Body 잘림: 더 읽을 수 없으므로 즉시 종료
+                    parse_errors += 1
+                    break
+
+                ts = ts_sec + ts_usec / 1e6
+
                 try:
-                    eth = dpkt.ethernet.Ethernet(buf)
+                    eth = dpkt.ethernet.Ethernet(body)
+                    valid_records += 1  # Ethernet 파싱 성공 (IP 여부 무관)
                     if not isinstance(eth.data, dpkt.ip.IP):
                         continue
                     ip = eth.data
@@ -120,12 +158,13 @@ def parse_pcap(path: Path) -> list[ParsedPacket]:
                     continue
 
             if parse_errors > 0:
-                if parse_errors == total_records:
+                # valid_records가 0이면 정상 파싱된 record가 하나도 없음 (ARP/IPv6 포함)
+                if valid_records == 0:
                     raise PcapParseError(
-                        f"모든 패킷 파싱 실패 ({parse_errors}/{total_records}): {path}"
+                        f"모든 레코드 파싱 실패 ({parse_errors}/{total_records}): {path}"
                     )
                 raise PartialPcapError(
-                    f"일부 패킷 파싱 실패 ({parse_errors}/{total_records}): {path}"
+                    f"일부 레코드 파싱 실패 ({parse_errors}/{total_records}): {path}"
                 )
     except PcapParseError:
         raise
