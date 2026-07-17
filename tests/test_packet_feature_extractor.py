@@ -14,10 +14,16 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from sqlalchemy.exc import OperationalError
+
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
+from edge.features.collect_feature_logs import parse_db_datetime
+from edge.features.packet_feature_utils import PartialPcapError
 from edge.features.run_packet_feature_extractor import (
     CAPTURE_SCOPE_DEFAULT,
+    _HAS_FCNTL,
     _acquire_lock,
+    _file_sha256,
     _insert_feature_rows,
     _load_ip_device_map,
     _move_pcap,
@@ -455,6 +461,7 @@ def test_db_error_leaves_segment_ready(db_session, ready_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not _HAS_FCNTL, reason="fcntl 미지원 환경 (Windows 등)")
 def test_lock_releases_after_context_exit(tmp_path: Path) -> None:
     lock_path = tmp_path / ".test.lock"
     with _acquire_lock(lock_path):
@@ -478,6 +485,7 @@ def _worker_try_lock(lock_path_str: str, result_queue: multiprocessing.Queue) ->
         result_queue.put("blocked")
 
 
+@pytest.mark.skipif(not _HAS_FCNTL, reason="fcntl 미지원 환경 (Windows 등)")
 def test_lock_blocks_concurrent_process(tmp_path: Path) -> None:
     lock_path = tmp_path / ".test.lock"
     q: multiprocessing.Queue = multiprocessing.Queue()
@@ -489,6 +497,18 @@ def test_lock_blocks_concurrent_process(tmp_path: Path) -> None:
 
     result = q.get_nowait()
     assert result == "blocked"
+
+
+def test_lock_no_fcntl_executes_without_lock(tmp_path: Path) -> None:
+    """_HAS_FCNTL=False 환경에서는 lock 없이 정상 실행된다."""
+    import edge.features.run_packet_feature_extractor as mod
+
+    executed = []
+    with patch.object(mod, "_HAS_FCNTL", False):
+        with mod._acquire_lock(tmp_path / ".lock"):
+            executed.append(True)
+
+    assert executed == [True]
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +528,24 @@ def test_move_pcap_moves_file_to_dst(tmp_path: Path) -> None:
     assert (dst_dir / "seg.pcap").read_bytes() == b"\xd4\xc3\xb2\xa1data"
 
 
-def test_move_pcap_overwrites_existing_dst(tmp_path: Path) -> None:
+def test_move_pcap_same_hash_removes_src(tmp_path: Path) -> None:
+    """dst에 같은 내용의 파일이 있으면 src만 삭제한다."""
+    src = tmp_path / "ready" / "seg.pcap"
+    src.parent.mkdir()
+    src.write_bytes(b"same_content")
+
+    dst_dir = tmp_path / "processed"
+    dst_dir.mkdir()
+    (dst_dir / "seg.pcap").write_bytes(b"same_content")
+
+    _move_pcap(src, dst_dir)
+
+    assert not src.exists()
+    assert (dst_dir / "seg.pcap").read_bytes() == b"same_content"
+
+
+def test_move_pcap_different_hash_raises_file_exists_error(tmp_path: Path) -> None:
+    """dst에 다른 내용의 동명 파일이 있으면 FileExistsError를 발생시킨다."""
     src = tmp_path / "ready" / "seg.pcap"
     src.parent.mkdir()
     src.write_bytes(b"new_content")
@@ -517,9 +554,12 @@ def test_move_pcap_overwrites_existing_dst(tmp_path: Path) -> None:
     dst_dir.mkdir()
     (dst_dir / "seg.pcap").write_bytes(b"old_content")
 
-    _move_pcap(src, dst_dir)
+    with pytest.raises(FileExistsError):
+        _move_pcap(src, dst_dir)
 
-    assert (dst_dir / "seg.pcap").read_bytes() == b"new_content"
+    # 기존 파일은 보존되어야 함
+    assert src.exists()
+    assert (dst_dir / "seg.pcap").read_bytes() == b"old_content"
 
 
 def test_move_pcap_creates_dst_dir_if_missing(tmp_path: Path) -> None:
@@ -948,3 +988,408 @@ def test_check_constraint_violation_raises_not_silently_ignored(
 
     with pytest.raises(Exception):
         _insert_feature_rows(db_session, segment["id"], bad_rows, {}, CAPTURE_SCOPE_DEFAULT)
+
+
+# ---------------------------------------------------------------------------
+# SHA-256 파일 해시
+# ---------------------------------------------------------------------------
+
+
+def test_file_sha256_same_content_same_hash(tmp_path: Path) -> None:
+    a = tmp_path / "a.bin"
+    b = tmp_path / "b.bin"
+    a.write_bytes(b"hello world")
+    b.write_bytes(b"hello world")
+    assert _file_sha256(a) == _file_sha256(b)
+
+
+def test_file_sha256_different_content_different_hash(tmp_path: Path) -> None:
+    a = tmp_path / "a.bin"
+    b = tmp_path / "b.bin"
+    a.write_bytes(b"hello")
+    b.write_bytes(b"world")
+    assert _file_sha256(a) != _file_sha256(b)
+
+
+# ---------------------------------------------------------------------------
+# 예상하지 못한 예외 전파 (Issue 5)
+# ---------------------------------------------------------------------------
+
+
+def test_unexpected_exception_propagates_from_extract(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """SQLAlchemyError가 아닌 예외는 루프를 중단하고 상위로 전파된다."""
+    import edge.features.run_packet_feature_extractor as mod
+
+    db_path = tmp_path / "test.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    TestSession, engine = _make_test_session_factory(db_path)
+
+    with TestSession() as db:
+        csid = _insert_capture_session(db)
+        _insert_segment(db, csid)
+
+    ready_dir = tmp_path / "ready"
+    ready_dir.mkdir()
+    _write_pcap(ready_dir / "test.pcap", [(WINDOW_TS, ESP_IP, PI_IP)])
+
+    monkeypatch.setattr(mod.settings, "capture_interface_ip", PI_IP)
+    monkeypatch.setattr(mod, "SessionLocal", TestSession)
+    monkeypatch.setattr(
+        mod, "process_segment",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("unexpected!")),
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected!"):
+        mod.extract_packet_features(
+            ready_dir=ready_dir,
+            processed_dir=tmp_path / "processed",
+            failed_dir=tmp_path / "failed",
+            lock_path=tmp_path / ".lock",
+        )
+    engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# UNSUPPORTED_FORMAT (Issue 6)
+# ---------------------------------------------------------------------------
+
+
+def test_failed_unsupported_format_when_non_ethernet_pcap(
+    db_session, ready_dir: Path
+) -> None:
+    """비-Ethernet Datalink pcap은 UNSUPPORTED_FORMAT으로 FAILED 처리된다."""
+    import dpkt
+
+    csid = _insert_capture_session(db_session)
+    segment = _insert_segment(db_session, csid)
+
+    DLT_NULL = 0  # loopback (Ethernet 아님)
+    pcap_path = ready_dir / "test.pcap"
+    with open(pcap_path, "wb") as f:
+        writer = dpkt.pcap.Writer(f, linktype=DLT_NULL)
+        writer.writepkt(b"\x00" * 20)
+
+    status = process_segment(db_session, segment, ready_dir, PI_IP, {})
+
+    assert status == "FAILED"
+    seg = _segment_status(db_session, segment["id"])
+    assert seg["status"] == "FAILED"
+    assert seg["error_code"] == "UNSUPPORTED_FORMAT"
+    assert seg["error_message"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Python 3.10 Z 파싱 (parse_db_datetime)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_db_datetime_z_suffix() -> None:
+    """'Z' 접미사가 있는 ISO 8601 문자열을 Python 3.10 이하에서도 파싱한다."""
+    from datetime import timezone
+
+    dt = parse_db_datetime("2026-07-16T10:00:00Z")
+    assert dt.year == 2026
+    assert dt.month == 7
+    assert dt.day == 16
+    assert dt.hour == 10
+    assert dt.minute == 0
+    assert dt.second == 0
+    assert dt.microsecond == 0
+
+
+def test_parse_db_datetime_z_matches_utc_offset() -> None:
+    """+00:00 형식과 Z 형식이 동일한 datetime을 반환한다."""
+    dt_z = parse_db_datetime("2026-07-16T10:00:00Z")
+    dt_plus = parse_db_datetime("2026-07-16T10:00:00+00:00")
+    assert dt_z == dt_plus
+
+
+def test_segment_with_z_window_start_processes_correctly(
+    db_session, ready_dir: Path
+) -> None:
+    """DB에서 'Z' 형식으로 저장된 window_start를 가진 segment를 정상 처리한다."""
+    csid = _insert_capture_session(db_session)
+    # WINDOW_START_STR = "2026-07-16T10:00:00Z" (Migration 실제 포맷)
+    segment = _insert_segment(db_session, csid, window_start=WINDOW_START_STR)
+    _write_pcap(ready_dir / "test.pcap", [(WINDOW_TS, ESP_IP, PI_IP)])
+
+    status = process_segment(db_session, segment, ready_dir, PI_IP, {})
+
+    assert status == "PROCESSED"
+
+
+# ---------------------------------------------------------------------------
+# OperationalError 처리 (일시적 DB 잠금)
+# ---------------------------------------------------------------------------
+
+
+def test_operational_error_continues_to_next_segment(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """OperationalError(SQLite locked 등)는 READY 유지 후 다음 segment로 넘어간다."""
+    import edge.features.run_packet_feature_extractor as mod
+
+    db_path = tmp_path / "test.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    TestSession, engine = _make_test_session_factory(db_path)
+
+    WINDOW_START_2 = "2026-07-16T10:00:10Z"
+    WINDOW_END_2 = "2026-07-16T10:00:20Z"
+    WINDOW_TS_2 = WINDOW_TS + 10.0
+
+    with TestSession() as db:
+        csid = _insert_capture_session(db)
+        _insert_segment(db, csid, file_name="seg1.pcap")
+        _insert_segment(
+            db, csid,
+            file_name="seg2.pcap",
+            window_start=WINDOW_START_2,
+            window_end=WINDOW_END_2,
+        )
+
+    ready_dir = tmp_path / "ready"
+    ready_dir.mkdir()
+    _write_pcap(ready_dir / "seg1.pcap", [(WINDOW_TS, ESP_IP, PI_IP)])
+    _write_pcap(ready_dir / "seg2.pcap", [(WINDOW_TS_2, ESP_IP, PI_IP)])
+
+    monkeypatch.setattr(mod.settings, "capture_interface_ip", PI_IP)
+    monkeypatch.setattr(mod, "SessionLocal", TestSession)
+
+    call_count = {"n": 0}
+    original_process = mod.process_segment
+
+    def _side_effect(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise OperationalError("(sqlite3.OperationalError) database is locked", None, None)
+        return original_process(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "process_segment", _side_effect)
+
+    count = mod.extract_packet_features(
+        ready_dir=ready_dir,
+        processed_dir=tmp_path / "processed",
+        failed_dir=tmp_path / "failed",
+        lock_path=tmp_path / ".lock",
+    )
+
+    # seg1은 OperationalError로 건너뜀(count 미증가), seg2는 정상 완료
+    assert count == 1
+
+    # seg2가 실제로 PROCESSED 됐는지 확인
+    with TestSession() as db:
+        row = db.execute(
+            text("SELECT status FROM packet_capture_segments WHERE file_name = 'seg2.pcap'")
+        ).fetchone()
+    assert row[0] == "PROCESSED"
+    engine.dispose()
+
+
+def test_non_operational_sqlalchemy_error_propagates(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """IntegrityError 등 구조적 DB 오류는 상위로 전파된다."""
+    from sqlalchemy.exc import IntegrityError
+
+    import edge.features.run_packet_feature_extractor as mod
+
+    db_path = tmp_path / "test.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    TestSession, engine = _make_test_session_factory(db_path)
+
+    with TestSession() as db:
+        csid = _insert_capture_session(db)
+        _insert_segment(db, csid)
+
+    ready_dir = tmp_path / "ready"
+    ready_dir.mkdir()
+    _write_pcap(ready_dir / "test.pcap", [(WINDOW_TS, ESP_IP, PI_IP)])
+
+    monkeypatch.setattr(mod.settings, "capture_interface_ip", PI_IP)
+    monkeypatch.setattr(mod, "SessionLocal", TestSession)
+    monkeypatch.setattr(
+        mod, "process_segment",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            IntegrityError("constraint failed", None, None)
+        ),
+    )
+
+    with pytest.raises(IntegrityError):
+        mod.extract_packet_features(
+            ready_dir=ready_dir,
+            processed_dir=tmp_path / "processed",
+            failed_dir=tmp_path / "failed",
+            lock_path=tmp_path / ".lock",
+        )
+    engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# 부분 손상 pcap (Issue 6 확장)
+# ---------------------------------------------------------------------------
+
+
+def test_failed_partial_capture_when_some_packets_corrupted(
+    db_session, ready_dir: Path
+) -> None:
+    """정상 1개 + 손상 1개: 일부 손상 pcap은 PARTIAL_CAPTURE로 FAILED 처리된다."""
+    csid = _insert_capture_session(db_session)
+    segment = _insert_segment(db_session, csid)
+
+    pcap_path = ready_dir / "test.pcap"
+    _write_pcap(pcap_path, [(WINDOW_TS, ESP_IP, PI_IP), (WINDOW_TS + 1.0, ESP_IP, PI_IP)])
+
+    call_count = [0]
+    original_eth = dpkt.ethernet.Ethernet
+
+    def _sometimes_fail(buf):
+        call_count[0] += 1
+        if call_count[0] == 2:
+            raise Exception("forced failure on 2nd packet")
+        return original_eth(buf)
+
+    with patch(
+        "edge.features.packet_feature_utils.dpkt.ethernet.Ethernet",
+        side_effect=_sometimes_fail,
+    ):
+        status = process_segment(db_session, segment, ready_dir, PI_IP, {})
+
+    assert status == "FAILED"
+    seg = _segment_status(db_session, segment["id"])
+    assert seg["error_code"] == "PARTIAL_CAPTURE"
+
+
+def test_failed_pcap_parse_error_when_all_packets_corrupted(
+    db_session, ready_dir: Path
+) -> None:
+    """모든 패킷 파싱 실패 pcap은 PCAP_PARSE_ERROR로 FAILED 처리된다."""
+    csid = _insert_capture_session(db_session)
+    segment = _insert_segment(db_session, csid)
+
+    pcap_path = ready_dir / "test.pcap"
+    _write_pcap(pcap_path, [(WINDOW_TS, ESP_IP, PI_IP)])  # 패킷 1개 전부 실패
+
+    with patch(
+        "edge.features.packet_feature_utils.dpkt.ethernet.Ethernet",
+        side_effect=Exception("forced parse failure"),
+    ):
+        status = process_segment(db_session, segment, ready_dir, PI_IP, {})
+
+    assert status == "FAILED"
+    seg = _segment_status(db_session, segment["id"])
+    assert seg["error_code"] == "PCAP_PARSE_ERROR"
+
+
+# ---------------------------------------------------------------------------
+# OperationalError: locked만 continue, 그 외 전파
+# ---------------------------------------------------------------------------
+
+
+def test_non_locked_operational_error_propagates(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """'locked'/'busy'가 아닌 OperationalError(테이블 누락 등)는 상위로 전파된다."""
+    import edge.features.run_packet_feature_extractor as mod
+
+    db_path = tmp_path / "test.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    TestSession, engine = _make_test_session_factory(db_path)
+
+    with TestSession() as db:
+        csid = _insert_capture_session(db)
+        _insert_segment(db, csid)
+
+    ready_dir = tmp_path / "ready"
+    ready_dir.mkdir()
+    _write_pcap(ready_dir / "test.pcap", [(WINDOW_TS, ESP_IP, PI_IP)])
+
+    monkeypatch.setattr(mod.settings, "capture_interface_ip", PI_IP)
+    monkeypatch.setattr(mod, "SessionLocal", TestSession)
+    monkeypatch.setattr(
+        mod, "process_segment",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            OperationalError("no such table: packet_feature_logs", None, None)
+        ),
+    )
+
+    with pytest.raises(OperationalError):
+        mod.extract_packet_features(
+            ready_dir=ready_dir,
+            processed_dir=tmp_path / "processed",
+            failed_dir=tmp_path / "failed",
+            lock_path=tmp_path / ".lock",
+        )
+    engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# isolated 상태 기기 Packet Feature 생성 (통합)
+# ---------------------------------------------------------------------------
+
+
+def test_isolated_device_packet_feature_created(db_session, ready_dir: Path) -> None:
+    """isolated 상태의 기기로부터 오는 패킷도 Packet Feature에 기록된다."""
+    db_session.execute(
+        text(
+            "INSERT INTO devices (device_id, ip_address, status, trust_score) "
+            "VALUES ('esp32_isolated', :ip, 'isolated', 0)"
+        ),
+        {"ip": ESP_IP},
+    )
+    db_session.commit()
+
+    csid = _insert_capture_session(db_session)
+    segment = _insert_segment(db_session, csid)
+    _write_pcap(ready_dir / "test.pcap", [(WINDOW_TS, ESP_IP, PI_IP)])
+
+    ip_device_map = _load_ip_device_map(db_session)
+    status = process_segment(db_session, segment, ready_dir, PI_IP, ip_device_map)
+
+    assert status == "PROCESSED"
+    features = _feature_rows(db_session, segment["id"])
+    assert len(features) == 1
+    assert features[0]["device_id"] == "esp32_isolated"
+
+
+# ---------------------------------------------------------------------------
+# 부분 삽입 후 실패 → 전체 rollback (통합)
+# ---------------------------------------------------------------------------
+
+
+def test_partial_feature_insert_failure_rolls_back_all(
+    db_session, ready_dir: Path
+) -> None:
+    """첫 번째 Feature 삽입 성공 후 두 번째 삽입 실패 시 전체 Feature와 Segment가 rollback된다."""
+    csid = _insert_capture_session(db_session)
+    segment = _insert_segment(db_session, csid)
+
+    # 두 peer_ip → feature_rows 2개
+    _write_pcap(
+        ready_dir / "test.pcap",
+        [
+            (WINDOW_TS + 0.0, ESP_IP, PI_IP),
+            (WINDOW_TS + 1.0, EXTERNAL_IP, PI_IP),
+        ],
+    )
+
+    import edge.features.run_packet_feature_extractor as _mod
+    _real_insert = _mod._insert_feature_rows  # patch 전에 원본 참조 저장
+
+    def _insert_first_then_fail(db, seg_id, feature_rows, ip_device_map, capture_scope):
+        # 첫 번째 row만 삽입 후 예외 발생 → 트랜잭션 전체 rollback 검증
+        _real_insert(db, seg_id, feature_rows[:1], ip_device_map, capture_scope)
+        raise Exception("second insert failed")
+
+    with patch(
+        "edge.features.run_packet_feature_extractor._insert_feature_rows",
+        side_effect=_insert_first_then_fail,
+    ):
+        with pytest.raises(Exception, match="second insert failed"):
+            process_segment(db_session, segment, ready_dir, PI_IP, {})
+
+    db_session.rollback()
+
+    assert _feature_rows(db_session, segment["id"]) == []
+    assert _segment_status(db_session, segment["id"])["status"] == "READY"

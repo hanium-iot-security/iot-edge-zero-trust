@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import contextlib
-import fcntl
+import hashlib
 import ipaddress
 import logging
 import shutil
@@ -18,7 +18,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+try:
+    import fcntl as _fcntl
+    _HAS_FCNTL = True
+except ImportError:
+    _fcntl = None  # type: ignore[assignment]
+    _HAS_FCNTL = False
+
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
@@ -26,7 +34,9 @@ from backend.app.database import SessionLocal
 from edge.features.collect_feature_logs import parse_db_datetime
 from edge.features.packet_feature_utils import (
     ParsedPacket,
+    PartialPcapError,
     PcapParseError,
+    UnsupportedPcapFormat,
     build_ip_device_map,
     build_packet_features,
     parse_pcap,
@@ -53,11 +63,16 @@ def _acquire_lock(lock_path: Path):
     """fcntl.flock() 기반 단일 실행 보장 컨텍스트 매니저.
 
     이미 다른 프로세스가 lock을 보유 중이면 RuntimeError를 발생시킵니다.
+    Windows 등 fcntl 미지원 환경에서는 경고 후 lock 없이 실행합니다.
     """
+    if not _HAS_FCNTL:
+        logger.warning("fcntl 미지원 환경: Lock 없이 실행합니다 (운영 환경에서는 Pi만 사용하세요).")
+        yield
+        return
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "w") as lock_file:
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError(
                 f"다른 extractor 프로세스가 실행 중입니다 ({lock_path})."
@@ -65,15 +80,33 @@ def _acquire_lock(lock_path: Path):
         try:
             yield
         finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
+
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _move_pcap(src: Path, dst_dir: Path) -> None:
-    """pcap 파일을 dst_dir로 이동합니다. 동명 파일이 있으면 덮어씁니다."""
+    """pcap 파일을 dst_dir로 이동합니다.
+
+    동명 파일이 이미 존재할 때:
+    - 내용이 같으면: src만 삭제 (중복 제거)
+    - 내용이 다르면: FileExistsError를 발생시켜 기존 파일을 보존합니다.
+    """
     dst_dir.mkdir(parents=True, exist_ok=True)
     dst = dst_dir / src.name
     if dst.exists():
-        dst.unlink()
+        if _file_sha256(src) == _file_sha256(dst):
+            src.unlink()
+            return
+        raise FileExistsError(
+            f"동명 파일이 이미 존재하며 내용이 다릅니다: {dst}. 기존 파일을 보존합니다."
+        )
     shutil.move(str(src), dst)
 
 
@@ -307,6 +340,26 @@ def process_segment(
         db.commit()
         logger.warning("PCAP_FILE_MISSING segment_id=%d file=%s", segment_id, pcap_path)
         return "FAILED"
+    except PartialPcapError as exc:
+        _update_segment(
+            db, segment_id,
+            status="FAILED",
+            error_code="PARTIAL_CAPTURE",
+            error_message=str(exc),
+        )
+        db.commit()
+        logger.warning("PARTIAL_CAPTURE segment_id=%d file=%s", segment_id, pcap_path)
+        return "FAILED"
+    except UnsupportedPcapFormat as exc:
+        _update_segment(
+            db, segment_id,
+            status="FAILED",
+            error_code="UNSUPPORTED_FORMAT",
+            error_message=str(exc),
+        )
+        db.commit()
+        logger.warning("UNSUPPORTED_FORMAT segment_id=%d file=%s", segment_id, pcap_path)
+        return "FAILED"
     except PcapParseError as exc:
         _update_segment(
             db, segment_id,
@@ -375,11 +428,30 @@ def extract_packet_features(
                     status = process_segment(
                         db, segment, ready_dir, pi_ip, ip_device_map, capture_scope
                     )
+            except OperationalError as exc:
+                err_lower = str(exc).lower()
+                if "locked" in err_lower or "busy" in err_lower:
+                    # SQLite database is locked/busy: 일시적 경합, READY 유지 후 재시도
+                    logger.exception(
+                        "DB 잠금/연결 오류로 segment_id=%d 처리 실패, READY 유지", segment["id"]
+                    )
+                    continue
+                # 테이블 누락, 디스크 오류 등 복구 불가능한 OperationalError: 상위로 전파
+                logger.exception(
+                    "복구 불가능한 OperationalError로 segment_id=%d 처리 중단", segment["id"]
+                )
+                raise
+            except SQLAlchemyError:
+                # IntegrityError, ProgrammingError 등 구조적 DB 오류: 상위로 전파
+                logger.exception(
+                    "복구 불가능한 DB 오류로 segment_id=%d 처리 중단", segment["id"]
+                )
+                raise
             except Exception:
                 logger.exception(
-                    "DB 오류로 segment_id=%d 처리 실패, READY 유지", segment["id"]
+                    "예상하지 못한 오류로 segment_id=%d 처리 중단", segment["id"]
                 )
-                continue
+                raise
 
             # DB 커밋 성공 후 파일 이동 실패는 별도 로그 (다음 실행 시 reconcile이 복구)
             try:

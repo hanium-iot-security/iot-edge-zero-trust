@@ -13,7 +13,9 @@ from edge.features.packet_feature_utils import (
     INBOUND,
     OUTBOUND,
     ParsedPacket,
+    PartialPcapError,
     PcapParseError,
+    UnsupportedPcapFormat,
     _inter_arrival_times,
     _is_mqtt_related,
     _is_non_mqtt_tcp_udp,
@@ -94,6 +96,67 @@ class TestParsePcap:
         with pytest.raises(PcapParseError):
             parse_pcap(empty)
 
+    def test_non_ethernet_datalink_raises_unsupported_format(self, tmp_path: Path) -> None:
+        """Ethernet(DLT=1)이 아닌 pcap은 UnsupportedPcapFormat을 발생시킨다."""
+        import dpkt
+
+        pcap_path = tmp_path / "loopback.pcap"
+        DLT_NULL = 0  # loopback
+        with open(pcap_path, "wb") as f:
+            writer = dpkt.pcap.Writer(f, linktype=DLT_NULL)
+            writer.writepkt(b"\x00" * 20)
+
+        with pytest.raises(UnsupportedPcapFormat):
+            parse_pcap(pcap_path)
+
+    def test_all_packets_corrupted_raises_parse_error(self, tmp_path: Path) -> None:
+        """유효한 Ethernet pcap이지만 모든 패킷이 파싱 실패하면 PcapParseError."""
+        import dpkt
+        from unittest.mock import patch
+
+        pcap_path = tmp_path / "all_corrupt.pcap"
+        with open(pcap_path, "wb") as f:
+            writer = dpkt.pcap.Writer(f)
+            writer.writepkt(b"\x00" * 14)  # 패킷 1개
+
+        with patch(
+            "edge.features.packet_feature_utils.dpkt.ethernet.Ethernet",
+            side_effect=Exception("forced parse failure"),
+        ):
+            with pytest.raises(PcapParseError) as exc_info:
+                parse_pcap(pcap_path)
+        # PartialPcapError가 아닌 기본 PcapParseError여야 함 (전체 실패)
+        assert not isinstance(exc_info.value, PartialPcapError)
+
+    def test_partial_packets_corrupted_raises_partial_pcap_error(
+        self, tmp_path: Path
+    ) -> None:
+        """정상 1개 + 손상 1개: 일부 실패면 PartialPcapError를 발생시킨다."""
+        import dpkt
+        from unittest.mock import patch
+
+        pcap_path = tmp_path / "partial_corrupt.pcap"
+        with open(pcap_path, "wb") as f:
+            writer = dpkt.pcap.Writer(f)
+            writer.writepkt(b"\x00" * 14)  # 패킷 1
+            writer.writepkt(b"\x00" * 14)  # 패킷 2
+
+        call_count = [0]
+        original = dpkt.ethernet.Ethernet
+
+        def _sometimes_fail(buf):
+            call_count[0] += 1
+            if call_count[0] == 2:
+                raise Exception("forced failure on 2nd packet")
+            return original(buf)
+
+        with patch(
+            "edge.features.packet_feature_utils.dpkt.ethernet.Ethernet",
+            side_effect=_sometimes_fail,
+        ):
+            with pytest.raises(PartialPcapError):
+                parse_pcap(pcap_path)
+
 
 class TestClassifyDirection:
     def test_inbound(self) -> None:
@@ -129,17 +192,22 @@ class TestInterArrivalTimes:
 
 
 class TestMqttRelated:
-    def test_dst_1883(self) -> None:
-        assert _is_mqtt_related(50000, 1883) is True
+    def test_tcp_dst_1883(self) -> None:
+        assert _is_mqtt_related("TCP", 50000, 1883) is True
 
-    def test_src_1883(self) -> None:
-        assert _is_mqtt_related(1883, 50000) is True
+    def test_tcp_src_1883(self) -> None:
+        assert _is_mqtt_related("TCP", 1883, 50000) is True
 
-    def test_neither(self) -> None:
-        assert _is_mqtt_related(443, 80) is False
+    def test_tcp_neither(self) -> None:
+        assert _is_mqtt_related("TCP", 443, 80) is False
 
     def test_none_ports(self) -> None:
-        assert _is_mqtt_related(None, None) is False
+        assert _is_mqtt_related("TCP", None, None) is False
+
+    def test_udp_1883_is_not_mqtt(self) -> None:
+        """UDP 1883은 MQTT(TCP 전용)가 아니다."""
+        assert _is_mqtt_related("UDP", 50000, 1883) is False
+        assert _is_mqtt_related("UDP", 1883, 50000) is False
 
 
 class TestNonMqttTcpUdp:
@@ -157,6 +225,11 @@ class TestNonMqttTcpUdp:
 
     def test_other_protocol(self) -> None:
         assert _is_non_mqtt_tcp_udp("OTHER", 443, 80) is False
+
+    def test_udp_1883_is_non_mqtt(self) -> None:
+        """UDP 1883은 MQTT(TCP 전용)가 아니므로 non_mqtt_tcp_udp에 포함된다."""
+        assert _is_non_mqtt_tcp_udp("UDP", 50000, 1883) is True
+        assert _is_non_mqtt_tcp_udp("UDP", 1883, 50000) is True
 
 
 class TestBuildPacketFeatures:

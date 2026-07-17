@@ -27,7 +27,9 @@ DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 def parse_db_datetime(value: str | datetime) -> datetime:
     if isinstance(value, datetime):
         return value.replace(microsecond=0)
-    return datetime.fromisoformat(value).replace(microsecond=0)
+    # Python 3.10 이하에서는 fromisoformat()이 'Z' 접미사를 처리하지 못함
+    normalized = value[:-1] + "+00:00" if isinstance(value, str) and value.endswith("Z") else value
+    return datetime.fromisoformat(normalized).replace(microsecond=0)
 
 
 def format_db_datetime(value: datetime) -> str:

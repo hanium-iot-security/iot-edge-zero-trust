@@ -22,6 +22,17 @@ class PcapParseError(Exception):
     """pcap 파일 자체가 손상되었거나 읽을 수 없을 때 발생합니다."""
 
 
+class UnsupportedPcapFormat(PcapParseError):
+    """지원하지 않는 Datalink 타입의 pcap 파일입니다."""
+
+
+class PartialPcapError(PcapParseError):
+    """일부 패킷만 파싱에 실패한 pcap 파일입니다 (나머지는 정상 파싱됨)."""
+
+
+DLT_EN10MB = 1
+
+
 @dataclass
 class ParsedPacket:
     timestamp: float
@@ -44,7 +55,8 @@ def parse_pcap(path: Path) -> list[ParsedPacket]:
     - 파일 없음: FileNotFoundError
     - 깨진 pcap / Reader 초기화 실패: PcapParseError
     - 정상 파싱이지만 IP 패킷 없음: []
-    - 패킷 단위 파싱 실패: 해당 패킷 skip
+    - 일부 패킷 파싱 실패: PartialPcapError
+    - 모든 패킷 파싱 실패: PcapParseError
     """
     if not path.exists():
         raise FileNotFoundError(f"pcap 파일을 찾을 수 없습니다: {path}")
@@ -57,7 +69,16 @@ def parse_pcap(path: Path) -> list[ParsedPacket]:
             except Exception as e:
                 raise PcapParseError(f"pcap Reader 초기화 실패: {path}") from e
 
+            if reader.datalink() != DLT_EN10MB:
+                raise UnsupportedPcapFormat(
+                    f"지원하지 않는 Datalink 타입: {reader.datalink()} "
+                    f"(Ethernet=1만 지원): {path}"
+                )
+
+            total_records = 0
+            parse_errors = 0
             for ts, buf in reader:
+                total_records += 1
                 try:
                     eth = dpkt.ethernet.Ethernet(buf)
                     if not isinstance(eth.data, dpkt.ip.IP):
@@ -95,7 +116,17 @@ def parse_pcap(path: Path) -> list[ParsedPacket]:
                         packet_length=packet_length,
                     ))
                 except Exception:
+                    parse_errors += 1
                     continue
+
+            if parse_errors > 0:
+                if parse_errors == total_records:
+                    raise PcapParseError(
+                        f"모든 패킷 파싱 실패 ({parse_errors}/{total_records}): {path}"
+                    )
+                raise PartialPcapError(
+                    f"일부 패킷 파싱 실패 ({parse_errors}/{total_records}): {path}"
+                )
     except PcapParseError:
         raise
     except Exception as e:
@@ -122,8 +153,8 @@ def _inter_arrival_times(timestamps: list[float]) -> list[float]:
     return [sorted_ts[i] - sorted_ts[i - 1] for i in range(1, len(sorted_ts))]
 
 
-def _is_mqtt_related(src_port: int | None, dst_port: int | None) -> bool:
-    return src_port == MQTT_PORT or dst_port == MQTT_PORT
+def _is_mqtt_related(protocol: str, src_port: int | None, dst_port: int | None) -> bool:
+    return protocol == "TCP" and (src_port == MQTT_PORT or dst_port == MQTT_PORT)
 
 
 def _is_non_mqtt_tcp_udp(
@@ -133,7 +164,9 @@ def _is_non_mqtt_tcp_udp(
 ) -> bool:
     if protocol not in ("TCP", "UDP"):
         return False
-    return src_port != MQTT_PORT and dst_port != MQTT_PORT
+    if protocol == "TCP" and (src_port == MQTT_PORT or dst_port == MQTT_PORT):
+        return False
+    return True
 
 
 def build_packet_features(
@@ -196,7 +229,7 @@ def build_packet_features(
             ),
             "mqtt_related_packet_count": sum(
                 1 for pkt in group
-                if _is_mqtt_related(pkt.src_port, pkt.dst_port)
+                if _is_mqtt_related(pkt.protocol, pkt.src_port, pkt.dst_port)
             ),
             "non_mqtt_tcp_udp_packet_count": sum(
                 1 for pkt in group
