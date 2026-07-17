@@ -190,6 +190,36 @@ def _make_config(tmp_path: Path) -> CaptureRuntimeConfig:
     )
 
 
+class TestCaptureRuntimeConfigFromEnv:
+    def test_default_capture_filter_limits_to_tcp_or_udp(self) -> None:
+        """5.1 절: 1차 Capture는 TCP/UDP 트래픽으로 한정해야 한다."""
+        config = CaptureRuntimeConfig.from_env()
+        assert config.capture_filter == "tcp or udp"
+
+
+class TestCaptureRuntimeConfigWindowSecondsValidation:
+    def test_rejects_window_seconds_other_than_ten(self) -> None:
+        """DB CHECK 제약(window_end - window_start == 10초)과 어긋나면 즉시 실패해야 한다."""
+        with pytest.raises(ValueError, match="window_seconds must be 10"):
+            CaptureRuntimeConfig(
+                capture_interface="eth0",
+                window_seconds=5,
+                incoming_dir=Path("incoming"),
+                ready_dir=Path("ready"),
+                failed_dir=Path("failed"),
+            )
+
+    def test_accepts_window_seconds_ten(self) -> None:
+        config = CaptureRuntimeConfig(
+            capture_interface="eth0",
+            window_seconds=10,
+            incoming_dir=Path("incoming"),
+            ready_dir=Path("ready"),
+            failed_dir=Path("failed"),
+        )
+        assert config.window_seconds == 10
+
+
 class TestExecuteCaptureWindowSuccess:
     def test_moves_file_to_ready_and_strips_tmp_suffix(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path)
@@ -268,3 +298,26 @@ class TestExecuteCaptureWindowFailure:
 
         assert result.success is False
         assert not result.final_path.exists()
+
+    def test_sigkill_escalation_is_not_treated_as_success(self, tmp_path: Path) -> None:
+        """SIGTERM에 응답하지 않아 SIGKILL까지 실행된 경우, window_seconds를 다 채웠어도
+        pcap 파일이 깨졌을 수 있으므로 성공으로 취급하면 안 된다."""
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        window_start = _utc(2026, 7, 15, 10, 0, 10)
+        window_end = _utc(2026, 7, 15, 10, 0, 20)
+        process = FakeCaptureProcess(
+            outcome=CaptureOutcome(completed_full_window=True, exit_code=-9, terminated_cleanly=False)
+        )
+
+        result = execute_capture_window(
+            process, config, session_id=SESSION_ID,
+            window_start=window_start, window_end=window_end,
+        )
+
+        assert result.success is False
+        assert result.error_code == "PARTIAL_CAPTURE"
+        assert "SIGKILL" in result.error_message
+        assert result.final_path == config.failed_dir / result.file_name
+        assert result.final_path.exists()
+        assert not (config.ready_dir / result.file_name).exists()

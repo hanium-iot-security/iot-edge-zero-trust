@@ -134,6 +134,61 @@ def reconcile_orphan_ready_files(db: Session, config: CaptureRuntimeConfig) -> i
     return reconciled
 
 
+def reconcile_orphan_failed_files(db: Session, config: CaptureRuntimeConfig) -> int:
+    """failed/에는 있지만 Segment row가 없는 파일에 대해 FAILED row를 복구합니다.
+
+    파일을 failed/로 옮긴 뒤 DB 저장(insert_failed_segment)이 실패하거나, 그 사이에
+    프로세스가 죽으면 파일만 있고 row가 없는 상태가 남을 수 있다 (7 번 리뷰 항목).
+    reconcile_orphan_ready_files와 대칭적인 복구 로직이다.
+    """
+    reconciled = 0
+    for failed_path in sorted(config.failed_dir.glob("*.pcap")):
+        if repo.find_segment_by_file_name(db, failed_path.name) is not None:
+            continue
+
+        parsed = parse_pcap_filename(failed_path.name)
+        if parsed is None:
+            logger.warning("failed에 이름 규칙에 맞지 않는 파일 발견, 건드리지 않음: %s", failed_path.name)
+            continue
+
+        session_pk = repo.find_session_pk_by_session_id(db, parsed.session_id)
+        if session_pk is None:
+            logger.warning(
+                "orphan failed 파일의 session_id를 DB에서 찾지 못해 FAILED row를 복구하지 못함: %s",
+                failed_path.name,
+            )
+            continue
+
+        repo.insert_failed_segment(
+            db,
+            capture_session_pk=session_pk,
+            file_name=failed_path.name,
+            capture_interface=parsed.interface,
+            window_start=parsed.window_start,
+            window_end=parsed.window_end,
+            error_code=repo.PARTIAL_CAPTURE,
+            error_message="orphan failed file recovered on restart: file existed without a Segment row",
+        )
+        reconciled += 1
+        logger.info("orphan failed 파일에 대해 FAILED row 복구: %s", failed_path.name)
+
+    if reconciled:
+        db.commit()
+    return reconciled
+
+
+def reconcile_stale_running_sessions(db: Session, config: CaptureRuntimeConfig, now: datetime) -> int:
+    """서비스가 비정상 종료되어 RUNNING 상태로 남아있는 이전 Session을 FAILED로 마감합니다.
+
+    새 Session을 생성하기 전에 호출해야 합니다 (5 번 리뷰 항목).
+    """
+    reconciled = repo.close_stale_running_sessions(db, config.capture_interface, now)
+    if reconciled:
+        db.commit()
+        logger.warning("비정상 종료로 남아있던 RUNNING Session %d개를 FAILED로 마감함", reconciled)
+    return reconciled
+
+
 def start_new_session(
     db: Session,
     config: CaptureRuntimeConfig,
@@ -198,8 +253,27 @@ def run_capture_loop(
     windows_captured = 0
 
     while not shutdown.requested:
-        _sleep_until(window_start, clock=clock, sleep=sleep)
+        now = clock()
         window_end = window_start + timedelta(seconds=config.window_seconds)
+
+        if window_end <= now:
+            # 이 Window는 대기하는 동안 이미 지나가 버렸다. 지금 캡처를 시작하면
+            # window_start/window_end 라벨과 실제로 잡히는 트래픽 시각이 어긋나므로
+            # (2 번 리뷰 항목), 캡처를 시도하지 않고 현재 시각 기준 다음 신선한
+            # 경계로 다시 정렬한다.
+            logger.warning(
+                "Window %s~%s는 대기 중 만료되어 건너뜀 (현재 시각=%s); 다음 경계로 재정렬",
+                window_start, window_end, now,
+            )
+            window_start = next_utc_boundary(now, config.window_seconds)
+            continue
+
+        _sleep_until(window_start, clock=clock, sleep=sleep)
+
+        if shutdown.requested:
+            # 대기 중 종료 신호를 받았다면 새 캡처를 시작하지 않고 즉시 빠져나간다
+            # (3 번 리뷰 항목).
+            break
 
         result = execute_capture_window(
             process,
@@ -281,8 +355,10 @@ def main() -> None:
     with SessionLocal() as db:
         reconcile_leftover_tmp_files(db, config)
         reconcile_orphan_ready_files(db, config)
+        reconcile_orphan_failed_files(db, config)
 
         now = datetime.now(timezone.utc)
+        reconcile_stale_running_sessions(db, config, now)
         session_pk, session_id, first_window_start = start_new_session(db, config, now)
 
         try:
@@ -298,6 +374,7 @@ def main() -> None:
             )
         except Exception:
             logger.exception("Capture loop failed unexpectedly; marking session FAILED")
+            db.rollback()
             repo.close_session(db, session_pk, datetime.now(timezone.utc), "FAILED")
             db.commit()
             raise  # non-zero exit -> systemd Restart=on-failure

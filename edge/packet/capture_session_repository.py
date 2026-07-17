@@ -105,6 +105,26 @@ def close_session(db: Session, session_pk: int, ended_at: datetime, status: str)
     )
 
 
+def close_stale_running_sessions(db: Session, capture_interface: str, ended_at: datetime) -> int:
+    """서비스가 비정상 종료되어 RUNNING 상태로 남아있는 이전 Session들을 FAILED로 마감합니다.
+
+    새 Session을 시작하기 전에 호출해야 합니다. 반환값은 마감한 Session 개수입니다.
+    """
+    result = db.execute(
+        text(
+            """
+            UPDATE packet_capture_sessions
+            SET status = 'FAILED',
+                ended_at = :ended_at,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE capture_interface = :capture_interface AND status = 'RUNNING'
+            """
+        ),
+        {"ended_at": format_utc_iso(ended_at), "capture_interface": capture_interface},
+    )
+    return result.rowcount
+
+
 def find_session_pk_by_session_id(db: Session, session_id: str) -> int | None:
     row = db.execute(
         text("SELECT id FROM packet_capture_sessions WHERE session_id = :session_id"),

@@ -21,7 +21,9 @@ from edge.packet.pcap_naming import build_pcap_filename, format_utc_iso
 from edge.packet.run_packet_capture import (
     GracefulShutdown,
     reconcile_leftover_tmp_files,
+    reconcile_orphan_failed_files,
     reconcile_orphan_ready_files,
+    reconcile_stale_running_sessions,
     run_capture_loop,
     start_new_session,
 )
@@ -368,6 +370,71 @@ class TestRunCaptureLoop:
 
         assert windows_captured == 0
 
+    def test_expired_window_is_skipped_and_realigned_to_fresh_boundary(self, db_session, tmp_path) -> None:
+        """대기하는 동안 이미 지나가 버린 Window는 캡처를 시도하지 않고
+        현재 시각 기준 다음 신선한 경계로 재정렬해야 한다 (리뷰 항목 2)."""
+        config = _make_config(tmp_path)
+        # first_window_start=10:00:10 이지만, "현재 시각"은 이미 10:00:25로
+        # window_end(10:00:20)를 지나버린 상황을 흉내낸다.
+        first_window_start = _utc(2026, 7, 15, 10, 0, 10)
+        session_pk = repo.create_session(
+            db_session, session_id=SESSION_ID_A, capture_interface="eth0",
+            started_at=_utc(2026, 7, 15, 10, 0, 3),
+        )
+        db_session.commit()
+
+        process = FakeCaptureProcess(
+            outcomes=[CaptureOutcome(completed_full_window=True, exit_code=-15)]
+        )
+        shutdown = GracefulShutdown()
+
+        windows_captured = run_capture_loop(
+            db_session, process, config,
+            session_pk=session_pk, session_id=SESSION_ID_A,
+            first_window_start=first_window_start,
+            shutdown=shutdown, max_windows=1,
+            clock=lambda: _utc(2026, 7, 15, 10, 0, 25),
+            sleep=lambda _seconds: None,
+        )
+
+        assert windows_captured == 1
+        segments = db_session.execute(
+            text("SELECT window_start, status FROM packet_capture_segments ORDER BY window_start")
+        ).fetchall()
+        # 만료된 10:00:10 Window는 캡처를 시도하지 않아 row가 없어야 하고,
+        # 실제로 캡처된 Window는 10:00:30(다음 신선한 경계)이어야 한다.
+        assert len(segments) == 1
+        assert segments[0][0] == "2026-07-15T10:00:30Z"
+        assert segments[0][1] == "READY"
+
+    def test_shutdown_requested_during_sleep_stops_before_capturing(self, db_session, tmp_path) -> None:
+        """window_start까지 대기하는 도중 종료 신호가 오면, 대기가 끝나도
+        새 캡처를 시작하지 않고 즉시 빠져나가야 한다 (리뷰 항목 3)."""
+        config = _make_config(tmp_path)
+        session_pk, session_id, first_window_start = start_new_session(
+            db_session, config, _utc(2026, 7, 15, 10, 0, 3)
+        )
+        process = FakeCaptureProcess(
+            outcomes=[CaptureOutcome(completed_full_window=True, exit_code=-15)]
+        )
+        shutdown = GracefulShutdown()
+
+        def sleep_and_request_shutdown(_seconds: float) -> None:
+            # sleep 도중(=대기 중) 종료 신호가 도착한 상황을 흉내낸다.
+            shutdown.requested = True
+
+        windows_captured = run_capture_loop(
+            db_session, process, config,
+            session_pk=session_pk, session_id=session_id,
+            first_window_start=first_window_start,
+            shutdown=shutdown,
+            clock=lambda: _utc(2026, 7, 15, 10, 0, 5),  # 아직 window_start 전 (만료 아님)
+            sleep=sleep_and_request_shutdown,
+        )
+
+        assert windows_captured == 0
+        assert process.outcomes == [CaptureOutcome(completed_full_window=True, exit_code=-15)]  # 소비 안 됨
+
 
 class TestCrashRecovery:
     def test_reconciles_leftover_tmp_as_partial_capture(self, db_session, tmp_path) -> None:
@@ -416,3 +483,113 @@ class TestCrashRecovery:
         segment = repo.find_segment_by_file_name(db_session, ready_filename)
         assert segment is not None
         assert segment["status"] == "READY"
+
+    def test_reconciles_orphan_failed_file(self, db_session, tmp_path) -> None:
+        """failed/에는 파일이 있지만 DB에 Segment row가 없는 경우를 복구한다 (리뷰 항목 7).
+
+        파일을 failed/로 옮긴 뒤 DB insert가 실패했거나 그 사이 프로세스가 죽은 상황을 흉내낸다.
+        """
+        config = _make_config(tmp_path)
+        session_id = SESSION_ID_A
+        repo.create_session(
+            db_session, session_id=session_id, capture_interface="eth0",
+            started_at=_utc(2026, 7, 15, 10, 0, 0),
+        )
+        db_session.commit()
+
+        failed_filename = build_pcap_filename(
+            session_id=session_id, interface="eth0",
+            window_start=_utc(2026, 7, 15, 10, 0, 0), window_end=_utc(2026, 7, 15, 10, 0, 10),
+            tmp=False,
+        )
+        (config.failed_dir / failed_filename).write_bytes(b"failed-bytes")
+
+        reconciled = reconcile_orphan_failed_files(db_session, config)
+
+        assert reconciled == 1
+        segment = repo.find_segment_by_file_name(db_session, failed_filename)
+        assert segment is not None
+        assert segment["status"] == "FAILED"
+
+    def test_orphan_failed_reconcile_is_idempotent(self, db_session, tmp_path) -> None:
+        """이미 Segment row가 있는 failed 파일은 다시 처리하지 않는다 (중복 방지)."""
+        config = _make_config(tmp_path)
+        session_pk = repo.create_session(
+            db_session, session_id=SESSION_ID_A, capture_interface="eth0",
+            started_at=_utc(2026, 7, 15, 10, 0, 0),
+        )
+        repo.insert_failed_segment(
+            db_session, capture_session_pk=session_pk, file_name="already_recorded.pcap",
+            capture_interface="eth0",
+            window_start=_utc(2026, 7, 15, 10, 0, 0), window_end=_utc(2026, 7, 15, 10, 0, 10),
+            error_code=repo.PARTIAL_CAPTURE, error_message="original failure",
+        )
+        db_session.commit()
+        (config.failed_dir / "already_recorded.pcap").write_bytes(b"failed-bytes")
+
+        reconciled = reconcile_orphan_failed_files(db_session, config)
+
+        assert reconciled == 0
+
+
+class TestStaleRunningSessionRecovery:
+    """리뷰 항목 5: 비정상 종료로 남아있는 RUNNING Session을 재시작 시 FAILED로 마감."""
+
+    def test_closes_stale_running_session_as_failed(self, db_session, tmp_path) -> None:
+        config = _make_config(tmp_path)
+        stale_session_pk = repo.create_session(
+            db_session, session_id=SESSION_ID_A, capture_interface="eth0",
+            started_at=_utc(2026, 7, 15, 9, 0, 0),
+        )
+        db_session.commit()
+
+        reconciled = reconcile_stale_running_sessions(
+            db_session, config, _utc(2026, 7, 15, 10, 0, 0)
+        )
+
+        assert reconciled == 1
+        row = db_session.execute(
+            text("SELECT status, ended_at FROM packet_capture_sessions WHERE id = :id"),
+            {"id": stale_session_pk},
+        ).mappings().first()
+        assert row["status"] == "FAILED"
+        assert row["ended_at"] == "2026-07-15T10:00:00Z"
+
+    def test_does_not_touch_already_terminal_sessions(self, db_session, tmp_path) -> None:
+        config = _make_config(tmp_path)
+        completed_session_pk = repo.create_session(
+            db_session, session_id=SESSION_ID_A, capture_interface="eth0",
+            started_at=_utc(2026, 7, 15, 9, 0, 0),
+        )
+        repo.close_session(db_session, completed_session_pk, _utc(2026, 7, 15, 9, 30, 0), "COMPLETED")
+        db_session.commit()
+
+        reconciled = reconcile_stale_running_sessions(
+            db_session, config, _utc(2026, 7, 15, 10, 0, 0)
+        )
+
+        assert reconciled == 0
+        row = db_session.execute(
+            text("SELECT status FROM packet_capture_sessions WHERE id = :id"),
+            {"id": completed_session_pk},
+        ).mappings().first()
+        assert row["status"] == "COMPLETED"
+
+    def test_only_affects_matching_capture_interface(self, db_session, tmp_path) -> None:
+        config = _make_config(tmp_path)
+        other_interface_session_pk = repo.create_session(
+            db_session, session_id=SESSION_ID_A, capture_interface="eth1",
+            started_at=_utc(2026, 7, 15, 9, 0, 0),
+        )
+        db_session.commit()
+
+        reconciled = reconcile_stale_running_sessions(
+            db_session, config, _utc(2026, 7, 15, 10, 0, 0)
+        )  # config.capture_interface == "eth0"
+
+        assert reconciled == 0
+        row = db_session.execute(
+            text("SELECT status FROM packet_capture_sessions WHERE id = :id"),
+            {"id": other_interface_session_pk},
+        ).mappings().first()
+        assert row["status"] == "RUNNING"

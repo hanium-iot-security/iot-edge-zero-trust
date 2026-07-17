@@ -32,6 +32,9 @@ class CaptureOutcome:
     # False: Wrapper가 신호를 보내기 전에 프로세스가 스스로 종료됨 (실패로 간주)
     completed_full_window: bool
     exit_code: int | None
+    # True: SIGTERM만으로 정상 종료됨 (pcap 파일이 깨끗하게 닫혔을 것으로 신뢰 가능)
+    # False: SIGTERM에 응답하지 않아 SIGKILL까지 실행함 (pcap 파일이 깨졌을 수 있어 신뢰 불가)
+    terminated_cleanly: bool = True
 
 
 class CaptureProcess(Protocol):
@@ -91,10 +94,13 @@ class TcpdumpCaptureProcess:
         process.terminate()
         try:
             exit_code = process.wait(timeout=self._terminate_grace_seconds)
+            return CaptureOutcome(completed_full_window=True, exit_code=exit_code, terminated_cleanly=True)
         except subprocess.TimeoutExpired:
+            # SIGTERM에 응답하지 않아 SIGKILL까지 실행함 -- pcap 파일이 깨졌을 수 있으므로
+            # window_seconds를 다 채웠더라도 성공으로 취급하지 않는다.
             process.kill()
             exit_code = process.wait(timeout=self._terminate_grace_seconds)
-        return CaptureOutcome(completed_full_window=True, exit_code=exit_code)
+            return CaptureOutcome(completed_full_window=True, exit_code=exit_code, terminated_cleanly=False)
 
 
 @dataclass(frozen=True)
@@ -110,6 +116,14 @@ class CaptureRuntimeConfig:
     def __post_init__(self) -> None:
         if not isfinite(self.window_seconds) or self.window_seconds <= 0:
             raise ValueError("window_seconds must be positive")
+        if self.window_seconds != 10:
+            # packet_capture_segments의 DB CHECK 제약이 window_end - window_start == 10초를
+            # 강제한다. 여기서 미리 걸러내지 않으면 DB insert 시점에서야 IntegrityError로
+            # 실패하게 되어 원인 파악이 어려워진다.
+            raise ValueError(
+                f"window_seconds must be 10 to satisfy the DB CHECK constraint on "
+                f"packet_capture_segments (got {self.window_seconds})"
+            )
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "CaptureRuntimeConfig":
@@ -172,7 +186,7 @@ def execute_capture_window(
 
     ready_filename = tmp_filename_to_ready(tmp_filename)
 
-    if outcome.completed_full_window:
+    if outcome.completed_full_window and outcome.terminated_cleanly:
         final_path = _atomic_rename_same_filesystem(tmp_path, config.ready_dir / ready_filename)
         return CaptureWindowResult(
             success=True,
@@ -182,16 +196,23 @@ def execute_capture_window(
         )
 
     final_path = _move_to_failed(tmp_path, config.failed_dir / ready_filename)
+    if not outcome.completed_full_window:
+        error_message = (
+            f"tcpdump exited before the {window_seconds:.0f}s window completed "
+            f"(exit_code={outcome.exit_code})"
+        )
+    else:
+        error_message = (
+            f"tcpdump did not respond to SIGTERM within the grace period and had to be "
+            f"SIGKILLed; pcap file may be corrupted (exit_code={outcome.exit_code})"
+        )
     return CaptureWindowResult(
         success=False,
         file_name=ready_filename,
         final_path=final_path,
         exit_code=outcome.exit_code,
         error_code=PARTIAL_CAPTURE,
-        error_message=(
-            f"tcpdump exited before the {window_seconds:.0f}s window completed "
-            f"(exit_code={outcome.exit_code})"
-        ),
+        error_message=error_message,
     )
 
 
