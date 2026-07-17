@@ -14,6 +14,21 @@ class Settings(BaseSettings):
     initial_trust_score: int = 100
     isolation_threshold: int = 30
 
+    # Packet Capture
+    capture_interface: str = "eth0"
+    pcap_window_seconds: int = 10
+    pcap_capture_filter: str = "tcp or udp"
+    pcap_incoming_dir: str = "data/pcap/incoming"
+    pcap_ready_dir: str = "data/pcap/ready"
+    pcap_processed_dir: str = "data/pcap/processed"
+    pcap_failed_dir: str = "data/pcap/failed"
+    pcap_samples_dir: str = "data/pcap/samples"
+    pcap_retention_hours: int = 1
+    pcap_max_storage_mb: int = 1024
+    failed_pcap_retention_hours: int = 24
+    failed_pcap_max_storage_mb: int = 256
+    failed_pcap_max_files: int = 20
+
     model_config = SettingsConfigDict(env_file=(".env", "../.env"), env_file_encoding="utf-8")
 
 

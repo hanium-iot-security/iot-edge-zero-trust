@@ -1,0 +1,40 @@
+[Unit]
+Description=IoT Edge Zero Trust - Raspberry Pi #1 Packet Capture Runtime
+After=network-online.target
+Wants=network-online.target
+
+# 짧은 시간에 재시작이 5번을 넘으면 systemd가 더 이상 재시작을 시도하지 않는다.
+# ("systemd Start Limit으로 반복 재시작을 제한한다")
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# TODO(원우민/정선우): 실제 배포 사용자/경로에 맞게 조정
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/iot-edge-zero-trust
+EnvironmentFile=-/home/pi/iot-edge-zero-trust/.env
+
+ExecStart=/home/pi/iot-edge-zero-trust/edge/scripts/run_packet_capture.sh
+
+# tcpdump가 root 없이 패킷을 캡처할 수 있도록 최소 권한만 부여한다.
+# sudo나 shell=True에 의존하지 않는다.
+#   CAP_NET_RAW   : raw socket으로 패킷을 읽기 위해 필요
+#   CAP_NET_ADMIN : promiscuous mode 등 인터페이스 제어에 필요
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=true
+
+# 비정상 종료 시에만 자동 재시작한다.
+# 관리자가 `systemctl stop`으로 정상 중지하면(exit code 0) 재시작하지 않는다.
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=packet-capture
+
+[Install]
+WantedBy=multi-user.target
