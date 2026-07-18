@@ -8,7 +8,7 @@ tcpdump 실행이나 파일시스템 rename은 capture_runtime.py가 담당합�
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -25,6 +25,12 @@ class SessionRecord:
     session_id: str
     capture_interface: str
     status: str
+
+
+@dataclass(frozen=True)
+class PacketCaptureReadiness:
+    session_id: str
+    packet_capture_ready_through: datetime | None
 
 
 def create_session(
@@ -165,6 +171,90 @@ def find_segment_by_file_name(db: Session, file_name: str) -> dict | None:
     return dict(row) if row is not None else None
 
 
+def get_capture_session_by_session_id(
+    db: Session,
+    *,
+    session_id: str,
+) -> dict | None:
+    row = db.execute(
+        text(
+            """
+            SELECT id, session_id, capture_interface, started_at,
+                   first_window_start, ended_at, capture_gap_start,
+                   capture_gap_end, status, created_at, updated_at
+            FROM packet_capture_sessions
+            WHERE session_id = :session_id
+            """
+        ),
+        {"session_id": session_id},
+    ).mappings().first()
+    return dict(row) if row is not None else None
+
+
+def list_capture_segments_by_session(
+    db: Session,
+    *,
+    session_id: str,
+) -> list[dict]:
+    rows = db.execute(
+        text(
+            """
+            SELECT pcsg.id, pcsg.capture_session_id, pcsg.file_name,
+                   pcsg.capture_interface, pcsg.window_start, pcsg.window_end,
+                   pcsg.status, pcsg.packet_count, pcsg.processed_at,
+                   pcsg.error_code, pcsg.error_message,
+                   pcsg.created_at, pcsg.updated_at
+            FROM packet_capture_segments pcsg
+            JOIN packet_capture_sessions pcs
+                ON pcs.id = pcsg.capture_session_id
+            WHERE pcs.session_id = :session_id
+            ORDER BY pcsg.window_start ASC, pcsg.id ASC
+            """
+        ),
+        {"session_id": session_id},
+    ).mappings()
+    return [dict(row) for row in rows]
+
+
+def get_packet_capture_ready_through(
+    db: Session,
+    *,
+    session_id: str,
+) -> PacketCaptureReadiness | None:
+    session = get_capture_session_by_session_id(db, session_id=session_id)
+    if session is None:
+        return None
+
+    first_window_start = session.get("first_window_start")
+    if first_window_start is None:
+        return PacketCaptureReadiness(session_id=session_id, packet_capture_ready_through=None)
+
+    expected_window_start = _parse_db_utc(first_window_start)
+    ready_through: datetime | None = None
+    completed_statuses = {"READY", "PROCESSED", "EMPTY"}
+
+    for segment in list_capture_segments_by_session(db, session_id=session_id):
+        window_start = _parse_db_utc(segment["window_start"])
+        if window_start < expected_window_start:
+            continue
+        if window_start > expected_window_start:
+            break
+        if segment["status"] not in completed_statuses:
+            break
+
+        window_end = _parse_db_utc(segment["window_end"])
+        if window_end != window_start + timedelta(seconds=10):
+            break
+
+        ready_through = window_end
+        expected_window_start = window_end
+
+    return PacketCaptureReadiness(
+        session_id=session_id,
+        packet_capture_ready_through=ready_through,
+    )
+
+
 def insert_ready_segment(
     db: Session,
     *,
@@ -237,3 +327,13 @@ def insert_failed_segment(
         },
     )
     return int(result.lastrowid or 0)
+
+
+def _parse_db_utc(value: str | datetime) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = parse_utc_iso(value)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).replace(microsecond=0)

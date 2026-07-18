@@ -10,7 +10,7 @@ import ipaddress
 import logging
 import shutil
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,22 +25,26 @@ except ImportError:
     _fcntl = None  # type: ignore[assignment]
     _HAS_FCNTL = False
 
-from sqlalchemy import text
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
 from backend.app.database import SessionLocal
 from edge.features.collect_feature_logs import parse_db_datetime
+from edge.features.packet_feature_repository import (
+    fetch_ready_segments,
+    get_segment_status_by_file_name,
+    insert_packet_feature_rows,
+    load_ip_device_map,
+    update_capture_segment_status,
+)
 from edge.features.packet_feature_utils import (
     ParsedPacket,
     PartialPcapError,
     PcapParseError,
     UnsupportedPcapFormat,
-    build_ip_device_map,
     build_packet_features,
     parse_pcap,
-    resolve_device_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,11 +55,6 @@ DEFAULT_PROCESSED_DIR = Path("data/pcap/processed")
 DEFAULT_FAILED_DIR = Path("data/pcap/failed")
 DEFAULT_LIMIT = 10
 DEFAULT_LOCK_PATH = Path("data/pcap/.extractor.lock")
-DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
-
-
-def _now_utc_str() -> str:
-    return datetime.now(timezone.utc).strftime(DATETIME_FORMAT)
 
 
 @contextlib.contextmanager
@@ -145,15 +144,9 @@ def reconcile_orphaned_files(
         return 0
     moved = 0
     for pcap_file in sorted(ready_dir.glob("*.pcap")):
-        row = db.execute(
-            text(
-                "SELECT status FROM packet_capture_segments WHERE file_name = :fname"
-            ),
-            {"fname": pcap_file.name},
-        ).fetchone()
-        if row is None:
+        status = get_segment_status_by_file_name(db, file_name=pcap_file.name)
+        if status is None:
             continue  # DB에 없는 파일: 무시
-        status = row[0]
         try:
             if status in ("PROCESSED", "EMPTY"):
                 _move_pcap(pcap_file, processed_dir)
@@ -178,33 +171,11 @@ def reconcile_orphaned_files(
 
 
 def _load_ip_device_map(db: Session) -> dict[str, str]:
-    rows = db.execute(
-        text(
-            """
-            SELECT device_id, ip_address
-            FROM devices
-            WHERE ip_address IS NOT NULL
-              AND ip_address != ''
-            """
-        )
-    ).mappings()
-    return build_ip_device_map([dict(row) for row in rows])
+    return load_ip_device_map(db)
 
 
 def _fetch_ready_segments(db: Session, limit: int) -> list[dict[str, Any]]:
-    rows = db.execute(
-        text(
-            """
-            SELECT id, file_name, window_start, window_end
-            FROM packet_capture_segments
-            WHERE status = 'READY'
-            ORDER BY window_start, id
-            LIMIT :limit
-            """
-        ),
-        {"limit": limit},
-    ).mappings()
-    return [dict(row) for row in rows]
+    return fetch_ready_segments(db, limit=limit)
 
 
 def _update_segment(
@@ -216,29 +187,13 @@ def _update_segment(
     error_code: str | None = None,
     error_message: str | None = None,
 ) -> None:
-    now = _now_utc_str()
-    db.execute(
-        text(
-            """
-            UPDATE packet_capture_segments
-            SET status        = :status,
-                packet_count  = :packet_count,
-                processed_at  = :processed_at,
-                error_code    = :error_code,
-                error_message = :error_message,
-                updated_at    = :updated_at
-            WHERE id = :id
-            """
-        ),
-        {
-            "status": status,
-            "packet_count": packet_count,
-            "processed_at": now if status in ("PROCESSED", "EMPTY") else None,
-            "error_code": error_code,
-            "error_message": error_message,
-            "updated_at": now,
-            "id": segment_id,
-        },
+    update_capture_segment_status(
+        db,
+        segment_id=segment_id,
+        status=status,
+        packet_count=packet_count,
+        error_code=error_code,
+        error_message=error_message,
     )
 
 
@@ -249,71 +204,13 @@ def _insert_feature_rows(
     ip_device_map: dict[str, str],
     capture_scope: str,
 ) -> None:
-    for row in feature_rows:
-        device_id = resolve_device_id(row["peer_ip"], ip_device_map)
-        # ON CONFLICT DO NOTHING: (capture_segment_id, peer_ip, direction) 중복만 무시.
-        # NOT NULL / CHECK 위반은 예외로 전파해 transaction 전체를 rollback합니다.
-        db.execute(
-            text(
-                """
-                INSERT INTO packet_feature_logs (
-                    capture_segment_id,
-                    device_id,
-                    peer_ip,
-                    direction,
-                    window_start,
-                    window_end,
-                    packet_count,
-                    total_bytes,
-                    avg_packet_size,
-                    max_packet_size,
-                    mean_inter_arrival_time,
-                    distinct_dest_port_count,
-                    tcp_syn_count,
-                    mqtt_related_packet_count,
-                    non_mqtt_tcp_udp_packet_count,
-                    capture_scope
-                )
-                VALUES (
-                    :capture_segment_id,
-                    :device_id,
-                    :peer_ip,
-                    :direction,
-                    :window_start,
-                    :window_end,
-                    :packet_count,
-                    :total_bytes,
-                    :avg_packet_size,
-                    :max_packet_size,
-                    :mean_inter_arrival_time,
-                    :distinct_dest_port_count,
-                    :tcp_syn_count,
-                    :mqtt_related_packet_count,
-                    :non_mqtt_tcp_udp_packet_count,
-                    :capture_scope
-                )
-                ON CONFLICT(capture_segment_id, peer_ip, direction) DO NOTHING
-                """
-            ),
-            {
-                "capture_segment_id": segment_id,
-                "device_id": device_id,
-                "peer_ip": row["peer_ip"],
-                "direction": row["direction"],
-                "window_start": row["window_start"],
-                "window_end": row["window_end"],
-                "packet_count": row["packet_count"],
-                "total_bytes": row["total_bytes"],
-                "avg_packet_size": row["avg_packet_size"],
-                "max_packet_size": row["max_packet_size"],
-                "mean_inter_arrival_time": row["mean_inter_arrival_time"],
-                "distinct_dest_port_count": row["distinct_dest_port_count"],
-                "tcp_syn_count": row["tcp_syn_count"],
-                "mqtt_related_packet_count": row["mqtt_related_packet_count"],
-                "non_mqtt_tcp_udp_packet_count": row["non_mqtt_tcp_udp_packet_count"],
-                "capture_scope": capture_scope,
-            },
-        )
+    insert_packet_feature_rows(
+        db,
+        capture_segment_id=segment_id,
+        feature_rows=feature_rows,
+        ip_device_map=ip_device_map,
+        capture_scope=capture_scope,
+    )
 
 
 def process_segment(
