@@ -381,6 +381,24 @@ def test_packet_feature_logs_reject_invalid_queries(api_client) -> None:
     ).status_code == 422
 
 
+def test_packet_feature_logs_return_500_for_stored_timestamp_error(api_client) -> None:
+    client, db_path = api_client
+    seed_packet_gateway_rows(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            UPDATE packet_feature_logs
+            SET created_at = 'not-a-timestamp'
+            WHERE peer_ip = '10.0.0.10'
+            """
+        )
+
+    response = client.get("/api/packet-feature-logs")
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "created_at must be a valid timestamp"
+
+
 def test_gateway_metrics_return_latest_rows_and_parse_json(api_client) -> None:
     client, db_path = api_client
     seed_packet_gateway_rows(db_path)

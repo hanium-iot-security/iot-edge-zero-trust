@@ -126,4 +126,19 @@ MVP에서는 중복 endpoint를 줄이기 위해 기기별 feature/event 조회�
 
 ## 현재 구현 상태
 
-현재 구현된 API는 `/api/health`, `/api/mqtt-logs`, `/api/feature-logs`입니다. 나머지 endpoint는 다음 API 구현 단계에서 맞춰야 할 MVP 계약입니다.
+현재 backend에 구현된 조회 API는 다음과 같습니다.
+
+```txt
+GET /api/health
+GET /api/dashboard/summary
+GET /api/devices
+GET /api/devices/{device_id}
+GET /api/mqtt-logs
+GET /api/feature-logs
+GET /api/packet-feature-logs
+GET /api/gateway-metrics
+GET /api/detection-events
+GET /api/trust-score/summary
+GET /api/trust-score/{device_id}/history
+GET /api/isolation/history
+```

@@ -17,6 +17,10 @@ from edge.packet.pcap_naming import format_utc_iso
 PACKET_WINDOW_SECONDS = 10.0
 
 
+class PacketFeatureDataError(RuntimeError):
+    """Raised when stored packet feature rows do not match the API contract."""
+
+
 def list_packet_features(
     db: Session,
     *,
@@ -119,7 +123,9 @@ def _format_api_timestamp(value: Any, field_name: str) -> str:
     try:
         parsed = datetime.fromisoformat(parse_target)
     except ValueError as exc:
-        raise ValueError(f"{field_name} must be a valid timestamp") from exc
+        raise PacketFeatureDataError(
+            f"{field_name} must be a valid timestamp"
+        ) from exc
 
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         parsed = parsed.replace(tzinfo=timezone.utc)

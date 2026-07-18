@@ -6,7 +6,10 @@ from sqlalchemy.orm import Session
 
 from backend.app.database import get_db
 from backend.app.schemas.packet_feature_schema import PacketFeatureListResponse
-from backend.app.services.packet_feature_query_service import list_packet_features
+from backend.app.services.packet_feature_query_service import (
+    PacketFeatureDataError,
+    list_packet_features,
+)
 
 
 router = APIRouter(prefix="/packet-feature-logs", tags=["packet-feature-logs"])
@@ -38,3 +41,5 @@ def get_packet_feature_logs(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except PacketFeatureDataError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
