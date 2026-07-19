@@ -160,14 +160,9 @@ def execute_capture_window(
     session_id: str,
     window_start: datetime,
     window_end: datetime,
+    capture_started_at: datetime | None = None,
 ) -> CaptureWindowResult:
-    """하나의 UTC 10초 Window를 캡처하고 결과에 따라 ready/failed로 원자적으로 이동시킵니다.
-
-    반환된 CaptureWindowResult.success == True 이면 파일은 이미 ready_dir에 있고,
-    호출자(run_packet_capture.py)는 capture_session_repository.insert_ready_segment()를
-    호출해 READY row를 만들면 됩니다. False이면 failed_dir로 이미 이동되어 있으므로
-    호출자는 insert_failed_segment()를 호출합니다.
-    """
+    """하나의 UTC 10초 Window를 캡처하고 결과에 따라 ready/failed로 원자적으로 이동시킵니다."""
     tmp_filename = build_pcap_filename(
         session_id=session_id,
         interface=config.capture_interface,
@@ -176,7 +171,11 @@ def execute_capture_window(
         tmp=True,
     )
     tmp_path = config.incoming_dir / tmp_filename
-    window_seconds = (window_end - window_start).total_seconds()
+
+    if capture_started_at is not None:
+        window_seconds = max(0.0, (window_end - capture_started_at).total_seconds())
+    else:
+        window_seconds = (window_end - window_start).total_seconds()
 
     outcome = process.capture_window(
         interface=config.capture_interface,

@@ -30,7 +30,7 @@ from edge.packet.capture_runtime import (
     TcpdumpCaptureProcess,
     execute_capture_window,
 )
-from edge.packet.pcap_naming import next_utc_boundary, parse_pcap_filename
+from edge.packet.pcap_naming import format_utc_iso, next_utc_boundary, parse_pcap_filename
 
 logger = logging.getLogger(__name__)
 
@@ -215,13 +215,13 @@ def start_new_session(
         repo.record_capture_gap(db, session_pk, previous_window_end, first_window_start)
         logger.info(
             "Capture Gap 기록: %s ~ %s (interface=%s)",
-            previous_window_end, first_window_start, config.capture_interface,
+            format_utc_iso(previous_window_end), format_utc_iso(first_window_start), config.capture_interface,
         )
 
     db.commit()
     logger.info(
         "새 Capture Session 시작: session_id=%s first_window_start=%s",
-        session_id, first_window_start,
+        session_id, format_utc_iso(first_window_start),
     )
     return session_pk, session_id, first_window_start
 
@@ -263,7 +263,7 @@ def run_capture_loop(
             # 경계로 다시 정렬한다.
             logger.warning(
                 "Window %s~%s는 대기 중 만료되어 건너뜀 (현재 시각=%s); 다음 경계로 재정렬",
-                window_start, window_end, now,
+                format_utc_iso(window_start), format_utc_iso(window_end), format_utc_iso(now),
             )
             window_start = next_utc_boundary(now, config.window_seconds)
             continue
@@ -275,12 +275,21 @@ def run_capture_loop(
             # (3 번 리뷰 항목).
             break
 
+        capture_started_at = clock()
+        drift_seconds = (capture_started_at - window_start).total_seconds()
+        if drift_seconds > 0:
+            # 이 지연 자체는 문제가 아니다 -- execute_capture_window가 window_end까지
+            # 남은 시간만큼만 캡처하도록 자체 보정하므로 다음 Window로 누적되지 않는다.
+            # 다만 지속적으로 지연이 관측되면 DB/디스크 성능 저하의 신호일 수 있어 로그로 남긴다.
+            logger.info("Window %s 캡처가 %.3fs 지연되어 시작됨 (자동 보정됨)", format_utc_iso(window_start), drift_seconds)
+
         result = execute_capture_window(
             process,
             config,
             session_id=session_id,
             window_start=window_start,
             window_end=window_end,
+            capture_started_at=capture_started_at,
         )
 
         if result.success:

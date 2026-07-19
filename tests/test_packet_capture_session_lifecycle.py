@@ -4,8 +4,8 @@
 - run_packet_capture.py: Session 생성, Gap 기록, 캡처 루프, Crash Recovery 전체 흐름
 """
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -17,7 +17,7 @@ from backend.app.database import SessionLocal
 from db.migration_runner import apply_migrations
 from edge.packet import capture_session_repository as repo
 from edge.packet.capture_runtime import CaptureOutcome, CaptureRuntimeConfig
-from edge.packet.pcap_naming import build_pcap_filename, format_utc_iso
+from edge.packet.pcap_naming import build_pcap_filename, format_utc_iso, parse_utc_iso
 from edge.packet.run_packet_capture import (
     GracefulShutdown,
     reconcile_leftover_tmp_files,
@@ -70,6 +70,38 @@ class FakeCaptureProcess:
         if self.write_file:
             output_path.write_bytes(b"fake-pcap-bytes")
         return outcome
+
+
+@dataclass
+class _MutableClock:
+    """테스트에서 clock()/sleep() 둘 다 같은 가짜 시계를 공유하게 만드는 헬퍼."""
+
+    value: datetime
+
+    def now(self) -> datetime:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += timedelta(seconds=seconds)
+
+
+@dataclass
+class _OverheadCaptureProcess:
+    """실제 tcpdump 대신, '요청받은 시간만큼 캡처 + 매 호출마다 고정 오버헤드'를
+    가짜 시계에 반영하는 프로세스. DB commit·로깅 등 부수 작업 시간을 흉내낸다.
+
+    PR #18 후속 리뷰: UTC Window 실행 지연이 연속 Capture에서 누적되는지 검증할 때 사용.
+    """
+
+    clock: _MutableClock
+    overhead_seconds: float
+    calls: list = field(default_factory=list)
+
+    def capture_window(self, *, interface, output_path, window_seconds):
+        self.calls.append(window_seconds)
+        output_path.write_bytes(b"fake-pcap-bytes")
+        self.clock.advance(window_seconds + self.overhead_seconds)
+        return CaptureOutcome(completed_full_window=True, exit_code=-15)
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +466,55 @@ class TestRunCaptureLoop:
 
         assert windows_captured == 0
         assert process.outcomes == [CaptureOutcome(completed_full_window=True, exit_code=-15)]  # 소비 안 됨
+
+
+class TestCumulativeDriftDoesNotAccumulate:
+    """PR #18 후속 리뷰: UTC Window의 실행 지연이 연속 Capture에서 누적될 수 있는 문제 보완.
+
+    매 Window마다 일정한 오버헤드(DB commit·로깅 등, 예: 0.3초)가 있어도,
+    execute_capture_window의 self-correcting duration 덕분에 지연이 다음 Window로
+    누적되지 않고, 5개 Window 모두 정확히 10초 간격의 UTC 경계에 기록되어야 한다.
+    """
+
+    def test_repeated_overhead_does_not_skip_windows_or_drift_labels(self, db_session, tmp_path) -> None:
+        config = _make_config(tmp_path)
+        session_pk, session_id, first_window_start = start_new_session(
+            db_session, config, _utc(2026, 7, 15, 10, 0, 3)
+        )
+        clock = _MutableClock(first_window_start)
+        process = _OverheadCaptureProcess(clock=clock, overhead_seconds=0.3)
+        shutdown = GracefulShutdown()
+
+        windows_captured = run_capture_loop(
+            db_session, process, config,
+            session_pk=session_pk, session_id=session_id,
+            first_window_start=first_window_start,
+            shutdown=shutdown, max_windows=5,
+            clock=clock.now,
+            sleep=clock.advance,
+        )
+
+        assert windows_captured == 5
+
+        rows = db_session.execute(
+            text("SELECT window_start FROM packet_capture_segments ORDER BY window_start")
+        ).fetchall()
+        starts = [parse_utc_iso(row[0]) for row in rows]
+
+        # 5개 모두 캡처됐다 (기존 버그였다면 반복 40회 중 34회쯤에서 하나가 통째로 스킵됨).
+        assert len(starts) == 5
+        assert starts[0] == first_window_start
+        # 각 Window는 서로 정확히 10초 간격의 UTC 경계여야 한다 -- 라벨 자체는
+        # 지연과 무관하게 항상 고정 산술로 계산되므로 절대 어긋나지 않는다.
+        for i in range(1, len(starts)):
+            assert (starts[i] - starts[i - 1]).total_seconds() == 10.0
+
+        # 실제로 tcpdump에 요청한 duration이 self-correcting되어, 첫 Window만 정상
+        # 10초이고 이후로는 오버헤드(0.3초)만큼 줄어든 채로 안정화되어야 한다
+        # (계속 줄어들며 누적되는 게 아니라 일정 수준에서 멈춰야 함).
+        assert process.calls[0] == pytest.approx(10.0, abs=1e-6)
+        for later_call in process.calls[1:]:
+            assert later_call == pytest.approx(9.7, abs=1e-6)
 
 
 class TestCrashRecovery:
