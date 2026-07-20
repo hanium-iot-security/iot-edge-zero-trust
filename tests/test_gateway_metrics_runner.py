@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -30,6 +31,19 @@ def db_session(tmp_path: Path):
     with session_factory() as session:
         session.execute(text("PRAGMA foreign_keys = ON"))
         yield session
+    engine.dispose()
+
+
+@pytest.fixture
+def session_factory(tmp_path: Path):
+    db_path = tmp_path / "gateway-metrics-loop.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    engine = create_engine(
+        f"sqlite:///{db_path}",
+        connect_args={"check_same_thread": False},
+    )
+    factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    yield factory
     engine.dispose()
 
 
@@ -68,6 +82,17 @@ def _first_sample() -> GatewayMetricsSample:
     )
 
 
+def _second_sample() -> GatewayMetricsSample:
+    first = _first_sample()
+    return replace(
+        first,
+        collected_at=first.collected_at + timedelta(seconds=10),
+        sample_interval_seconds=10.0,
+        cpu_percent=12.5,
+        temperature_c=45.0,
+    )
+
+
 class FakeCollector:
     def __init__(self, samples: list[GatewayMetricsSample]) -> None:
         self._samples = iter(samples)
@@ -81,6 +106,19 @@ class FakeCollector:
 class FailingCollector:
     def collect(self) -> GatewayMetricsSample:
         raise RuntimeError("collector failed")
+
+
+class FakeShutdown:
+    def __init__(self, *, stop_after_waits: int = 1_000, requested: bool = False) -> None:
+        self.requested = requested
+        self._stop_after_waits = stop_after_waits
+        self.wait_timeouts: list[float] = []
+
+    def wait(self, timeout: float) -> bool:
+        self.wait_timeouts.append(timeout)
+        if len(self.wait_timeouts) >= self._stop_after_waits:
+            self.requested = True
+        return self.requested
 
 
 def test_collect_and_store_commits_first_nullable_sample(db_session: Session) -> None:
@@ -166,3 +204,85 @@ def test_collect_and_store_rolls_back_when_shutdown_arrives_before_commit(
 
     assert result is None
     assert count_gateway_metrics(db_session) == 0
+
+
+def test_build_collector_passes_gateway_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = runner.GatewayMetricsConfig(
+        interval_seconds=5.0,
+        internal_lan_interface="lan0",
+        usb_lan_interface="usb0",
+    )
+    captured: dict[str, object] = {}
+
+    class CollectorSpy:
+        def __init__(self, *, reader, clock, config) -> None:
+            captured.update(reader=reader, clock=clock, config=config)
+
+    monkeypatch.setattr(runner, "GatewayMetricsCollector", CollectorSpy)
+
+    collector = runner.build_collector(config)
+
+    assert isinstance(collector, CollectorSpy)
+    assert captured["config"] is config
+    clock = captured["clock"]
+    assert callable(clock)
+    assert clock().tzinfo is not None
+
+
+def test_loop_reuses_one_collector_and_stores_two_samples(session_factory) -> None:
+    collector = FakeCollector([_first_sample(), _second_sample()])
+    shutdown = FakeShutdown(stop_after_waits=2)
+
+    stored_count = runner.run_gateway_metrics_loop(
+        runner.GatewayMetricsConfig(interval_seconds=5.0),
+        collector,
+        shutdown,
+        session_factory=session_factory,
+    )
+
+    assert stored_count == 2
+    assert collector.collect_count == 2
+    assert shutdown.wait_timeouts == [5.0, 5.0]
+    with session_factory() as db:
+        assert count_gateway_metrics(db) == 2
+
+
+def test_loop_propagates_cycle_failure_for_systemd_restart(session_factory) -> None:
+    with pytest.raises(RuntimeError, match="collector failed"):
+        runner.run_gateway_metrics_loop(
+            runner.GatewayMetricsConfig(),
+            FailingCollector(),
+            FakeShutdown(),
+            session_factory=session_factory,
+        )
+
+
+def test_loop_does_not_open_session_after_shutdown_request() -> None:
+    session_calls = 0
+
+    def session_factory():
+        nonlocal session_calls
+        session_calls += 1
+        raise AssertionError("session must not be opened")
+
+    stored_count = runner.run_gateway_metrics_loop(
+        runner.GatewayMetricsConfig(),
+        FakeCollector([_first_sample()]),
+        FakeShutdown(requested=True),
+        session_factory=session_factory,
+    )
+
+    assert stored_count == 0
+    assert session_calls == 0
+
+
+def test_graceful_shutdown_interrupts_wait() -> None:
+    shutdown = runner.GracefulShutdown()
+
+    assert shutdown.wait(0) is False
+    shutdown.request(15, None)
+
+    assert shutdown.requested is True
+    assert shutdown.wait(1) is True
