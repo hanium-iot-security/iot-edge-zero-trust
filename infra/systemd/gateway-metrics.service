@@ -1,0 +1,27 @@
+[Unit]
+Description=IoT Edge Zero Trust - Gateway Metrics Collector
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/iot-edge-zero-trust
+EnvironmentFile=-/home/pi/iot-edge-zero-trust/.env
+ExecStart=/home/pi/iot-edge-zero-trust/venv/bin/python -m edge.gateway.run_gateway_metrics_collector
+
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=15
+NoNewPrivileges=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gateway-metrics
+
+[Install]
+WantedBy=multi-user.target

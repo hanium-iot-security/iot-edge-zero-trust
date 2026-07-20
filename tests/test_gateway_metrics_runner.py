@@ -286,3 +286,19 @@ def test_graceful_shutdown_interrupts_wait() -> None:
 
     assert shutdown.requested is True
     assert shutdown.wait(1) is True
+
+
+def test_gateway_metrics_systemd_unit_contract() -> None:
+    unit = Path("infra/systemd/gateway-metrics.service").read_text(encoding="utf-8")
+
+    assert "WorkingDirectory=/home/pi/iot-edge-zero-trust" in unit
+    assert "EnvironmentFile=-/home/pi/iot-edge-zero-trust/.env" in unit
+    assert (
+        "ExecStart=/home/pi/iot-edge-zero-trust/venv/bin/python "
+        "-m edge.gateway.run_gateway_metrics_collector"
+    ) in unit
+    assert "Restart=on-failure" in unit
+    assert "RestartSec=5" in unit
+    assert "StartLimitIntervalSec=" in unit
+    assert "StartLimitBurst=" in unit
+    assert "TimeoutStopSec=" in unit
