@@ -18,11 +18,14 @@ const API_BASE_URL =
 const USE_MOCK =
   import.meta.env.VITE_USE_MOCK === "true";
 
-console.log("[ENV CHECK]", {
-  API_BASE_URL,
-  USE_MOCK,
-});
+const IS_DEV = import.meta.env.DEV;
 
+if (IS_DEV) {
+  console.log("[ENV CHECK]", {
+    API_BASE_URL,
+    USE_MOCK,
+  });
+}
 
 function removeEmptyParams(params = {}) {
   return Object.fromEntries(
@@ -35,12 +38,46 @@ function removeEmptyParams(params = {}) {
   );
 }
 
+function createApiErrorMessage(error) {
+  const status =
+    error.response?.status;
+
+  const detail =
+    error.response?.data?.detail;
+
+  if (typeof detail === "string") {
+    return detail;
+  }
+
+  if (Array.isArray(detail)) {
+    const validationMessage = detail
+      .map((item) => item?.msg)
+      .filter(Boolean)
+      .join(", ");
+
+    if (validationMessage) {
+      return validationMessage;
+    }
+  }
+
+  if (error.code === "ERR_NETWORK") {
+    return "백엔드 서버에 연결할 수 없습니다.";
+  }
+
+  if (status) {
+    return `API 요청에 실패했습니다. (${status})`;
+  }
+
+  return "API 요청에 실패했습니다.";
+}
+
 /**
  * 공통 GET 요청 함수
  *
  * @param {string} path API 경로
  * @param {*} mockData Mock 모드에서 반환할 데이터
  * @param {object} params Query parameter
+ * @returns {Promise<*>}
  */
 async function request(
   path,
@@ -51,11 +88,13 @@ async function request(
     removeEmptyParams(params);
 
   if (USE_MOCK) {
-    console.log(
-      "[MOCK]",
-      path,
-      validParams
-    );
+    if (IS_DEV) {
+      console.log(
+        "[MOCK]",
+        path,
+        validParams
+      );
+    }
 
     return mockData;
   }
@@ -71,52 +110,38 @@ async function request(
       }
     );
 
-    console.log(
-      "[API]",
-      path,
-      validParams,
-      response.data
-    );
+    if (IS_DEV) {
+      console.log(
+        "[API]",
+        path,
+        validParams,
+        response.data
+      );
+    }
 
     return response.data;
   } catch (error) {
-    const status =
-      error.response?.status;
+    const message =
+      createApiErrorMessage(error);
 
-    const detail =
-      error.response?.data?.detail;
-
-    let message =
-      "API 요청에 실패했습니다.";
-
-    if (typeof detail === "string") {
-      message = detail;
-    } else if (Array.isArray(detail)) {
-      message = detail
-        .map((item) => item.msg)
-        .filter(Boolean)
-        .join(", ");
-    } else if (
-      error.code === "ERR_NETWORK"
-    ) {
-      message =
-        "백엔드 서버에 연결할 수 없습니다.";
-    } else if (status) {
-      message =
-        `API 요청에 실패했습니다. (${status})`;
+    /*
+     * 운영 환경에서는 API 응답 원문이나
+     * 오류 객체를 Console에 출력하지 않습니다.
+     */
+    if (IS_DEV) {
+      console.error(
+        "[API ERROR]",
+        {
+          path,
+          params: validParams,
+          status:
+            error.response?.status,
+          response:
+            error.response?.data,
+          error,
+        }
+      );
     }
-
-    console.error(
-      "[API ERROR]",
-      {
-        path,
-        params: validParams,
-        status,
-        response:
-          error.response?.data,
-        error,
-      }
-    );
 
     throw new Error(message);
   }
@@ -239,25 +264,77 @@ export function getTrustScoreHistory(
 export function getPacketFeatureLogs(
   params = {}
 ) {
+  const queryParams = {
+    limit: 20,
+    offset: 0,
+    ...params,
+  };
+
+  /*
+   * Mock 모드에서도 실제 API와 동일하게
+   * Direction 필터와 limit·offset 페이지 이동을
+   * 확인할 수 있도록 응답을 가공합니다.
+   */
+  const mockItems =
+    Array.isArray(
+      mockPacketFeatureLogs.items
+    )
+      ? mockPacketFeatureLogs.items
+      : [];
+
+  const filteredMockItems =
+    queryParams.direction
+      ? mockItems.filter(
+          (item) =>
+            item.direction ===
+            queryParams.direction
+        )
+      : mockItems;
+
+  const parsedLimit =
+    Number(queryParams.limit);
+
+  const parsedOffset =
+    Number(queryParams.offset);
+
+  const safeLimit =
+    Number.isFinite(parsedLimit) &&
+    parsedLimit > 0
+      ? parsedLimit
+      : 20;
+
+  const safeOffset =
+    Number.isFinite(parsedOffset) &&
+    parsedOffset >= 0
+      ? parsedOffset
+      : 0;
+
+  const pagedMockData = {
+    items:
+      filteredMockItems.slice(
+        safeOffset,
+        safeOffset + safeLimit
+      ),
+    total:
+      filteredMockItems.length,
+  };
+
   return request(
     "/packet-feature-logs",
-    mockPacketFeatureLogs,
-    {
-      limit: 100,
-      offset: 0,
-      ...params,
-    }
+    pagedMockData,
+    queryParams
   );
 }
-
 
 export function getGatewayMetrics(
   params = {}
 ) {
-
+  /*
+   * Mock 데이터의 collected_at을 요청 시점마다
+   * 갱신해 30초 후 STALE로 고정되는 문제를 방지합니다.
+   */
   const refreshedMockGatewayMetrics = {
     ...mockGatewayMetrics,
-
     items: (
       mockGatewayMetrics.items || []
     ).map((item, index) =>

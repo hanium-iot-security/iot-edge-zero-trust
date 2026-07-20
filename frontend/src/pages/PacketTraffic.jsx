@@ -1,13 +1,16 @@
 import {
   useCallback,
   useEffect,
+  useRef,
   useState,
 } from "react";
 import {
   getPacketFeatureLogs,
 } from "../api/api";
 
+const DEFAULT_LIMIT = 20;
 const POLLING_INTERVAL_MS = 10_000;
+const IS_DEV = import.meta.env.DEV;
 
 function formatKST(dateString) {
   if (!dateString) {
@@ -79,6 +82,9 @@ export default function PacketTraffic() {
   const [direction, setDirection] =
     useState("");
 
+  const [offset, setOffset] =
+    useState(0);
+
   const [searchText, setSearchText] =
     useState("");
 
@@ -91,49 +97,88 @@ export default function PacketTraffic() {
   const [error, setError] =
     useState("");
 
+  const [pollWarning, setPollWarning] =
+    useState("");
+
+  const isFetchingRef = useRef(false);
+
+  const hasDataRef = useRef(false);
+
   const loadPacketFeatures =
-    useCallback(async (isManualRefresh = false) => {
-      if (isManualRefresh) {
-        setRefreshing(true);
-      }
+    useCallback(
+      async (
+        isManualRefresh = false
+      ) => {
+        if (isFetchingRef.current) {
+          return;
+        }
 
-      try {
-        const data =
-          await getPacketFeatureLogs();
+        isFetchingRef.current = true;
 
-        const items =
-          Array.isArray(data?.items)
-            ? data.items
-            : [];
+        if (isManualRefresh) {
+          setRefreshing(true);
+        }
 
-        const responseTotal =
-          Number(data?.total);
+        try {
+          const data =
+            await getPacketFeatureLogs({
+              limit: DEFAULT_LIMIT,
+              offset,
+              direction:
+                direction ||
+                undefined,
+            });
 
-        setPacketFeatures(items);
+          const items =
+            Array.isArray(data?.items)
+              ? data.items
+              : [];
 
-        setTotal(
-          Number.isFinite(responseTotal)
-            ? responseTotal
-            : 0
-        );
+          const responseTotal =
+            Number(data?.total);
 
-        setError("");
-      } catch (err) {
-        console.error(
-          "Packet feature load failed:",
-          err
-        );
+          setPacketFeatures(items);
 
-        setError(
-          err instanceof Error
-            ? err.message
-            : "Packet Traffic 데이터를 불러오지 못했습니다."
-        );
-      } finally {
-        setLoading(false);
-        setRefreshing(false);
-      }
-    }, []);
+          setTotal(
+            Number.isFinite(
+              responseTotal
+            )
+              ? responseTotal
+              : 0
+          );
+
+          hasDataRef.current = true;
+
+          setError("");
+          setPollWarning("");
+        } catch (err) {
+          if (IS_DEV) {
+            console.error(
+              "Packet feature load failed:",
+              err
+            );
+          }
+
+          const message =
+            err instanceof Error
+              ? err.message
+              : "Packet Traffic 데이터를 불러오지 못했습니다.";
+
+          if (hasDataRef.current) {
+            setPollWarning(message);
+          } else {
+            setError(message);
+          }
+        } finally {
+          setLoading(false);
+          setRefreshing(false);
+
+          isFetchingRef.current =
+            false;
+        }
+      },
+      [offset, direction]
+    );
 
   useEffect(() => {
     loadPacketFeatures();
@@ -152,17 +197,16 @@ export default function PacketTraffic() {
 
   const filteredItems =
     packetFeatures.filter((item) => {
-      const matchesDirection =
-        !direction ||
-        item.direction === direction;
-
       const keyword =
         searchText
           .trim()
           .toLowerCase();
 
-      const matchesSearch =
-        !keyword ||
+      if (!keyword) {
+        return true;
+      }
+
+      return (
         normalizeSearchValue(
           item.device_id
         ).includes(keyword) ||
@@ -171,26 +215,90 @@ export default function PacketTraffic() {
         ).includes(keyword) ||
         normalizeSearchValue(
           item.session_id
-        ).includes(keyword);
-
-      return (
-        matchesDirection &&
-        matchesSearch
+        ).includes(keyword)
       );
     });
 
-  const mappedDeviceCount =
-    packetFeatures.filter(
-      (item) => Boolean(item.device_id)
-    ).length;
+  const uniqueDeviceCount =
+    new Set(
+      packetFeatures
+        .filter(
+          (item) =>
+            Boolean(item.device_id)
+        )
+        .map(
+          (item) =>
+            item.device_id
+        )
+    ).size;
 
-  const unmappedIpCount =
-    packetFeatures.filter(
-      (item) => !item.device_id
-    ).length;
+  const uniqueUnmappedIpCount =
+    new Set(
+      packetFeatures
+        .filter(
+          (item) =>
+            !item.device_id &&
+            item.peer_ip
+        )
+        .map(
+          (item) =>
+            item.peer_ip
+        )
+    ).size;
+
+  const currentPage =
+    Math.floor(
+      offset / DEFAULT_LIMIT
+    ) + 1;
+
+  const totalPages =
+    Math.max(
+      1,
+      Math.ceil(
+        total / DEFAULT_LIMIT
+      )
+    );
+
+  const canGoPrev =
+    offset > 0;
+
+  const canGoNext =
+    offset + DEFAULT_LIMIT <
+    total;
 
   function handleRefresh() {
     loadPacketFeatures(true);
+  }
+
+  function handleDirectionChange(
+    value
+  ) {
+    setDirection(value);
+    setOffset(0);
+    setSearchText("");
+  }
+
+  function handlePrevPage() {
+    if (!canGoPrev) {
+      return;
+    }
+
+    setOffset(
+      Math.max(
+        0,
+        offset - DEFAULT_LIMIT
+      )
+    );
+  }
+
+  function handleNextPage() {
+    if (!canGoNext) {
+      return;
+    }
+
+    setOffset(
+      offset + DEFAULT_LIMIT
+    );
   }
 
   let content;
@@ -199,7 +307,8 @@ export default function PacketTraffic() {
     content = (
       <section className="panel">
         <p>
-          Packet Traffic 데이터를 불러오는 중입니다.
+          Packet Traffic 데이터를
+          불러오는 중입니다.
         </p>
       </section>
     );
@@ -230,12 +339,14 @@ export default function PacketTraffic() {
       <section className="panel">
         <div className="empty-state">
           <h2>
-            표시할 Packet Feature가 없습니다.
+            표시할 Packet Feature가
+            없습니다.
           </h2>
 
           <p>
-            Packet Capture와 Feature Extractor가
-            실행 중인지 확인해주세요.
+            Packet Capture와 Feature
+            Extractor가 실행 중인지
+            확인해주세요.
           </p>
         </div>
       </section>
@@ -246,17 +357,33 @@ export default function PacketTraffic() {
         <div className="card-grid packet-summary-grid">
           <div className="card">
             <span className="card-label">
-              전체 Feature
+              현재 페이지 등록 기기
             </span>
 
             <strong>
-              {formatNumber(total, 0)}
+              {formatNumber(
+                uniqueDeviceCount,
+                0
+              )}
+            </strong>
+          </div>
+
+          <div className="card warning-card">
+            <span className="card-label">
+              현재 페이지 미매핑 IP
+            </span>
+
+            <strong>
+              {formatNumber(
+                uniqueUnmappedIpCount,
+                0
+              )}
             </strong>
           </div>
 
           <div className="card">
             <span className="card-label">
-              현재 표시
+              현재 페이지 표시
             </span>
 
             <strong>
@@ -269,25 +396,12 @@ export default function PacketTraffic() {
 
           <div className="card">
             <span className="card-label">
-              등록 기기
+              전체 Feature
             </span>
 
             <strong>
               {formatNumber(
-                mappedDeviceCount,
-                0
-              )}
-            </strong>
-          </div>
-
-          <div className="card warning-card">
-            <span className="card-label">
-              미매핑 IP
-            </span>
-
-            <strong>
-              {formatNumber(
-                unmappedIpCount,
+                total,
                 0
               )}
             </strong>
@@ -299,6 +413,7 @@ export default function PacketTraffic() {
             <div className="filter-item">
               <label htmlFor="packet-search">
                 기기 또는 IP 검색
+                (현재 페이지 내)
               </label>
 
               <input
@@ -323,7 +438,7 @@ export default function PacketTraffic() {
                 id="direction-filter"
                 value={direction}
                 onChange={(event) => {
-                  setDirection(
+                  handleDirectionChange(
                     event.target.value
                   );
                 }}
@@ -342,6 +457,13 @@ export default function PacketTraffic() {
               </select>
             </div>
           </div>
+
+          <p className="filter-note">
+            검색과 기기/IP 집계는 현재
+            페이지의 최대 {DEFAULT_LIMIT}건
+            기준입니다. Direction은 서버
+            조회 조건으로 적용됩니다.
+          </p>
         </section>
 
         <section className="panel">
@@ -362,10 +484,12 @@ export default function PacketTraffic() {
             </span>
           </div>
 
-          {filteredItems.length === 0 ? (
+          {filteredItems.length ===
+          0 ? (
             <div className="empty-state">
               <p>
-                검색 조건에 맞는 Packet
+                현재 페이지에서 검색
+                조건에 맞는 Packet
                 Feature가 없습니다.
               </p>
             </div>
@@ -444,7 +568,7 @@ export default function PacketTraffic() {
                           <span
                             className={`badge direction-${normalizeSearchValue(
                               item.direction ||
-                                "unknown"
+                              "unknown"
                             )}`}
                           >
                             {item.direction ||
@@ -555,6 +679,43 @@ export default function PacketTraffic() {
               </table>
             </div>
           )}
+
+          <div className="pagination-row">
+            <button
+              type="button"
+              onClick={handlePrevPage}
+              disabled={
+                !canGoPrev ||
+                loading ||
+                refreshing
+              }
+            >
+              이전
+            </button>
+
+            <span>
+              페이지 {currentPage} /{" "}
+              {totalPages}
+              {" "}(총{" "}
+              {formatNumber(
+                total,
+                0
+              )}
+              건)
+            </span>
+
+            <button
+              type="button"
+              onClick={handleNextPage}
+              disabled={
+                !canGoNext ||
+                loading ||
+                refreshing
+              }
+            >
+              다음
+            </button>
+          </div>
         </section>
       </>
     );
@@ -586,6 +747,31 @@ export default function PacketTraffic() {
             : "새로고침"}
         </button>
       </div>
+
+      {pollWarning && (
+        <div className="warning-box">
+          <span>
+            ⚠ 최신 데이터 갱신 실패:{" "}
+            {pollWarning}
+            {" "}(이전 데이터를 계속
+            표시합니다)
+          </span>
+
+          <span className="retry-indicator">
+            {refreshing
+              ? "재시도 중..."
+              : `${POLLING_INTERVAL_MS / 1000}초마다 자동 재시도합니다.`}
+          </span>
+
+          <button
+            type="button"
+            onClick={handleRefresh}
+            disabled={refreshing}
+          >
+            지금 다시 시도
+          </button>
+        </div>
+      )}
 
       {content}
     </div>

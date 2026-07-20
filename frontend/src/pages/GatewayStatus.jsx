@@ -1,13 +1,28 @@
 import {
   useCallback,
   useEffect,
+  useRef,
   useState,
 } from "react";
-import { getGatewayMetrics } from "../api/api";
+import {
+  getGatewayMetrics,
+} from "../api/api";
 
-const ONLINE_THRESHOLD_SECONDS = 30;
-const POLLING_INTERVAL_MS = 10_000;
-const STATUS_UPDATE_INTERVAL_MS = 1_000;
+const COLLECTION_INTERVAL_SECONDS = 10;
+const ONLINE_THRESHOLD_MULTIPLIER = 3;
+
+const ONLINE_THRESHOLD_SECONDS =
+  COLLECTION_INTERVAL_SECONDS *
+  ONLINE_THRESHOLD_MULTIPLIER;
+
+const POLLING_INTERVAL_MS =
+  COLLECTION_INTERVAL_SECONDS *
+  1_000;
+
+const STATUS_UPDATE_INTERVAL_MS =
+  1_000;
+
+const IS_DEV = import.meta.env.DEV;
 
 function formatKST(dateString) {
   if (!dateString) {
@@ -63,7 +78,10 @@ function getProgressValue(value) {
     return 0;
   }
 
-  return Math.min(Math.max(number, 0), 100);
+  return Math.min(
+    Math.max(number, 0),
+    100
+  );
 }
 
 function getGatewayStatus(collectedAt) {
@@ -71,21 +89,26 @@ function getGatewayStatus(collectedAt) {
     return "UNKNOWN";
   }
 
-  const collectedTime = new Date(collectedAt).getTime();
+  const collectedTime =
+    new Date(collectedAt).getTime();
 
   if (Number.isNaN(collectedTime)) {
     return "UNKNOWN";
   }
 
   const elapsedSeconds =
-    (Date.now() - collectedTime) / 1_000;
+    (Date.now() - collectedTime) /
+    1_000;
 
-  return elapsedSeconds <= ONLINE_THRESHOLD_SECONDS
+  return elapsedSeconds <=
+    ONLINE_THRESHOLD_SECONDS
     ? "ONLINE"
     : "STALE";
 }
 
-function getInterfaceStatus(interfaceData) {
+function getInterfaceStatus(
+  interfaceData
+) {
   if (!interfaceData?.exists) {
     return {
       text: "미인식",
@@ -137,7 +160,8 @@ function InterfaceCard({
           <span>IP Address</span>
 
           <strong>
-            {interfaceData?.ip_address || "-"}
+            {interfaceData?.ip_address ||
+              "-"}
           </strong>
         </div>
 
@@ -207,39 +231,81 @@ export default function GatewayStatus() {
   const [error, setError] =
     useState("");
 
+  const [pollWarning, setPollWarning] =
+    useState("");
+
+  const isFetchingRef =
+    useRef(false);
+
+  const hasSuccessfulResponseRef =
+    useRef(false);
+
   const loadGatewayMetrics =
-    useCallback(async (isManualRefresh = false) => {
-      if (isManualRefresh) {
-        setRefreshing(true);
-      }
+    useCallback(
+      async (
+        isManualRefresh = false
+      ) => {
+        if (isFetchingRef.current) {
+          return;
+        }
 
-      try {
-        const data =
-          await getGatewayMetrics();
+        isFetchingRef.current = true;
 
-        const metric =
-          Array.isArray(data?.items)
-            ? data.items[0] ?? null
-            : null;
+        if (isManualRefresh) {
+          setRefreshing(true);
+        }
 
-        setLatestMetric(metric);
-        setError("");
-      } catch (err) {
-        console.error(
-          "Gateway metrics load failed:",
-          err
-        );
+        try {
+          const data =
+            await getGatewayMetrics();
 
-        setError(
-          err instanceof Error
-            ? err.message
-            : "Gateway Metrics를 불러오지 못했습니다."
-        );
-      } finally {
-        setLoading(false);
-        setRefreshing(false);
-      }
-    }, []);
+          const metric =
+            Array.isArray(data?.items)
+              ? data.items[0] ?? null
+              : null;
+
+          setLatestMetric(metric);
+
+          /*
+           * items가 비어 있어도 API 요청 자체가
+           * 성공했다면 이후 Polling 실패 시
+           * 최초 오류 화면으로 돌아가지 않습니다.
+           */
+          hasSuccessfulResponseRef.current =
+            true;
+
+          setError("");
+          setPollWarning("");
+        } catch (err) {
+          if (IS_DEV) {
+            console.error(
+              "Gateway metrics load failed:",
+              err
+            );
+          }
+
+          const message =
+            err instanceof Error
+              ? err.message
+              : "Gateway Metrics를 불러오지 못했습니다.";
+
+          if (
+            hasSuccessfulResponseRef.current
+          ) {
+            setPollWarning(message);
+          } else {
+            setError(message);
+          }
+        } finally {
+          setLoading(false);
+          setRefreshing(false);
+
+          isFetchingRef.current =
+            false;
+        }
+      },
+      []
+    );
 
   useEffect(() => {
     loadGatewayMetrics();
@@ -257,7 +323,8 @@ export default function GatewayStatus() {
   }, [loadGatewayMetrics]);
 
   const collectedAt =
-    latestMetric?.collected_at ?? null;
+    latestMetric?.collected_at ??
+    null;
 
   useEffect(() => {
     function updateGatewayStatus() {
@@ -282,7 +349,8 @@ export default function GatewayStatus() {
   }, [collectedAt]);
 
   const interfaces =
-    latestMetric?.interface_metrics ?? {};
+    latestMetric?.interface_metrics ??
+    {};
 
   const internalLan =
     interfaces.internal_lan ?? null;
@@ -296,15 +364,22 @@ export default function GatewayStatus() {
 
   let content;
 
-  if (loading) {
+  if (
+    loading &&
+    !hasSuccessfulResponseRef.current
+  ) {
     content = (
       <section className="panel">
         <p>
-          Gateway Metrics를 불러오는 중입니다.
+          Gateway Metrics를 불러오는
+          중입니다.
         </p>
       </section>
     );
-  } else if (error) {
+  } else if (
+    error &&
+    !hasSuccessfulResponseRef.current
+  ) {
     content = (
       <section className="panel">
         <div className="error-box gateway-error-box">
@@ -332,12 +407,13 @@ export default function GatewayStatus() {
         </span>
 
         <h2>
-          수집된 Gateway Metrics가 없습니다.
+          수집된 Gateway Metrics가
+          없습니다.
         </h2>
 
         <p>
-          Gateway Metrics Collector가 실행
-          중인지 확인해주세요.
+          Gateway Metrics Collector가
+          실행 중인지 확인해주세요.
         </p>
       </section>
     );
@@ -364,6 +440,14 @@ export default function GatewayStatus() {
                 )}
               </span>
             </div>
+
+            <p className="threshold-note">
+              수집 주기{" "}
+              {COLLECTION_INTERVAL_SECONDS}초 ×{" "}
+              {ONLINE_THRESHOLD_MULTIPLIER}배 ={" "}
+              {ONLINE_THRESHOLD_SECONDS}초 이내
+              수집되면 ONLINE으로 표시합니다.
+            </p>
           </div>
 
           <div className="sample-interval">
@@ -472,7 +556,9 @@ export default function GatewayStatus() {
         <section className="panel">
           <div className="panel-header">
             <div>
-              <h2>Network Interface</h2>
+              <h2>
+                Network Interface
+              </h2>
 
               <p className="panel-description">
                 내부 LAN과 USB LAN을
@@ -484,7 +570,9 @@ export default function GatewayStatus() {
           <div className="interface-grid">
             <InterfaceCard
               title="내부 LAN"
-              interfaceData={internalLan}
+              interfaceData={
+                internalLan
+              }
             />
 
             <InterfaceCard
@@ -505,7 +593,8 @@ export default function GatewayStatus() {
 
           <p className="page-description">
             Raspberry Pi Gateway의 시스템
-            자원과 네트워크 상태를 확인합니다.
+            자원과 네트워크 상태를
+            확인합니다.
           </p>
         </div>
 
@@ -522,6 +611,31 @@ export default function GatewayStatus() {
             : "새로고침"}
         </button>
       </div>
+
+      {pollWarning && (
+        <div className="warning-box gateway-poll-warning">
+          <span>
+            ⚠ 최신 데이터 갱신 실패:{" "}
+            {pollWarning}
+            {" "}(이전 데이터를 계속
+            표시합니다)
+          </span>
+
+          <span className="retry-indicator">
+            {refreshing
+              ? "재시도 중..."
+              : `${POLLING_INTERVAL_MS / 1000}초마다 자동 재시도합니다.`}
+          </span>
+
+          <button
+            type="button"
+            onClick={handleRefresh}
+            disabled={refreshing}
+          >
+            지금 다시 시도
+          </button>
+        </div>
+      )}
 
       {content}
     </div>
