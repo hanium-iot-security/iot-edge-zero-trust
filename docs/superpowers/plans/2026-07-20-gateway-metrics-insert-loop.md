@@ -1,38 +1,38 @@
-# Gateway Metrics DB Insert Loop Implementation Plan
+# Gateway Metrics DB Insert Loop 구현 계획
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Agent 작업 지침:** 이 계획은 `superpowers:subagent-driven-development` 또는 `superpowers:executing-plans` 절차로 Task별 실행한다. 진행 상태는 체크박스(`- [ ]`)로 추적한다.
 
-**Goal:** Persist Raspberry Pi Gateway Metrics at the configured interval through the existing Repository and expose fresh committed rows to the existing API.
+**목표:** Raspberry Pi의 Gateway Metrics를 설정된 주기로 수집해 기존 Repository를 통해 DB에 저장하고, Commit된 최신 Row를 기존 API에서 조회할 수 있게 한다.
 
-**Architecture:** A long-lived Collector retains cumulative counter state while a small runner creates one SQLAlchemy Session per sample. Each cycle performs collect, insert, and commit atomically; any failure rolls back and escapes so systemd can restart a clean process. Signal handlers set an event that prevents new work and interrupts the idle wait.
+**구조:** 장기 실행되는 Collector 한 개가 누적 Counter 기준값을 유지하고, Runner는 Sample마다 새 SQLAlchemy Session을 생성한다. 각 Cycle은 `Collect → Insert → Commit`을 하나의 Transaction 경계로 처리한다. 오류가 발생하면 Rollback 후 예외를 전파하여 systemd가 깨끗한 프로세스로 재시작하게 한다. Signal Handler는 종료 Event를 설정해 새로운 작업을 막고 대기 상태를 즉시 해제한다.
 
-**Tech Stack:** Python 3.10, SQLAlchemy, SQLite, pytest, systemd
+**기술 구성:** Python 3.10, SQLAlchemy, SQLite, pytest, systemd
 
-## Global Constraints
+## 공통 구현 계약
 
-- Use `GatewayMetricsConfig.from_env()` and pass the same config to the Collector and loop.
-- Reuse one `GatewayMetricsCollector` for the process lifetime.
-- Error policy is rollback, non-zero process exit, and systemd restart after 5 seconds.
-- Preserve existing first-sample, long-interval, DOWN, Missing, and Counter Reset contracts.
-- Do not persist `GatewayMetricsSample.disk_total_mb`.
-- Do not change the existing DB schema, Repository query contract, API, or Dashboard.
-- All tests must run on Windows; final service and restart acceptance is performed on Raspberry Pi.
+- `GatewayMetricsConfig.from_env()`로 설정을 읽고 동일한 Config를 Collector와 Loop에 전달한다.
+- 프로세스 수명 동안 하나의 `GatewayMetricsCollector`를 재사용한다.
+- 오류 정책은 현재 Transaction Rollback, non-zero 프로세스 종료, 5초 후 systemd 재시작으로 고정한다.
+- 기존 최초 Sample, 긴 수집 간격, Interface DOWN·Missing, Counter Reset 계약을 유지한다.
+- `GatewayMetricsSample.disk_total_mb`는 현재 DB 저장 대상에서 제외한다.
+- 기존 DB Schema, Repository 조회 계약, API, Dashboard는 변경하지 않는다.
+- 모든 자동 테스트는 Windows에서도 실행 가능해야 하며, 최종 Service·재시작 검증은 Raspberry Pi에서 수행한다.
 
 ---
 
-### Task 1: Transactional single-sample persistence
+### Task 1: 단일 Sample Transaction 저장
 
-**Files:**
-- Create: `tests/test_gateway_metrics_runner.py`
-- Create: `edge/gateway/run_gateway_metrics_collector.py`
+**대상 파일:**
+- 신규: `tests/test_gateway_metrics_runner.py`
+- 신규: `edge/gateway/run_gateway_metrics_collector.py`
 
-**Interfaces:**
-- Consumes: `GatewayMetricsCollector.collect()`, `insert_gateway_metrics_sample(db, sample=...)`
-- Produces: `collect_and_store_sample(db, collector, *, shutdown_requested) -> GatewayMetricsSample | None`
+**Interface:**
+- 사용: `GatewayMetricsCollector.collect()`, `insert_gateway_metrics_sample(db, sample=...)`
+- 제공: `collect_and_store_sample(db, collector, *, shutdown_requested) -> GatewayMetricsSample | None`
 
-- [ ] **Step 1: Write the failing transaction tests**
+- [ ] **Step 1: 실패하는 Transaction 테스트 작성**
 
-Add real migrated SQLite tests that cover a committed first sample, repository failure after an insert, Collector failure, and shutdown requested after insert. Use `apply_migrations`, a temporary engine, and a fake Collector that returns a complete `GatewayMetricsSample` with nullable first-sample fields.
+Migration을 적용한 실제 임시 SQLite DB를 사용한다. 최초 Sample Commit, Insert 후 Repository 실패, Collector 실패, Insert 후 종료 요청을 검증한다. `apply_migrations`, 임시 Engine, Nullable 최초 Sample을 반환하는 Fake Collector를 사용한다.
 
 ```python
 def test_collect_and_store_commits_first_nullable_sample(db_session):
@@ -92,19 +92,19 @@ def test_collect_and_store_rolls_back_when_shutdown_arrives_before_commit(
     assert count_gateway_metrics(db_session) == 0
 ```
 
-- [ ] **Step 2: Run tests and verify RED**
+- [ ] **Step 2: 테스트를 실행해 RED 확인**
 
-Run:
+실행:
 
 ```powershell
 python -m pytest tests/test_gateway_metrics_runner.py -q
 ```
 
-Expected: collection fails because `edge.gateway.run_gateway_metrics_collector` does not exist.
+예상 결과: `edge.gateway.run_gateway_metrics_collector`가 아직 없으므로 Test Collection이 실패한다.
 
-- [ ] **Step 3: Implement the minimal transaction function**
+- [ ] **Step 3: 최소 Transaction 함수 구현**
 
-Create the module and implement:
+모듈을 생성하고 다음 Transaction 경계를 구현한다.
 
 ```python
 def collect_and_store_sample(
@@ -131,13 +131,13 @@ def collect_and_store_sample(
         raise
 ```
 
-- [ ] **Step 4: Run the focused tests and verify GREEN**
+- [ ] **Step 4: 관련 테스트를 실행해 GREEN 확인**
 
-Run `python -m pytest tests/test_gateway_metrics_runner.py -q`.
+`python -m pytest tests/test_gateway_metrics_runner.py -q`를 실행한다.
 
-Expected: transaction tests pass with no committed row after failure or shutdown.
+예상 결과: Transaction 테스트가 통과하고, 실패 또는 종료 요청 이후에는 Commit된 Row가 없어야 한다.
 
-- [ ] **Step 5: Commit the transaction boundary**
+- [ ] **Step 5: Transaction 경계 Commit**
 
 ```powershell
 git add tests/test_gateway_metrics_runner.py edge/gateway/run_gateway_metrics_collector.py
@@ -146,19 +146,19 @@ git commit -m "feat: persist gateway metrics transactions"
 
 ---
 
-### Task 2: Long-lived Collector, loop, and graceful shutdown
+### Task 2: 장기 실행 Collector·Loop·Graceful Shutdown
 
-**Files:**
-- Modify: `tests/test_gateway_metrics_runner.py`
-- Modify: `edge/gateway/run_gateway_metrics_collector.py`
+**대상 파일:**
+- 수정: `tests/test_gateway_metrics_runner.py`
+- 수정: `edge/gateway/run_gateway_metrics_collector.py`
 
-**Interfaces:**
-- Consumes: Task 1 `collect_and_store_sample`
-- Produces: `GracefulShutdown`, `build_collector(config)`, `run_gateway_metrics_loop(config, collector, shutdown, session_factory) -> int`, `main()`
+**Interface:**
+- 사용: Task 1의 `collect_and_store_sample`
+- 제공: `GracefulShutdown`, `build_collector(config)`, `run_gateway_metrics_loop(config, collector, shutdown, session_factory) -> int`, `main()`
 
-- [ ] **Step 1: Write failing loop and configuration tests**
+- [ ] **Step 1: 실패하는 Loop·Config 테스트 작성**
 
-Cover these behaviors with dependency injection rather than real sleep or Linux `/proc` reads:
+실제 Sleep이나 Linux `/proc`를 읽지 않고 Dependency Injection으로 다음 동작을 검증한다.
 
 ```python
 def test_build_collector_passes_gateway_config(monkeypatch):
@@ -207,18 +207,17 @@ def test_loop_propagates_cycle_failure_for_systemd_restart(session_factory):
         )
 ```
 
-Also test that a pre-requested shutdown opens no Session and that
-`GracefulShutdown.wait()` returns immediately after `request()`.
+미리 종료가 요청된 상태에서는 Session을 열지 않는지, `request()` 이후 `GracefulShutdown.wait()`가 즉시 반환되는지도 검증한다.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [ ] **Step 2: 관련 테스트를 실행해 RED 확인**
 
-Run `python -m pytest tests/test_gateway_metrics_runner.py -q`.
+`python -m pytest tests/test_gateway_metrics_runner.py -q`를 실행한다.
 
-Expected: failures report missing `GracefulShutdown`, `build_collector`, or `run_gateway_metrics_loop`.
+예상 결과: `GracefulShutdown`, `build_collector`, `run_gateway_metrics_loop`가 없다는 이유로 실패한다.
 
-- [ ] **Step 3: Implement the loop and entry point**
+- [ ] **Step 3: Loop와 Entry Point 구현**
 
-Implement the public behavior below, preserving one Collector instance:
+Collector 인스턴스 하나를 계속 유지하면서 다음 Public 동작을 구현한다.
 
 ```python
 class GracefulShutdown:
@@ -272,17 +271,17 @@ def run_gateway_metrics_loop(
     return stored_count
 ```
 
-`main()` configures logging, loads `GatewayMetricsConfig.from_env()`, installs handlers, builds the Collector once, runs the loop, and lets exceptions escape for a non-zero exit.
+`main()`은 Logging을 설정하고 `GatewayMetricsConfig.from_env()`를 읽은 뒤 Signal Handler를 설치한다. Collector를 한 번만 생성해 Loop를 실행하며, 오류는 잡아서 정상 처리하지 않고 전파해 non-zero로 종료되게 한다.
 
-- [ ] **Step 4: Run runner, Collector, and Repository tests**
+- [ ] **Step 4: Runner·Collector·Repository 테스트 실행**
 
 ```powershell
 python -m pytest tests/test_gateway_metrics_runner.py tests/test_gateway_metrics_collector.py tests/test_gateway_metrics_repository.py -q
 ```
 
-Expected: all tests pass; existing Collector contract tests remain unchanged.
+예상 결과: 모든 테스트가 통과하고 기존 Collector 계약 테스트는 변경 없이 유지된다.
 
-- [ ] **Step 5: Commit the runtime**
+- [ ] **Step 5: Runtime Commit**
 
 ```powershell
 git add tests/test_gateway_metrics_runner.py edge/gateway/run_gateway_metrics_collector.py
@@ -291,17 +290,17 @@ git commit -m "feat: run gateway metrics collection loop"
 
 ---
 
-### Task 3: systemd service and final verification
+### Task 3: systemd Service와 최종 검증
 
-**Files:**
-- Create: `infra/systemd/gateway-metrics.service`
-- Modify: `tests/test_gateway_metrics_runner.py`
+**대상 파일:**
+- 신규: `infra/systemd/gateway-metrics.service`
+- 수정: `tests/test_gateway_metrics_runner.py`
 
-**Interfaces:**
-- Consumes: Task 2 module entry point
-- Produces: Pi service installation artifact
+**Interface:**
+- 사용: Task 2의 Module Entry Point
+- 제공: Raspberry Pi에 설치할 systemd Unit
 
-- [ ] **Step 1: Write the failing unit-file contract test**
+- [ ] **Step 1: 실패하는 systemd Unit 계약 테스트 작성**
 
 ```python
 def test_gateway_metrics_systemd_unit_contract():
@@ -320,13 +319,13 @@ def test_gateway_metrics_systemd_unit_contract():
     assert "TimeoutStopSec=" in unit
 ```
 
-- [ ] **Step 2: Run the test and verify RED**
+- [ ] **Step 2: 테스트를 실행해 RED 확인**
 
-Run `python -m pytest tests/test_gateway_metrics_runner.py::test_gateway_metrics_systemd_unit_contract -q`.
+`python -m pytest tests/test_gateway_metrics_runner.py::test_gateway_metrics_systemd_unit_contract -q`를 실행한다.
 
-Expected: `FileNotFoundError` for `infra/systemd/gateway-metrics.service`.
+예상 결과: `infra/systemd/gateway-metrics.service`가 없어 `FileNotFoundError`가 발생한다.
 
-- [ ] **Step 3: Add the systemd unit**
+- [ ] **Step 3: systemd Unit 추가**
 
 ```ini
 [Unit]
@@ -355,7 +354,7 @@ SyslogIdentifier=gateway-metrics
 WantedBy=multi-user.target
 ```
 
-- [ ] **Step 4: Run fresh verification**
+- [ ] **Step 4: 전체 검증을 새로 실행**
 
 ```powershell
 python -m pytest tests/test_gateway_metrics_runner.py -q
@@ -365,21 +364,21 @@ python -m compileall -q edge backend tests
 git diff --check
 ```
 
-Expected: every command exits zero. On Windows, only already-documented POSIX-only skips are acceptable.
+예상 결과: 모든 명령이 Exit Code 0으로 끝난다. Windows에서는 기존에 문서화된 POSIX 전용 테스트 Skip만 허용한다.
 
-- [ ] **Step 5: Review the requirement checklist**
+- [ ] **Step 5: 요구사항 Checklist 재검토**
 
-Confirm in the diff and test output:
+Diff와 테스트 결과에서 다음 항목을 확인한다.
 
-- One Collector instance survives across cycles.
-- Interval configuration controls Collector validity and loop waiting.
-- Success commits; failure and pre-commit shutdown roll back.
-- Failures propagate to systemd rather than looping internally.
-- `disk_total_mb` remains absent from persistence.
-- Existing nullable and network rate contracts still pass.
-- Pi restart and API/dashboard freshness remain explicitly unverified until run on hardware.
+- 하나의 Collector 인스턴스가 여러 Cycle에서 유지된다.
+- Interval 설정이 Collector의 Rate 유효 간격과 Loop 대기 시간에 함께 적용된다.
+- 성공 시 Commit하고, 실패 또는 Commit 전 종료 요청 시 Rollback한다.
+- 오류는 내부에서 무한 반복하지 않고 systemd가 처리하도록 전파한다.
+- `disk_total_mb`는 저장 대상에서 계속 제외된다.
+- 기존 Nullable·Network Rate 계약 테스트가 통과한다.
+- Pi 재시작과 API·Dashboard 최신값 검증은 실제 장비에서 실행하기 전까지 명시적으로 미검증 상태를 유지한다.
 
-- [ ] **Step 6: Commit the service and tests**
+- [ ] **Step 6: Service와 테스트 Commit**
 
 ```powershell
 git add infra/systemd/gateway-metrics.service tests/test_gateway_metrics_runner.py
