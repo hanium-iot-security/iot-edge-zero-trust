@@ -1,12 +1,18 @@
-import { useCallback, useEffect, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useState,
+} from "react";
 import { getGatewayMetrics } from "../api/api";
 
 const ONLINE_THRESHOLD_SECONDS = 30;
-const POLLING_INTERVAL_MS = 10000;
-const STATUS_UPDATE_INTERVAL_MS = 1000;
+const POLLING_INTERVAL_MS = 10_000;
+const STATUS_UPDATE_INTERVAL_MS = 1_000;
 
 function formatKST(dateString) {
-  if (!dateString) return "-";
+  if (!dateString) {
+    return "-";
+  }
 
   const date = new Date(dateString);
 
@@ -22,23 +28,42 @@ function formatKST(dateString) {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
+    hour12: false,
   }).format(date);
 }
 
-function formatMetric(value, unit = "", maximumFractionDigits = 2) {
-  if (value === null || value === undefined) {
+function formatMetric(
+  value,
+  unit = "",
+  maximumFractionDigits = 2
+) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ""
+  ) {
     return "측정 불가";
   }
 
   const number = Number(value);
 
-  if (Number.isNaN(number)) {
+  if (!Number.isFinite(number)) {
     return "측정 불가";
   }
 
   return `${number.toLocaleString("ko-KR", {
     maximumFractionDigits,
   })}${unit}`;
+}
+
+function getProgressValue(value) {
+  const number = Number(value);
+
+  if (!Number.isFinite(number)) {
+    return 0;
+  }
+
+  return Math.min(Math.max(number, 0), 100);
 }
 
 function getGatewayStatus(collectedAt) {
@@ -52,7 +77,8 @@ function getGatewayStatus(collectedAt) {
     return "UNKNOWN";
   }
 
-  const elapsedSeconds = (Date.now() - collectedTime) / 1000;
+  const elapsedSeconds =
+    (Date.now() - collectedTime) / 1_000;
 
   return elapsedSeconds <= ONLINE_THRESHOLD_SECONDS
     ? "ONLINE"
@@ -80,18 +106,28 @@ function getInterfaceStatus(interfaceData) {
   };
 }
 
-function InterfaceCard({ title, interfaceData }) {
-  const status = getInterfaceStatus(interfaceData);
+function InterfaceCard({
+  title,
+  interfaceData,
+}) {
+  const status =
+    getInterfaceStatus(interfaceData);
 
   return (
     <div className="interface-card">
       <div className="interface-header">
         <div>
           <h3>{title}</h3>
-          <p>{interfaceData?.interface_name || "인터페이스 없음"}</p>
+
+          <p>
+            {interfaceData?.interface_name ||
+              "인터페이스 없음"}
+          </p>
         </div>
 
-        <span className={`status-badge ${status.className}`}>
+        <span
+          className={`status-badge ${status.className}`}
+        >
           {status.text}
         </span>
       </div>
@@ -99,25 +135,39 @@ function InterfaceCard({ title, interfaceData }) {
       <div className="interface-detail-grid">
         <div className="metric-item">
           <span>IP Address</span>
-          <strong>{interfaceData?.ip_address || "-"}</strong>
+
+          <strong>
+            {interfaceData?.ip_address || "-"}
+          </strong>
         </div>
 
         <div className="metric-item">
           <span>누적 RX</span>
+
           <strong>
-            {formatMetric(interfaceData?.rx_bytes, " B", 0)}
+            {formatMetric(
+              interfaceData?.rx_bytes,
+              " B",
+              0
+            )}
           </strong>
         </div>
 
         <div className="metric-item">
           <span>누적 TX</span>
+
           <strong>
-            {formatMetric(interfaceData?.tx_bytes, " B", 0)}
+            {formatMetric(
+              interfaceData?.tx_bytes,
+              " B",
+              0
+            )}
           </strong>
         </div>
 
         <div className="metric-item">
           <span>RX 전송률</span>
+
           <strong>
             {formatMetric(
               interfaceData?.rx_bytes_per_sec,
@@ -128,6 +178,7 @@ function InterfaceCard({ title, interfaceData }) {
 
         <div className="metric-item">
           <span>TX 전송률</span>
+
           <strong>
             {formatMetric(
               interfaceData?.tx_bytes_per_sec,
@@ -141,76 +192,116 @@ function InterfaceCard({ title, interfaceData }) {
 }
 
 export default function GatewayStatus() {
-  const [latestMetric, setLatestMetric] = useState(null);
-  const [gatewayStatus, setGatewayStatus] = useState("UNKNOWN");
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+  const [latestMetric, setLatestMetric] =
+    useState(null);
 
-  const loadGatewayMetrics = useCallback(async () => {
-    try {
-      const data = await getGatewayMetrics();
-      const metric = data?.items?.[0] || null;
+  const [gatewayStatus, setGatewayStatus] =
+    useState("UNKNOWN");
 
-      setLatestMetric(metric);
-      setError("");
-    } catch (err) {
-      console.error("Gateway metrics load failed:", err);
-      setError("Gateway Metrics를 불러오지 못했습니다.");
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const [loading, setLoading] =
+    useState(true);
 
-  /*
-   * Gateway Metrics API 조회 전용 Effect
-   * 최초 실행 후 10초마다 API를 호출합니다.
-   */
+  const [refreshing, setRefreshing] =
+    useState(false);
+
+  const [error, setError] =
+    useState("");
+
+  const loadGatewayMetrics =
+    useCallback(async (isManualRefresh = false) => {
+      if (isManualRefresh) {
+        setRefreshing(true);
+      }
+
+      try {
+        const data =
+          await getGatewayMetrics();
+
+        const metric =
+          Array.isArray(data?.items)
+            ? data.items[0] ?? null
+            : null;
+
+        setLatestMetric(metric);
+        setError("");
+      } catch (err) {
+        console.error(
+          "Gateway metrics load failed:",
+          err
+        );
+
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Gateway Metrics를 불러오지 못했습니다."
+        );
+      } finally {
+        setLoading(false);
+        setRefreshing(false);
+      }
+    }, []);
+
   useEffect(() => {
     loadGatewayMetrics();
 
-    const pollingTimer = setInterval(
-      loadGatewayMetrics,
-      POLLING_INTERVAL_MS
-    );
+    const pollingTimer =
+      window.setInterval(() => {
+        loadGatewayMetrics();
+      }, POLLING_INTERVAL_MS);
 
     return () => {
-      clearInterval(pollingTimer);
+      window.clearInterval(
+        pollingTimer
+      );
     };
   }, [loadGatewayMetrics]);
 
-  const collectedAt = latestMetric?.collected_at ?? null;
+  const collectedAt =
+    latestMetric?.collected_at ?? null;
 
-  /*
-   * Gateway ONLINE / STALE 상태 계산 전용 Effect
-   * API를 추가 호출하지 않고 최신 collected_at만 사용합니다.
-   */
   useEffect(() => {
     function updateGatewayStatus() {
-      setGatewayStatus(getGatewayStatus(collectedAt));
+      setGatewayStatus(
+        getGatewayStatus(collectedAt)
+      );
     }
 
     updateGatewayStatus();
 
-    const statusTimer = setInterval(
-      updateGatewayStatus,
-      STATUS_UPDATE_INTERVAL_MS
-    );
+    const statusTimer =
+      window.setInterval(
+        updateGatewayStatus,
+        STATUS_UPDATE_INTERVAL_MS
+      );
 
     return () => {
-      clearInterval(statusTimer);
+      window.clearInterval(
+        statusTimer
+      );
     };
   }, [collectedAt]);
 
-  const interfaces = latestMetric?.interface_metrics || {};
-  const internalLan = interfaces.internal_lan;
-  const usbLan = interfaces.usb_lan;
+  const interfaces =
+    latestMetric?.interface_metrics ?? {};
+
+  const internalLan =
+    interfaces.internal_lan ?? null;
+
+  const usbLan =
+    interfaces.usb_lan ?? null;
+
+  function handleRefresh() {
+    loadGatewayMetrics(true);
+  }
 
   let content;
 
   if (loading) {
     content = (
       <section className="panel">
-        <p>Gateway Metrics를 불러오는 중입니다.</p>
+        <p>
+          Gateway Metrics를 불러오는 중입니다.
+        </p>
       </section>
     );
   } else if (error) {
@@ -218,8 +309,17 @@ export default function GatewayStatus() {
       <section className="panel">
         <div className="error-box gateway-error-box">
           <span>{error}</span>
-          <button type="button" onClick={loadGatewayMetrics}>
-            다시 시도
+
+          <button
+            type="button"
+            onClick={() =>
+              loadGatewayMetrics(true)
+            }
+            disabled={refreshing}
+          >
+            {refreshing
+              ? "불러오는 중..."
+              : "다시 시도"}
           </button>
         </div>
       </section>
@@ -227,10 +327,17 @@ export default function GatewayStatus() {
   } else if (!latestMetric) {
     content = (
       <section className="panel gateway-empty">
-        <span className="status-badge unknown">UNKNOWN</span>
-        <h2>수집된 Gateway Metrics가 없습니다.</h2>
+        <span className="status-badge unknown">
+          UNKNOWN
+        </span>
+
+        <h2>
+          수집된 Gateway Metrics가 없습니다.
+        </h2>
+
         <p>
-          Gateway Metrics Collector가 실행 중인지 확인해주세요.
+          Gateway Metrics Collector가 실행
+          중인지 확인해주세요.
         </p>
       </section>
     );
@@ -239,7 +346,9 @@ export default function GatewayStatus() {
       <>
         <section className="panel gateway-overview">
           <div>
-            <span className="section-label">Gateway 상태</span>
+            <span className="section-label">
+              Gateway 상태
+            </span>
 
             <div className="gateway-status-row">
               <span
@@ -249,13 +358,17 @@ export default function GatewayStatus() {
               </span>
 
               <span className="last-collected">
-                마지막 수집: {formatKST(latestMetric.collected_at)}
+                마지막 수집:{" "}
+                {formatKST(
+                  latestMetric.collected_at
+                )}
               </span>
             </div>
           </div>
 
           <div className="sample-interval">
             <span>실제 수집 간격</span>
+
             <strong>
               {formatMetric(
                 latestMetric.sample_interval_seconds,
@@ -268,17 +381,20 @@ export default function GatewayStatus() {
         <div className="gateway-resource-grid">
           <div className="resource-card">
             <span>CPU</span>
+
             <strong>
-              {formatMetric(latestMetric.cpu_percent, "%")}
+              {formatMetric(
+                latestMetric.cpu_percent,
+                "%"
+              )}
             </strong>
 
             <div className="progress-bar">
               <div
                 className="progress-value"
                 style={{
-                  width: `${Math.min(
-                    Math.max(latestMetric.cpu_percent ?? 0, 0),
-                    100
+                  width: `${getProgressValue(
+                    latestMetric.cpu_percent
                   )}%`,
                 }}
               />
@@ -287,17 +403,20 @@ export default function GatewayStatus() {
 
           <div className="resource-card">
             <span>Memory</span>
+
             <strong>
-              {formatMetric(latestMetric.memory_percent, "%")}
+              {formatMetric(
+                latestMetric.memory_percent,
+                "%"
+              )}
             </strong>
 
             <div className="progress-bar">
               <div
                 className="progress-value"
                 style={{
-                  width: `${Math.min(
-                    Math.max(latestMetric.memory_percent ?? 0, 0),
-                    100
+                  width: `${getProgressValue(
+                    latestMetric.memory_percent
                   )}%`,
                 }}
               />
@@ -306,22 +425,28 @@ export default function GatewayStatus() {
 
           <div className="resource-card">
             <span>Disk</span>
+
             <strong>
-              {formatMetric(latestMetric.disk_percent, "%")}
+              {formatMetric(
+                latestMetric.disk_percent,
+                "%"
+              )}
             </strong>
 
             <small>
               사용량:{" "}
-              {formatMetric(latestMetric.disk_used_mb, " MB")}
+              {formatMetric(
+                latestMetric.disk_used_mb,
+                " MB"
+              )}
             </small>
 
             <div className="progress-bar">
               <div
                 className="progress-value"
                 style={{
-                  width: `${Math.min(
-                    Math.max(latestMetric.disk_percent ?? 0, 0),
-                    100
+                  width: `${getProgressValue(
+                    latestMetric.disk_percent
                   )}%`,
                 }}
               />
@@ -330,11 +455,17 @@ export default function GatewayStatus() {
 
           <div className="resource-card">
             <span>온도</span>
+
             <strong>
-              {formatMetric(latestMetric.temperature_c, "℃")}
+              {formatMetric(
+                latestMetric.temperature_c,
+                "℃"
+              )}
             </strong>
 
-            <small>Raspberry Pi CPU Temperature</small>
+            <small>
+              Raspberry Pi CPU Temperature
+            </small>
           </div>
         </div>
 
@@ -342,8 +473,10 @@ export default function GatewayStatus() {
           <div className="panel-header">
             <div>
               <h2>Network Interface</h2>
+
               <p className="panel-description">
-                내부 LAN과 USB LAN을 독립적으로 표시합니다.
+                내부 LAN과 USB LAN을
+                독립적으로 표시합니다.
               </p>
             </div>
           </div>
@@ -369,18 +502,24 @@ export default function GatewayStatus() {
       <div className="page-header">
         <div>
           <h1>Gateway Status</h1>
+
           <p className="page-description">
-            Raspberry Pi Gateway의 시스템 자원과 네트워크 상태를
-            확인합니다.
+            Raspberry Pi Gateway의 시스템
+            자원과 네트워크 상태를 확인합니다.
           </p>
         </div>
 
         <button
           type="button"
           className="refresh-button"
-          onClick={loadGatewayMetrics}
+          onClick={handleRefresh}
+          disabled={
+            loading || refreshing
+          }
         >
-          새로고침
+          {refreshing
+            ? "새로고침 중..."
+            : "새로고침"}
         </button>
       </div>
 
