@@ -10,7 +10,7 @@
 
 ## 공통 구현 계약
 
-- `GatewayMetricsConfig.from_env()`로 설정을 읽고 동일한 Config를 Collector와 Loop에 전달한다.
+- 공통 `backend.app.config.settings`가 `.env`를 읽고, 이를 `GatewayMetricsConfig`로 변환해 Collector와 Loop에 전달한다.
 - 프로세스 수명 동안 하나의 `GatewayMetricsCollector`를 재사용한다.
 - 오류 정책은 현재 Transaction Rollback, non-zero 프로세스 종료, 5초 후 systemd 재시작으로 고정한다.
 - 기존 최초 Sample, 긴 수집 간격, Interface DOWN·Missing, Counter Reset 계약을 유지한다.
@@ -154,7 +154,7 @@ git commit -m "feat: persist gateway metrics transactions"
 
 **Interface:**
 - 사용: Task 1의 `collect_and_store_sample`
-- 제공: `GracefulShutdown`, `build_collector(config)`, `run_gateway_metrics_loop(config, collector, shutdown, session_factory) -> int`, `main()`
+- 제공: `GracefulShutdown`, `UtcFormatter`, `load_gateway_metrics_config(settings)`, `build_collector(config)`, `run_gateway_metrics_loop(config, collector, shutdown, session_factory, max_samples) -> int`, `parse_args()`, `main()`
 
 - [ ] **Step 1: 실패하는 Loop·Config 테스트 작성**
 
@@ -207,7 +207,7 @@ def test_loop_propagates_cycle_failure_for_systemd_restart(session_factory):
         )
 ```
 
-미리 종료가 요청된 상태에서는 Session을 열지 않는지, `request()` 이후 `GracefulShutdown.wait()`가 즉시 반환되는지도 검증한다.
+미리 종료가 요청된 상태에서는 Session을 열지 않는지, `request()` 이후 `GracefulShutdown.wait()`가 즉시 반환되는지도 검증한다. 공통 Settings가 `.env`의 Gateway 설정을 읽는지, UTC Log Formatter가 Host Timezone과 무관하게 UTC를 출력하는지, `--samples 2`가 두 번째 Commit 직후 추가 대기 없이 종료되는지도 포함한다.
 
 - [ ] **Step 2: 관련 테스트를 실행해 RED 확인**
 
@@ -271,7 +271,7 @@ def run_gateway_metrics_loop(
     return stored_count
 ```
 
-`main()`은 Logging을 설정하고 `GatewayMetricsConfig.from_env()`를 읽은 뒤 Signal Handler를 설치한다. Collector를 한 번만 생성해 Loop를 실행하며, 오류는 잡아서 정상 처리하지 않고 전파해 non-zero로 종료되게 한다.
+`main()`은 UTC Logging을 설정하고 공통 `.env` 기반 Settings를 `GatewayMetricsConfig`로 변환한 뒤 Signal Handler를 설치한다. Collector를 한 번만 생성해 Loop를 실행하며, 오류는 잡아서 정상 처리하지 않고 전파해 non-zero로 종료되게 한다. `--samples N`을 지정하면 N건 Commit 후 정상 종료한다.
 
 - [ ] **Step 4: Runner·Collector·Repository 테스트 실행**
 
@@ -294,6 +294,7 @@ git commit -m "feat: run gateway metrics collection loop"
 
 **대상 파일:**
 - 신규: `infra/systemd/gateway-metrics.service`
+- 신규: `docs/gateway-metrics-runbook.md`
 - 수정: `tests/test_gateway_metrics_runner.py`
 
 **Interface:**
@@ -307,7 +308,7 @@ def test_gateway_metrics_systemd_unit_contract():
     unit = Path("infra/systemd/gateway-metrics.service").read_text(encoding="utf-8")
 
     assert "WorkingDirectory=/home/pi/iot-edge-zero-trust" in unit
-    assert "EnvironmentFile=-/home/pi/iot-edge-zero-trust/.env" in unit
+    assert "EnvironmentFile=/home/pi/iot-edge-zero-trust/.env" in unit
     assert (
         "ExecStart=/home/pi/iot-edge-zero-trust/venv/bin/python "
         "-m edge.gateway.run_gateway_metrics_collector"
@@ -340,7 +341,7 @@ Type=simple
 User=pi
 Group=pi
 WorkingDirectory=/home/pi/iot-edge-zero-trust
-EnvironmentFile=-/home/pi/iot-edge-zero-trust/.env
+EnvironmentFile=/home/pi/iot-edge-zero-trust/.env
 ExecStart=/home/pi/iot-edge-zero-trust/venv/bin/python -m edge.gateway.run_gateway_metrics_collector
 Restart=on-failure
 RestartSec=5
@@ -377,10 +378,11 @@ Diff와 테스트 결과에서 다음 항목을 확인한다.
 - `disk_total_mb`는 저장 대상에서 계속 제외된다.
 - 기존 Nullable·Network Rate 계약 테스트가 통과한다.
 - Pi 재시작과 API·Dashboard 최신값 검증은 실제 장비에서 실행하기 전까지 명시적으로 미검증 상태를 유지한다.
+- 수동 Smoke 전 `gateway-metrics.service`를 중지하고 `--samples 2` 실행 후 Service를 다시 시작하는 절차를 Runbook에 유지한다.
 
 - [ ] **Step 6: Service와 테스트 Commit**
 
 ```powershell
-git add infra/systemd/gateway-metrics.service tests/test_gateway_metrics_runner.py
+git add infra/systemd/gateway-metrics.service docs/gateway-metrics-runbook.md tests/test_gateway_metrics_runner.py
 git commit -m "ops: add gateway metrics systemd service"
 ```

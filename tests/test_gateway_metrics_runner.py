@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import logging
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -9,6 +10,7 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
+from backend.app.config import Settings
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
 from edge.gateway.gateway_metrics_repository import (
     count_gateway_metrics,
@@ -231,6 +233,23 @@ def test_build_collector_passes_gateway_config(
     assert clock().tzinfo is not None
 
 
+def test_common_settings_load_gateway_metrics_values_from_env_file(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "GATEWAY_METRICS_INTERVAL_SECONDS=5\n"
+        "INTERNAL_LAN_INTERFACE=lan0\n"
+        "USB_LAN_INTERFACE=usb0\n",
+        encoding="utf-8",
+    )
+
+    app_settings = Settings(_env_file=env_file)
+    config = runner.load_gateway_metrics_config(app_settings)
+
+    assert config.interval_seconds == 5.0
+    assert config.internal_lan_interface == "lan0"
+    assert config.usb_lan_interface == "usb0"
+
+
 def test_loop_reuses_one_collector_and_stores_two_samples(session_factory) -> None:
     collector = FakeCollector([_first_sample(), _second_sample()])
     shutdown = FakeShutdown(stop_after_waits=2)
@@ -288,11 +307,61 @@ def test_graceful_shutdown_interrupts_wait() -> None:
     assert shutdown.wait(1) is True
 
 
+def test_utc_formatter_uses_utc_iso_timestamp() -> None:
+    record = logging.LogRecord(
+        name="gateway-metrics",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="sample",
+        args=(),
+        exc_info=None,
+    )
+    record.created = 0
+    formatter = runner.UtcFormatter(
+        "%(asctime)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%SZ",
+    )
+
+    assert formatter.format(record) == "1970-01-01T00:00:00Z sample"
+
+
+def test_loop_stops_after_requested_sample_count_without_extra_wait(
+    session_factory,
+) -> None:
+    collector = FakeCollector([_first_sample(), _second_sample()])
+    shutdown = FakeShutdown()
+
+    stored_count = runner.run_gateway_metrics_loop(
+        runner.GatewayMetricsConfig(interval_seconds=5.0),
+        collector,
+        shutdown,
+        session_factory=session_factory,
+        max_samples=2,
+    )
+
+    assert stored_count == 2
+    assert collector.collect_count == 2
+    assert shutdown.wait_timeouts == [5.0]
+
+
+def test_parse_args_accepts_positive_sample_limit() -> None:
+    args = runner.parse_args(["--samples", "2"])
+
+    assert args.samples == 2
+
+
+def test_parse_args_rejects_non_positive_sample_limit() -> None:
+    with pytest.raises(SystemExit):
+        runner.parse_args(["--samples", "0"])
+
+
 def test_gateway_metrics_systemd_unit_contract() -> None:
     unit = Path("infra/systemd/gateway-metrics.service").read_text(encoding="utf-8")
 
     assert "WorkingDirectory=/home/pi/iot-edge-zero-trust" in unit
-    assert "EnvironmentFile=-/home/pi/iot-edge-zero-trust/.env" in unit
+    assert "EnvironmentFile=/home/pi/iot-edge-zero-trust/.env" in unit
+    assert "EnvironmentFile=-/home/pi/iot-edge-zero-trust/.env" not in unit
     assert (
         "ExecStart=/home/pi/iot-edge-zero-trust/venv/bin/python "
         "-m edge.gateway.run_gateway_metrics_collector"
@@ -302,3 +371,14 @@ def test_gateway_metrics_systemd_unit_contract() -> None:
     assert "StartLimitIntervalSec=" in unit
     assert "StartLimitBurst=" in unit
     assert "TimeoutStopSec=" in unit
+
+
+def test_gateway_metrics_runbook_prevents_manual_and_service_overlap() -> None:
+    runbook = Path("docs/gateway-metrics-runbook.md").read_text(encoding="utf-8")
+
+    assert "sudo systemctl stop gateway-metrics.service" in runbook
+    assert (
+        "python -m edge.gateway.run_gateway_metrics_collector --samples 2"
+        in runbook
+    )
+    assert "sudo systemctl start gateway-metrics.service" in runbook

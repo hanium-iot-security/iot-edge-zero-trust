@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import argparse
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 import logging
 import signal
 from threading import Event
+import time
 
 from sqlalchemy.orm import Session
 
+from backend.app.config import Settings, settings
 from backend.app.database import SessionLocal
 from edge.gateway.gateway_metrics_repository import insert_gateway_metrics_sample
 from edge.gateway.metrics_collector import (
@@ -21,6 +24,12 @@ from edge.gateway.system_metrics import LinuxSystemMetricsReader
 
 
 logger = logging.getLogger(__name__)
+
+
+class UtcFormatter(logging.Formatter):
+    """Format log timestamps in UTC regardless of the host timezone."""
+
+    converter = time.gmtime
 
 
 class GracefulShutdown:
@@ -51,6 +60,17 @@ def build_collector(config: GatewayMetricsConfig) -> GatewayMetricsCollector:
         reader=LinuxSystemMetricsReader(),
         clock=lambda: datetime.now(timezone.utc),
         config=config,
+    )
+
+
+def load_gateway_metrics_config(
+    app_settings: Settings = settings,
+) -> GatewayMetricsConfig:
+    """Build Collector config from the project's shared `.env`-backed settings."""
+    return GatewayMetricsConfig(
+        interval_seconds=app_settings.gateway_metrics_interval_seconds,
+        internal_lan_interface=app_settings.internal_lan_interface,
+        usb_lan_interface=app_settings.usb_lan_interface,
     )
 
 
@@ -85,8 +105,12 @@ def run_gateway_metrics_loop(
     shutdown: GracefulShutdown,
     *,
     session_factory: Callable[[], Session] = SessionLocal,
+    max_samples: int | None = None,
 ) -> int:
     """Persist samples until shutdown, propagating failures for systemd restart."""
+    if max_samples is not None and max_samples <= 0:
+        raise ValueError("max_samples must be positive")
+
     stored_count = 0
     while not shutdown.requested:
         with session_factory() as db:
@@ -100,24 +124,58 @@ def run_gateway_metrics_loop(
             break
 
         stored_count += 1
+        if max_samples is not None and stored_count >= max_samples:
+            break
         if shutdown.wait(config.interval_seconds):
             break
 
     return stored_count
 
 
-def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
-    config = GatewayMetricsConfig.from_env()
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Raspberry Pi Gateway Metrics Collector")
+    parser.add_argument(
+        "--samples",
+        type=_positive_int,
+        default=None,
+        help="저장할 Sample 수 (미지정 시 종료 Signal까지 반복)",
+    )
+    return parser.parse_args(argv)
+
+
+def configure_logging() -> None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        UtcFormatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%SZ",
+        )
+    )
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
+    configure_logging()
+
+    config = load_gateway_metrics_config()
     shutdown = GracefulShutdown()
     shutdown.install()
     collector = build_collector(config)
 
-    stored_count = run_gateway_metrics_loop(config, collector, shutdown)
+    stored_count = run_gateway_metrics_loop(
+        config,
+        collector,
+        shutdown,
+        max_samples=args.samples,
+    )
     logger.info("Gateway Metrics collector stopped (stored_samples=%d)", stored_count)
 
 

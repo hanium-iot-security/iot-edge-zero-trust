@@ -10,7 +10,7 @@ Type=simple
 User=pi
 Group=pi
 WorkingDirectory=/home/pi/iot-edge-zero-trust
-EnvironmentFile=-/home/pi/iot-edge-zero-trust/.env
+EnvironmentFile=/home/pi/iot-edge-zero-trust/.env
 ExecStart=/home/pi/iot-edge-zero-trust/venv/bin/python -m edge.gateway.run_gateway_metrics_collector
 
 Restart=on-failure

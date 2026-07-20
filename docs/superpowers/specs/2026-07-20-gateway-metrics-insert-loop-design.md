@@ -12,8 +12,8 @@ This design implements Notion task `P4-0-02 — Gateway Metrics DB Insert Loop`.
 
 In scope:
 
-- Build one long-lived `GatewayMetricsCollector` from
-  `GatewayMetricsConfig.from_env()`.
+- Load `.env` through the shared `backend.app.config.settings`, then build one
+  long-lived `GatewayMetricsCollector` from the resulting config.
 - Collect and store samples at `interval_seconds`.
 - Own database `commit()` and `rollback()` in the runner.
 - Stop safely on `SIGTERM` or `SIGINT`.
@@ -44,8 +44,10 @@ The module provides three boundaries:
 3. `run_gateway_metrics_loop(...)` owns the repeating loop and interruptible wait.
    It executes the first sample immediately, then waits the configured interval.
 
-`main()` loads the environment configuration, installs signal handlers, creates
-the Collector once, and starts the loop with `SessionLocal`.
+`main()` loads the shared `.env`-backed configuration, installs signal handlers,
+creates the Collector once, and starts the loop with `SessionLocal`. A positive
+`--samples N` option provides a bounded manual smoke run; omission keeps the
+systemd process running until a shutdown signal.
 
 ## Transaction and failure policy
 
@@ -63,8 +65,9 @@ the Collector once, and starts the loop with `SessionLocal`.
 
 ## Data contract
 
-- `GatewayMetricsConfig.interval_seconds` is passed directly to the Collector and
-  is also the loop interval.
+- Shared Settings fields are mapped to `GatewayMetricsConfig`; its
+  `interval_seconds` is passed directly to the Collector and is also the loop
+  interval.
 - Existing Collector behavior remains the source of truth for first sample,
   interval greater than three collection periods, interface DOWN/Missing, and
   Counter Reset values.
@@ -77,7 +80,8 @@ the Collector once, and starts the loop with `SessionLocal`.
 `infra/systemd/gateway-metrics.service` uses:
 
 - `WorkingDirectory=/home/pi/iot-edge-zero-trust`
-- `EnvironmentFile=-/home/pi/iot-edge-zero-trust/.env`
+- `EnvironmentFile=/home/pi/iot-edge-zero-trust/.env` so a missing production
+  configuration fails service startup instead of silently using defaults
 - `/home/pi/iot-edge-zero-trust/venv/bin/python -m
   edge.gateway.run_gateway_metrics_collector`
 - `Restart=on-failure`, `RestartSec=5`, and a bounded Start Limit
@@ -90,13 +94,20 @@ The service needs no packet-capture capabilities.
 `tests/test_gateway_metrics_runner.py` verifies:
 
 - The environment interval and interface names reach the long-lived Collector.
+- Manual execution reads those values from the project `.env` through shared
+  Settings.
 - Two cycles insert and commit two rows while reusing one Collector.
 - The first stored sample preserves nullable interval, CPU, temperature, and
   network rates.
 - Collector and repository/commit failures roll back and propagate.
 - A shutdown request prevents a new cycle and interrupts the idle wait.
+- UTC log formatting and the bounded `--samples 2` smoke path behave consistently.
 - The systemd unit contains the required venv, working directory, environment,
   restart, and Start Limit settings.
+
+`docs/gateway-metrics-runbook.md` requires stopping the service before a manual
+smoke run and restarting it after validation, preventing two Collectors from
+writing duplicate samples concurrently.
 
 Existing Collector and Repository tests remain the regression coverage for rate
 and storage contracts. Final acceptance additionally requires Raspberry Pi proof

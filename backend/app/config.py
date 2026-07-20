@@ -15,6 +15,11 @@ class Settings(BaseSettings):
     initial_trust_score: int = 100
     isolation_threshold: int = 30
 
+    # Gateway Metrics
+    gateway_metrics_interval_seconds: float = 10.0
+    internal_lan_interface: str = "eth0"
+    usb_lan_interface: str = "eth1"
+
     # Packet Capture
     capture_interface: str = "eth0"
     pcap_window_seconds: int = 10
