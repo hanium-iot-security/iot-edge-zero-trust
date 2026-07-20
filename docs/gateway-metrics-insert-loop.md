@@ -1,5 +1,10 @@
 # Gateway Metrics DB Insert Loop 구현 계획
 
+> **상태: 구현 완료**
+>
+> 아래 체크박스와 RED/GREEN 설명은 개발 전에 작성한 TDD 구현 계획이다.
+> 실제 구현·검증 상태는 PR 본문과 `docs/gateway-metrics-runbook.md`를 기준으로 확인한다.
+
 **목표:** Raspberry Pi의 Gateway Metrics를 설정된 주기로 수집해 기존 Repository를 통해 DB에 저장하고, Commit된 최신 Row를 기존 API에서 조회할 수 있게 한다.
 
 **구조:** 장기 실행되는 Collector 한 개가 누적 Counter 기준값을 유지하고, Runner는 Sample마다 새 SQLAlchemy Session을 생성한다. 각 Cycle은 `Collect → Insert → Commit`을 하나의 Transaction 경계로 처리한다. 오류가 발생하면 Rollback 후 예외를 전파하여 systemd가 깨끗한 프로세스로 재시작하게 한다. Signal Handler는 종료 Event를 설정해 새로운 작업을 막고 대기 상태를 즉시 해제한다.

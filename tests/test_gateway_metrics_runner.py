@@ -326,6 +326,23 @@ def test_utc_formatter_uses_utc_iso_timestamp() -> None:
     assert formatter.format(record) == "1970-01-01T00:00:00Z sample"
 
 
+def test_configure_logging_forces_utc_root_handler(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def capture_basic_config(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(runner.logging, "basicConfig", capture_basic_config)
+
+    runner.configure_logging()
+
+    assert captured["force"] is True
+    handlers = captured["handlers"]
+    assert isinstance(handlers, list)
+    assert len(handlers) == 1
+    assert isinstance(handlers[0].formatter, runner.UtcFormatter)
+
+
 def test_loop_stops_after_requested_sample_count_without_extra_wait(
     session_factory,
 ) -> None:
@@ -382,3 +399,19 @@ def test_gateway_metrics_runbook_prevents_manual_and_service_overlap() -> None:
         in runbook
     )
     assert "sudo systemctl start gateway-metrics.service" in runbook
+
+
+def test_gateway_metrics_runbook_uses_configurable_database_path() -> None:
+    runbook = Path("docs/gateway-metrics-runbook.md").read_text(encoding="utf-8")
+
+    assert "DB_PATH=backend/data/iot_security.db" in runbook
+    assert runbook.count('sqlite3 "$DB_PATH"') == 3
+    assert "sqlite3 backend/data/iot_security.db" not in runbook
+
+
+def test_gateway_metrics_plan_marks_completed_tdd_plan_status() -> None:
+    plan = Path("docs/gateway-metrics-insert-loop.md").read_text(encoding="utf-8")
+
+    assert "> **상태: 구현 완료**" in plan
+    assert "아래 체크박스와 RED/GREEN 설명은 개발 전에 작성한 TDD 구현 계획" in plan
+    assert "실제 구현·검증 상태는 PR 본문과 `docs/gateway-metrics-runbook.md`" in plan

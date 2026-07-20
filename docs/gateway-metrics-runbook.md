@@ -25,6 +25,10 @@ USB_LAN_INTERFACE=eth1
 `gateway-metrics.service`는 `.env`를 필수 파일로 사용한다. 파일이 없거나
 읽을 수 없으면 기본값으로 조용히 실행하지 않고 Service 시작이 실패해야 한다.
 
+아래 SQLite 조회 명령은 기본 운영 DB 경로인
+`sqlite:///./backend/data/iot_security.db`를 기준으로 한다. `DATABASE_URL`을
+변경했다면 `DB_PATH`를 동일한 실제 SQLite 파일 경로로 변경해 실행한다.
+
 ## 수동 2-Sample Smoke Test
 
 먼저 운영 Service를 중지해 수동 Runner와 동시에 실행되지 않게 한다.
@@ -42,7 +46,9 @@ python -m edge.gateway.run_gateway_metrics_collector --samples 2
 실행 후 Row와 최신 Sample을 확인한다.
 
 ```bash
-sqlite3 backend/data/iot_security.db \
+DB_PATH=backend/data/iot_security.db
+
+sqlite3 "$DB_PATH" \
   "SELECT id, collected_at, sample_interval_seconds, cpu_percent FROM gateway_metrics ORDER BY id DESC LIMIT 2;"
 ```
 
@@ -83,10 +89,12 @@ systemd는 5초 후 재시작하며, 반복 실패는 Start Limit으로 제한�
 ## 재시작 검증
 
 ```bash
-before=$(sqlite3 backend/data/iot_security.db "SELECT COUNT(*) FROM gateway_metrics;")
+DB_PATH=backend/data/iot_security.db
+
+before=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM gateway_metrics;")
 sudo systemctl restart gateway-metrics.service
 sleep 12
-after=$(sqlite3 backend/data/iot_security.db "SELECT COUNT(*) FROM gateway_metrics;")
+after=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM gateway_metrics;")
 printf 'before=%s after=%s\n' "$before" "$after"
 ```
 

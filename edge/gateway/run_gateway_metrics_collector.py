@@ -158,7 +158,7 @@ def configure_logging() -> None:
             datefmt="%Y-%m-%dT%H:%M:%SZ",
         )
     )
-    logging.basicConfig(level=logging.INFO, handlers=[handler])
+    logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
