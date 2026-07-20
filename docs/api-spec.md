@@ -11,11 +11,79 @@ GET /api/devices
 GET /api/devices/{device_id}
 GET /api/mqtt-logs
 GET /api/feature-logs
+GET /api/packet-feature-logs
+GET /api/gateway-metrics
 GET /api/detection-events
 GET /api/trust-score/summary
 GET /api/trust-score/{device_id}/history
 GET /api/isolation/history
 ```
+
+## Packet Gateway Read APIs
+
+### GET /api/packet-feature-logs
+
+Query parameters:
+
+- `session_id`
+- `device_id`
+- `peer_ip`
+- `direction`: `INBOUND` or `OUTBOUND`
+- `from`: timezone-aware ISO 8601 timestamp
+- `to`: timezone-aware ISO 8601 timestamp
+- `limit`: default `100`, minimum `1`, maximum `500`
+- `offset`: default `0`, minimum `0`
+
+Response wrapper:
+
+```json
+{
+  "items": [],
+  "total": 0
+}
+```
+
+Each item includes packet window fields from `packet_feature_logs`, the joined `session_id`, UTC `Z` timestamps, and two derived values based on the fixed 10 second packet window:
+
+```text
+packets_per_second = packet_count / 10.0
+bytes_per_second = total_bytes / 10.0
+```
+
+Unmapped peer IP rows return `device_id: null`. Empty results return `items: []` and `total: 0`.
+
+### GET /api/gateway-metrics
+
+Query parameters:
+
+- `from`: timezone-aware ISO 8601 timestamp
+- `to`: timezone-aware ISO 8601 timestamp
+- `limit`: default `100`, minimum `1`, maximum `500`
+- `offset`: default `0`, minimum `0`
+
+`GET /api/gateway-metrics?limit=1` returns the latest gateway metric row by `collected_at DESC, id DESC`.
+
+Response wrapper:
+
+```json
+{
+  "items": [],
+  "total": 0
+}
+```
+
+The API parses DB `interface_metrics_json` into the response field `interface_metrics`. It preserves role keys such as `internal_lan` and `usb_lan`, interface names, `exists`, `is_up`, IP address, counters, rates, and null values.
+
+The following DB/internal fields are not exposed in the response:
+
+- `interface_metrics_json`
+- `network_rx_bytes`
+- `network_tx_bytes`
+- `created_at`
+- `disk_total_mb`
+- `gateway_status`
+
+First samples may return `sample_interval_seconds: null`, `cpu_percent: null`, `temperature_c: null`, and null interface rates. Missing USB LAN is represented inside `interface_metrics.usb_lan` with `exists: false` and `is_up: false`.
 
 MVP에서는 중복 endpoint를 줄이기 위해 기기별 feature/event 조회는 query parameter 방식으로 처리합니다.
 
@@ -58,4 +126,19 @@ MVP에서는 중복 endpoint를 줄이기 위해 기기별 feature/event 조회�
 
 ## 현재 구현 상태
 
-현재 구현된 API는 `/api/health`, `/api/mqtt-logs`, `/api/feature-logs`입니다. 나머지 endpoint는 다음 API 구현 단계에서 맞춰야 할 MVP 계약입니다.
+현재 backend에 구현된 조회 API는 다음과 같습니다.
+
+```txt
+GET /api/health
+GET /api/dashboard/summary
+GET /api/devices
+GET /api/devices/{device_id}
+GET /api/mqtt-logs
+GET /api/feature-logs
+GET /api/packet-feature-logs
+GET /api/gateway-metrics
+GET /api/detection-events
+GET /api/trust-score/summary
+GET /api/trust-score/{device_id}/history
+GET /api/isolation/history
+```
