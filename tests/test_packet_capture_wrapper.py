@@ -275,21 +275,27 @@ class TestExecuteCaptureWindowDriftCorrection:
 
         assert process.last_call["window_seconds"] == 10.0
 
-    def test_capture_started_at_past_window_end_clamps_to_zero(self, tmp_path: Path) -> None:
-        """방어적 처리: 어떤 이유로든 이미 window_end를 지난 뒤 호출됐다면 음수 대신 0으로 clamp."""
+    def test_capture_started_at_past_window_end_does_not_invoke_process(self, tmp_path: Path) -> None:
+        """window_seconds<=0이면 tcpdump조차 실행하지 않고
+        즉시 실패로 처리해야 한다. 남은 시간이 없는 캡처가 정상 READY Segment로
+        저장되는 일을 막기 위한 방어 코드다."""
         config = _make_config(tmp_path)
         config.ensure_directories()
         window_start = _utc(2026, 7, 15, 10, 0, 10)
         window_end = _utc(2026, 7, 15, 10, 0, 20)
         process = FakeCaptureProcess(outcome=CaptureOutcome(completed_full_window=True, exit_code=-15))
 
-        execute_capture_window(
+        result = execute_capture_window(
             process, config, session_id=SESSION_ID,
             window_start=window_start, window_end=window_end,
             capture_started_at=_utc(2026, 7, 15, 10, 0, 25),  # window_end보다도 늦음
         )
 
-        assert process.last_call["window_seconds"] == 0.0
+        assert process.last_call is None  # capture_window()가 호출되지 않음
+        assert result.success is False
+        assert result.error_code == "PARTIAL_CAPTURE"
+        assert not (config.ready_dir / result.file_name).exists()
+        assert not (config.failed_dir / result.file_name).exists()  # 파일 자체가 생성되지 않음
 
 
 class TestExecuteCaptureWindowSuccess:

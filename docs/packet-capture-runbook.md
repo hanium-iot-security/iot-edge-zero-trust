@@ -20,7 +20,7 @@ Test Pack(`tests/fixtures/packet/pcap/`) 수집 절차·검증 기준을 정리�
 | Window 길이 | 10초 고정 (UTC 정수 초 경계) |
 
 `eth0`, `192.168.0.20`은 [raspberry-pi-setup.md](./raspberry-pi-setup.md)에 기록된 실제 배포
-환경과 동일하며, Gateway Metrics 실기기 검증(PR #14, 2026-07-16)에서 재확인됐습니다.
+환경과 동일하며, 원우민의 Gateway Metrics 실기기 검증(PR #14, 2026-07-16)에서 재확인됐습니다.
 
 ## 2. 환경 변수
 
@@ -59,7 +59,10 @@ tcpdump는 raw socket 권한이 필요합니다. 로컬에서 sudo 없이 테스
 sudo setcap cap_net_raw,cap_net_admin+eip "$(which tcpdump)"
 
 # 옵션 B: sudo로 직접 실행 (Capture Wrapper 자체는 sudo를 사용하지 않으므로 개발 중 확인용)
-sudo python -m edge.packet.run_packet_capture --windows 1
+# 시스템 python이 아니라 Pi 가상환경의 python을 명시적으로 지정한다.
+# (systemd에는 로그인 셸 환경이 없어 venv가 PATH에 안 잡히는 문제와 동일한 이유 --
+#  `sudo python`은 venv 밖의 시스템 python을 부를 위험이 있다.)
+sudo /home/pi/iot-edge-zero-trust/venv/bin/python -m edge.packet.run_packet_capture --windows 1
 ```
 
 ### 3.2 systemd (운영)
@@ -101,6 +104,15 @@ READY segment 생성: capture_<uuid>_eth0_1752537620_1752537630.pcap
 `data/pcap/ready/`에 10초 간격 파일명의 `.pcap`이 계속 쌓이고, `data/pcap/incoming/`에는
 찰나(1초 미만)를 제외하면 `.pcap.tmp`가 남아있지 않아야 합니다.
 
+시스템 부하 등으로 Window를 놓치면(대기 전 또는 대기 후 모두), 다음과 같이 현재 Session이
+종료되고 새 Session이 시작되는 로그가 남습니다. 같은 Session 안에서 계속 이어지지 않는 것이
+정상입니다 (Capture Gap이 새 Session에 기록되어야 연속성 조회가 그 지점에서 멈추지 않습니다).
+
+```
+Window 2026-07-15T00:00:20Z~2026-07-15T00:00:30Z는 캡처 시작 전에 만료됨 (capture_started_at=2026-07-15T00:00:31Z); Session을 종료하고 다음 경계에서 새 Session을 시작
+새 Capture Session 시작: session_id=<new-uuid> first_window_start=2026-07-15T00:00:40Z
+```
+
 ## 4. Test Pack (`tests/fixtures/packet/pcap/`)
 
 Extractor(정종민) 및 Capture 자체 개발·회귀 테스트가 실제 장비 없이도 병렬로 진행될 수
@@ -108,11 +120,11 @@ Extractor(정종민) 및 Capture 자체 개발·회귀 테스트가 실제 장�
 
 | 파일 | 수집 방식 | 담당 |
 | --- | --- | --- |
-| `normal_mqtt.pcap` | 실제 Pi #1 + ESP32 | (실기기) |
-| `port_scan.pcap` | 실제 Pi #1 + 공격 노드 | (실기기) |
-| `packet_flood.pcap` | 실제 Pi #1 + 공격 노드 | (실기기) |
-| `empty_window.pcap` | 합성 생성 스크립트 | (완료) |
-| `partial_capture.pcap` | 합성 생성 스크립트 | (완료) |
+| `normal_mqtt.pcap` | 실제 Pi #1 + ESP32 | 원우민 (실기기) |
+| `port_scan.pcap` | 실제 Pi #1 + 공격 노드 | 원우민 (실기기) |
+| `packet_flood.pcap` | 실제 Pi #1 + 공격 노드 | 원우민 (실기기) |
+| `empty_window.pcap` | 합성 생성 스크립트 | 정선우 (완료) |
+| `partial_capture.pcap` | 합성 생성 스크립트 | 정선우 (완료) |
 
 ### 4.1 `normal_mqtt.pcap` — 정상 MQTT 트래픽
 
@@ -141,29 +153,78 @@ sudo tcpdump -i eth0 -w tests/fixtures/packet/pcap/normal_mqtt.pcap "tcp or udp"
 **목적**: `distinct_dest_port_count`, `tcp_syn_count` 같은 Rule/AI 판단 근거 Feature가
 공격 상황에서 정상 트래픽과 다르게 나오는지 검증.
 
-**수집 절차**: 기존 `attacks/` 폴더의 Port Scan 스크립트(Phase 3-A)를 Pi #1 대상으로
-실행하면서 동시에 캡처합니다.
+> `attacks/` 폴더에는 Port Scan 스크립트가 없습니다 (MQTT 레벨 공격 시나리오만 있음).
+> 대신 범용 도구인 `nmap`으로 실제 포트 스캔 트래픽을 발생시킵니다.
+
+**대상 및 조건**:
+
+| 항목 | 값 |
+| --- | --- |
+| 대상 IP | Pi #1의 `eth0` IP (`192.168.0.20`) |
+| 스캔 Port 범위 | `1-1000` (MQTT 1883 포함하려면 `1-2000`) |
+| 스캔 노드 | Pi #2 또는 관리자 노트북 (Pi #1과 같은 내부 LAN) |
+| 캡처 시간 | 스캔 시작 5초 전부터 스캔 종료 5초 후까지 (여유 포함 약 30~40초) |
+| 반복 횟수 | 1회 (재현성 확인용으로 2회차를 별도 파일로 추가 수집해도 무방) |
+
+**수집 절차**:
 
 ```bash
+# Pi #1에서: 캡처 먼저 시작
 sudo tcpdump -i eth0 -w tests/fixtures/packet/pcap/port_scan.pcap "tcp or udp" &
 TCPDUMP_PID=$!
-# 공격 노드(Pi #2 또는 관리자 노트북)에서 Port Scan 스크립트 실행
-sleep 30
+sleep 5
+
+# 공격 노드(Pi #2 또는 관리자 노트북)에서: Pi #1의 1~2000번 포트를 SYN 스캔
+nmap -sS -p 1-2000 --min-rate 500 192.168.0.20
+
+# Pi #1에서: 스캔 종료 후 5초 더 대기하고 캡처 종료
+sleep 5
 sudo kill -TERM $TCPDUMP_PID
 ```
 
+**예상 결과**: `nmap` 실행 후 몇 초 안에 "Nmap scan report for 192.168.0.20" 이하 포트별
+open/closed/filtered 목록이 출력되면 스캔 자체는 정상 완료된 것입니다. tcpdump 종료 로그의
+`X packets captured`가 최소 수백~수천 개 수준으로 나와야 합니다 (SYN 패킷 다수).
+
 **검증 기준**:
 
-- 같은 `peer_ip`에서 짧은 시간 안에 `distinct_dest_port_count`가 비정상적으로 높음
-- `tcp_syn_count`가 정상 트래픽 대비 훨씬 높음 (완료되지 않은 연결 다수)
+- 같은 `peer_ip`(스캔 노드 IP)에서 `distinct_dest_port_count`가 수백 단위로 비정상적으로 높음
+- `tcp_syn_count`가 정상 트래픽 대비 훨씬 높음 (완료되지 않은 연결 다수, 대부분 SYN만 있고 응답 없음)
 - 방향은 INBOUND 기준 (5.2절: "PORT_SCAN 후보 Feature는 INBOUND를 기준으로 한다")
 
 ### 4.3 `packet_flood.pcap` — Packet/Byte Rate 이상 시나리오
 
 **목적**: `packets_per_second`/`bytes_per_second` 급증 상황의 Feature 값 검증.
 
-**수집 절차**: Port Scan과 동일한 방식으로, 공격 노드에서 짧은 시간에 다량의 패킷을
-Pi #1로 전송하면서 캡처합니다 (예: `hping3` 또는 유사 트래픽 생성 도구).
+**대상 및 조건**:
+
+| 항목 | 값 |
+| --- | --- |
+| 대상 | Pi #1의 MQTT Broker (`192.168.0.20:1883`) |
+| 방식 | 기존 `attacks/flooding_attack.py`로 MQTT Publish를 짧은 간격으로 반복 발행 |
+| 발행 횟수 | 30회 (`--count 30`) |
+| 발행 간격 | 0.1초 (`--interval 0.1`, 기본 발행 간격 4~6초 대비 현저히 빠름) |
+| 캡처 시간 | 공격 스크립트 실행 5초 전부터 종료 5초 후까지 (여유 포함 약 15~20초) |
+
+**수집 절차**:
+
+```bash
+# Pi #1에서: 캡처 먼저 시작
+sudo tcpdump -i eth0 -w tests/fixtures/packet/pcap/packet_flood.pcap "tcp or udp" &
+TCPDUMP_PID=$!
+sleep 5
+
+# 공격 노드에서 (또는 Pi #1 자체에서): 기존 flooding_attack.py 실행
+python -m attacks.flooding_attack --host 192.168.0.20 --count 30 --interval 0.1
+
+# Pi #1에서: 종료 후 5초 더 대기하고 캡처 종료
+sleep 5
+sudo kill -TERM $TCPDUMP_PID
+```
+
+**예상 결과**: `flooding_attack.py` 실행 로그에 30건의 Publish 성공 메시지가 3초 안팎으로
+빠르게 출력되어야 합니다. tcpdump 종료 로그의 `X packets captured`가 `normal_mqtt.pcap`
+대비 같은 시간 동안 훨씬 많아야 합니다.
 
 **검증 기준**:
 
@@ -186,6 +247,16 @@ python tests/fixtures/packet/generate_synthetic_pcaps.py
 (24바이트 global header만 있고 패킷 레코드 0개). Extractor 쪽 검증(Segment EMPTY 처리)은
 `tests/test_packet_feature_extractor.py`(정종민 담당)에서 이 파일을 입력으로 사용합니다.
 
+**커밋된 파일과의 일치 확인**: 생성 스크립트는 랜덤 요소가 전혀 없는 결정적(deterministic)
+스크립트이므로, 재생성한 파일과 저장소에 커밋된 파일의 SHA256은 항상 동일해야 합니다.
+
+```bash
+python tests/fixtures/packet/generate_synthetic_pcaps.py /tmp/regenerated
+diff <(sha256sum tests/fixtures/packet/pcap/empty_window.pcap | cut -d' ' -f1) \
+     <(sha256sum /tmp/regenerated/empty_window.pcap | cut -d' ' -f1)
+# 출력이 없으면(diff 없음) 일치하는 것
+```
+
 ### 4.5 `partial_capture.pcap` — 손상/중단된 Capture (합성 생성, 완료)
 
 **목적**: 재시작 시 `.pcap.tmp`가 `PARTIAL_CAPTURE`로 처리되는 시나리오, 그리고 Extractor가
@@ -200,6 +271,18 @@ python tests/fixtures/packet/generate_synthetic_pcaps.py
 
 **검증 기준**: `tests/test_generate_synthetic_pcaps.py`가 첫 레코드는 온전하고 마지막
 레코드는 선언된 길이만큼 실제로 존재하지 않음(잘림)을 고정 검증합니다.
+
+**커밋된 파일과의 일치 확인**: `empty_window.pcap`과 동일하게, 재생성 결과와 SHA256을
+비교해 확인합니다.
+
+```bash
+python tests/fixtures/packet/generate_synthetic_pcaps.py /tmp/regenerated
+diff <(sha256sum tests/fixtures/packet/pcap/partial_capture.pcap | cut -d' ' -f1) \
+     <(sha256sum /tmp/regenerated/partial_capture.pcap | cut -d' ' -f1)
+```
+
+두 합성 pcap 모두 Extractor/Parser 테스트(정종민 담당)에서 `tests/fixtures/packet/pcap/`
+경로로 직접 입력 파일로 사용할 수 있습니다 (별도 복사 불필요).
 
 ## 5. 참고 문서
 

@@ -1,7 +1,7 @@
 """Packet Capture Runtime 진입점.
 
 전체 흐름: Crash Recovery -> Session 생성 -> Gap 기록 -> 10초 Window 반복 캡처.
-systemd(packet-capture.service)가 이 모듈을 기동/재시작합니다 (5.4 절).
+systemd(packet-capture.service)가 이 모듈을 기동/재시작합니다.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ class GracefulShutdown:
     """SIGTERM/SIGINT 수신 시 현재 Window 작업을 끝까지 마친 뒤 루프를 빠져나가게 합니다.
 
     관리자가 `systemctl stop`으로 정상 중지한 경우 프로세스는 exit code 0으로
-    종료되므로 Restart=on-failure가 재시작을 트리거하지 않습니다 (5.4 절).
+    종료되므로 Restart=on-failure가 재시작을 트리거하지 않습니다.
     """
 
     def __init__(self) -> None:
@@ -55,7 +55,7 @@ class GracefulShutdown:
 
 
 def reconcile_leftover_tmp_files(db: Session, config: CaptureRuntimeConfig) -> int:
-    """재시작 시 incoming에 남은 .pcap.tmp를 PARTIAL_CAPTURE로 확정합니다 (3.4 절).
+    """재시작 시 incoming에 남은 .pcap.tmp를 PARTIAL_CAPTURE로 확정합니다.
 
     정상 Feature로 사용하지 않고 failed 디렉터리로 옮긴 뒤 FAILED Segment row를 남깁니다.
     """
@@ -242,9 +242,10 @@ def run_capture_loop(
     """first_window_start부터 연속으로 10초 Window를 캡처합니다.
 
     Window 경계(window_start)까지 대기한 뒤 캡처를 시작하고, 캡처 자체가
-    window_seconds만큼 블로킹되므로 window_end에 자연스럽게 끝납니다 (2.1 절).
+    window_seconds만큼 블로킹되므로 window_end에 자연스럽게 끝납니다.
 
     max_windows가 주어지면 그만큼만 캡처하고 반환합니다 (수동 테스트/`--windows` 옵션용).
+    max_windows 카운트에는 만료로 건너뛴 Window는 포함하지 않습니다.
 
     Returns:
         실제로 캡처를 시도한 Window 개수.
@@ -252,76 +253,109 @@ def run_capture_loop(
     window_start = first_window_start
     windows_captured = 0
 
-    while not shutdown.requested:
-        now = clock()
-        window_end = window_start + timedelta(seconds=config.window_seconds)
-
-        if window_end <= now:
-            # 이 Window는 대기하는 동안 이미 지나가 버렸다. 지금 캡처를 시작하면
-            # window_start/window_end 라벨과 실제로 잡히는 트래픽 시각이 어긋나므로
-            # (2 번 리뷰 항목), 캡처를 시도하지 않고 현재 시각 기준 다음 신선한
-            # 경계로 다시 정렬한다.
-            logger.warning(
-                "Window %s~%s는 대기 중 만료되어 건너뜀 (현재 시각=%s); 다음 경계로 재정렬",
-                format_utc_iso(window_start), format_utc_iso(window_end), format_utc_iso(now),
-            )
-            window_start = next_utc_boundary(now, config.window_seconds)
-            continue
-
-        _sleep_until(window_start, clock=clock, sleep=sleep)
-
-        if shutdown.requested:
-            # 대기 중 종료 신호를 받았다면 새 캡처를 시작하지 않고 즉시 빠져나간다
-            # (3 번 리뷰 항목).
-            break
-
-        capture_started_at = clock()
-        drift_seconds = (capture_started_at - window_start).total_seconds()
-        if drift_seconds > 0:
-            # 이 지연 자체는 문제가 아니다 -- execute_capture_window가 window_end까지
-            # 남은 시간만큼만 캡처하도록 자체 보정하므로 다음 Window로 누적되지 않는다.
-            # 다만 지속적으로 지연이 관측되면 DB/디스크 성능 저하의 신호일 수 있어 로그로 남긴다.
-            logger.info("Window %s 캡처가 %.3fs 지연되어 시작됨 (자동 보정됨)", format_utc_iso(window_start), drift_seconds)
-
-        result = execute_capture_window(
-            process,
-            config,
-            session_id=session_id,
-            window_start=window_start,
-            window_end=window_end,
-            capture_started_at=capture_started_at,
-        )
-
-        if result.success:
-            repo.insert_ready_segment(
-                db,
-                capture_session_pk=session_pk,
-                file_name=result.file_name,
-                capture_interface=config.capture_interface,
-                window_start=window_start,
-                window_end=window_end,
-            )
-            logger.info("READY segment 생성: %s", result.file_name)
-        else:
-            repo.insert_failed_segment(
-                db,
-                capture_session_pk=session_pk,
-                file_name=result.file_name,
-                capture_interface=config.capture_interface,
-                window_start=window_start,
-                window_end=window_end,
-                error_code=result.error_code or repo.PARTIAL_CAPTURE,
-                error_message=result.error_message or "",
-            )
-            logger.warning("FAILED segment 생성: %s (%s)", result.file_name, result.error_code)
-
+    def _close_current_session(now: datetime, status: str) -> None:
+        repo.close_session(db, session_pk, now, status)
         db.commit()
-        window_start = window_end
-        windows_captured += 1
 
-        if max_windows is not None and windows_captured >= max_windows:
-            break
+    def _transition_to_new_session(now: datetime) -> None:
+        nonlocal session_pk, session_id, window_start
+        _close_current_session(now, "COMPLETED")
+        session_pk, session_id, window_start = start_new_session(db, config, now)
 
+    try:
+        while not shutdown.requested:
+            now = clock()
+            window_end = window_start + timedelta(seconds=config.window_seconds)
+
+            if window_end <= now:
+                # 이 Window는 대기를 시작하기도 전에 이미 만료된 상태로 발견됐다.
+                logger.warning(
+                    "Window %s~%s는 대기 중 만료되어 건너뜀 (현재 시각=%s); "
+                    "Session을 종료하고 다음 경계에서 새 Session을 시작",
+                    format_utc_iso(window_start), format_utc_iso(window_end), format_utc_iso(now),
+                )
+                _transition_to_new_session(now)
+                continue
+
+            _sleep_until(window_start, clock=clock, sleep=sleep)
+
+            if shutdown.requested:
+                # 대기 중 종료 신호를 받았다면 새 캡처를 시작하지 않고 즉시 빠져나간다
+                break
+
+            capture_started_at = clock()
+
+            if capture_started_at >= window_end:
+                logger.warning(
+                    "Window %s~%s는 캡처 시작 전에 만료됨 (capture_started_at=%s); "
+                    "Session을 종료하고 다음 경계에서 새 Session을 시작",
+                    format_utc_iso(window_start), format_utc_iso(window_end),
+                    format_utc_iso(capture_started_at),
+                )
+                _transition_to_new_session(capture_started_at)
+                continue
+
+            drift_seconds = (capture_started_at - window_start).total_seconds()
+            if drift_seconds > 0:
+                # 이 지연 자체는 문제가 아니다 -- execute_capture_window가 window_end까지
+                # 남은 시간만큼만 캡처하도록 자체 보정하므로 다음 Window로 누적되지 않는다.
+                # 다만 지속적으로 지연이 관측되면 DB/디스크 성능 저하의 신호일 수 있어
+                # 로그로 남긴다.
+                logger.info(
+                    "Window %s 캡처가 %.3fs 지연되어 시작됨 (자동 보정됨)",
+                    format_utc_iso(window_start), drift_seconds,
+                )
+
+            result = execute_capture_window(
+                process,
+                config,
+                session_id=session_id,
+                window_start=window_start,
+                window_end=window_end,
+                capture_started_at=capture_started_at,
+            )
+
+            if result.success:
+                repo.insert_ready_segment(
+                    db,
+                    capture_session_pk=session_pk,
+                    file_name=result.file_name,
+                    capture_interface=config.capture_interface,
+                    window_start=window_start,
+                    window_end=window_end,
+                )
+                logger.info("READY segment 생성: %s", result.file_name)
+            else:
+                repo.insert_failed_segment(
+                    db,
+                    capture_session_pk=session_pk,
+                    file_name=result.file_name,
+                    capture_interface=config.capture_interface,
+                    window_start=window_start,
+                    window_end=window_end,
+                    error_code=result.error_code or repo.PARTIAL_CAPTURE,
+                    error_message=result.error_message or "",
+                )
+                logger.warning("FAILED segment 생성: %s (%s)", result.file_name, result.error_code)
+
+            db.commit()
+            window_start = window_end
+            windows_captured += 1
+
+            if max_windows is not None and windows_captured >= max_windows:
+                break
+    except Exception:
+        logger.exception("Capture loop failed unexpectedly; marking current session FAILED")
+        try:
+            db.rollback()
+            _close_current_session(clock(), "FAILED")
+        except Exception:
+            logger.exception(
+                "Session을 FAILED로 마감하는 cleanup 자체가 실패함 (원래 예외는 위 로그 참고)"
+            )
+        raise  # non-zero exit -> systemd Restart=on-failure
+
+    _close_current_session(clock(), "COMPLETED")
     return windows_captured
 
 
@@ -370,30 +404,17 @@ def main() -> None:
         reconcile_stale_running_sessions(db, config, now)
         session_pk, session_id, first_window_start = start_new_session(db, config, now)
 
-        try:
-            windows_captured = run_capture_loop(
-                db,
-                process,
-                config,
-                session_pk=session_pk,
-                session_id=session_id,
-                first_window_start=first_window_start,
-                shutdown=shutdown,
-                max_windows=args.windows,
-            )
-        except Exception:
-            logger.exception("Capture loop failed unexpectedly; marking session FAILED")
-            db.rollback()
-            repo.close_session(db, session_pk, datetime.now(timezone.utc), "FAILED")
-            db.commit()
-            raise  # non-zero exit -> systemd Restart=on-failure
-
-        repo.close_session(db, session_pk, datetime.now(timezone.utc), "COMPLETED")
-        db.commit()
-        logger.info(
-            "Capture session 정상 종료: session_id=%s windows_captured=%d",
-            session_id, windows_captured,
+        windows_captured = run_capture_loop(
+            db,
+            process,
+            config,
+            session_pk=session_pk,
+            session_id=session_id,
+            first_window_start=first_window_start,
+            shutdown=shutdown,
+            max_windows=args.windows,
         )
+        logger.info("Capture Runtime 종료: windows_captured=%d", windows_captured)
 
 
 if __name__ == "__main__":
