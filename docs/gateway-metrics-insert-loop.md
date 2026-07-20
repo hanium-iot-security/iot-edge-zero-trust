@@ -1,7 +1,5 @@
 # Gateway Metrics DB Insert Loop 구현 계획
 
-> **Agent 작업 지침:** 이 계획은 `superpowers:subagent-driven-development` 또는 `superpowers:executing-plans` 절차로 Task별 실행한다. 진행 상태는 체크박스(`- [ ]`)로 추적한다.
-
 **목표:** Raspberry Pi의 Gateway Metrics를 설정된 주기로 수집해 기존 Repository를 통해 DB에 저장하고, Commit된 최신 Row를 기존 API에서 조회할 수 있게 한다.
 
 **구조:** 장기 실행되는 Collector 한 개가 누적 Counter 기준값을 유지하고, Runner는 Sample마다 새 SQLAlchemy Session을 생성한다. 각 Cycle은 `Collect → Insert → Commit`을 하나의 Transaction 경계로 처리한다. 오류가 발생하면 Rollback 후 예외를 전파하여 systemd가 깨끗한 프로세스로 재시작하게 한다. Signal Handler는 종료 Event를 설정해 새로운 작업을 막고 대기 상태를 즉시 해제한다.
