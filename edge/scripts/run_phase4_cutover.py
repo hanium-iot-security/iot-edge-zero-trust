@@ -27,6 +27,7 @@ from edge.scripts.phase4_cutover import (
     SmokeTestConfig,
     execute_cutover,
     run_cutover_smoke_test,
+    termination_signal_guard,
 )
 
 
@@ -242,22 +243,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         _validate_operational_preflight(
             database,
             args.migrations_dir,
-            (),
+            writer_services,
             backup_directory=args.smoke_database.parent,
             result_path=result_path,
         )
         initializer = _load_initializer(args.checkpoint_initializer)
-        report = run_cutover_smoke_test(
-            SmokeTestConfig(
-                source_database_path=database,
-                smoke_database_path=args.smoke_database,
-                migrations_directory=args.migrations_dir,
-                result_path=result_path,
-                git_sha=args.git_sha,
-            ),
-            apply_migrations=_migration_adapter,
-            initialize_checkpoints=initializer,
-        )
+        with termination_signal_guard():
+            report = run_cutover_smoke_test(
+                SmokeTestConfig(
+                    source_database_path=database,
+                    smoke_database_path=args.smoke_database,
+                    migrations_directory=args.migrations_dir,
+                    result_path=result_path,
+                    git_sha=args.git_sha,
+                    paused_writer_services=writer_services,
+                ),
+                apply_migrations=_migration_adapter,
+                initialize_checkpoints=initializer,
+                stop_service=lambda service: _systemctl("stop", service),
+                start_service=lambda service: _systemctl("start", service),
+                is_service_active=_systemctl_is_active,
+            )
         print(json.dumps({"status": report.status, "result": str(result_path.resolve())}))
         return 0
 
@@ -274,25 +280,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         backup_directory=backup_directory,
         result_path=result_path,
     )
-    report = execute_cutover(
-        CutoverConfig(
-            database_path=database,
-            backup_directory=backup_directory,
-            migrations_directory=args.migrations_dir,
-            result_path=result_path,
-            git_sha=args.git_sha,
-            legacy_services=legacy_services,
-            new_services=new_services,
-            paused_writer_services=writer_services,
-        ),
-        CutoverDependencies(
-            stop_service=lambda service: _systemctl("stop", service),
-            start_service=lambda service: _systemctl("start", service),
-            is_service_active=_systemctl_is_active,
-            apply_migrations=_migration_adapter,
-            initialize_checkpoints=initializer,
-        ),
-    )
+    with termination_signal_guard():
+        report = execute_cutover(
+            CutoverConfig(
+                database_path=database,
+                backup_directory=backup_directory,
+                migrations_directory=args.migrations_dir,
+                result_path=result_path,
+                git_sha=args.git_sha,
+                legacy_services=legacy_services,
+                new_services=new_services,
+                paused_writer_services=writer_services,
+            ),
+            CutoverDependencies(
+                stop_service=lambda service: _systemctl("stop", service),
+                start_service=lambda service: _systemctl("start", service),
+                is_service_active=_systemctl_is_active,
+                apply_migrations=_migration_adapter,
+                initialize_checkpoints=initializer,
+            ),
+        )
     print(json.dumps({"status": report.status, "result": str(result_path)}))
     return 0
 

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
 import json
 from pathlib import Path
+import signal
 import sqlite3
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from edge.scripts.phase4_cutover_storage import (
     BackupArtifact,
@@ -23,6 +25,7 @@ from edge.scripts.phase4_cutover_storage import (
     table_row_counts as _table_row_counts,
     validate_data_preservation as _validate_data_preservation,
     verify_database,
+    verify_phase3b_database_identity,
 )
 
 
@@ -41,6 +44,28 @@ EXPECTED_CHECKPOINT_KEYS = frozenset(
 
 class CutoverExecutionError(RuntimeError):
     """Raised after a failed cutover has attempted its rollback path."""
+
+
+@contextmanager
+def termination_signal_guard() -> Iterator[None]:
+    """Convert SIGINT/SIGTERM into an exception handled by guarded workflows."""
+
+    previous_handlers: dict[signal.Signals, object] = {}
+
+    def interrupt(signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt(signal.Signals(signum).name)
+
+    for signal_name in ("SIGINT", "SIGTERM"):
+        current_signal = getattr(signal, signal_name, None)
+        if current_signal is None:
+            continue
+        previous_handlers[current_signal] = signal.getsignal(current_signal)
+        signal.signal(current_signal, interrupt)
+    try:
+        yield
+    finally:
+        for current_signal, previous_handler in previous_handlers.items():
+            signal.signal(current_signal, previous_handler)
 
 
 @dataclass(frozen=True)
@@ -90,6 +115,7 @@ class CutoverReport:
     rollback_succeeded: bool | None = None
     rollback_error: str | None = None
     rollback_verification: Mapping[str, object] = field(default_factory=dict)
+    database_evidence: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -99,6 +125,7 @@ class SmokeTestConfig:
     migrations_directory: Path
     result_path: Path
     git_sha: str
+    paused_writer_services: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -129,6 +156,9 @@ class SmokeTestReport:
     migration_summary: Mapping[str, object]
     checkpoint_summary: Mapping[str, object]
     database_evidence: Mapping[str, object] = field(default_factory=dict)
+    paused_writer_services: tuple[str, ...] = ()
+    writer_services_before: Mapping[str, bool] = field(default_factory=dict)
+    writer_services_after: Mapping[str, bool] = field(default_factory=dict)
     failure_stage: str | None = None
     error: str | None = None
 
@@ -484,6 +514,7 @@ def execute_cutover(
     migrations_directory = config.migrations_directory.expanduser().resolve()
     if not database.is_file():
         raise CutoverSafetyError(f"Operational database does not exist: {database}")
+    verify_phase3b_database_identity(database)
     cutover_at = dependencies.now()
     cutover_at_iso = _utc_iso(cutover_at)
     backup_path = backup_directory / _backup_name(database, cutover_at)
@@ -548,6 +579,8 @@ def execute_cutover(
     artifact: BackupArtifact | None = None
     migration_summary: Mapping[str, object] = {}
     checkpoint_summary: Mapping[str, object] = {}
+    database_evidence: dict[str, object] = {}
+    database_mutation_started = False
     failure_stage = "service-stop"
 
     with _operation_lock(database):
@@ -560,12 +593,21 @@ def execute_cutover(
                 raise CutoverSafetyError(
                     "Pre-cutover backup failed integrity or foreign-key checks"
                 )
+            database_evidence["before"] = _database_evidence(artifact.database_path)
 
             failure_stage = "migration"
+            database_mutation_started = True
             migration_summary = _summary(
                 dependencies.apply_migrations(database, migrations_directory)
             )
             _validate_migration_summary(migration_summary)
+            database_evidence["after_migration"] = _database_evidence(database)
+            failure_stage = "data-preservation-check"
+            _validate_data_preservation(
+                database_evidence["before"],
+                database_evidence["after_migration"],
+            )
+            failure_stage = "migration-verification"
             post_migration = verify_database(database)
             if post_migration.integrity_check != "ok" or post_migration.foreign_key_violations:
                 raise CutoverSafetyError(
@@ -578,6 +620,13 @@ def execute_cutover(
             )
             _validate_checkpoint_summary(checkpoint_summary)
             _validate_checkpoint_database(database, checkpoint_summary)
+            database_evidence["final"] = _database_evidence(database)
+            failure_stage = "final-data-preservation-check"
+            _validate_data_preservation(
+                database_evidence["before"],
+                database_evidence["final"],
+            )
+            failure_stage = "checkpoint-verification"
             post_checkpoint = verify_database(database)
             if post_checkpoint.integrity_check != "ok" or post_checkpoint.foreign_key_violations:
                 raise CutoverSafetyError(
@@ -620,17 +669,19 @@ def execute_cutover(
                 paused_writer_services=config.paused_writer_services,
                 services_before=services_before,
                 services_after=services_after,
+                database_evidence=database_evidence,
             )
             _write_report(result_path, report)
             return report
-        except Exception as exc:
+        except (Exception, KeyboardInterrupt) as exc:
             rollback_verification: Mapping[str, object] = {}
             rollback_errors: list[str] = []
+            database_safe = not database_mutation_started
             try:
                 _stop_services(config.new_services, dependencies.stop_service)
             except Exception as stop_exc:  # noqa: BLE001
                 rollback_errors.append(str(stop_exc))
-            if artifact is not None:
+            if artifact is not None and database_mutation_started:
                 try:
                     restored = restore_sqlite_backup(
                         target_path=database,
@@ -638,27 +689,34 @@ def execute_cutover(
                         sha256_path=artifact.sha256_path,
                     )
                     rollback_verification = _verification_mapping(restored)
+                    database_safe = True
                 except Exception as restore_exc:  # noqa: BLE001
                     rollback_errors.append(str(restore_exc))
-            try:
-                _restore_service_states(
-                    services_before,
-                    start_service=dependencies.start_service,
-                    stop_service=dependencies.stop_service,
+            if database_safe:
+                try:
+                    _restore_service_states(
+                        services_before,
+                        start_service=dependencies.start_service,
+                        stop_service=dependencies.stop_service,
+                    )
+                except Exception as service_exc:  # noqa: BLE001
+                    rollback_errors.append(str(service_exc))
+            else:
+                rollback_errors.append(
+                    "service restart skipped because database restoration was not verified"
                 )
-            except Exception as service_exc:  # noqa: BLE001
-                rollback_errors.append(str(service_exc))
 
             services_after: Mapping[str, bool] = {}
             try:
                 services_after = _service_states(
                     all_services, dependencies.is_service_active
                 )
-                _validate_service_states(
-                    services_after,
-                    services_before,
-                    context="automatic rollback",
-                )
+                if database_safe:
+                    _validate_service_states(
+                        services_after,
+                        services_before,
+                        context="automatic rollback",
+                    )
             except Exception as verification_exc:  # noqa: BLE001
                 rollback_errors.append(str(verification_exc))
 
@@ -689,6 +747,7 @@ def execute_cutover(
                 rollback_succeeded=not rollback_errors,
                 rollback_error="; ".join(rollback_errors) if rollback_errors else None,
                 rollback_verification=rollback_verification,
+                database_evidence=database_evidence,
             )
             _write_report(result_path, report)
             raise CutoverExecutionError(error_message) from exc
@@ -699,6 +758,9 @@ def run_cutover_smoke_test(
     *,
     apply_migrations: Callable[[Path, Path], object],
     initialize_checkpoints: Callable[[Path, datetime], Mapping[str, object]],
+    stop_service: Callable[[str], None] | None = None,
+    start_service: Callable[[str], None] | None = None,
+    is_service_active: Callable[[str], bool] | None = None,
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> SmokeTestReport:
     """Exercise Migration and checkpoint initialization on a verified DB copy."""
@@ -709,8 +771,15 @@ def run_cutover_smoke_test(
     result_path = config.result_path.expanduser().resolve()
     if not source.is_file():
         raise CutoverSafetyError(f"Source database does not exist: {source}")
+    verify_phase3b_database_identity(source)
     if source == smoke_database:
         raise CutoverSafetyError("Smoke-test database must differ from the source database")
+    if config.paused_writer_services and (
+        stop_service is None or start_service is None or is_service_active is None
+    ):
+        raise CutoverSafetyError(
+            "Smoke-test writer services require stop, start, and status callbacks"
+        )
     source_snapshot_before = smoke_database.with_name(
         f"{smoke_database.stem}.source-before{source.suffix}"
     )
@@ -774,10 +843,29 @@ def run_cutover_smoke_test(
     checkpoint_summary: Mapping[str, object] = {}
     final_verification: DatabaseVerification | None = None
     evidence: Mapping[str, object] = {}
+    writer_states: Mapping[str, bool] = {}
+    writer_states_after: Mapping[str, bool] = {}
+    writer_pause_attempted = False
     failure_stage = "snapshot"
 
     with _operation_lock(source):
         try:
+            if config.paused_writer_services:
+                assert stop_service is not None
+                assert start_service is not None
+                assert is_service_active is not None
+                failure_stage = "writer-pause"
+                writer_states = _service_states(
+                    config.paused_writer_services, is_service_active
+                )
+                writer_pause_attempted = True
+                _stop_services(config.paused_writer_services, stop_service)
+                _validate_service_states(
+                    _service_states(config.paused_writer_services, is_service_active),
+                    {service: False for service in config.paused_writer_services},
+                    context="smoke-test writer pause",
+                )
+                failure_stage = "snapshot"
             source_snapshot_before_artifact = create_sqlite_backup(
                 source, source_snapshot_before
             )
@@ -857,6 +945,25 @@ def run_cutover_smoke_test(
             if not source_unchanged:
                 raise CutoverSafetyError("Smoke-test source database changed unexpectedly")
 
+            if writer_pause_attempted:
+                assert start_service is not None
+                assert stop_service is not None
+                assert is_service_active is not None
+                failure_stage = "writer-restore"
+                _restore_service_states(
+                    writer_states,
+                    start_service=start_service,
+                    stop_service=stop_service,
+                )
+                _validate_service_states(
+                    _service_states(config.paused_writer_services, is_service_active),
+                    writer_states,
+                    context="smoke-test writer restore",
+                )
+                writer_states_after = _service_states(
+                    config.paused_writer_services, is_service_active
+                )
+
             report = SmokeTestReport(
                 status="succeeded",
                 mode="smoke-test",
@@ -888,10 +995,34 @@ def run_cutover_smoke_test(
                 migration_summary=migration_summary,
                 checkpoint_summary=checkpoint_summary,
                 database_evidence=evidence,
+                paused_writer_services=config.paused_writer_services,
+                writer_services_before=writer_states,
+                writer_services_after=writer_states_after,
             )
             _write_report(result_path, report)
             return report
-        except Exception as exc:
+        except (Exception, KeyboardInterrupt) as exc:
+            writer_restore_error: str | None = None
+            if writer_pause_attempted:
+                assert start_service is not None
+                assert stop_service is not None
+                assert is_service_active is not None
+                try:
+                    _restore_service_states(
+                        writer_states,
+                        start_service=start_service,
+                        stop_service=stop_service,
+                    )
+                    _validate_service_states(
+                        _service_states(config.paused_writer_services, is_service_active),
+                        writer_states,
+                        context="smoke-test writer recovery",
+                    )
+                    writer_states_after = _service_states(
+                        config.paused_writer_services, is_service_active
+                    )
+                except Exception as writer_exc:  # noqa: BLE001
+                    writer_restore_error = str(writer_exc)
             source_sha_after = _sha256_file(source)
             if source_snapshot_after_artifact is None:
                 try:
@@ -970,11 +1101,18 @@ def run_cutover_smoke_test(
                 migration_summary=migration_summary,
                 checkpoint_summary=checkpoint_summary,
                 database_evidence=evidence,
+                paused_writer_services=config.paused_writer_services,
+                writer_services_before=writer_states,
+                writer_services_after=writer_states_after,
                 failure_stage=failure_stage,
-                error=str(exc),
+                error=(
+                    str(exc)
+                    if writer_restore_error is None
+                    else f"{exc}; writer recovery failed: {writer_restore_error}"
+                ),
             )
             _write_report(result_path, report)
-            raise CutoverExecutionError(str(exc)) from exc
+            raise CutoverExecutionError(report.error or str(exc)) from exc
 
 
 def execute_rollback(
@@ -1062,6 +1200,7 @@ def execute_rollback(
         record_preflight_failure(message)
         raise CutoverSafetyError(message)
     try:
+        verify_phase3b_database_identity(database)
         expected = _expected_sha256(sha256_path, backup)
         actual = _sha256_file(backup)
         if actual != expected:
@@ -1074,6 +1213,7 @@ def execute_rollback(
             or backup_verification.foreign_key_violations
         ):
             raise CutoverSafetyError("Backup database failed checks; refusing rollback")
+        verify_phase3b_database_identity(backup)
     except Exception as exc:
         record_preflight_failure(str(exc))
         raise
@@ -1088,6 +1228,7 @@ def execute_rollback(
 
     pre_rollback_artifact: BackupArtifact | None = None
     restored: DatabaseVerification | None = None
+    database_mutation_started = False
     failure_stage = "service-stop"
 
     with _operation_lock(database):
@@ -1096,8 +1237,17 @@ def execute_rollback(
 
             failure_stage = "pre-rollback-backup"
             pre_rollback_artifact = create_sqlite_backup(database, pre_rollback_path)
+            if (
+                pre_rollback_artifact.integrity_check != "ok"
+                or pre_rollback_artifact.foreign_key_violations
+            ):
+                raise CutoverSafetyError(
+                    "Pre-rollback backup failed integrity or foreign-key checks"
+                )
+            verify_phase3b_database_identity(pre_rollback_artifact.database_path)
 
             failure_stage = "database-restore"
+            database_mutation_started = True
             restored = restore_sqlite_backup(
                 target_path=database,
                 backup_path=backup,
@@ -1143,35 +1293,43 @@ def execute_rollback(
             )
             _write_report(result_path, report)
             return report
-        except Exception as exc:
+        except (Exception, KeyboardInterrupt) as exc:
             recovery_errors: list[str] = []
-            if pre_rollback_artifact is not None:
+            database_safe = not database_mutation_started
+            if pre_rollback_artifact is not None and database_mutation_started:
                 try:
                     restore_sqlite_backup(
                         target_path=database,
                         backup_path=pre_rollback_artifact.database_path,
                         sha256_path=pre_rollback_artifact.sha256_path,
                     )
+                    database_safe = True
                 except Exception as restore_exc:  # noqa: BLE001
                     recovery_errors.append(str(restore_exc))
-            try:
-                _restore_service_states(
-                    services_before,
-                    start_service=dependencies.start_service,
-                    stop_service=dependencies.stop_service,
+            if database_safe:
+                try:
+                    _restore_service_states(
+                        services_before,
+                        start_service=dependencies.start_service,
+                        stop_service=dependencies.stop_service,
+                    )
+                except Exception as service_exc:  # noqa: BLE001
+                    recovery_errors.append(str(service_exc))
+            else:
+                recovery_errors.append(
+                    "service restart skipped because database recovery was not verified"
                 )
-            except Exception as service_exc:  # noqa: BLE001
-                recovery_errors.append(str(service_exc))
             services_after: Mapping[str, bool] = {}
             try:
                 services_after = _service_states(
                     all_services, dependencies.is_service_active
                 )
-                _validate_service_states(
-                    services_after,
-                    services_before,
-                    context="rollback recovery",
-                )
+                if database_safe:
+                    _validate_service_states(
+                        services_after,
+                        services_before,
+                        context="rollback recovery",
+                    )
             except Exception as verification_exc:  # noqa: BLE001
                 recovery_errors.append(str(verification_exc))
             error_message = str(exc)

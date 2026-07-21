@@ -74,6 +74,8 @@ Runner는 반환 요약과 DB Row의 Key·`last_processed_id`·UTC 완료 Window
 - 운영 DB를 단순 파일 복사하지 않고 Python SQLite Backup API로 Snapshot을 만든다.
 - Backup과 SHA256 Manifest의 파일명이 일치해야 한다.
 - Backup 복원 전 SHA256, `PRAGMA integrity_check`, `PRAGMA foreign_key_check`를 검증한다.
+- 운영 DB와 복원 대상 Backup은 Phase 3-B 필수 테이블과 `schema_migrations` Version 1·2가
+  모두 존재하는지 확인한다. 일반 SQLite 파일이나 다른 프로젝트 DB는 사용하지 않는다.
 - 실제 Cutover는 `--execute --confirm PHASE4-CUTOVER`가 모두 있어야 한다.
 - 실제 Rollback은 `--execute --confirm PHASE4-ROLLBACK`이 모두 있어야 한다.
 - Pi의 실제 Cutover·Rollback은 root 권한으로 실행한다.
@@ -82,6 +84,10 @@ Runner는 반환 요약과 DB Row의 Key·`last_processed_id`·UTC 완료 Window
   쓰는 모든 Unit을 전달한다. Cutover 동안 중지하고 성공·실패 후 작업 전 상태로 복구한다.
 - 기존·신규·Writer Unit의 작업 전 active/inactive 상태를 JSON에 기록한다. 실패 시에는
   작업 전 active였던 Unit만 다시 활성화하고 원래 inactive였던 Unit은 시작하지 않는다.
+- SIGINT·SIGTERM을 포함한 중단은 실패로 처리하고, Migration·Checkpoint·서비스 전환 중
+  발생했다면 동일한 자동 Rollback 경로를 실행한다.
+- DB 변경 후 복원과 무결성·FK 검증이 성공한 경우에만 기존·Writer 서비스를 재시작한다.
+  DB 안전성을 확인할 수 없으면 관련 Unit을 중지 상태로 유지하고 수동 복구한다.
 - DB별 Lock 파일로 Cutover·Smoke·Rollback의 동시 실행을 차단한다.
 - POSIX에서는 `flock`이 사용하는 Lock 파일을 해제 후에도 삭제하지 않는다. 동일 경로의
   동일 inode를 다음 실행에서도 재사용하는 것이 정상이다.
@@ -150,12 +156,15 @@ python -m edge.scripts.run_phase4_cutover \
   --smoke-database /home/pi/iot-edge-zero-trust/backend/data/backups/phase4-cutover-smoke.db \
   --result /home/pi/iot-edge-zero-trust/data/exports/phase4-cutover-smoke.json \
   --git-sha "$(git rev-parse HEAD)" \
+  --writer-service packet-capture.service \
+  --writer-service gateway-metrics.service \
   --smoke-test
 ```
 
 확인 기준:
 
-- 원본 운영 DB는 실행 전·후 각각 SQLite Backup API로 논리 Snapshot을 생성함
+- 전달한 Writer Unit을 작업 전 상태로 기록하고 Smoke 동안 중지한 뒤 작업 전 상태로 복구함
+- Writer가 중지된 안정된 원본 운영 DB에서 실행 전·후 각각 SQLite Backup API로 논리 Snapshot을 생성함
 - `source_snapshot_before`, `source_snapshot_after`와 각 SHA256 Manifest가 별도 보존됨
 - 두 논리 Snapshot의 SHA256과 Table별 Row 수가 같고 `source_unchanged=true`임
 - Migration 전 Smoke Snapshot Manifest와 Migration 후 Manifest가 별도 파일로 보존됨
@@ -172,6 +181,9 @@ python -m edge.scripts.run_phase4_cutover \
 - Migration 직후뿐 아니라 Checkpoint 초기화 후 `smoke_final` 증적에서도 보존 계약을 다시 검증함
 - 보존 검사가 실패하면 `failure_stage=data-preservation-check` 또는
   `failure_stage=final-data-preservation-check`로 기록됨
+
+운영 DB에 쓰는 활성 systemd Writer는 모두 `--writer-service`로 전달한다. Cron 기반 Writer는
+Smoke 직전에 별도로 중지하고 완료 후 원래 상태로 복구하며 그 증거를 결과 문서에 남긴다.
 
 기존 Smoke DB를 재사용하지 말고 실행별 새 경로를 사용한다. 실패한 Smoke DB와 결과 JSON은
 삭제하지 않고 원인 분석용으로 보존한다.
@@ -210,14 +222,17 @@ sudo /home/pi/iot-edge-zero-trust/venv/bin/python \
 - 적용·건너뛴 Migration Version
 - Source별 초기 Checkpoint 요약
 - FK·Integrity 결과
+- Backup 기준 `before`, Migration 직후 `after_migration`, Checkpoint 초기화 후 `final`의
+  Segment·Packet Feature·Detection Event 보존 증적과 검사 결과
 - 중지한 기존 서비스와 시작한 신규 서비스
 - Writer를 포함한 전체 Unit의 작업 전·후 active 상태
 - 성공 판정 시 기존 Unit은 inactive, 신규 Unit은 active, Writer는 작업 전 상태와 일치함
 - 실패 시 `failure_stage`, `primary_error`, `rollback_attempted`, `rollback_succeeded`,
   `rollback_error`와 하위 호환용 `error` 요약
 
-도중 실패하면 도구가 생성한 Backup을 검증해 자동 복원을 시도하고 기존 systemd Unit을
-재시작한다. 복구 명령 이후 전체 Unit의 실제 상태가 작업 전 상태와 정확히 일치해야만
+도중 실패하면 도구가 생성한 Backup을 검증해 자동 복원을 시도한다. DB 변경이 시작된 뒤
+복원이 실패하거나 복원 후 무결성·FK를 확인할 수 없으면 기존·Writer Unit을 재시작하지 않는다.
+DB 안전성이 확인된 경우에만 복구 명령을 실행하며, 전체 Unit의 실제 상태가 작업 전 상태와 정확히 일치해야만
 `rolled_back`, `rollback_succeeded=true`로 기록한다. `rollback_failed`이면 서비스를 임의로
 재시작하지 말고 아래 명시적 Rollback 절차를 수행한다.
 
@@ -265,10 +280,11 @@ sudo /home/pi/iot-edge-zero-trust/venv/bin/python \
 
 명시적 Rollback은 대상 운영 DB가 실제 일반 파일인지 먼저 확인하고, 전달된 기존·신규·Writer
 Unit이 실제 systemd에 존재하는지 서비스 변경 전에 확인한다. 이후 Unit을 모두 중지한 후 현재
-DB를 `pre_manual_rollback` Backup·SHA256으로 추가 보존한다. 지정
+DB를 `pre_manual_rollback` Backup·SHA256으로 추가 보존한다. Pre-rollback Backup의 SHA256,
+무결성·FK와 Phase 3-B DB 식별 검증이 통과해야만 지정 Backup 복원을 시작한다. 지정
 Backup 복원과 검증이 끝나면 기존 Unit을 시작하고 Writer는 작업 전 상태로 복구하며 신규 Unit은
 중지 상태를 유지한다. 명령 실행 후 이 실제 상태가 확인돼야만 성공으로 기록한다. 복원이 검증되기
-전에는 기존 Cron을 재시작하지 않는다. Rollback 이후
+전에는 systemd Unit과 기존 Cron을 재시작하지 않는다. Rollback 이후
 새 Cutover를 시도하려면 새 Backup·SHA256과 새로운 `phase4_cutover_at`을 생성한다.
 
 ## 9. 결과 기록

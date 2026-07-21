@@ -36,6 +36,25 @@ _DETECTION_EVENT_PRESERVED_COLUMNS = (
     "policy_version",
 )
 
+_PHASE3B_REQUIRED_TABLES = frozenset(
+    {
+        "schema_migrations",
+        "devices",
+        "mqtt_logs",
+        "feature_logs",
+        "detection_events",
+        "isolation_history",
+        "packet_capture_sessions",
+        "packet_capture_segments",
+        "packet_feature_logs",
+        "gateway_metrics",
+        "detector_checkpoints",
+        "trust_score_history",
+        "firewall_rules",
+    }
+)
+_PHASE3B_REQUIRED_MIGRATION_VERSIONS = frozenset({1, 2})
+
 
 @dataclass(frozen=True)
 class DatabaseVerification:
@@ -69,6 +88,51 @@ def verify_database(database_path: str | Path) -> DatabaseVerification:
         integrity_check=integrity,
         foreign_key_violations=foreign_key_violations,
     )
+
+
+def verify_phase3b_database_identity(database_path: str | Path) -> Mapping[str, object]:
+    """Reject valid SQLite files that are not the expected Phase 3-B database."""
+
+    path = Path(database_path).expanduser().resolve()
+    if not path.is_file():
+        raise CutoverSafetyError(f"Database does not exist: {path}")
+    try:
+        with sqlite3.connect(path) as connection:
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            missing_tables = sorted(_PHASE3B_REQUIRED_TABLES - tables)
+            if missing_tables:
+                raise CutoverSafetyError(
+                    "Not a Phase 3-B database; missing required tables: "
+                    f"{missing_tables}"
+                )
+            applied_versions = {
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT version FROM schema_migrations"
+                ).fetchall()
+            }
+    except sqlite3.DatabaseError as exc:
+        raise CutoverSafetyError(
+            f"Not a Phase 3-B database; schema inspection failed: {exc}"
+        ) from exc
+
+    missing_versions = sorted(
+        _PHASE3B_REQUIRED_MIGRATION_VERSIONS - applied_versions
+    )
+    if missing_versions:
+        raise CutoverSafetyError(
+            "Not a Phase 3-B database; missing applied Migration versions: "
+            f"{missing_versions}"
+        )
+    return {
+        "required_tables": tuple(sorted(_PHASE3B_REQUIRED_TABLES)),
+        "applied_migration_versions": tuple(sorted(applied_versions)),
+    }
 
 
 def file_sha256(path: Path) -> str:

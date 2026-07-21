@@ -33,6 +33,19 @@ def create_source_database(path: Path) -> None:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(
             """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO schema_migrations (version, name) VALUES (?, ?)",
+            ((1, "init"), (2, "packet_gateway")),
+        )
+        connection.execute(
+            """
             CREATE TABLE parent (
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL
@@ -58,6 +71,48 @@ def create_source_database(path: Path) -> None:
                 last_completed_window_end DATETIME,
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (detector_name, source_table)
+            )
+            """
+        )
+        for table_name in (
+            "devices",
+            "mqtt_logs",
+            "feature_logs",
+            "isolation_history",
+            "packet_capture_sessions",
+            "gateway_metrics",
+            "trust_score_history",
+            "firewall_rules",
+        ):
+            connection.execute(
+                f'CREATE TABLE "{table_name}" (id INTEGER PRIMARY KEY)'
+            )
+        connection.execute(
+            """
+            CREATE TABLE packet_capture_segments (
+                id INTEGER PRIMARY KEY,
+                status TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE packet_feature_logs (
+                id INTEGER PRIMARY KEY,
+                capture_segment_id INTEGER
+                    REFERENCES packet_capture_segments(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE detection_events (
+                id INTEGER PRIMARY KEY,
+                detector_type TEXT,
+                event_type TEXT,
+                severity TEXT,
+                score_delta INTEGER,
+                description TEXT
             )
             """
         )
@@ -109,30 +164,6 @@ def persist_checkpoint_summary(
 def create_phase3b_evidence_tables(path: Path) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute(
-            "CREATE TABLE packet_capture_segments (id INTEGER PRIMARY KEY, status TEXT)"
-        )
-        connection.execute(
-            """
-            CREATE TABLE packet_feature_logs (
-                id INTEGER PRIMARY KEY,
-                capture_segment_id INTEGER NOT NULL
-                    REFERENCES packet_capture_segments(id)
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE detection_events (
-                id INTEGER PRIMARY KEY,
-                detector_type TEXT,
-                event_type TEXT,
-                severity TEXT,
-                score_delta INTEGER,
-                description TEXT
-            )
-            """
-        )
         connection.execute(
             "INSERT INTO packet_capture_segments (id, status) VALUES (10, 'PROCESSED')"
         )

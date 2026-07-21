@@ -22,6 +22,7 @@ from edge.scripts.phase4_cutover import (
     execute_cutover,
     execute_rollback,
     run_cutover_smoke_test,
+    termination_signal_guard,
 )
 from tests.phase4_cutover_test_support import (
     CHECKPOINT_KEYS,
@@ -30,6 +31,35 @@ from tests.phase4_cutover_test_support import (
     create_source_database as _create_source_database,
     persist_checkpoint_summary as _persist_checkpoint_summary,
 )
+
+
+def test_termination_signal_guard_converts_sigterm_and_restores_handlers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    previous_handlers = {
+        cutover_runtime.signal.SIGINT: object(),
+        cutover_runtime.signal.SIGTERM: object(),
+    }
+    installed_handlers: dict[int, object] = {}
+
+    monkeypatch.setattr(
+        cutover_runtime.signal,
+        "getsignal",
+        lambda signal_number: previous_handlers[signal_number],
+    )
+
+    def record_handler(signal_number: int, handler: object) -> None:
+        installed_handlers[signal_number] = handler
+
+    monkeypatch.setattr(cutover_runtime.signal, "signal", record_handler)
+
+    with pytest.raises(KeyboardInterrupt, match="SIGTERM"):
+        with termination_signal_guard():
+            handler = installed_handlers[cutover_runtime.signal.SIGTERM]
+            assert callable(handler)
+            handler(cutover_runtime.signal.SIGTERM, None)
+
+    assert installed_handlers == previous_handlers
 
 
 def test_execute_cutover_uses_safe_order_and_records_result(tmp_path: Path) -> None:
@@ -530,7 +560,8 @@ def test_cutover_report_separates_primary_and_database_restore_errors(
     assert saved["primary_error"] == "checkpoint failed"
     assert saved["rollback_attempted"] is True
     assert saved["rollback_succeeded"] is False
-    assert saved["rollback_error"] == "restore IO failed"
+    assert "restore IO failed" in saved["rollback_error"]
+    assert "service restart skipped" in saved["rollback_error"]
 
 
 def test_manual_rollback_stops_all_writers_and_preserves_current_database_backup(
@@ -1408,3 +1439,349 @@ def test_smoke_rejects_replacing_existing_detection_event_ids(tmp_path: Path) ->
             initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
             now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
         )
+
+
+def test_cutover_does_not_restart_services_when_database_restore_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "operational.db"
+    _create_source_database(database)
+    active = {"legacy.service": True, "new.service": False}
+    started: list[str] = []
+
+    def stop(service: str) -> None:
+        active[service] = False
+
+    def start(service: str) -> None:
+        started.append(service)
+        active[service] = True
+
+    def migrate(path: Path, _: Path) -> dict[str, object]:
+        with sqlite3.connect(path) as connection:
+            connection.execute("UPDATE parent SET name = 'unsafe' WHERE id = 1")
+        return {"applied_versions": [3]}
+
+    monkeypatch.setattr(
+        cutover_runtime,
+        "restore_sqlite_backup",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("restore failed")),
+    )
+
+    with pytest.raises(CutoverExecutionError, match="restore failed"):
+        execute_cutover(
+            CutoverConfig(
+                database_path=database,
+                backup_directory=tmp_path / "backups",
+                migrations_directory=tmp_path / "migrations",
+                result_path=tmp_path / "cutover.json",
+                git_sha="2b7a517",
+                legacy_services=("legacy.service",),
+                new_services=("new.service",),
+            ),
+            CutoverDependencies(
+                stop_service=stop,
+                start_service=start,
+                is_service_active=lambda service: active[service],
+                apply_migrations=migrate,
+                initialize_checkpoints=lambda *_: (_ for _ in ()).throw(
+                    RuntimeError("checkpoint failed")
+                ),
+            ),
+        )
+
+    assert started == []
+    assert active == {"legacy.service": False, "new.service": False}
+
+
+@pytest.mark.parametrize("interrupt_stage", ["migration", "checkpoint", "service-start"])
+def test_cutover_rolls_back_keyboard_interrupt_at_each_mutating_stage(
+    tmp_path: Path,
+    interrupt_stage: str,
+) -> None:
+    database = tmp_path / "operational.db"
+    _create_source_database(database)
+    active = {"legacy.service": True, "new.service": False}
+
+    def stop(service: str) -> None:
+        active[service] = False
+
+    def start(service: str) -> None:
+        if interrupt_stage == "service-start" and service == "new.service":
+            raise KeyboardInterrupt("SIGTERM")
+        active[service] = True
+
+    def migrate(path: Path, _: Path) -> dict[str, object]:
+        with sqlite3.connect(path) as connection:
+            connection.execute("UPDATE parent SET name = 'migrated' WHERE id = 1")
+        if interrupt_stage == "migration":
+            raise KeyboardInterrupt("SIGTERM")
+        return {"applied_versions": [3]}
+
+    def initialize(path: Path, _: datetime) -> dict[str, object]:
+        if interrupt_stage == "checkpoint":
+            raise KeyboardInterrupt("SIGTERM")
+        return _persist_checkpoint_summary(path)
+
+    with pytest.raises(CutoverExecutionError, match="SIGTERM"):
+        execute_cutover(
+            CutoverConfig(
+                database_path=database,
+                backup_directory=tmp_path / "backups",
+                migrations_directory=tmp_path / "migrations",
+                result_path=tmp_path / "cutover.json",
+                git_sha="2b7a517",
+                legacy_services=("legacy.service",),
+                new_services=("new.service",),
+            ),
+            CutoverDependencies(
+                stop_service=stop,
+                start_service=start,
+                is_service_active=lambda service: active[service],
+                apply_migrations=migrate,
+                initialize_checkpoints=initialize,
+            ),
+        )
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT name FROM parent WHERE id = 1").fetchone()[0] == (
+            "before-cutover"
+        )
+    assert active == {"legacy.service": True, "new.service": False}
+
+
+def test_operational_cutover_rejects_phase3b_data_preservation_violation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "operational.db"
+    _create_source_database(database)
+    _create_phase3b_evidence_tables(database)
+    active = {"new.service": False}
+
+    def migrate(path: Path, _: Path) -> dict[str, object]:
+        with sqlite3.connect(path) as connection:
+            connection.execute("DELETE FROM packet_capture_segments WHERE id = 10")
+        return {"applied_versions": [3]}
+
+    with pytest.raises(CutoverExecutionError, match="segment rows changed"):
+        execute_cutover(
+            CutoverConfig(
+                database_path=database,
+                backup_directory=tmp_path / "backups",
+                migrations_directory=tmp_path / "migrations",
+                result_path=tmp_path / "cutover.json",
+                git_sha="2b7a517",
+                new_services=("new.service",),
+            ),
+            CutoverDependencies(
+                stop_service=lambda service: active.__setitem__(service, False),
+                start_service=lambda service: active.__setitem__(service, True),
+                is_service_active=lambda service: active[service],
+                apply_migrations=migrate,
+                initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+            ),
+        )
+
+    saved = json.loads((tmp_path / "cutover.json").read_text(encoding="utf-8"))
+    assert saved["failure_stage"] == "data-preservation-check"
+    assert saved["database_evidence"]["before"]
+    assert saved["database_evidence"]["after_migration"]
+
+
+def test_cutover_rejects_unrelated_sqlite_database_before_services_change(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "unrelated.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+    events: list[str] = []
+
+    with pytest.raises(CutoverSafetyError, match="Phase 3-B database"):
+        execute_cutover(
+            CutoverConfig(
+                database_path=database,
+                backup_directory=tmp_path / "backups",
+                migrations_directory=tmp_path / "migrations",
+                result_path=tmp_path / "cutover.json",
+                git_sha="2b7a517",
+            ),
+            CutoverDependencies(
+                stop_service=lambda service: events.append(service),
+                start_service=lambda service: events.append(service),
+                is_service_active=lambda _: False,
+                apply_migrations=lambda *_: {"applied_versions": [3]},
+                initialize_checkpoints=lambda *_: _complete_checkpoint_summary(),
+            ),
+        )
+
+    assert events == []
+
+
+def test_smoke_pauses_and_restores_configured_writer_services(tmp_path: Path) -> None:
+    source = tmp_path / "operational.db"
+    _create_source_database(source)
+    active = {"mqtt-writer.service": True, "gateway-metrics.service": True}
+    events: list[str] = []
+
+    def stop(service: str) -> None:
+        events.append(f"stop:{service}")
+        active[service] = False
+
+    def start(service: str) -> None:
+        events.append(f"start:{service}")
+        active[service] = True
+
+    report = run_cutover_smoke_test(
+        SmokeTestConfig(
+            source_database_path=source,
+            smoke_database_path=tmp_path / "smoke.db",
+            migrations_directory=tmp_path / "migrations",
+            result_path=tmp_path / "smoke.json",
+            git_sha="2b7a517",
+            paused_writer_services=("mqtt-writer.service", "gateway-metrics.service"),
+        ),
+        apply_migrations=lambda *_: {"applied_versions": [3]},
+        initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+        stop_service=stop,
+        start_service=start,
+        is_service_active=lambda service: active[service],
+    )
+
+    assert report.status == "succeeded"
+    assert events[:2] == ["stop:mqtt-writer.service", "stop:gateway-metrics.service"]
+    assert active == {"mqtt-writer.service": True, "gateway-metrics.service": True}
+    assert report.writer_services_before == active
+    assert report.writer_services_after == active
+
+
+def test_manual_rollback_rejects_invalid_pre_rollback_backup_before_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "operational.db"
+    selected_backup = tmp_path / "selected.db"
+    _create_source_database(database)
+    selected_artifact = create_sqlite_backup(database, selected_backup)
+    real_create_backup = cutover_runtime.create_sqlite_backup
+    real_restore_backup = cutover_runtime.restore_sqlite_backup
+    restore_called = False
+
+    def create_invalid_prebackup(source: Path, destination: Path):
+        artifact = real_create_backup(source, destination)
+        return type(artifact)(
+            database_path=artifact.database_path,
+            sha256_path=artifact.sha256_path,
+            sha256=artifact.sha256,
+            integrity_check="corrupt",
+            foreign_key_violations=(),
+        )
+
+    def track_restore(**kwargs):
+        nonlocal restore_called
+        restore_called = True
+        return real_restore_backup(**kwargs)
+
+    monkeypatch.setattr(cutover_runtime, "create_sqlite_backup", create_invalid_prebackup)
+    monkeypatch.setattr(cutover_runtime, "restore_sqlite_backup", track_restore)
+
+    with pytest.raises(CutoverExecutionError, match="Pre-rollback backup failed"):
+        execute_rollback(
+            RollbackConfig(
+                database_path=database,
+                backup_path=selected_backup,
+                sha256_path=selected_artifact.sha256_path,
+                backup_directory=tmp_path / "pre-rollback",
+                result_path=tmp_path / "rollback.json",
+                git_sha="2b7a517",
+            ),
+            RollbackDependencies(
+                stop_service=lambda _: None,
+                start_service=lambda _: None,
+                is_service_active=lambda _: False,
+            ),
+        )
+
+    assert restore_called is False
+
+
+def test_manual_rollback_rejects_unrelated_backup_before_services_change(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "operational.db"
+    unrelated = tmp_path / "unrelated.db"
+    _create_source_database(database)
+    with sqlite3.connect(unrelated) as connection:
+        connection.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+    manifest = unrelated.with_suffix(".db.sha256")
+    digest = hashlib.sha256(unrelated.read_bytes()).hexdigest()
+    manifest.write_text(f"{digest}  {unrelated.name}\n", encoding="utf-8")
+    events: list[str] = []
+
+    with pytest.raises(CutoverSafetyError, match="Phase 3-B database"):
+        execute_rollback(
+            RollbackConfig(
+                database_path=database,
+                backup_path=unrelated,
+                sha256_path=manifest,
+                backup_directory=tmp_path / "pre-rollback",
+                result_path=tmp_path / "rollback.json",
+                git_sha="2b7a517",
+            ),
+            RollbackDependencies(
+                stop_service=lambda service: events.append(f"stop:{service}"),
+                start_service=lambda service: events.append(f"start:{service}"),
+                is_service_active=lambda _: False,
+            ),
+        )
+
+    assert events == []
+
+
+def test_manual_rollback_does_not_restart_services_when_database_recovery_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "operational.db"
+    selected = tmp_path / "selected.db"
+    _create_source_database(database)
+    artifact = create_sqlite_backup(database, selected)
+    active = {"legacy.service": False, "new.service": True}
+    started: list[str] = []
+    restore_attempts = 0
+
+    def fail_restore(**_: object):
+        nonlocal restore_attempts
+        restore_attempts += 1
+        raise RuntimeError(f"restore failed {restore_attempts}")
+
+    def stop(service: str) -> None:
+        active[service] = False
+
+    def start(service: str) -> None:
+        started.append(service)
+        active[service] = True
+
+    monkeypatch.setattr(cutover_runtime, "restore_sqlite_backup", fail_restore)
+
+    with pytest.raises(CutoverExecutionError, match="rollback recovery failed"):
+        execute_rollback(
+            RollbackConfig(
+                database_path=database,
+                backup_path=selected,
+                sha256_path=artifact.sha256_path,
+                backup_directory=tmp_path / "pre-rollback",
+                result_path=tmp_path / "rollback.json",
+                git_sha="2b7a517",
+                legacy_services=("legacy.service",),
+                new_services=("new.service",),
+            ),
+            RollbackDependencies(
+                stop_service=stop,
+                start_service=start,
+                is_service_active=lambda service: active[service],
+            ),
+        )
+
+    assert restore_attempts == 2
+    assert started == []
+    assert active == {"legacy.service": False, "new.service": False}

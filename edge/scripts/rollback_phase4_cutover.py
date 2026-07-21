@@ -17,6 +17,7 @@ from edge.scripts.phase4_cutover import (
     RollbackConfig,
     RollbackDependencies,
     execute_rollback,
+    termination_signal_guard,
 )
 from edge.scripts.run_phase4_cutover import (
     _probe_writable_directory,
@@ -166,24 +167,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         result_path=result_path,
         services=all_services,
     )
-    report = execute_rollback(
-        RollbackConfig(
-            database_path=database,
-            backup_path=backup,
-            sha256_path=sha256_path,
-            backup_directory=args.pre_rollback_backup_dir,
-            result_path=result_path,
-            git_sha=args.git_sha,
-            legacy_services=legacy_services,
-            new_services=new_services,
-            paused_writer_services=writer_services,
-        ),
-        RollbackDependencies(
-            stop_service=lambda service: _systemctl("stop", service),
-            start_service=lambda service: _systemctl("start", service),
-            is_service_active=_systemctl_is_active,
-        ),
-    )
+    with termination_signal_guard():
+        report = execute_rollback(
+            RollbackConfig(
+                database_path=database,
+                backup_path=backup,
+                sha256_path=sha256_path,
+                backup_directory=args.pre_rollback_backup_dir,
+                result_path=result_path,
+                git_sha=args.git_sha,
+                legacy_services=legacy_services,
+                new_services=new_services,
+                paused_writer_services=writer_services,
+            ),
+            RollbackDependencies(
+                stop_service=lambda service: _systemctl("stop", service),
+                start_service=lambda service: _systemctl("start", service),
+                is_service_active=_systemctl_is_active,
+            ),
+        )
     print(json.dumps({"status": report.status, "result": str(result_path)}))
     return 0
 
