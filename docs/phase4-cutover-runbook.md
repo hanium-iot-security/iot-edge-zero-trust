@@ -62,8 +62,10 @@ def initialize_phase4_cutover(
 ```
 
 각 Checkpoint 값에는 `last_processed_id`, `last_completed_window_end`가 반드시 존재한다.
-함수가 없거나 Import할 수 없고, Migration 003이 적용·기적용되지 않았거나 7개 Key가
-누락되면 실제 Cutover는 신규 서비스를 시작하지 않고 Backup 복원 경로로 전환한다.
+함수는 요약을 반환하는 것뿐 아니라 `detector_checkpoints`에 7개 Row를 실제 UPSERT해야 한다.
+Runner는 반환 요약과 DB Row의 Key·`last_processed_id`·UTC 완료 Window가 일치하는지
+재조회한다. 함수가 없거나 Import할 수 없고, Migration 003이 적용·기적용되지 않았거나
+요약과 DB가 다르면 신규 서비스를 시작하지 않고 Backup 복원 경로로 전환한다.
 
 ## 3. 공통 안전 계약
 
@@ -75,8 +77,11 @@ def initialize_phase4_cutover(
 - 실제 Rollback은 `--execute --confirm PHASE4-ROLLBACK`이 모두 있어야 한다.
 - Pi의 실제 Cutover·Rollback은 root 권한으로 실행한다.
 - CLI는 전달받은 systemd Unit만 제어한다. Crontab은 자동 수정하지 않는다.
-- Capture, Packet Feature, Gateway Metrics 등 Producer를 계속 실행해야 한다면 동일 DB
-  Snapshot의 Cutoff와 마지막 Source ID를 함께 계산할 수 있는지 먼저 확인한다.
+- `--writer-service`에는 Capture, Packet Feature, Gateway Metrics, MQTT Producer 등 운영 DB에
+  쓰는 모든 Unit을 전달한다. Cutover 동안 중지하고 성공·실패 후 작업 전 상태로 복구한다.
+- 기존·신규·Writer Unit의 작업 전 active/inactive 상태를 JSON에 기록한다. 실패 시에는
+  작업 전 active였던 Unit만 다시 활성화하고 원래 inactive였던 Unit은 시작하지 않는다.
+- DB별 Lock 파일로 Cutover·Smoke·Rollback의 동시 실행을 차단한다.
 - 로그와 결과 파일에 비밀번호, Token, SSH Key, `.env` 전체 내용을 남기지 않는다.
 
 ## 4. 사전 기록
@@ -116,6 +121,8 @@ python -m edge.scripts.run_phase4_cutover \
   --legacy-service trust-score.service \
   --new-service detection-orchestrator.service \
   --new-service firewall-worker.service \
+  --writer-service packet-capture.service \
+  --writer-service gateway-metrics.service \
   --dry-run
 ```
 
@@ -141,6 +148,8 @@ python -m edge.scripts.run_phase4_cutover \
 확인 기준:
 
 - 원본 운영 DB SHA256과 Row 수가 실행 전후 동일함
+- `source_sha256_before`, `source_sha256_after`, `source_unchanged=true`임
+- Migration 전 Smoke Snapshot Manifest와 Migration 후 Manifest가 별도 파일로 보존됨
 - Smoke DB에 Migration 003 기록이 존재함
 - `foreign_key_check` 결과가 0건임
 - `integrity_check` 결과가 `ok`임
@@ -154,8 +163,8 @@ python -m edge.scripts.run_phase4_cutover \
 
 > 이 절차는 Phase 4 통합 Smoke Test 전에는 실행하지 않는다.
 
-1. 기존 Detector·Trust Cron 또는 서비스를 중지한다.
-2. 신규 Orchestrator·Firewall Worker Unit이 설치돼 있지만 중지 상태인지 확인한다.
+1. 기존 Detector·Trust Cron을 중지한다. systemd Unit은 도구가 작업 전 상태를 기록하고 중지한다.
+2. 신규 Orchestrator·Firewall Worker Unit과 모든 DB Writer Unit 이름을 확정한다.
 3. Dry Run과 독립 DB Smoke Test 결과를 확인한다.
 4. 다음 명령을 root 권한으로 실행한다.
 
@@ -170,6 +179,8 @@ sudo /home/pi/iot-edge-zero-trust/venv/bin/python \
   --legacy-service trust-score.service \
   --new-service detection-orchestrator.service \
   --new-service firewall-worker.service \
+  --writer-service packet-capture.service \
+  --writer-service gateway-metrics.service \
   --execute \
   --confirm PHASE4-CUTOVER
 ```
@@ -183,6 +194,8 @@ sudo /home/pi/iot-edge-zero-trust/venv/bin/python \
 - Source별 초기 Checkpoint 요약
 - FK·Integrity 결과
 - 중지한 기존 서비스와 시작한 신규 서비스
+- Writer를 포함한 전체 Unit의 작업 전·후 active 상태
+- 실패 시 `failure_stage`, 최초 오류, 자동 복원 결과
 
 도중 실패하면 도구가 생성한 Backup을 검증해 자동 복원을 시도하고 기존 systemd Unit을
 재시작한다. 결과 상태가 `rolled_back`인지 확인한다. `rollback_failed`이면 서비스를 임의로
@@ -198,11 +211,14 @@ python -m edge.scripts.rollback_phase4_cutover \
   --backup /home/pi/iot-edge-zero-trust/backend/data/backups/ACTUAL_BACKUP.db \
   --sha256 /home/pi/iot-edge-zero-trust/backend/data/backups/ACTUAL_BACKUP.db.sha256 \
   --result /home/pi/iot-edge-zero-trust/data/exports/phase4-rollback.json \
+  --pre-rollback-backup-dir /home/pi/iot-edge-zero-trust/backend/data/backups/pre-rollback \
   --git-sha "$(git rev-parse HEAD)" \
   --new-service detection-orchestrator.service \
   --new-service firewall-worker.service \
   --legacy-service mqtt-feature-rule.service \
   --legacy-service trust-score.service \
+  --writer-service packet-capture.service \
+  --writer-service gateway-metrics.service \
   --dry-run
 ```
 
@@ -215,17 +231,23 @@ sudo /home/pi/iot-edge-zero-trust/venv/bin/python \
   --backup /home/pi/iot-edge-zero-trust/backend/data/backups/ACTUAL_BACKUP.db \
   --sha256 /home/pi/iot-edge-zero-trust/backend/data/backups/ACTUAL_BACKUP.db.sha256 \
   --result /home/pi/iot-edge-zero-trust/data/exports/phase4-rollback.json \
+  --pre-rollback-backup-dir /home/pi/iot-edge-zero-trust/backend/data/backups/pre-rollback \
   --git-sha "$(git rev-parse HEAD)" \
   --new-service detection-orchestrator.service \
   --new-service firewall-worker.service \
   --legacy-service mqtt-feature-rule.service \
   --legacy-service trust-score.service \
+  --writer-service packet-capture.service \
+  --writer-service gateway-metrics.service \
   --execute \
   --confirm PHASE4-ROLLBACK
 ```
 
-복원이 검증되기 전에는 기존 Cron을 재시작하지 않는다. Rollback 이후 새 Cutover를 시도하려면
-새 Backup·SHA256과 새로운 `phase4_cutover_at`을 생성한다.
+명시적 Rollback은 대상 운영 DB가 실제 일반 파일인지 먼저 확인하고, 전달된 기존·신규·Writer
+Unit을 모두 중지한 후 현재 DB를 `pre_manual_rollback` Backup·SHA256으로 추가 보존한다. 지정
+Backup 복원과 검증이 끝나면 기존 Unit을 시작하고 Writer는 작업 전 상태로 복구하며 신규 Unit은
+중지 상태를 유지한다. 복원이 검증되기 전에는 기존 Cron을 재시작하지 않는다. Rollback 이후
+새 Cutover를 시도하려면 새 Backup·SHA256과 새로운 `phase4_cutover_at`을 생성한다.
 
 ## 9. 결과 기록
 

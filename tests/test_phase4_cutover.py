@@ -18,6 +18,7 @@ from edge.scripts.phase4_cutover import (
     RollbackConfig,
     RollbackDependencies,
     SmokeTestConfig,
+    _operation_lock,
     create_sqlite_backup,
     execute_cutover,
     execute_rollback,
@@ -71,6 +72,48 @@ def _create_source_database(path: Path) -> None:
         )
         connection.execute("INSERT INTO parent (id, name) VALUES (1, 'before-cutover')")
         connection.execute("INSERT INTO child (id, parent_id) VALUES (1, 1)")
+        connection.execute(
+            """
+            CREATE TABLE detector_checkpoints (
+                detector_name TEXT NOT NULL,
+                source_table TEXT NOT NULL,
+                last_processed_id INTEGER,
+                last_completed_window_end DATETIME,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (detector_name, source_table)
+            )
+            """
+        )
+
+
+def _persist_checkpoint_summary(
+    database: Path,
+    summary: dict[str, object] | None = None,
+) -> dict[str, object]:
+    result = summary or _complete_checkpoint_summary()
+    checkpoints = result["checkpoints"]
+    assert isinstance(checkpoints, dict)
+    with sqlite3.connect(database) as connection:
+        for key, value in checkpoints.items():
+            assert isinstance(value, dict)
+            detector_name, source_table = key.split("+", 1)
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO detector_checkpoints (
+                    detector_name,
+                    source_table,
+                    last_processed_id,
+                    last_completed_window_end
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    detector_name,
+                    source_table,
+                    value["last_processed_id"],
+                    value["last_completed_window_end"],
+                ),
+            )
+    return result
 
 
 def test_create_sqlite_backup_writes_consistent_snapshot_and_sha256(tmp_path: Path) -> None:
@@ -189,7 +232,7 @@ def test_execute_cutover_uses_safe_order_and_records_result(tmp_path: Path) -> N
         assert db_path == database.resolve()
         assert timestamp == cutover_at
         events.append("initialize")
-        return _complete_checkpoint_summary()
+        return _persist_checkpoint_summary(db_path)
 
     def now() -> datetime:
         events.append("cutover-timestamp")
@@ -208,6 +251,10 @@ def test_execute_cutover_uses_safe_order_and_records_result(tmp_path: Path) -> N
         CutoverDependencies(
             stop_service=stop_service,
             start_service=start_service,
+            is_service_active=lambda service: service in {
+                "rule-detector.service",
+                "trust-score.service",
+            },
             apply_migrations=migrate,
             initialize_checkpoints=initialize_checkpoints,
             now=now,
@@ -216,11 +263,11 @@ def test_execute_cutover_uses_safe_order_and_records_result(tmp_path: Path) -> N
 
     assert report.status == "succeeded"
     assert events == [
+        "cutover-timestamp",
         "stop:rule-detector.service",
         "stop:trust-score.service",
         "stop:detection-orchestrator.service",
         "stop:firewall-worker.service",
-        "cutover-timestamp",
         "migrate",
         "initialize",
         "start:detection-orchestrator.service",
@@ -266,13 +313,14 @@ def test_execute_cutover_restores_backup_and_legacy_services_on_failure(tmp_path
             CutoverDependencies(
                 stop_service=lambda service: events.append(f"stop:{service}"),
                 start_service=lambda service: events.append(f"start:{service}"),
+                is_service_active=lambda service: service == "rule-detector.service",
                 apply_migrations=migrate,
                 initialize_checkpoints=fail_checkpoint_initialization,
                 now=lambda: cutover_at,
             ),
         )
 
-    assert events == [
+    assert events[:7] == [
         "stop:rule-detector.service",
         "stop:detection-orchestrator.service",
         "stop:firewall-worker.service",
@@ -280,8 +328,10 @@ def test_execute_cutover_restores_backup_and_legacy_services_on_failure(tmp_path
         "initialize",
         "stop:detection-orchestrator.service",
         "stop:firewall-worker.service",
-        "start:rule-detector.service",
     ]
+    assert "start:rule-detector.service" in events[7:]
+    assert "start:detection-orchestrator.service" not in events
+    assert "start:firewall-worker.service" not in events
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT name FROM parent WHERE id = 1").fetchone()[0] == (
             "before-cutover"
@@ -318,6 +368,7 @@ def test_execute_cutover_rejects_unsafe_result_path_before_stopping_services(
             CutoverDependencies(
                 stop_service=lambda service: events.append(f"stop:{service}"),
                 start_service=lambda service: events.append(f"start:{service}"),
+                is_service_active=lambda _: False,
                 apply_migrations=lambda *_: {},
                 initialize_checkpoints=lambda *_: {},
             ),
@@ -342,7 +393,7 @@ def test_cutover_smoke_test_uses_copy_and_preserves_source(tmp_path: Path) -> No
     def initialize(db_path: Path, _: datetime) -> dict[str, object]:
         with sqlite3.connect(db_path) as connection:
             connection.execute("CREATE TABLE checkpoint_smoke (id INTEGER PRIMARY KEY)")
-        return _complete_checkpoint_summary()
+        return _persist_checkpoint_summary(db_path)
 
     report = run_cutover_smoke_test(
         SmokeTestConfig(
@@ -374,9 +425,20 @@ def test_cutover_smoke_test_uses_copy_and_preserves_source(tmp_path: Path) -> No
     saved = json.loads(result_path.read_text(encoding="utf-8"))
     assert saved["source_database"] == str(database.resolve())
     assert saved["smoke_database"] == str(smoke_database.resolve())
+    assert saved["source_unchanged"] is True
+    assert saved["source_sha256_before"] == saved["source_sha256_after"]
+    assert saved["source_table_row_counts_before"] == saved[
+        "source_table_row_counts_after"
+    ]
     assert set(saved["checkpoint_summary"]["checkpoints"]) == set(CHECKPOINT_KEYS)
     smoke_manifest = smoke_database.with_suffix(smoke_database.suffix + ".sha256")
-    assert smoke_manifest.read_text(encoding="utf-8") == (
+    post_manifest = smoke_database.with_suffix(
+        smoke_database.suffix + ".post-migration.sha256"
+    )
+    assert smoke_manifest.read_text(encoding="utf-8").split()[0] == (
+        report.smoke_sha256_before_migration
+    )
+    assert post_manifest.read_text(encoding="utf-8") == (
         f"{hashlib.sha256(smoke_database.read_bytes()).hexdigest()}  {smoke_database.name}\n"
     )
 
@@ -416,6 +478,7 @@ def test_execute_cutover_rolls_back_when_phase4_contract_is_incomplete(
             CutoverDependencies(
                 stop_service=lambda service: events.append(f"stop:{service}"),
                 start_service=lambda service: events.append(f"start:{service}"),
+                is_service_active=lambda service: service == "rule-detector.service",
                 apply_migrations=lambda *_: migration_summary,
                 initialize_checkpoints=lambda *_: checkpoint_summary or {},
                 now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
@@ -423,7 +486,7 @@ def test_execute_cutover_rolls_back_when_phase4_contract_is_incomplete(
         )
 
     assert "start:detection-orchestrator.service" not in events
-    assert events[-1] == "start:rule-detector.service"
+    assert "start:rule-detector.service" in events
 
 
 def test_execute_rollback_verifies_backup_then_restores_and_starts_legacy_services(
@@ -451,12 +514,18 @@ def test_execute_rollback_verifies_backup_then_restores_and_starts_legacy_servic
         RollbackDependencies(
             stop_service=lambda service: events.append(f"stop:{service}"),
             start_service=lambda service: events.append(f"start:{service}"),
+            is_service_active=lambda service: service in {
+                "detection-orchestrator.service",
+                "firewall-worker.service",
+            },
             now=lambda: datetime(2026, 7, 21, 5, 0, tzinfo=timezone.utc),
         ),
     )
 
     assert report.status == "succeeded"
     assert events == [
+        "stop:rule-detector.service",
+        "stop:trust-score.service",
         "stop:detection-orchestrator.service",
         "stop:firewall-worker.service",
         "start:rule-detector.service",
@@ -566,3 +635,393 @@ def test_rollback_cli_dry_run_does_not_restore_database(
         assert connection.execute("SELECT name FROM parent WHERE id = 1").fetchone()[0] == (
             "current-state"
         )
+
+
+def test_execute_rollback_rejects_missing_operational_database_before_services_change(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    _create_source_database(source)
+    artifact = create_sqlite_backup(source, backup)
+    events: list[str] = []
+    result_path = tmp_path / "rollback.json"
+
+    with pytest.raises(CutoverSafetyError, match="Operational database does not exist"):
+        execute_rollback(
+            RollbackConfig(
+                database_path=tmp_path / "typo-operational.db",
+                backup_path=backup,
+                sha256_path=artifact.sha256_path,
+                backup_directory=tmp_path / "pre-rollback",
+                result_path=result_path,
+                git_sha="3e30d0d",
+                legacy_services=("rule-detector.service",),
+                new_services=("detection-orchestrator.service",),
+                paused_writer_services=("gateway-metrics.service",),
+            ),
+            RollbackDependencies(
+                stop_service=lambda service: events.append(f"stop:{service}"),
+                start_service=lambda service: events.append(f"start:{service}"),
+                is_service_active=lambda _: True,
+            ),
+        )
+
+    assert events == []
+    assert not (tmp_path / "typo-operational.db").exists()
+    saved = json.loads(result_path.read_text(encoding="utf-8"))
+    assert saved["status"] == "failed"
+    assert saved["failure_stage"] == "preflight"
+
+
+def test_cutover_failure_restores_only_originally_active_services_and_writers(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "operational.db"
+    _create_source_database(database)
+    events: list[str] = []
+    active = {
+        "rule-detector.service": True,
+        "trust-score.service": False,
+        "gateway-metrics.service": True,
+        "packet-capture.service": False,
+        "detection-orchestrator.service": False,
+    }
+
+    def stop(service: str) -> None:
+        events.append(f"stop:{service}")
+        active[service] = False
+
+    def start(service: str) -> None:
+        events.append(f"start:{service}")
+        active[service] = True
+
+    with pytest.raises(CutoverExecutionError, match="checkpoint failed"):
+        execute_cutover(
+            CutoverConfig(
+                database_path=database,
+                backup_directory=tmp_path / "backups",
+                migrations_directory=tmp_path / "migrations",
+                result_path=tmp_path / "cutover.json",
+                git_sha="3e30d0d",
+                legacy_services=("rule-detector.service", "trust-score.service"),
+                new_services=("detection-orchestrator.service",),
+                paused_writer_services=(
+                    "gateway-metrics.service",
+                    "packet-capture.service",
+                ),
+            ),
+            CutoverDependencies(
+                stop_service=stop,
+                start_service=start,
+                is_service_active=lambda service: active[service],
+                apply_migrations=lambda *_: {"applied_versions": [3]},
+                initialize_checkpoints=lambda *_: (_ for _ in ()).throw(
+                    RuntimeError("checkpoint failed")
+                ),
+                now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+            ),
+        )
+
+    assert active["rule-detector.service"] is True
+    assert active["trust-score.service"] is False
+    assert active["gateway-metrics.service"] is True
+    assert active["packet-capture.service"] is False
+    assert active["detection-orchestrator.service"] is False
+    assert "start:trust-score.service" not in events
+    assert "start:packet-capture.service" not in events
+
+
+def test_manual_rollback_stops_all_writers_and_preserves_current_database_backup(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "operational.db"
+    selected_backup = tmp_path / "selected.db"
+    _create_source_database(database)
+    artifact = create_sqlite_backup(database, selected_backup)
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE parent SET name = 'pre-manual-rollback' WHERE id = 1")
+    active = {
+        "rule-detector.service": False,
+        "detection-orchestrator.service": True,
+        "gateway-metrics.service": True,
+    }
+    events: list[str] = []
+
+    def stop(service: str) -> None:
+        events.append(f"stop:{service}")
+        active[service] = False
+
+    def start(service: str) -> None:
+        events.append(f"start:{service}")
+        active[service] = True
+
+    report = execute_rollback(
+        RollbackConfig(
+            database_path=database,
+            backup_path=selected_backup,
+            sha256_path=artifact.sha256_path,
+            backup_directory=tmp_path / "pre-rollback",
+            result_path=tmp_path / "rollback.json",
+            git_sha="3e30d0d",
+            legacy_services=("rule-detector.service",),
+            new_services=("detection-orchestrator.service",),
+            paused_writer_services=("gateway-metrics.service",),
+        ),
+        RollbackDependencies(
+            stop_service=stop,
+            start_service=start,
+            is_service_active=lambda service: active[service],
+            now=lambda: datetime(2026, 7, 21, 5, 0, tzinfo=timezone.utc),
+        ),
+    )
+
+    assert events[:3] == [
+        "stop:rule-detector.service",
+        "stop:detection-orchestrator.service",
+        "stop:gateway-metrics.service",
+    ]
+    assert report.pre_rollback_backup is not None
+    pre_rollback = Path(report.pre_rollback_backup)
+    assert pre_rollback.is_file()
+    with sqlite3.connect(pre_rollback) as connection:
+        assert connection.execute("SELECT name FROM parent WHERE id = 1").fetchone()[0] == (
+            "pre-manual-rollback"
+        )
+    assert active["rule-detector.service"] is True
+    assert active["detection-orchestrator.service"] is False
+    assert active["gateway-metrics.service"] is True
+
+
+def test_smoke_test_records_source_evidence_and_rejects_source_mutation(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "operational.db"
+    smoke = tmp_path / "smoke.db"
+    result = tmp_path / "smoke.json"
+    _create_source_database(source)
+
+    def mutate_source_while_migrating(_: Path, __: Path) -> dict[str, object]:
+        with sqlite3.connect(source) as connection:
+            connection.execute("UPDATE parent SET name = 'unexpected-mutation' WHERE id = 1")
+        return {"applied_versions": [3]}
+
+    with pytest.raises(CutoverExecutionError, match="source database changed"):
+        run_cutover_smoke_test(
+            SmokeTestConfig(
+                source_database_path=source,
+                smoke_database_path=smoke,
+                migrations_directory=tmp_path / "migrations",
+                result_path=result,
+                git_sha="3e30d0d",
+            ),
+            apply_migrations=mutate_source_while_migrating,
+            initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+            now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+        )
+
+    saved = json.loads(result.read_text(encoding="utf-8"))
+    assert saved["status"] == "failed"
+    assert saved["source_unchanged"] is False
+    assert saved["source_sha256_before"] != saved["source_sha256_after"]
+    assert saved["failure_stage"] == "source-preservation-check"
+
+
+def test_cutover_rejects_checkpoint_summary_not_persisted_to_database(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "operational.db"
+    _create_source_database(database)
+    events: list[str] = []
+
+    with pytest.raises(CutoverExecutionError, match="database rows"):
+        execute_cutover(
+            CutoverConfig(
+                database_path=database,
+                backup_directory=tmp_path / "backups",
+                migrations_directory=tmp_path / "migrations",
+                result_path=tmp_path / "cutover.json",
+                git_sha="3e30d0d",
+                new_services=("detection-orchestrator.service",),
+            ),
+            CutoverDependencies(
+                stop_service=lambda service: events.append(f"stop:{service}"),
+                start_service=lambda service: events.append(f"start:{service}"),
+                is_service_active=lambda _: False,
+                apply_migrations=lambda *_: {"applied_versions": [3]},
+                initialize_checkpoints=lambda *_: _complete_checkpoint_summary(),
+                now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+            ),
+        )
+
+    assert "start:detection-orchestrator.service" not in events
+
+
+def test_datetime_checkpoint_summary_is_json_serializable_after_database_match(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "operational.db"
+    _create_source_database(database)
+    completed_at = datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc)
+    summary = _complete_checkpoint_summary()
+    checkpoints = summary["checkpoints"]
+    assert isinstance(checkpoints, dict)
+    for value in checkpoints.values():
+        assert isinstance(value, dict)
+        value["last_completed_window_end"] = completed_at
+
+    report = execute_cutover(
+        CutoverConfig(
+            database_path=database,
+            backup_directory=tmp_path / "backups",
+            migrations_directory=tmp_path / "migrations",
+            result_path=tmp_path / "cutover.json",
+            git_sha="3e30d0d",
+            new_services=("detection-orchestrator.service",),
+        ),
+        CutoverDependencies(
+            stop_service=lambda _: None,
+            start_service=lambda _: None,
+            is_service_active=lambda _: False,
+            apply_migrations=lambda *_: {"applied_versions": [3]},
+            initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db, summary),
+            now=lambda: completed_at,
+        ),
+    )
+
+    assert report.status == "succeeded"
+    saved = json.loads((tmp_path / "cutover.json").read_text(encoding="utf-8"))
+    assert saved["checkpoint_summary"]["checkpoints"][CHECKPOINT_KEYS[0]][
+        "last_completed_window_end"
+    ] == "2026-07-21T04:30:00Z"
+
+
+def test_cutover_service_stop_failure_still_restores_other_service_states(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "operational.db"
+    _create_source_database(database)
+    active = {
+        "rule-detector.service": True,
+        "missing-new.service": False,
+        "gateway-metrics.service": True,
+    }
+    events: list[str] = []
+
+    def stop(service: str) -> None:
+        events.append(f"stop:{service}")
+        if service == "missing-new.service":
+            raise RuntimeError("unit not found")
+        active[service] = False
+
+    def start(service: str) -> None:
+        events.append(f"start:{service}")
+        active[service] = True
+
+    with pytest.raises(CutoverExecutionError, match="unit not found"):
+        execute_cutover(
+            CutoverConfig(
+                database_path=database,
+                backup_directory=tmp_path / "backups",
+                migrations_directory=tmp_path / "migrations",
+                result_path=tmp_path / "cutover.json",
+                git_sha="3e30d0d",
+                legacy_services=("rule-detector.service",),
+                new_services=("missing-new.service",),
+                paused_writer_services=("gateway-metrics.service",),
+            ),
+            CutoverDependencies(
+                stop_service=stop,
+                start_service=start,
+                is_service_active=lambda service: active[service],
+                apply_migrations=lambda *_: {"applied_versions": [3]},
+                initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+            ),
+        )
+
+    assert "stop:gateway-metrics.service" in events
+    assert active["rule-detector.service"] is True
+    assert active["gateway-metrics.service"] is True
+    saved = json.loads((tmp_path / "cutover.json").read_text(encoding="utf-8"))
+    assert saved["status"] == "rollback_failed"
+    assert saved["failure_stage"] == "service-stop"
+
+
+def test_cutover_rejects_concurrent_operation_lock_before_services_change(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "operational.db"
+    _create_source_database(database)
+    events: list[str] = []
+
+    with _operation_lock(database):
+        with pytest.raises(CutoverSafetyError, match="holds the lock"):
+            execute_cutover(
+                CutoverConfig(
+                    database_path=database,
+                    backup_directory=tmp_path / "backups",
+                    migrations_directory=tmp_path / "migrations",
+                    result_path=tmp_path / "cutover.json",
+                    git_sha="3e30d0d",
+                    legacy_services=("rule-detector.service",),
+                ),
+                CutoverDependencies(
+                    stop_service=lambda service: events.append(f"stop:{service}"),
+                    start_service=lambda service: events.append(f"start:{service}"),
+                    is_service_active=lambda _: True,
+                    apply_migrations=lambda *_: {"applied_versions": [3]},
+                    initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+                ),
+            )
+
+    assert events == []
+
+
+def test_sqlite_backup_preserves_wal_mode_committed_rows(tmp_path: Path) -> None:
+    source = tmp_path / "wal-operational.db"
+    backup = tmp_path / "wal-backup.db"
+    with sqlite3.connect(source) as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("CREATE TABLE samples (id INTEGER PRIMARY KEY, value TEXT)")
+        connection.execute("INSERT INTO samples (value) VALUES ('committed-in-wal')")
+        connection.commit()
+        artifact = create_sqlite_backup(source, backup)
+
+    assert artifact.integrity_check == "ok"
+    with sqlite3.connect(backup) as connection:
+        assert connection.execute("SELECT value FROM samples").fetchone()[0] == (
+            "committed-in-wal"
+        )
+
+
+def test_cutover_backup_collision_is_rejected_before_services_stop(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    backup_directory = tmp_path / "backups"
+    _create_source_database(database)
+    backup_directory.mkdir()
+    collision = backup_directory / "operational_before_phase4_20260721T043000Z.db"
+    collision.write_bytes(b"existing evidence")
+    events: list[str] = []
+
+    with pytest.raises(CutoverSafetyError, match="already exists"):
+        execute_cutover(
+            CutoverConfig(
+                database_path=database,
+                backup_directory=backup_directory,
+                migrations_directory=tmp_path / "migrations",
+                result_path=tmp_path / "cutover.json",
+                git_sha="3e30d0d",
+                legacy_services=("rule-detector.service",),
+            ),
+            CutoverDependencies(
+                stop_service=lambda service: events.append(f"stop:{service}"),
+                start_service=lambda service: events.append(f"start:{service}"),
+                is_service_active=lambda _: True,
+                apply_migrations=lambda *_: {"applied_versions": [3]},
+                initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+                now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+            ),
+        )
+
+    assert events == []
+    assert collision.read_bytes() == b"existing evidence"

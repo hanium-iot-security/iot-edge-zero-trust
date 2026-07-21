@@ -10,12 +10,14 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import shutil
 from typing import Callable, Mapping, Sequence
 
 from db.migration_runner import apply_migrations
 from edge.scripts.phase4_cutover import (
     CutoverConfig,
     CutoverDependencies,
+    CutoverExecutionError,
     CutoverSafetyError,
     SmokeTestConfig,
     execute_cutover,
@@ -38,6 +40,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--git-sha", required=True)
     parser.add_argument("--legacy-service", action="append", default=[])
     parser.add_argument("--new-service", action="append", default=[])
+    parser.add_argument("--writer-service", action="append", default=[])
     parser.add_argument("--checkpoint-initializer", default=DEFAULT_CHECKPOINT_INITIALIZER)
     parser.add_argument("--smoke-database", type=Path)
     parser.add_argument("--confirm")
@@ -76,6 +79,38 @@ def _systemctl(action: str, service: str) -> None:
     subprocess.run(["systemctl", action, service], check=True)
 
 
+def _systemctl_is_active(service: str) -> bool:
+    result = subprocess.run(
+        ["systemctl", "is-active", "--quiet", service],
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _validate_operational_preflight(
+    database: Path,
+    migrations_directory: Path,
+    services: tuple[str, ...],
+) -> None:
+    migrations = migrations_directory.expanduser().resolve()
+    if not migrations.is_dir():
+        raise CutoverSafetyError(f"Migration directory does not exist: {migrations}")
+    if not any(path.name.startswith("003_") for path in migrations.glob("003_*.sql")):
+        raise CutoverSafetyError(f"Migration 003 SQL is missing: {migrations}")
+    required_bytes = max(database.stat().st_size * 3, 10 * 1024 * 1024)
+    if shutil.disk_usage(database.parent).free < required_bytes:
+        raise CutoverSafetyError("Insufficient disk space for backup, migration, and rollback")
+    for service in services:
+        result = subprocess.run(
+            ["systemctl", "show", service, "--property=LoadState", "--value"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0 or result.stdout.strip() == "not-found":
+            raise CutoverSafetyError(f"systemd service unit is unavailable: {service}")
+
+
 def _require_root_for_operational_cutover() -> None:
     if os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() != 0:
         raise CutoverSafetyError("Operational cutover must run as root on Raspberry Pi")
@@ -92,9 +127,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     result_path = args.result.expanduser().resolve()
     legacy_services = _validate_services(args.legacy_service)
     new_services = _validate_services(args.new_service)
-    overlap = set(legacy_services) & set(new_services)
+    writer_services = _validate_services(args.writer_service)
+    overlap = (
+        (set(legacy_services) & set(new_services))
+        | (set(legacy_services) & set(writer_services))
+        | (set(new_services) & set(writer_services))
+    )
     if overlap:
-        raise CutoverSafetyError(f"Legacy and new service sets overlap: {sorted(overlap)}")
+        raise CutoverSafetyError(
+            f"Legacy, new, and writer service sets overlap: {sorted(overlap)}"
+        )
     if not database.is_file():
         raise CutoverSafetyError(f"Operational database does not exist: {database}")
 
@@ -110,9 +152,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "git_sha": args.git_sha,
                     "legacy_services_to_stop": legacy_services,
                     "new_services_to_start": new_services,
+                    "paused_writer_services": writer_services,
                     "checkpoint_initializer": args.checkpoint_initializer,
                     "execution_order": [
-                        "stop legacy and new services",
+                        "record service states and stop legacy, new, and writer services",
                         "create SQLite backup and SHA256",
                         "apply migrations",
                         "run foreign_key_check and integrity_check",
@@ -130,6 +173,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.smoke_test:
         if args.smoke_database is None:
             raise CutoverSafetyError("--smoke-test requires --smoke-database")
+        _validate_operational_preflight(database, args.migrations_dir, ())
         initializer = _load_initializer(args.checkpoint_initializer)
         report = run_cutover_smoke_test(
             SmokeTestConfig(
@@ -151,6 +195,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise CutoverSafetyError("Operational cutover requires at least one --new-service")
     _require_root_for_operational_cutover()
     initializer = _load_initializer(args.checkpoint_initializer)
+    _validate_operational_preflight(
+        database,
+        args.migrations_dir,
+        legacy_services + new_services + writer_services,
+    )
     report = execute_cutover(
         CutoverConfig(
             database_path=database,
@@ -160,10 +209,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             git_sha=args.git_sha,
             legacy_services=legacy_services,
             new_services=new_services,
+            paused_writer_services=writer_services,
         ),
         CutoverDependencies(
             stop_service=lambda service: _systemctl("stop", service),
             start_service=lambda service: _systemctl("start", service),
+            is_service_active=_systemctl_is_active,
             apply_migrations=_migration_adapter,
             initialize_checkpoints=initializer,
         ),
@@ -175,6 +226,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except CutoverSafetyError as exc:
+    except (CutoverSafetyError, CutoverExecutionError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc

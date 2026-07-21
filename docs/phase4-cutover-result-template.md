@@ -23,6 +23,7 @@
 | Backup 파일 |  |
 | SHA256 Manifest |  |
 | SHA256 |  |
+| 수동 Rollback 직전 보존 Backup·SHA256 |  |
 | Windows·외부 복사 위치 |  |
 
 ## 3. 서비스 전환
@@ -32,8 +33,21 @@
 | 기존 Detector·Trust Cron/Service |  |  |
 | Detection Orchestrator |  |  |
 | Firewall Worker |  |  |
+| Packet Capture·Feature Writer |  |  |
+| Gateway Metrics·MQTT Producer |  |  |
 
-## 4. DB 검증
+## 4. Smoke 원본 보존 증적
+
+| 항목 | 실행 전 | 실행 후 |
+| --- | --- | --- |
+| 운영 원본 SHA256 |  |  |
+| 운영 원본 Table별 Row 수 |  |  |
+| Smoke DB SHA256 | Migration 전 | Migration 후 |
+| Segment ID Digest |  |  |
+| Packet Feature Row·고아 FK |  |  |
+| Detection Event Row |  |  |
+
+## 5. DB 검증
 
 | 검증 | Migration 전 | Migration 후 | Rollback 후 |
 | --- | --- | --- | --- |
@@ -43,7 +57,7 @@
 | Segment Row·ID |  |  |  |
 | Packet Feature FK |  |  |  |
 
-## 5. Cutover Checkpoint
+## 6. Cutover Checkpoint
 
 | Detector Key | `last_processed_id` | `last_completed_window_end` | 계산 근거 |
 | --- | ---: | --- | --- |
@@ -55,17 +69,18 @@
 | `packet_if + packet_feature_logs` |  |  |  |
 | `trust_score_v2 + detection_events` |  |  |  |
 
-## 6. 관측 결과
+## 7. 관측 결과
 
 - 실제 실행 명령:
 - 예상 결과:
 - 실제 결과:
 - 오류·경고:
+- 실패 단계(`failure_stage`):
 - 자동 Rollback 여부:
 - 수동 조치:
 - 남은 미검증 항목:
 
-## 7. 최종 판단
+## 8. 최종 판단
 
 - [ ] Cutover 성공
 - [ ] Rollback 성공
@@ -74,6 +89,9 @@
 - [ ] 기존 데이터·ID·FK 보존
 - [ ] Cutover 이전 Event 재감점 없음
 - [ ] 신규 서비스 정상 시작
+- [ ] Writer 서비스 작업 전 상태 복구
+- [ ] 반환 Checkpoint와 DB 7개 Row 일치
+- [ ] Smoke 원본 SHA256·Row 수 불변
 - [ ] 기존 Cron과 신규 Orchestrator 동시 실행 없음
 
 **판단:** 진행 / Rollback 유지 / 추가 수정 필요

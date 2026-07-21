@@ -11,6 +11,7 @@ import sys
 from typing import Sequence
 
 from edge.scripts.phase4_cutover import (
+    CutoverExecutionError,
     CutoverSafetyError,
     RollbackConfig,
     RollbackDependencies,
@@ -25,9 +26,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--backup", type=Path, required=True)
     parser.add_argument("--sha256", type=Path, required=True)
     parser.add_argument("--result", type=Path, required=True)
+    parser.add_argument("--pre-rollback-backup-dir", type=Path)
     parser.add_argument("--git-sha", required=True)
     parser.add_argument("--legacy-service", action="append", default=[])
     parser.add_argument("--new-service", action="append", default=[])
+    parser.add_argument("--writer-service", action="append", default=[])
     parser.add_argument("--confirm")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
@@ -39,6 +42,16 @@ def _systemctl(action: str, service: str) -> None:
     subprocess.run(["systemctl", action, service], check=True)
 
 
+def _systemctl_is_active(service: str) -> bool:
+    return (
+        subprocess.run(
+            ["systemctl", "is-active", "--quiet", service],
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     database = args.database.expanduser().resolve()
@@ -47,6 +60,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     result_path = args.result.expanduser().resolve()
     legacy_services = _validate_services(args.legacy_service)
     new_services = _validate_services(args.new_service)
+    writer_services = _validate_services(args.writer_service)
+    all_services = legacy_services + new_services + writer_services
+    if len(all_services) != len(set(all_services)):
+        raise CutoverSafetyError(
+            "Legacy, new, and writer service sets must not overlap"
+        )
 
     if args.dry_run:
         print(
@@ -60,6 +79,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "result": str(result_path),
                     "new_services_to_stop": new_services,
                     "legacy_services_to_start": legacy_services,
+                    "paused_writer_services": writer_services,
+                    "pre_rollback_backup_directory": str(
+                        args.pre_rollback_backup_dir.resolve()
+                        if args.pre_rollback_backup_dir
+                        else backup.parent / "pre-rollback"
+                    ),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -76,14 +101,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             database_path=database,
             backup_path=backup,
             sha256_path=sha256_path,
+            backup_directory=args.pre_rollback_backup_dir,
             result_path=result_path,
             git_sha=args.git_sha,
             legacy_services=legacy_services,
             new_services=new_services,
+            paused_writer_services=writer_services,
         ),
         RollbackDependencies(
             stop_service=lambda service: _systemctl("stop", service),
             start_service=lambda service: _systemctl("start", service),
+            is_service_active=_systemctl_is_active,
         ),
     )
     print(json.dumps({"status": report.status, "result": str(result_path)}))
@@ -93,6 +121,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except CutoverSafetyError as exc:
+    except (CutoverSafetyError, CutoverExecutionError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
