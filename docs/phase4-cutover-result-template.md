@@ -49,6 +49,8 @@
 | Packet Feature Row·고아 FK |  |  |
 | Detection Event Row |  |  |
 | 기존 Detection Event ID 부분집합 보존 |  |  |
+| 기존 Detection Event 불변 핵심 값 보존 |  |  |
+| 신규 Detection Event ID·`event_type` (`LEGACY_MIGRATION`만 허용) |  |  |
 | Checkpoint 초기화 후 `smoke_final` 보존 검사 |  |  |
 
 ## 5. DB 검증

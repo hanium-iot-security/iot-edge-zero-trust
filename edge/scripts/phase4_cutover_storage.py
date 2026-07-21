@@ -15,6 +15,28 @@ class CutoverSafetyError(RuntimeError):
     """Raised when a cutover action violates an explicit safety contract."""
 
 
+_DETECTION_EVENT_PRESERVED_COLUMNS = (
+    "device_id",
+    "feature_log_id",
+    "mqtt_log_id",
+    "packet_feature_log_id",
+    "detector_type",
+    "event_type",
+    "severity",
+    "score_delta",
+    "description",
+    "detected_at",
+    "analysis_window_start",
+    "analysis_window_end",
+    "incident_family",
+    "subject_ip",
+    "evidence_json",
+    "evidence_schema_version",
+    "dedupe_key",
+    "policy_version",
+)
+
+
 @dataclass(frozen=True)
 class DatabaseVerification:
     integrity_check: str
@@ -182,6 +204,41 @@ def _optional_ids(database: Path, table: str) -> tuple[int, ...] | None:
         return None
 
 
+def _optional_detection_event_rows(
+    database: Path,
+) -> Mapping[int, Mapping[str, object]] | None:
+    try:
+        with sqlite3.connect(database) as connection:
+            available_columns = {
+                str(row[1])
+                for row in connection.execute(
+                    'PRAGMA table_info("detection_events")'
+                ).fetchall()
+            }
+            if "id" not in available_columns:
+                return None
+            preserved_columns = [
+                column
+                for column in _DETECTION_EVENT_PRESERVED_COLUMNS
+                if column in available_columns
+            ]
+            selected_columns = ["id", *preserved_columns]
+            rows = connection.execute(
+                "SELECT "
+                + ", ".join(f'"{column}"' for column in selected_columns)
+                + ' FROM "detection_events" ORDER BY id'
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    return {
+        int(row[0]): {
+            column: row[index]
+            for index, column in enumerate(preserved_columns, start=1)
+        }
+        for row in rows
+    }
+
+
 def database_evidence(database: Path) -> Mapping[str, object]:
     return {
         "table_row_counts": table_row_counts(database),
@@ -206,6 +263,7 @@ def database_evidence(database: Path) -> Mapping[str, object]:
             database, "SELECT COUNT(*) FROM detection_events"
         ),
         "detection_event_ids": _optional_ids(database, "detection_events"),
+        "detection_event_rows": _optional_detection_event_rows(database),
     }
 
 
@@ -250,6 +308,39 @@ def validate_data_preservation(
                 event_ids_before
             ).issubset(event_ids_after):
                 errors.append("detection event IDs were removed")
+        event_rows_before = before.get("detection_event_rows")
+        event_rows_after = after.get("detection_event_rows")
+        if isinstance(event_rows_before, Mapping):
+            if not isinstance(event_rows_after, Mapping):
+                errors.append("detection event evidence is unavailable")
+            else:
+                for event_id, values_before in event_rows_before.items():
+                    values_after = event_rows_after.get(event_id)
+                    if values_after is None:
+                        continue
+                    changed_fields = [
+                        field
+                        for field, value_before in values_before.items()
+                        if field not in values_after
+                        or values_after[field] != value_before
+                    ]
+                    if changed_fields:
+                        errors.append(
+                            "existing detection event values changed: "
+                            f"id={event_id}, fields={changed_fields}"
+                        )
+                new_event_ids = set(event_rows_after) - set(event_rows_before)
+                non_legacy_ids = [
+                    event_id
+                    for event_id in sorted(new_event_ids)
+                    if event_rows_after[event_id].get("event_type")
+                    != "LEGACY_MIGRATION"
+                ]
+                if non_legacy_ids:
+                    errors.append(
+                        "non-LEGACY_MIGRATION detection events were added: "
+                        f"ids={non_legacy_ids}"
+                    )
 
     table_counts_before = before.get("table_row_counts")
     table_counts_after = after.get("table_row_counts")

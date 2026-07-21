@@ -1056,6 +1056,133 @@ def test_smoke_allows_legacy_detection_event_addition(tmp_path: Path) -> None:
 
     assert report.status == "succeeded"
     assert report.database_evidence["smoke_after"]["detection_event_count"] == 2
+    assert report.database_evidence["smoke_final"]["detection_event_count"] == 2
+    assert report.database_evidence["smoke_after"]["detection_event_rows"][31][
+        "event_type"
+    ] == "LEGACY_MIGRATION"
+    assert report.database_evidence["smoke_final"]["detection_event_rows"][30][
+        "score_delta"
+    ] == -20
+
+
+def test_smoke_rejects_non_legacy_detection_event_addition(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    smoke = tmp_path / "smoke.db"
+    _create_source_database(source)
+    _create_phase3b_evidence_tables(source)
+
+    def migrate(database: Path, _: Path) -> dict[str, object]:
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "INSERT INTO detection_events (id, event_type) VALUES (31, 'AI_ANOMALY')"
+            )
+        return {"applied_versions": [3]}
+
+    with pytest.raises(CutoverExecutionError, match="non-LEGACY_MIGRATION"):
+        run_cutover_smoke_test(
+            SmokeTestConfig(
+                source_database_path=source,
+                smoke_database_path=smoke,
+                migrations_directory=tmp_path / "migrations",
+                result_path=tmp_path / "smoke.json",
+                git_sha="43663ed",
+            ),
+            apply_migrations=migrate,
+            initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+            now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+        )
+
+    saved = json.loads((tmp_path / "smoke.json").read_text(encoding="utf-8"))
+    assert saved["failure_stage"] == "data-preservation-check"
+
+
+def test_smoke_rejects_existing_detection_event_value_changes(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    smoke = tmp_path / "smoke.db"
+    _create_source_database(source)
+    _create_phase3b_evidence_tables(source)
+
+    def migrate(database: Path, _: Path) -> dict[str, object]:
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "UPDATE detection_events SET score_delta = -99 WHERE id = 30"
+            )
+        return {"applied_versions": [3]}
+
+    with pytest.raises(CutoverExecutionError, match="existing detection event values changed"):
+        run_cutover_smoke_test(
+            SmokeTestConfig(
+                source_database_path=source,
+                smoke_database_path=smoke,
+                migrations_directory=tmp_path / "migrations",
+                result_path=tmp_path / "smoke.json",
+                git_sha="43663ed",
+            ),
+            apply_migrations=migrate,
+            initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+            now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+        )
+
+
+def test_smoke_allows_new_nullable_detection_event_columns(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    smoke = tmp_path / "smoke.db"
+    _create_source_database(source)
+    _create_phase3b_evidence_tables(source)
+
+    def migrate(database: Path, _: Path) -> dict[str, object]:
+        with sqlite3.connect(database) as connection:
+            connection.execute("ALTER TABLE detection_events ADD COLUMN dedupe_key TEXT")
+            connection.execute("ALTER TABLE detection_events ADD COLUMN policy_version TEXT")
+        return {"applied_versions": [3]}
+
+    report = run_cutover_smoke_test(
+        SmokeTestConfig(
+            source_database_path=source,
+            smoke_database_path=smoke,
+            migrations_directory=tmp_path / "migrations",
+            result_path=tmp_path / "smoke.json",
+            git_sha="43663ed",
+        ),
+        apply_migrations=migrate,
+        initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+        now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+    )
+
+    assert report.status == "succeeded"
+
+
+def test_smoke_rejects_non_legacy_event_added_by_checkpoint_initializer(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.db"
+    smoke = tmp_path / "smoke.db"
+    _create_source_database(source)
+    _create_phase3b_evidence_tables(source)
+
+    def initialize(database: Path, _: datetime) -> dict[str, object]:
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "INSERT INTO detection_events (id, event_type) VALUES (31, 'UNKNOWN_DEVICE')"
+            )
+        return _persist_checkpoint_summary(database)
+
+    with pytest.raises(CutoverExecutionError, match="non-LEGACY_MIGRATION"):
+        run_cutover_smoke_test(
+            SmokeTestConfig(
+                source_database_path=source,
+                smoke_database_path=smoke,
+                migrations_directory=tmp_path / "migrations",
+                result_path=tmp_path / "smoke.json",
+                git_sha="43663ed",
+            ),
+            apply_migrations=lambda *_: {"applied_versions": [3]},
+            initialize_checkpoints=initialize,
+            now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+        )
+
+    saved = json.loads((tmp_path / "smoke.json").read_text(encoding="utf-8"))
+    assert saved["failure_stage"] == "final-data-preservation-check"
 
 
 def test_automatic_rollback_rejects_service_state_mismatch(tmp_path: Path) -> None:

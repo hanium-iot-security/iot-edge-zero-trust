@@ -164,8 +164,11 @@ python -m edge.scripts.run_phase4_cutover \
 - `integrity_check` 결과가 `ok`임
 - Source별 Cutover Watermark와 Checkpoint 7개가 JSON 결과에 기록됨
 - 기존 Segment Row 수·ID Digest와 Packet Feature Row 수가 보존되고 고아 FK가 0건임
-- 기존 주요 Table Row 수가 감소하지 않고 Migration 전 Detection Event ID가 최종 ID 집합에
-  모두 포함됨. 신규 `LEGACY_MIGRATION` Event ID 추가는 허용함
+- `detection_event_rows` 증적에는 Event ID별 `event_type`, Source FK, Detector·Severity·Score,
+  설명·탐지 시각·분석 Window·Incident·Evidence·Policy 핵심 값을 기록함. Cutover에서 의도적으로
+  갱신할 수 있는 `applied_to_score`, `processed_at`, `processing_reason`은 불변 비교에서 제외함
+- 기존 Detection Event ID와 위 불변 핵심 값은 그대로 보존돼야 하며, Migration 전에는 없던
+  신규 ID는 `event_type=LEGACY_MIGRATION`인 경우만 허용함
 - Migration 직후뿐 아니라 Checkpoint 초기화 후 `smoke_final` 증적에서도 보존 계약을 다시 검증함
 - 보존 검사가 실패하면 `failure_stage=data-preservation-check` 또는
   `failure_stage=final-data-preservation-check`로 기록됨

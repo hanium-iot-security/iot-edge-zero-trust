@@ -122,7 +122,16 @@ def create_phase3b_evidence_tables(path: Path) -> None:
             """
         )
         connection.execute(
-            "CREATE TABLE detection_events (id INTEGER PRIMARY KEY, event_type TEXT)"
+            """
+            CREATE TABLE detection_events (
+                id INTEGER PRIMARY KEY,
+                detector_type TEXT,
+                event_type TEXT,
+                severity TEXT,
+                score_delta INTEGER,
+                description TEXT
+            )
+            """
         )
         connection.execute(
             "INSERT INTO packet_capture_segments (id, status) VALUES (10, 'PROCESSED')"
@@ -131,5 +140,14 @@ def create_phase3b_evidence_tables(path: Path) -> None:
             "INSERT INTO packet_feature_logs (id, capture_segment_id) VALUES (20, 10)"
         )
         connection.execute(
-            "INSERT INTO detection_events (id, event_type) VALUES (30, 'LEGACY')"
+            """
+            INSERT INTO detection_events (
+                id,
+                detector_type,
+                event_type,
+                severity,
+                score_delta,
+                description
+            ) VALUES (30, 'RULE', 'LEGACY', 'high', -20, 'existing event')
+            """
         )
