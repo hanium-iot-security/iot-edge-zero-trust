@@ -1005,6 +1005,10 @@ def test_smoke_snapshot_detects_wal_row_value_change_with_equal_row_count(
             "segment IDs changed",
         ),
         (
+            "UPDATE packet_capture_segments SET status = 'FAILED' WHERE id = 10",
+            "segment values changed",
+        ),
+        (
             "DELETE FROM packet_feature_logs WHERE id = 20",
             "packet feature rows decreased",
         ),
@@ -1015,6 +1019,11 @@ def test_smoke_snapshot_detects_wal_row_value_change_with_equal_row_count(
         (
             "UPDATE packet_feature_logs SET capture_segment_id = 999 WHERE id = 20",
             "orphan packet feature foreign keys",
+        ),
+        (
+            "UPDATE packet_feature_logs SET packet_count = 0, total_bytes = 0 "
+            "WHERE id = 20",
+            "packet feature values changed",
         ),
         (
             "DELETE FROM detection_events WHERE id = 30",
@@ -1409,6 +1418,81 @@ def test_smoke_revalidates_data_after_checkpoint_initialization(tmp_path: Path) 
             initialize_checkpoints=destructive_initializer,
             now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
         )
+
+
+def test_smoke_rejects_packet_value_change_after_checkpoint_initialization(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.db"
+    smoke = tmp_path / "smoke.db"
+    result = tmp_path / "smoke.json"
+    _create_source_database(source)
+    _create_phase3b_evidence_tables(source)
+
+    def mutate_existing_packet_values(
+        database: Path,
+        _: datetime,
+    ) -> dict[str, object]:
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "UPDATE packet_capture_segments SET status = 'FAILED' WHERE id = 10"
+            )
+            connection.execute(
+                "UPDATE packet_feature_logs SET packet_count = 0 WHERE id = 20"
+            )
+        return _persist_checkpoint_summary(database)
+
+    with pytest.raises(CutoverExecutionError, match="values changed"):
+        run_cutover_smoke_test(
+            SmokeTestConfig(
+                source_database_path=source,
+                smoke_database_path=smoke,
+                migrations_directory=tmp_path / "migrations",
+                result_path=result,
+                git_sha="a2754c3",
+            ),
+            apply_migrations=lambda *_: {"applied_versions": [3]},
+            initialize_checkpoints=mutate_existing_packet_values,
+            now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+        )
+
+    saved = json.loads(result.read_text(encoding="utf-8"))
+    assert saved["failure_stage"] == "final-data-preservation-check"
+
+
+def test_smoke_allows_new_nullable_packet_columns_without_changing_existing_values(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.db"
+    smoke = tmp_path / "smoke.db"
+    _create_source_database(source)
+    _create_phase3b_evidence_tables(source)
+
+    def add_nullable_columns(database: Path, _: Path) -> dict[str, object]:
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "ALTER TABLE packet_capture_segments "
+                "ADD COLUMN actual_capture_started_at DATETIME"
+            )
+            connection.execute(
+                "ALTER TABLE packet_feature_logs ADD COLUMN policy_version TEXT"
+            )
+        return {"applied_versions": [3]}
+
+    report = run_cutover_smoke_test(
+        SmokeTestConfig(
+            source_database_path=source,
+            smoke_database_path=smoke,
+            migrations_directory=tmp_path / "migrations",
+            result_path=tmp_path / "smoke.json",
+            git_sha="a2754c3",
+        ),
+        apply_migrations=add_nullable_columns,
+        initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+        now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+    )
+
+    assert report.status == "succeeded"
 
 
 def test_smoke_rejects_replacing_existing_detection_event_ids(tmp_path: Path) -> None:

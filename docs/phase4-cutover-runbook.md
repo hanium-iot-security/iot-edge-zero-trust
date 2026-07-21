@@ -173,6 +173,11 @@ python -m edge.scripts.run_phase4_cutover \
 - `integrity_check` 결과가 `ok`임
 - Source별 Cutover Watermark와 Checkpoint 7개가 JSON 결과에 기록됨
 - 기존 Segment Row 수·ID Digest와 Packet Feature Row 수가 보존되고 고아 FK가 0건임
+- `packet_capture_segments`, `packet_feature_logs`는 Migration 전에 존재한 모든 컬럼을 대상으로
+  정렬된 `(id, value)`의 컬럼별 SHA256을 기록하고 전후가 일치해야 함. Segment 상태·파일·Window와
+  Packet Feature의 Source·방향·Window·Count·Size·Interval 등 기존 값의 변조를 허용하지 않음
+- Migration 003에서 새 Nullable 컬럼을 추가하는 것은 허용하되, 새 컬럼은 Migration 전 증적에
+  없으므로 기존 컬럼 보존 비교에는 포함하지 않음
 - `detection_event_rows` 증적에는 Event ID별 `event_type`, Source FK, Detector·Severity·Score,
   설명·탐지 시각·분석 Window·Incident·Evidence·Policy 핵심 값을 기록함. Cutover에서 의도적으로
   갱신할 수 있는 `applied_to_score`, `processed_at`, `processing_reason`은 불변 비교에서 제외함
@@ -223,7 +228,7 @@ sudo /home/pi/iot-edge-zero-trust/venv/bin/python \
 - Source별 초기 Checkpoint 요약
 - FK·Integrity 결과
 - Backup 기준 `before`, Migration 직후 `after_migration`, Checkpoint 초기화 후 `final`의
-  Segment·Packet Feature·Detection Event 보존 증적과 검사 결과
+  Segment·Packet Feature 컬럼별 `(id, value)` Digest·Detection Event 보존 증적과 검사 결과
 - 중지한 기존 서비스와 시작한 신규 서비스
 - Writer를 포함한 전체 Unit의 작업 전·후 active 상태
 - 성공 판정 시 기존 Unit은 inactive, 신규 Unit은 active, Writer는 작업 전 상태와 일치함

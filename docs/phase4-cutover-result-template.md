@@ -51,7 +51,9 @@
 | 운영 원본 Table별 Row 수 |  |  |
 | Smoke DB SHA256 | Migration 전 | Migration 후 |
 | Segment ID Digest |  |  |
+| Segment 기존 컬럼별 `(id, value)` SHA256 |  |  |
 | Packet Feature Row·고아 FK |  |  |
+| Packet Feature 기존 컬럼별 `(id, value)` SHA256 |  |  |
 | Detection Event Row |  |  |
 | 기존 Detection Event ID 부분집합 보존 |  |  |
 | 기존 Detection Event 불변 핵심 값 보존 |  |  |
@@ -63,7 +65,9 @@
 | 항목 | Backup 기준 `before` | Migration 직후 `after_migration` | Checkpoint 이후 `final` |
 | --- | --- | --- | --- |
 | Segment Row·ID Digest |  |  |  |
+| Segment 기존 컬럼별 `(id, value)` SHA256 |  |  |  |
 | Packet Feature Row·고아 FK |  |  |  |
+| Packet Feature 기존 컬럼별 `(id, value)` SHA256 |  |  |  |
 | 기존 Detection Event ID·불변 핵심 값 |  |  |  |
 | 신규 Detection Event 유형 |  |  |  |
 

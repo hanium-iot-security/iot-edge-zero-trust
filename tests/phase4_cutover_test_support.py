@@ -91,7 +91,18 @@ def create_source_database(path: Path) -> None:
             """
             CREATE TABLE packet_capture_segments (
                 id INTEGER PRIMARY KEY,
-                status TEXT
+                capture_session_id INTEGER,
+                file_name TEXT,
+                capture_interface TEXT,
+                window_start DATETIME,
+                window_end DATETIME,
+                status TEXT,
+                packet_count INTEGER,
+                processed_at DATETIME,
+                error_code TEXT,
+                error_message TEXT,
+                created_at DATETIME,
+                updated_at DATETIME
             )
             """
         )
@@ -100,7 +111,23 @@ def create_source_database(path: Path) -> None:
             CREATE TABLE packet_feature_logs (
                 id INTEGER PRIMARY KEY,
                 capture_segment_id INTEGER
-                    REFERENCES packet_capture_segments(id)
+                    REFERENCES packet_capture_segments(id),
+                device_id TEXT,
+                peer_ip TEXT,
+                direction TEXT,
+                window_start DATETIME,
+                window_end DATETIME,
+                packet_count INTEGER,
+                total_bytes INTEGER,
+                avg_packet_size REAL,
+                max_packet_size INTEGER,
+                mean_inter_arrival_time REAL,
+                distinct_dest_port_count INTEGER,
+                tcp_syn_count INTEGER,
+                mqtt_related_packet_count INTEGER,
+                non_mqtt_tcp_udp_packet_count INTEGER,
+                capture_scope TEXT,
+                created_at DATETIME
             )
             """
         )
@@ -165,10 +192,35 @@ def create_phase3b_evidence_tables(path: Path) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(
-            "INSERT INTO packet_capture_segments (id, status) VALUES (10, 'PROCESSED')"
+            """
+            INSERT INTO packet_capture_segments (
+                id, capture_session_id, file_name, capture_interface,
+                window_start, window_end, status, packet_count, processed_at,
+                error_code, error_message, created_at, updated_at
+            ) VALUES (
+                10, 1, 'segment-10.pcap', 'eth0',
+                '2026-07-21T04:30:00Z', '2026-07-21T04:30:10Z',
+                'PROCESSED', 12, '2026-07-21T04:30:11Z', NULL, NULL,
+                '2026-07-21T04:30:10Z', '2026-07-21T04:30:11Z'
+            )
+            """
         )
         connection.execute(
-            "INSERT INTO packet_feature_logs (id, capture_segment_id) VALUES (20, 10)"
+            """
+            INSERT INTO packet_feature_logs (
+                id, capture_segment_id, device_id, peer_ip, direction,
+                window_start, window_end, packet_count, total_bytes,
+                avg_packet_size, max_packet_size, mean_inter_arrival_time,
+                distinct_dest_port_count, tcp_syn_count,
+                mqtt_related_packet_count, non_mqtt_tcp_udp_packet_count,
+                capture_scope, created_at
+            ) VALUES (
+                20, 10, 'esp32_01', '192.168.0.4', 'INBOUND',
+                '2026-07-21T04:30:00Z', '2026-07-21T04:30:10Z',
+                12, 1200, 100.0, 180, 0.5, 2, 1, 8, 4,
+                'REGISTERED_DEVICE', '2026-07-21T04:30:11Z'
+            )
+            """
         )
         connection.execute(
             """

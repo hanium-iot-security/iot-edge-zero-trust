@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -268,6 +269,60 @@ def _optional_ids(database: Path, table: str) -> tuple[int, ...] | None:
         return None
 
 
+def _canonical_sqlite_value(value: object) -> object:
+    if isinstance(value, bytes):
+        return {"bytes_hex": value.hex()}
+    return value
+
+
+def _optional_table_column_digests(
+    database: Path,
+    table: str,
+) -> Mapping[str, object] | None:
+    """Hash every existing column as ordered ``(id, value)`` pairs."""
+
+    try:
+        with sqlite3.connect(database) as connection:
+            columns = tuple(
+                str(row[1])
+                for row in connection.execute(
+                    f'PRAGMA table_info("{table}")'
+                ).fetchall()
+            )
+            if "id" not in columns:
+                return None
+            ids = tuple(
+                int(row[0])
+                for row in connection.execute(
+                    f'SELECT id FROM "{table}" ORDER BY id'
+                ).fetchall()
+            )
+            column_digests: dict[str, str] = {}
+            for column in columns:
+                if column == "id":
+                    continue
+                rows = connection.execute(
+                    f'SELECT id, "{column}" FROM "{table}" ORDER BY id'
+                ).fetchall()
+                payload = [
+                    [int(row[0]), _canonical_sqlite_value(row[1])]
+                    for row in rows
+                ]
+                serialized = json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                column_digests[column] = hashlib.sha256(serialized).hexdigest()
+    except sqlite3.OperationalError:
+        return None
+    return {
+        "ids": ids,
+        "columns": tuple(column for column in columns if column != "id"),
+        "column_digests": column_digests,
+    }
+
+
 def _optional_detection_event_rows(
     database: Path,
 ) -> Mapping[int, Mapping[str, object]] | None:
@@ -310,8 +365,14 @@ def database_evidence(database: Path) -> Mapping[str, object]:
             database, "SELECT COUNT(*) FROM packet_capture_segments"
         ),
         "segment_id_digest": _id_digest(database, "packet_capture_segments"),
+        "segment_row_evidence": _optional_table_column_digests(
+            database, "packet_capture_segments"
+        ),
         "packet_feature_count": _optional_scalar(
             database, "SELECT COUNT(*) FROM packet_feature_logs"
+        ),
+        "packet_feature_row_evidence": _optional_table_column_digests(
+            database, "packet_feature_logs"
         ),
         "orphan_packet_feature_fk_count": _optional_scalar(
             database,
@@ -331,6 +392,40 @@ def database_evidence(database: Path) -> Mapping[str, object]:
     }
 
 
+def _validate_packet_row_values(
+    before: object,
+    after: object,
+    *,
+    label: str,
+    errors: list[str],
+) -> None:
+    if not isinstance(before, Mapping):
+        return
+    if not isinstance(after, Mapping):
+        errors.append(f"{label} row evidence is unavailable")
+        return
+
+    before_ids = before.get("ids")
+    after_ids = after.get("ids")
+    if before_ids != after_ids:
+        errors.append(f"{label} IDs changed")
+
+    before_digests = before.get("column_digests")
+    after_digests = after.get("column_digests")
+    if not isinstance(before_digests, Mapping) or not isinstance(
+        after_digests, Mapping
+    ):
+        errors.append(f"{label} column evidence is unavailable")
+        return
+    changed_fields = [
+        column
+        for column, digest in before_digests.items()
+        if after_digests.get(column) != digest
+    ]
+    if changed_fields:
+        errors.append(f"{label} values changed: fields={changed_fields}")
+
+
 def validate_data_preservation(
     before: Mapping[str, object],
     after: Mapping[str, object],
@@ -345,6 +440,12 @@ def validate_data_preservation(
             errors.append("packet capture segment rows changed")
         if after.get("segment_id_digest") != before.get("segment_id_digest"):
             errors.append("packet capture segment IDs changed")
+        _validate_packet_row_values(
+            before.get("segment_row_evidence"),
+            after.get("segment_row_evidence"),
+            label="packet capture segment",
+            errors=errors,
+        )
 
     feature_count_before = before.get("packet_feature_count")
     if feature_count_before is not None:
@@ -359,6 +460,12 @@ def validate_data_preservation(
         orphan_count = after.get("orphan_packet_feature_fk_count")
         if orphan_count is None or int(orphan_count) != 0:
             errors.append("orphan packet feature foreign keys were created")
+        _validate_packet_row_values(
+            before.get("packet_feature_row_evidence"),
+            after.get("packet_feature_row_evidence"),
+            label="packet feature",
+            errors=errors,
+        )
 
     event_count_before = before.get("detection_event_count")
     if event_count_before is not None:
