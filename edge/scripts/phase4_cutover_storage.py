@@ -171,6 +171,17 @@ def _id_digest(database: Path, table: str) -> str | None:
     return hashlib.sha256(",".join(ids).encode("utf-8")).hexdigest()
 
 
+def _optional_ids(database: Path, table: str) -> tuple[int, ...] | None:
+    try:
+        with sqlite3.connect(database) as connection:
+            return tuple(
+                int(row[0])
+                for row in connection.execute(f'SELECT id FROM "{table}" ORDER BY id')
+            )
+    except sqlite3.OperationalError:
+        return None
+
+
 def database_evidence(database: Path) -> Mapping[str, object]:
     return {
         "table_row_counts": table_row_counts(database),
@@ -194,6 +205,7 @@ def database_evidence(database: Path) -> Mapping[str, object]:
         "detection_event_count": _optional_scalar(
             database, "SELECT COUNT(*) FROM detection_events"
         ),
+        "detection_event_ids": _optional_ids(database, "detection_events"),
     }
 
 
@@ -231,6 +243,13 @@ def validate_data_preservation(
         event_count_after = after.get("detection_event_count")
         if event_count_after is None or int(event_count_after) < int(event_count_before):
             errors.append("detection event rows decreased")
+        event_ids_before = before.get("detection_event_ids")
+        event_ids_after = after.get("detection_event_ids")
+        if isinstance(event_ids_before, (tuple, list)):
+            if not isinstance(event_ids_after, (tuple, list)) or not set(
+                event_ids_before
+            ).issubset(event_ids_after):
+                errors.append("detection event IDs were removed")
 
     table_counts_before = before.get("table_row_counts")
     table_counts_after = after.get("table_row_counts")

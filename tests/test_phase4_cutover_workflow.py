@@ -328,6 +328,20 @@ def test_execute_rollback_verifies_backup_then_restores_and_starts_legacy_servic
     with sqlite3.connect(database) as connection:
         connection.execute("UPDATE parent SET name = 'broken-cutover' WHERE id = 1")
     events: list[str] = []
+    active = {
+        "rule-detector.service": False,
+        "trust-score.service": False,
+        "detection-orchestrator.service": True,
+        "firewall-worker.service": True,
+    }
+
+    def stop(service: str) -> None:
+        events.append(f"stop:{service}")
+        active[service] = False
+
+    def start(service: str) -> None:
+        events.append(f"start:{service}")
+        active[service] = True
 
     report = execute_rollback(
         RollbackConfig(
@@ -340,12 +354,9 @@ def test_execute_rollback_verifies_backup_then_restores_and_starts_legacy_servic
             new_services=("detection-orchestrator.service", "firewall-worker.service"),
         ),
         RollbackDependencies(
-            stop_service=lambda service: events.append(f"stop:{service}"),
-            start_service=lambda service: events.append(f"start:{service}"),
-            is_service_active=lambda service: service in {
-                "detection-orchestrator.service",
-                "firewall-worker.service",
-            },
+            stop_service=stop,
+            start_service=start,
+            is_service_active=lambda service: active[service],
             now=lambda: datetime(2026, 7, 21, 5, 0, tzinfo=timezone.utc),
         ),
     )
@@ -1045,3 +1056,228 @@ def test_smoke_allows_legacy_detection_event_addition(tmp_path: Path) -> None:
 
     assert report.status == "succeeded"
     assert report.database_evidence["smoke_after"]["detection_event_count"] == 2
+
+
+def test_automatic_rollback_rejects_service_state_mismatch(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    result_path = tmp_path / "cutover.json"
+    _create_source_database(database)
+    active = {
+        "legacy.service": True,
+        "orchestrator.service": False,
+    }
+
+    def stop(service: str) -> None:
+        active[service] = False
+
+    def start_without_becoming_active(_: str) -> None:
+        return None
+
+    with pytest.raises(CutoverExecutionError, match="service state verification"):
+        execute_cutover(
+            CutoverConfig(
+                database_path=database,
+                backup_directory=tmp_path / "backups",
+                migrations_directory=tmp_path / "migrations",
+                result_path=result_path,
+                git_sha="ef4a64a",
+                legacy_services=("legacy.service",),
+                new_services=("orchestrator.service",),
+            ),
+            CutoverDependencies(
+                stop_service=stop,
+                start_service=start_without_becoming_active,
+                is_service_active=lambda service: active[service],
+                apply_migrations=lambda *_: {"applied_versions": [3]},
+                initialize_checkpoints=lambda *_: (_ for _ in ()).throw(
+                    RuntimeError("checkpoint failed")
+                ),
+                now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+            ),
+        )
+
+    saved = json.loads(result_path.read_text(encoding="utf-8"))
+    assert saved["status"] == "rollback_failed"
+    assert saved["rollback_succeeded"] is False
+    assert "service state verification" in saved["rollback_error"]
+
+
+def test_manual_rollback_rejects_post_restore_service_state_mismatch(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "operational.db"
+    backup = tmp_path / "selected.db"
+    result_path = tmp_path / "rollback.json"
+    _create_source_database(database)
+    artifact = create_sqlite_backup(database, backup)
+    active = {
+        "legacy.service": False,
+        "orchestrator.service": True,
+    }
+
+    with pytest.raises(CutoverExecutionError, match="service state verification"):
+        execute_rollback(
+            RollbackConfig(
+                database_path=database,
+                backup_path=backup,
+                sha256_path=artifact.sha256_path,
+                result_path=result_path,
+                git_sha="ef4a64a",
+                legacy_services=("legacy.service",),
+                new_services=("orchestrator.service",),
+            ),
+            RollbackDependencies(
+                stop_service=lambda _: None,
+                start_service=lambda _: None,
+                is_service_active=lambda service: active[service],
+                now=lambda: datetime(2026, 7, 21, 5, 0, tzinfo=timezone.utc),
+            ),
+        )
+
+    saved = json.loads(result_path.read_text(encoding="utf-8"))
+    assert saved["status"] == "failed"
+    assert saved["failure_stage"] == "post-service-verification"
+
+
+def test_cutover_rejects_result_path_matching_planned_backup(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    backup_directory = tmp_path / "backups"
+    _create_source_database(database)
+    result_path = backup_directory / "operational_before_phase4_20260721T043000Z.db"
+    service_events: list[str] = []
+
+    with pytest.raises(CutoverSafetyError, match="artifact paths conflict"):
+        execute_cutover(
+            CutoverConfig(
+                database_path=database,
+                backup_directory=backup_directory,
+                migrations_directory=tmp_path / "migrations",
+                result_path=result_path,
+                git_sha="ef4a64a",
+            ),
+            CutoverDependencies(
+                stop_service=lambda service: service_events.append(f"stop:{service}"),
+                start_service=lambda service: service_events.append(f"start:{service}"),
+                is_service_active=lambda _: False,
+                apply_migrations=lambda *_: {"applied_versions": [3]},
+                initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+                now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+            ),
+        )
+
+    assert service_events == []
+    assert not result_path.exists()
+
+
+def test_smoke_rejects_result_path_matching_source_snapshot(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    smoke = tmp_path / "smoke.db"
+    result_path = tmp_path / "smoke.source-before.db"
+    _create_source_database(source)
+
+    with pytest.raises(CutoverSafetyError, match="artifact paths conflict"):
+        run_cutover_smoke_test(
+            SmokeTestConfig(
+                source_database_path=source,
+                smoke_database_path=smoke,
+                migrations_directory=tmp_path / "migrations",
+                result_path=result_path,
+                git_sha="ef4a64a",
+            ),
+            apply_migrations=lambda *_: {"applied_versions": [3]},
+            initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+            now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+        )
+
+    assert not result_path.exists()
+    assert not smoke.exists()
+
+
+def test_manual_rollback_rejects_result_path_matching_prebackup(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    selected_backup = tmp_path / "selected.db"
+    prebackup_directory = tmp_path / "pre-rollback"
+    result_path = (
+        prebackup_directory
+        / "operational_pre_manual_rollback_20260721T050000Z.db"
+    )
+    _create_source_database(database)
+    artifact = create_sqlite_backup(database, selected_backup)
+    service_events: list[str] = []
+
+    with pytest.raises(CutoverSafetyError, match="artifact paths conflict"):
+        execute_rollback(
+            RollbackConfig(
+                database_path=database,
+                backup_path=selected_backup,
+                sha256_path=artifact.sha256_path,
+                backup_directory=prebackup_directory,
+                result_path=result_path,
+                git_sha="ef4a64a",
+            ),
+            RollbackDependencies(
+                stop_service=lambda service: service_events.append(f"stop:{service}"),
+                start_service=lambda service: service_events.append(f"start:{service}"),
+                is_service_active=lambda _: False,
+                now=lambda: datetime(2026, 7, 21, 5, 0, tzinfo=timezone.utc),
+            ),
+        )
+
+    assert service_events == []
+    assert not result_path.exists()
+
+
+def test_smoke_revalidates_data_after_checkpoint_initialization(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    smoke = tmp_path / "smoke.db"
+    _create_source_database(source)
+    _create_phase3b_evidence_tables(source)
+
+    def destructive_initializer(database: Path, _: datetime) -> dict[str, object]:
+        with sqlite3.connect(database) as connection:
+            connection.execute("DELETE FROM packet_feature_logs")
+        return _persist_checkpoint_summary(database)
+
+    with pytest.raises(CutoverExecutionError, match="packet feature rows decreased"):
+        run_cutover_smoke_test(
+            SmokeTestConfig(
+                source_database_path=source,
+                smoke_database_path=smoke,
+                migrations_directory=tmp_path / "migrations",
+                result_path=tmp_path / "smoke.json",
+                git_sha="ef4a64a",
+            ),
+            apply_migrations=lambda *_: {"applied_versions": [3]},
+            initialize_checkpoints=destructive_initializer,
+            now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+        )
+
+
+def test_smoke_rejects_replacing_existing_detection_event_ids(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    smoke = tmp_path / "smoke.db"
+    _create_source_database(source)
+    _create_phase3b_evidence_tables(source)
+
+    def replace_existing_event(database: Path, _: Path) -> dict[str, object]:
+        with sqlite3.connect(database) as connection:
+            connection.execute("DELETE FROM detection_events WHERE id = 30")
+            connection.executemany(
+                "INSERT INTO detection_events (id, event_type) VALUES (?, ?)",
+                ((31, "LEGACY_MIGRATION"), (32, "LEGACY_MIGRATION")),
+            )
+        return {"applied_versions": [3]}
+
+    with pytest.raises(CutoverExecutionError, match="detection event IDs were removed"):
+        run_cutover_smoke_test(
+            SmokeTestConfig(
+                source_database_path=source,
+                smoke_database_path=smoke,
+                migrations_directory=tmp_path / "migrations",
+                result_path=tmp_path / "smoke.json",
+                git_sha="ef4a64a",
+            ),
+            apply_migrations=replace_existing_event,
+            initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+            now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+        )

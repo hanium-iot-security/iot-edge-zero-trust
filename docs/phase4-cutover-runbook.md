@@ -87,8 +87,9 @@ Runner는 반환 요약과 DB Row의 Key·`last_processed_id`·UTC 완료 Window
   동일 inode를 다음 실행에서도 재사용하는 것이 정상이다.
 - Execute·Smoke 직전에는 `discover_migrations()`로 전체 Migration 이름·연속 Version·SQL
   완결성을 검증하며, Version 3은 정확히 한 개여야 한다.
-- 서비스 중지 전 운영 DB·Backup·결과·Pre-rollback 출력 경로별로 충돌, 쓰기 Probe와
-  `fsync`, 실제 파일시스템 여유 공간을 확인한다. Dry Run은 파일·디렉터리를 만들지 않는다.
+- 서비스 중지 전 운영 DB·Backup·Snapshot·SHA256 Manifest·결과 JSON·결과 임시 파일·
+  Pre-rollback 출력 경로를 모두 계산하고 상호 충돌 여부를 확인한다. 출력 디렉터리별 쓰기
+  Probe와 `fsync`, 실제 파일시스템 여유 공간도 확인한다. Dry Run은 파일·디렉터리를 만들지 않는다.
 - 로그와 결과 파일에 비밀번호, Token, SSH Key, `.env` 전체 내용을 남기지 않는다.
 
 ## 4. 사전 기록
@@ -163,8 +164,11 @@ python -m edge.scripts.run_phase4_cutover \
 - `integrity_check` 결과가 `ok`임
 - Source별 Cutover Watermark와 Checkpoint 7개가 JSON 결과에 기록됨
 - 기존 Segment Row 수·ID Digest와 Packet Feature Row 수가 보존되고 고아 FK가 0건임
-- 기존 주요 Table Row 수와 기존 Detection Event Row 수가 감소하지 않음
-- 위 보존 검사가 실패하면 `failure_stage=data-preservation-check`로 기록됨
+- 기존 주요 Table Row 수가 감소하지 않고 Migration 전 Detection Event ID가 최종 ID 집합에
+  모두 포함됨. 신규 `LEGACY_MIGRATION` Event ID 추가는 허용함
+- Migration 직후뿐 아니라 Checkpoint 초기화 후 `smoke_final` 증적에서도 보존 계약을 다시 검증함
+- 보존 검사가 실패하면 `failure_stage=data-preservation-check` 또는
+  `failure_stage=final-data-preservation-check`로 기록됨
 
 기존 Smoke DB를 재사용하지 말고 실행별 새 경로를 사용한다. 실패한 Smoke DB와 결과 JSON은
 삭제하지 않고 원인 분석용으로 보존한다.
@@ -210,7 +214,8 @@ sudo /home/pi/iot-edge-zero-trust/venv/bin/python \
   `rollback_error`와 하위 호환용 `error` 요약
 
 도중 실패하면 도구가 생성한 Backup을 검증해 자동 복원을 시도하고 기존 systemd Unit을
-재시작한다. 결과 상태가 `rolled_back`인지 확인한다. `rollback_failed`이면 서비스를 임의로
+재시작한다. 복구 명령 이후 전체 Unit의 실제 상태가 작업 전 상태와 정확히 일치해야만
+`rolled_back`, `rollback_succeeded=true`로 기록한다. `rollback_failed`이면 서비스를 임의로
 재시작하지 말고 아래 명시적 Rollback 절차를 수행한다.
 
 ## 8. 명시적 Rollback
@@ -256,9 +261,11 @@ sudo /home/pi/iot-edge-zero-trust/venv/bin/python \
 ```
 
 명시적 Rollback은 대상 운영 DB가 실제 일반 파일인지 먼저 확인하고, 전달된 기존·신규·Writer
-Unit을 모두 중지한 후 현재 DB를 `pre_manual_rollback` Backup·SHA256으로 추가 보존한다. 지정
+Unit이 실제 systemd에 존재하는지 서비스 변경 전에 확인한다. 이후 Unit을 모두 중지한 후 현재
+DB를 `pre_manual_rollback` Backup·SHA256으로 추가 보존한다. 지정
 Backup 복원과 검증이 끝나면 기존 Unit을 시작하고 Writer는 작업 전 상태로 복구하며 신규 Unit은
-중지 상태를 유지한다. 복원이 검증되기 전에는 기존 Cron을 재시작하지 않는다. Rollback 이후
+중지 상태를 유지한다. 명령 실행 후 이 실제 상태가 확인돼야만 성공으로 기록한다. 복원이 검증되기
+전에는 기존 Cron을 재시작하지 않는다. Rollback 이후
 새 Cutover를 시도하려면 새 Backup·SHA256과 새로운 `phase4_cutover_at`을 생성한다.
 
 ## 9. 결과 기록

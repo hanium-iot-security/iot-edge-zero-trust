@@ -48,6 +48,8 @@
 | Segment ID Digest |  |  |
 | Packet Feature Row·고아 FK |  |  |
 | Detection Event Row |  |  |
+| 기존 Detection Event ID 부분집합 보존 |  |  |
+| Checkpoint 초기화 후 `smoke_final` 보존 검사 |  |  |
 
 ## 5. DB 검증
 
@@ -82,6 +84,7 @@
 - 자동 Rollback 시도(`rollback_attempted`):
 - 자동 Rollback 성공(`rollback_succeeded`):
 - 자동 Rollback 오류(`rollback_error`):
+- Rollback 후 실제 Unit 상태와 기대 상태 비교:
 - 수동 조치:
 - 남은 미검증 항목:
 

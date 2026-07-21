@@ -356,6 +356,8 @@ def _expected_cutover_service_states(
 def _validate_service_states(
     actual: Mapping[str, bool],
     expected: Mapping[str, bool],
+    *,
+    context: str = "post-cutover",
 ) -> None:
     mismatches = {
         service: {"expected": expected_state, "actual": actual.get(service)}
@@ -364,8 +366,25 @@ def _validate_service_states(
     }
     if mismatches:
         raise CutoverSafetyError(
-            f"Post-cutover service state verification failed: {mismatches}"
+            f"{context} service state verification failed: {mismatches}"
         )
+
+
+def _expected_rollback_service_states(
+    config: RollbackConfig,
+    services_before: Mapping[str, bool],
+) -> Mapping[str, bool]:
+    expected: dict[str, bool] = {
+        service: True for service in config.legacy_services
+    }
+    expected.update({service: False for service in config.new_services})
+    expected.update(
+        {
+            service: services_before[service]
+            for service in config.paused_writer_services
+        }
+    )
+    return expected
 
 
 def _stop_services(
@@ -418,6 +437,29 @@ def _validate_new_result_path(path: Path, protected_paths: tuple[Path, ...]) -> 
         raise CutoverSafetyError(f"Cutover temporary result path is unsafe: {temporary}")
 
 
+def _validate_distinct_artifact_paths(paths: Mapping[str, Path]) -> None:
+    by_path: dict[Path, list[str]] = {}
+    for label, path in paths.items():
+        by_path.setdefault(path.expanduser().resolve(), []).append(label)
+    conflicts = {
+        str(path): labels
+        for path, labels in by_path.items()
+        if len(labels) > 1
+    }
+    if conflicts:
+        raise CutoverSafetyError(f"Workflow artifact paths conflict: {conflicts}")
+
+
+def _validate_new_artifact_paths(paths: Mapping[str, Path]) -> None:
+    existing = {
+        label: str(path)
+        for label, path in paths.items()
+        if path.expanduser().resolve().exists()
+    }
+    if existing:
+        raise CutoverSafetyError(f"Workflow artifact paths already exist: {existing}")
+
+
 def _backup_name(database_path: Path, cutover_at: datetime) -> str:
     timestamp = cutover_at.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{database_path.stem}_before_phase4_{timestamp}{database_path.suffix}"
@@ -442,7 +484,23 @@ def execute_cutover(
     migrations_directory = config.migrations_directory.expanduser().resolve()
     if not database.is_file():
         raise CutoverSafetyError(f"Operational database does not exist: {database}")
-    _validate_new_result_path(result_path, (database,))
+    cutover_at = dependencies.now()
+    cutover_at_iso = _utc_iso(cutover_at)
+    backup_path = backup_directory / _backup_name(database, cutover_at)
+    backup_sha256_path = backup_path.with_suffix(backup_path.suffix + ".sha256")
+    result_temporary = result_path.with_suffix(result_path.suffix + ".tmp")
+    operation_lock = database.with_suffix(database.suffix + ".phase4.lock")
+    _validate_distinct_artifact_paths(
+        {
+            "operational_database": database,
+            "operation_lock": operation_lock,
+            "backup_database": backup_path,
+            "backup_sha256": backup_sha256_path,
+            "result_json": result_path,
+            "result_json_temporary": result_temporary,
+        }
+    )
+    _validate_new_result_path(result_path, (database, operation_lock))
 
     all_services = tuple(
         dict.fromkeys(
@@ -452,10 +510,6 @@ def execute_cutover(
         )
     )
     services_before = _service_states(all_services, dependencies.is_service_active)
-    cutover_at = dependencies.now()
-    cutover_at_iso = _utc_iso(cutover_at)
-    backup_path = backup_directory / _backup_name(database, cutover_at)
-    backup_sha256_path = backup_path.with_suffix(backup_path.suffix + ".sha256")
 
     def record_preflight_failure(message: str) -> None:
         _write_report(
@@ -595,11 +649,23 @@ def execute_cutover(
             except Exception as service_exc:  # noqa: BLE001
                 rollback_errors.append(str(service_exc))
 
+            services_after: Mapping[str, bool] = {}
+            try:
+                services_after = _service_states(
+                    all_services, dependencies.is_service_active
+                )
+                _validate_service_states(
+                    services_after,
+                    services_before,
+                    context="automatic rollback",
+                )
+            except Exception as verification_exc:  # noqa: BLE001
+                rollback_errors.append(str(verification_exc))
+
             status = "rolled_back" if not rollback_errors else "rollback_failed"
             error_message = str(exc)
             if rollback_errors:
                 error_message += "; rollback failed: " + "; ".join(rollback_errors)
-            services_after = _service_states(all_services, dependencies.is_service_active)
             report = CutoverReport(
                 status=status,
                 git_sha=config.git_sha,
@@ -645,7 +711,51 @@ def run_cutover_smoke_test(
         raise CutoverSafetyError(f"Source database does not exist: {source}")
     if source == smoke_database:
         raise CutoverSafetyError("Smoke-test database must differ from the source database")
-    _validate_new_result_path(result_path, (source, smoke_database))
+    source_snapshot_before = smoke_database.with_name(
+        f"{smoke_database.stem}.source-before{source.suffix}"
+    )
+    source_snapshot_after = smoke_database.with_name(
+        f"{smoke_database.stem}.source-after{source.suffix}"
+    )
+    smoke_sha256_path = smoke_database.with_suffix(smoke_database.suffix + ".sha256")
+    source_snapshot_before_sha256 = source_snapshot_before.with_suffix(
+        source_snapshot_before.suffix + ".sha256"
+    )
+    source_snapshot_after_sha256 = source_snapshot_after.with_suffix(
+        source_snapshot_after.suffix + ".sha256"
+    )
+    post_manifest_path = smoke_database.with_suffix(
+        smoke_database.suffix + ".post-migration.sha256"
+    )
+    result_temporary = result_path.with_suffix(result_path.suffix + ".tmp")
+    operation_lock = source.with_suffix(source.suffix + ".phase4.lock")
+    _validate_distinct_artifact_paths(
+        {
+            "source_database": source,
+            "operation_lock": operation_lock,
+            "smoke_database": smoke_database,
+            "smoke_sha256": smoke_sha256_path,
+            "source_snapshot_before": source_snapshot_before,
+            "source_snapshot_before_sha256": source_snapshot_before_sha256,
+            "source_snapshot_after": source_snapshot_after,
+            "source_snapshot_after_sha256": source_snapshot_after_sha256,
+            "post_migration_sha256": post_manifest_path,
+            "result_json": result_path,
+            "result_json_temporary": result_temporary,
+        }
+    )
+    _validate_new_result_path(result_path, (source, smoke_database, operation_lock))
+    _validate_new_artifact_paths(
+        {
+            "smoke_database": smoke_database,
+            "smoke_sha256": smoke_sha256_path,
+            "source_snapshot_before": source_snapshot_before,
+            "source_snapshot_before_sha256": source_snapshot_before_sha256,
+            "source_snapshot_after": source_snapshot_after,
+            "source_snapshot_after_sha256": source_snapshot_after_sha256,
+            "post_migration_sha256": post_manifest_path,
+        }
+    )
 
     cutover_at = now()
     cutover_at_iso = _utc_iso(cutover_at)
@@ -655,12 +765,6 @@ def run_cutover_smoke_test(
     source_sha_after: str | None = None
     source_counts_after: Mapping[str, int] = {}
     source_unchanged: bool | None = None
-    source_snapshot_before = smoke_database.with_name(
-        f"{smoke_database.stem}.source-before{source.suffix}"
-    )
-    source_snapshot_after = smoke_database.with_name(
-        f"{smoke_database.stem}.source-after{source.suffix}"
-    )
     source_snapshot_before_artifact: BackupArtifact | None = None
     source_snapshot_after_artifact: BackupArtifact | None = None
     artifact: BackupArtifact | None = None
@@ -710,6 +814,16 @@ def run_cutover_smoke_test(
             checkpoint_summary = dict(initialize_checkpoints(smoke_database, cutover_at))
             _validate_checkpoint_summary(checkpoint_summary)
             _validate_checkpoint_database(smoke_database, checkpoint_summary)
+            smoke_final = _database_evidence(smoke_database)
+            evidence = {
+                "source_before": source_evidence_before,
+                "smoke_before": smoke_before,
+                "smoke_after": smoke_after,
+                "smoke_final": smoke_final,
+            }
+            failure_stage = "final-data-preservation-check"
+            _validate_data_preservation(smoke_before, smoke_final)
+            failure_stage = "checkpoint-verification"
             final_verification = verify_database(smoke_database)
             if (
                 final_verification.integrity_check != "ok"
@@ -720,9 +834,7 @@ def run_cutover_smoke_test(
                 )
 
             final_smoke_sha256 = _sha256_file(smoke_database)
-            post_manifest = smoke_database.with_suffix(
-                smoke_database.suffix + ".post-migration.sha256"
-            )
+            post_manifest = post_manifest_path
             if post_manifest.exists():
                 raise CutoverSafetyError(
                     f"Smoke post-migration SHA256 already exists: {post_manifest}"
@@ -875,13 +987,38 @@ def execute_rollback(
     backup = config.backup_path.expanduser().resolve()
     sha256_path = config.sha256_path.expanduser().resolve()
     result_path = config.result_path.expanduser().resolve()
-    _validate_new_result_path(result_path, (database, backup, sha256_path))
     rollback_at = dependencies.now()
     rollback_at_iso = _utc_iso(rollback_at)
     backup_directory = (
         config.backup_directory.expanduser().resolve()
         if config.backup_directory is not None
         else backup.parent / "pre-rollback"
+    )
+    timestamp = rollback_at.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    pre_rollback_path = (
+        backup_directory
+        / f"{database.stem}_pre_manual_rollback_{timestamp}{database.suffix}"
+    )
+    pre_rollback_sha256_path = pre_rollback_path.with_suffix(
+        pre_rollback_path.suffix + ".sha256"
+    )
+    result_temporary = result_path.with_suffix(result_path.suffix + ".tmp")
+    operation_lock = database.with_suffix(database.suffix + ".phase4.lock")
+    _validate_distinct_artifact_paths(
+        {
+            "operational_database": database,
+            "selected_backup": backup,
+            "selected_backup_sha256": sha256_path,
+            "operation_lock": operation_lock,
+            "pre_rollback_backup": pre_rollback_path,
+            "pre_rollback_sha256": pre_rollback_sha256_path,
+            "result_json": result_path,
+            "result_json_temporary": result_temporary,
+        }
+    )
+    _validate_new_result_path(
+        result_path,
+        (database, backup, sha256_path, operation_lock),
     )
     all_services = tuple(
         dict.fromkeys(
@@ -941,14 +1078,6 @@ def execute_rollback(
         record_preflight_failure(str(exc))
         raise
 
-    timestamp = rollback_at.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    pre_rollback_path = (
-        backup_directory
-        / f"{database.stem}_pre_manual_rollback_{timestamp}{database.suffix}"
-    )
-    pre_rollback_sha256_path = pre_rollback_path.with_suffix(
-        pre_rollback_path.suffix + ".sha256"
-    )
     if pre_rollback_path.exists() or pre_rollback_sha256_path.exists():
         message = (
             "Pre-rollback backup destination already exists: "
@@ -987,7 +1116,13 @@ def execute_rollback(
                 start_service=dependencies.start_service,
                 stop_service=dependencies.stop_service,
             )
+            failure_stage = "post-service-verification"
             services_after = _service_states(all_services, dependencies.is_service_active)
+            _validate_service_states(
+                services_after,
+                _expected_rollback_service_states(config, services_before),
+                context="manual rollback",
+            )
 
             report = RollbackReport(
                 status="succeeded",
@@ -1027,12 +1162,23 @@ def execute_rollback(
                 )
             except Exception as service_exc:  # noqa: BLE001
                 recovery_errors.append(str(service_exc))
+            services_after: Mapping[str, bool] = {}
+            try:
+                services_after = _service_states(
+                    all_services, dependencies.is_service_active
+                )
+                _validate_service_states(
+                    services_after,
+                    services_before,
+                    context="rollback recovery",
+                )
+            except Exception as verification_exc:  # noqa: BLE001
+                recovery_errors.append(str(verification_exc))
             error_message = str(exc)
             if recovery_errors:
                 error_message += "; rollback recovery failed: " + "; ".join(
                     recovery_errors
                 )
-            services_after = _service_states(all_services, dependencies.is_service_active)
             report = RollbackReport(
                 status="failed" if not recovery_errors else "recovery_failed",
                 git_sha=config.git_sha,

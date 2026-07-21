@@ -63,6 +63,7 @@ def _validate_rollback_preflight(
     sha256_path: Path,
     pre_rollback_backup_directory: Path,
     result_path: Path,
+    services: tuple[str, ...],
 ) -> None:
     for required_file, label in (
         (database, "Operational database"),
@@ -97,6 +98,15 @@ def _validate_rollback_preflight(
             raise CutoverSafetyError(
                 f"Insufficient disk space for rollback output path: {directory}"
             )
+    for service in services:
+        result = subprocess.run(
+            ["systemctl", "show", service, "--property=LoadState", "--value"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0 or result.stdout.strip() == "not-found":
+            raise CutoverSafetyError(f"systemd service unit is unavailable: {service}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -154,6 +164,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sha256_path=sha256_path,
         pre_rollback_backup_directory=pre_rollback_backup_directory,
         result_path=result_path,
+        services=all_services,
     )
     report = execute_rollback(
         RollbackConfig(

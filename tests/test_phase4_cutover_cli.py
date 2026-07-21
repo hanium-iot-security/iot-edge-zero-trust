@@ -135,6 +135,7 @@ def test_rollback_preflight_probes_actual_output_paths(
         sha256_path=artifact.sha256_path,
         pre_rollback_backup_directory=pre_rollback_directory,
         result_path=result_path,
+        services=(),
     )
 
     assert set(probed) == {
@@ -142,6 +143,47 @@ def test_rollback_preflight_probes_actual_output_paths(
         pre_rollback_directory.resolve(),
         result_path.parent.resolve(),
     }
+
+
+def test_rollback_preflight_rejects_missing_systemd_unit_before_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "operational.db"
+    backup = tmp_path / "selected.db"
+    create_source_database(database)
+    artifact = create_sqlite_backup(database, backup)
+    calls: list[list[str]] = []
+
+    def missing_unit(command: list[str], **_: object) -> object:
+        calls.append(command)
+        return type(
+            "Completed",
+            (),
+            {"returncode": 0, "stdout": "not-found\n"},
+        )()
+
+    monkeypatch.setattr(rollback_cli.subprocess, "run", missing_unit)
+
+    with pytest.raises(CutoverSafetyError, match="unit is unavailable"):
+        rollback_cli._validate_rollback_preflight(
+            database=database,
+            backup=backup,
+            sha256_path=artifact.sha256_path,
+            pre_rollback_backup_directory=tmp_path / "pre-rollback",
+            result_path=tmp_path / "rollback.json",
+            services=("missing.service",),
+        )
+
+    assert calls == [
+        [
+            "systemctl",
+            "show",
+            "missing.service",
+            "--property=LoadState",
+            "--value",
+        ]
+    ]
 
 
 @pytest.mark.parametrize(
