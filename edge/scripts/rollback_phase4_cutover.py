@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from typing import Sequence
@@ -17,7 +18,10 @@ from edge.scripts.phase4_cutover import (
     RollbackDependencies,
     execute_rollback,
 )
-from edge.scripts.run_phase4_cutover import _validate_services
+from edge.scripts.run_phase4_cutover import (
+    _probe_writable_directory,
+    _validate_services,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -50,6 +54,49 @@ def _systemctl_is_active(service: str) -> bool:
         ).returncode
         == 0
     )
+
+
+def _validate_rollback_preflight(
+    *,
+    database: Path,
+    backup: Path,
+    sha256_path: Path,
+    pre_rollback_backup_directory: Path,
+    result_path: Path,
+) -> None:
+    for required_file, label in (
+        (database, "Operational database"),
+        (backup, "Selected rollback backup"),
+        (sha256_path, "Selected rollback SHA256 manifest"),
+    ):
+        if not required_file.is_file():
+            raise CutoverSafetyError(f"{label} does not exist: {required_file}")
+    if result_path.exists():
+        raise CutoverSafetyError(f"Rollback result already exists: {result_path}")
+
+    required_bytes = max(
+        database.stat().st_size + backup.stat().st_size,
+        10 * 1024 * 1024,
+    )
+    directories = {
+        database.parent.resolve(),
+        pre_rollback_backup_directory.resolve(),
+        result_path.parent.resolve(),
+    }
+    checked_filesystems: set[int] = set()
+    for directory in sorted(directories, key=str):
+        _probe_writable_directory(directory)
+        disk_path = directory
+        while not disk_path.exists() and disk_path != disk_path.parent:
+            disk_path = disk_path.parent
+        device = disk_path.stat().st_dev
+        if device in checked_filesystems:
+            continue
+        checked_filesystems.add(device)
+        if shutil.disk_usage(disk_path).free < required_bytes:
+            raise CutoverSafetyError(
+                f"Insufficient disk space for rollback output path: {directory}"
+            )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -96,6 +143,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise CutoverSafetyError("--execute requires --confirm PHASE4-ROLLBACK")
     if os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() != 0:
         raise CutoverSafetyError("Operational rollback must run as root on Raspberry Pi")
+    pre_rollback_backup_directory = (
+        args.pre_rollback_backup_dir.expanduser().resolve()
+        if args.pre_rollback_backup_dir is not None
+        else backup.parent / "pre-rollback"
+    )
+    _validate_rollback_preflight(
+        database=database,
+        backup=backup,
+        sha256_path=sha256_path,
+        pre_rollback_backup_directory=pre_rollback_backup_directory,
+        result_path=result_path,
+    )
     report = execute_rollback(
         RollbackConfig(
             database_path=database,

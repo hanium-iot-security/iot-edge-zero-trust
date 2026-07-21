@@ -2,16 +2,28 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
-import hashlib
 import json
-import os
 from pathlib import Path
 import sqlite3
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Mapping
+
+from edge.scripts.phase4_cutover_storage import (
+    BackupArtifact,
+    CutoverSafetyError,
+    DatabaseVerification,
+    create_sqlite_backup,
+    database_evidence as _database_evidence,
+    expected_backup_sha256 as _expected_sha256,
+    file_sha256 as _sha256_file,
+    operation_lock as _operation_lock,
+    restore_sqlite_backup,
+    table_row_counts as _table_row_counts,
+    validate_data_preservation as _validate_data_preservation,
+    verify_database,
+)
 
 
 EXPECTED_CHECKPOINT_KEYS = frozenset(
@@ -27,27 +39,8 @@ EXPECTED_CHECKPOINT_KEYS = frozenset(
 )
 
 
-class CutoverSafetyError(RuntimeError):
-    """Raised when a cutover action violates an explicit safety contract."""
-
-
 class CutoverExecutionError(RuntimeError):
     """Raised after a failed cutover has attempted its rollback path."""
-
-
-@dataclass(frozen=True)
-class DatabaseVerification:
-    integrity_check: str
-    foreign_key_violations: tuple[tuple[object, ...], ...]
-
-
-@dataclass(frozen=True)
-class BackupArtifact:
-    database_path: Path
-    sha256_path: Path
-    sha256: str
-    integrity_check: str
-    foreign_key_violations: tuple[tuple[object, ...], ...]
 
 
 @dataclass(frozen=True)
@@ -92,6 +85,10 @@ class CutoverReport:
     services_after: Mapping[str, bool] = field(default_factory=dict)
     failure_stage: str | None = None
     error: str | None = None
+    primary_error: str | None = None
+    rollback_attempted: bool = False
+    rollback_succeeded: bool | None = None
+    rollback_error: str | None = None
     rollback_verification: Mapping[str, object] = field(default_factory=dict)
 
 
@@ -114,6 +111,12 @@ class SmokeTestReport:
     smoke_database: str
     source_sha256_before: str
     source_sha256_after: str | None
+    source_snapshot_before: str | None
+    source_snapshot_after: str | None
+    source_snapshot_sha256_before: str | None
+    source_snapshot_sha256_after: str | None
+    source_snapshot_before_sha256_path: str | None
+    source_snapshot_after_sha256_path: str | None
     source_unchanged: bool | None
     source_table_row_counts_before: Mapping[str, int]
     source_table_row_counts_after: Mapping[str, int]
@@ -170,107 +173,10 @@ class RollbackReport:
     services_after: Mapping[str, bool] = field(default_factory=dict)
     failure_stage: str | None = None
     error: str | None = None
-
-
-def _database_checks(database_path: Path) -> tuple[str, tuple[tuple[object, ...], ...]]:
-    with sqlite3.connect(database_path) as connection:
-        connection.execute("PRAGMA foreign_keys = ON")
-        integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
-        foreign_key_rows = connection.execute("PRAGMA foreign_key_check").fetchall()
-    return integrity, tuple(tuple(row) for row in foreign_key_rows)
-
-
-def verify_database(database_path: str | Path) -> DatabaseVerification:
-    path = Path(database_path).expanduser().resolve()
-    if not path.is_file():
-        raise CutoverSafetyError(f"Database does not exist: {path}")
-    integrity, foreign_key_violations = _database_checks(path)
-    return DatabaseVerification(
-        integrity_check=integrity,
-        foreign_key_violations=foreign_key_violations,
-    )
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as file_obj:
-        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _expected_sha256(sha256_path: Path, backup_path: Path) -> str:
-    parts = sha256_path.read_text(encoding="utf-8").strip().split()
-    if len(parts) != 2 or parts[1] != backup_path.name:
-        raise CutoverSafetyError("Invalid SHA256 manifest for the selected backup")
-    return parts[0].lower()
-
-
-def create_sqlite_backup(source_path: str | Path, backup_path: str | Path) -> BackupArtifact:
-    """Create and verify a transactionally consistent SQLite backup."""
-
-    source = Path(source_path).expanduser().resolve()
-    backup = Path(backup_path).expanduser().resolve()
-    if not source.is_file():
-        raise CutoverSafetyError(f"Source database does not exist: {source}")
-    if source == backup:
-        raise CutoverSafetyError("Source and backup must use different paths")
-    if backup.exists():
-        raise CutoverSafetyError(f"Backup destination already exists: {backup}")
-    sha256_path = backup.with_suffix(backup.suffix + ".sha256")
-    if sha256_path.exists():
-        raise CutoverSafetyError(f"SHA256 destination already exists: {sha256_path}")
-    backup.parent.mkdir(parents=True, exist_ok=True)
-
-    with sqlite3.connect(source) as source_connection, sqlite3.connect(backup) as backup_connection:
-        source_connection.backup(backup_connection)
-
-    integrity, foreign_key_violations = _database_checks(backup)
-    digest = _sha256_file(backup)
-    sha256_path.write_text(f"{digest}  {backup.name}\n", encoding="utf-8")
-    return BackupArtifact(
-        database_path=backup,
-        sha256_path=sha256_path,
-        sha256=digest,
-        integrity_check=integrity,
-        foreign_key_violations=foreign_key_violations,
-    )
-
-
-def restore_sqlite_backup(
-    *,
-    target_path: str | Path,
-    backup_path: str | Path,
-    sha256_path: str | Path,
-) -> DatabaseVerification:
-    """Verify a backup and restore it through SQLite's Backup API."""
-
-    target = Path(target_path).expanduser().resolve()
-    backup = Path(backup_path).expanduser().resolve()
-    checksum_manifest = Path(sha256_path).expanduser().resolve()
-    if target == backup:
-        raise CutoverSafetyError("Target and backup must use different paths")
-
-    expected = _expected_sha256(checksum_manifest, backup)
-    actual = _sha256_file(backup)
-    if actual != expected:
-        raise CutoverSafetyError("Backup SHA256 mismatch; refusing to restore")
-
-    backup_integrity, backup_foreign_keys = _database_checks(backup)
-    if backup_integrity != "ok" or backup_foreign_keys:
-        raise CutoverSafetyError("Backup database failed integrity or foreign-key checks")
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(backup) as backup_connection, sqlite3.connect(target) as target_connection:
-        backup_connection.backup(target_connection)
-
-    integrity, foreign_key_violations = _database_checks(target)
-    if integrity != "ok" or foreign_key_violations:
-        raise CutoverSafetyError("Restored database failed integrity or foreign-key checks")
-    return DatabaseVerification(
-        integrity_check=integrity,
-        foreign_key_violations=foreign_key_violations,
-    )
+    primary_error: str | None = None
+    rollback_attempted: bool = False
+    rollback_succeeded: bool | None = None
+    rollback_error: str | None = None
 
 
 def _utc_iso(value: datetime) -> str:
@@ -423,74 +329,43 @@ def _json_compatible(value: Any) -> Any:
     return value
 
 
-def _table_row_counts(database: Path) -> Mapping[str, int]:
-    with sqlite3.connect(database) as connection:
-        tables = [
-            str(row[0])
-            for row in connection.execute(
-                """
-                SELECT name
-                FROM sqlite_master
-                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-                ORDER BY name
-                """
-            ).fetchall()
-        ]
-        return {
-            table: int(connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
-            for table in tables
-        }
-
-
-def _optional_scalar(database: Path, query: str) -> object | None:
-    try:
-        with sqlite3.connect(database) as connection:
-            row = connection.execute(query).fetchone()
-    except sqlite3.OperationalError:
-        return None
-    return row[0] if row is not None else None
-
-
-def _id_digest(database: Path, table: str) -> str | None:
-    try:
-        with sqlite3.connect(database) as connection:
-            ids = [str(row[0]) for row in connection.execute(f'SELECT id FROM "{table}" ORDER BY id')]
-    except sqlite3.OperationalError:
-        return None
-    return hashlib.sha256(",".join(ids).encode("utf-8")).hexdigest()
-
-
-def _database_evidence(database: Path) -> Mapping[str, object]:
-    return {
-        "table_row_counts": _table_row_counts(database),
-        "segment_count": _optional_scalar(
-            database, "SELECT COUNT(*) FROM packet_capture_segments"
-        ),
-        "segment_id_digest": _id_digest(database, "packet_capture_segments"),
-        "packet_feature_count": _optional_scalar(
-            database, "SELECT COUNT(*) FROM packet_feature_logs"
-        ),
-        "orphan_packet_feature_fk_count": _optional_scalar(
-            database,
-            """
-            SELECT COUNT(*)
-            FROM packet_feature_logs AS feature
-            LEFT JOIN packet_capture_segments AS segment
-              ON segment.id = feature.capture_segment_id
-            WHERE segment.id IS NULL
-            """,
-        ),
-        "detection_event_count": _optional_scalar(
-            database, "SELECT COUNT(*) FROM detection_events"
-        ),
-    }
-
-
 def _service_states(
     services: tuple[str, ...],
     is_active: Callable[[str], bool],
 ) -> Mapping[str, bool]:
     return {service: bool(is_active(service)) for service in services}
+
+
+def _expected_cutover_service_states(
+    config: CutoverConfig,
+    services_before: Mapping[str, bool],
+) -> Mapping[str, bool]:
+    expected: dict[str, bool] = {
+        service: False for service in config.legacy_services
+    }
+    expected.update({service: True for service in config.new_services})
+    expected.update(
+        {
+            service: services_before[service]
+            for service in config.paused_writer_services
+        }
+    )
+    return expected
+
+
+def _validate_service_states(
+    actual: Mapping[str, bool],
+    expected: Mapping[str, bool],
+) -> None:
+    mismatches = {
+        service: {"expected": expected_state, "actual": actual.get(service)}
+        for service, expected_state in expected.items()
+        if actual.get(service) is not expected_state
+    }
+    if mismatches:
+        raise CutoverSafetyError(
+            f"Post-cutover service state verification failed: {mismatches}"
+        )
 
 
 def _stop_services(
@@ -521,49 +396,6 @@ def _restore_service_states(
             errors.append(f"{service}: {exc}")
     if errors:
         raise CutoverSafetyError("Failed to restore service states: " + "; ".join(errors))
-
-
-@contextmanager
-def _operation_lock(database: Path) -> Iterator[None]:
-    lock_path = database.with_suffix(database.suffix + ".phase4.lock")
-    if os.name == "posix":
-        import fcntl
-
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with lock_path.open("a+", encoding="ascii") as lock_file:
-            try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise CutoverSafetyError(
-                    f"Another Phase 4 operation holds the lock: {lock_path}"
-                ) from exc
-            lock_file.seek(0)
-            lock_file.truncate()
-            lock_file.write(f"pid={os.getpid()}\n")
-            lock_file.flush()
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
-        return
-
-    try:
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError as exc:
-        raise CutoverSafetyError(f"Another Phase 4 operation holds the lock: {lock_path}") from exc
-    try:
-        os.write(descriptor, f"pid={os.getpid()}\n".encode("ascii"))
-        os.close(descriptor)
-        yield
-    finally:
-        try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def _write_report(path: Path, report: object) -> None:
@@ -624,12 +456,41 @@ def execute_cutover(
     cutover_at_iso = _utc_iso(cutover_at)
     backup_path = backup_directory / _backup_name(database, cutover_at)
     backup_sha256_path = backup_path.with_suffix(backup_path.suffix + ".sha256")
-    if backup_path.exists():
-        raise CutoverSafetyError(f"Backup destination already exists: {backup_path}")
-    if backup_sha256_path.exists():
-        raise CutoverSafetyError(
-            f"SHA256 destination already exists: {backup_sha256_path}"
+
+    def record_preflight_failure(message: str) -> None:
+        _write_report(
+            result_path,
+            CutoverReport(
+                status="failed",
+                git_sha=config.git_sha,
+                phase4_cutover_at=cutover_at_iso,
+                database_path=str(database),
+                backup_database=None,
+                backup_sha256_path=None,
+                backup_sha256=None,
+                integrity_check=None,
+                legacy_services=config.legacy_services,
+                new_services=config.new_services,
+                paused_writer_services=config.paused_writer_services,
+                services_before=services_before,
+                services_after=services_before,
+                failure_stage="preflight",
+                error=message,
+                primary_error=message,
+                rollback_attempted=False,
+                rollback_succeeded=None,
+                rollback_error=None,
+            ),
         )
+
+    if backup_path.exists():
+        message = f"Backup destination already exists: {backup_path}"
+        record_preflight_failure(message)
+        raise CutoverSafetyError(message)
+    if backup_sha256_path.exists():
+        message = f"SHA256 destination already exists: {backup_sha256_path}"
+        record_preflight_failure(message)
+        raise CutoverSafetyError(message)
     artifact: BackupArtifact | None = None
     migration_summary: Mapping[str, object] = {}
     checkpoint_summary: Mapping[str, object] = {}
@@ -681,7 +542,12 @@ def execute_cutover(
                 start_service=dependencies.start_service,
                 stop_service=dependencies.stop_service,
             )
+            failure_stage = "post-service-verification"
             services_after = _service_states(all_services, dependencies.is_service_active)
+            _validate_service_states(
+                services_after,
+                _expected_cutover_service_states(config, services_before),
+            )
 
             report = CutoverReport(
                 status="succeeded",
@@ -752,6 +618,10 @@ def execute_cutover(
                 services_after=services_after,
                 failure_stage=failure_stage,
                 error=error_message,
+                primary_error=str(exc),
+                rollback_attempted=True,
+                rollback_succeeded=not rollback_errors,
+                rollback_error="; ".join(rollback_errors) if rollback_errors else None,
                 rollback_verification=rollback_verification,
             )
             _write_report(result_path, report)
@@ -780,22 +650,36 @@ def run_cutover_smoke_test(
     cutover_at = now()
     cutover_at_iso = _utc_iso(cutover_at)
     source_sha_before = _sha256_file(source)
-    source_counts_before = _table_row_counts(source)
-    source_evidence_before = _database_evidence(source)
+    source_counts_before: Mapping[str, int] = {}
+    source_evidence_before: Mapping[str, object] = {}
     source_sha_after: str | None = None
     source_counts_after: Mapping[str, int] = {}
     source_unchanged: bool | None = None
+    source_snapshot_before = smoke_database.with_name(
+        f"{smoke_database.stem}.source-before{source.suffix}"
+    )
+    source_snapshot_after = smoke_database.with_name(
+        f"{smoke_database.stem}.source-after{source.suffix}"
+    )
+    source_snapshot_before_artifact: BackupArtifact | None = None
+    source_snapshot_after_artifact: BackupArtifact | None = None
     artifact: BackupArtifact | None = None
     final_smoke_sha256: str | None = None
     post_manifest: Path | None = None
     migration_summary: Mapping[str, object] = {}
     checkpoint_summary: Mapping[str, object] = {}
     final_verification: DatabaseVerification | None = None
-    evidence: Mapping[str, object] = {"source_before": source_evidence_before}
+    evidence: Mapping[str, object] = {}
     failure_stage = "snapshot"
 
     with _operation_lock(source):
         try:
+            source_snapshot_before_artifact = create_sqlite_backup(
+                source, source_snapshot_before
+            )
+            source_counts_before = _table_row_counts(source_snapshot_before)
+            source_evidence_before = _database_evidence(source_snapshot_before)
+            evidence = {"source_before": source_evidence_before}
             artifact = create_sqlite_backup(source, smoke_database)
             if artifact.integrity_check != "ok" or artifact.foreign_key_violations:
                 raise CutoverSafetyError(
@@ -808,6 +692,16 @@ def run_cutover_smoke_test(
                 apply_migrations(smoke_database, migrations_directory)
             )
             _validate_migration_summary(migration_summary)
+            smoke_after = _database_evidence(smoke_database)
+            evidence = {
+                "source_before": source_evidence_before,
+                "smoke_before": smoke_before,
+                "smoke_after": smoke_after,
+            }
+            failure_stage = "data-preservation-check"
+            _validate_data_preservation(smoke_before, smoke_after)
+
+            failure_stage = "migration-verification"
             post_migration = verify_database(smoke_database)
             if post_migration.integrity_check != "ok" or post_migration.foreign_key_violations:
                 raise CutoverSafetyError("Smoke-test migration failed database checks")
@@ -837,17 +731,15 @@ def run_cutover_smoke_test(
                 f"{final_smoke_sha256}  {smoke_database.name}\n",
                 encoding="utf-8",
             )
-            evidence = {
-                "source_before": source_evidence_before,
-                "smoke_before": smoke_before,
-                "smoke_after": _database_evidence(smoke_database),
-            }
-
             failure_stage = "source-preservation-check"
             source_sha_after = _sha256_file(source)
-            source_counts_after = _table_row_counts(source)
+            source_snapshot_after_artifact = create_sqlite_backup(
+                source, source_snapshot_after
+            )
+            source_counts_after = _table_row_counts(source_snapshot_after)
             source_unchanged = (
-                source_sha_before == source_sha_after
+                source_snapshot_before_artifact.sha256
+                == source_snapshot_after_artifact.sha256
                 and source_counts_before == source_counts_after
             )
             if not source_unchanged:
@@ -862,6 +754,16 @@ def run_cutover_smoke_test(
                 smoke_database=str(smoke_database),
                 source_sha256_before=source_sha_before,
                 source_sha256_after=source_sha_after,
+                source_snapshot_before=str(source_snapshot_before),
+                source_snapshot_after=str(source_snapshot_after),
+                source_snapshot_sha256_before=source_snapshot_before_artifact.sha256,
+                source_snapshot_sha256_after=source_snapshot_after_artifact.sha256,
+                source_snapshot_before_sha256_path=str(
+                    source_snapshot_before_artifact.sha256_path
+                ),
+                source_snapshot_after_sha256_path=str(
+                    source_snapshot_after_artifact.sha256_path
+                ),
                 source_unchanged=True,
                 source_table_row_counts_before=source_counts_before,
                 source_table_row_counts_after=source_counts_after,
@@ -879,9 +781,20 @@ def run_cutover_smoke_test(
             return report
         except Exception as exc:
             source_sha_after = _sha256_file(source)
-            source_counts_after = _table_row_counts(source)
+            if source_snapshot_after_artifact is None:
+                try:
+                    source_snapshot_after_artifact = create_sqlite_backup(
+                        source, source_snapshot_after
+                    )
+                except Exception:  # noqa: BLE001 - preserve the primary smoke failure
+                    source_snapshot_after_artifact = None
+            if source_snapshot_after_artifact is not None:
+                source_counts_after = _table_row_counts(source_snapshot_after)
             source_unchanged = (
-                source_sha_before == source_sha_after
+                source_snapshot_before_artifact is not None
+                and source_snapshot_after_artifact is not None
+                and source_snapshot_before_artifact.sha256
+                == source_snapshot_after_artifact.sha256
                 and source_counts_before == source_counts_after
             )
             report = SmokeTestReport(
@@ -893,6 +806,36 @@ def run_cutover_smoke_test(
                 smoke_database=str(smoke_database),
                 source_sha256_before=source_sha_before,
                 source_sha256_after=source_sha_after,
+                source_snapshot_before=(
+                    str(source_snapshot_before)
+                    if source_snapshot_before_artifact is not None
+                    else None
+                ),
+                source_snapshot_after=(
+                    str(source_snapshot_after)
+                    if source_snapshot_after_artifact is not None
+                    else None
+                ),
+                source_snapshot_sha256_before=(
+                    source_snapshot_before_artifact.sha256
+                    if source_snapshot_before_artifact is not None
+                    else None
+                ),
+                source_snapshot_sha256_after=(
+                    source_snapshot_after_artifact.sha256
+                    if source_snapshot_after_artifact is not None
+                    else None
+                ),
+                source_snapshot_before_sha256_path=(
+                    str(source_snapshot_before_artifact.sha256_path)
+                    if source_snapshot_before_artifact is not None
+                    else None
+                ),
+                source_snapshot_after_sha256_path=(
+                    str(source_snapshot_after_artifact.sha256_path)
+                    if source_snapshot_after_artifact is not None
+                    else None
+                ),
                 source_unchanged=source_unchanged,
                 source_table_row_counts_before=source_counts_before,
                 source_table_row_counts_after=source_counts_after,
@@ -970,6 +913,10 @@ def execute_rollback(
                 services_after=services_before,
                 failure_stage="preflight",
                 error=message,
+                primary_error=message,
+                rollback_attempted=False,
+                rollback_succeeded=None,
+                rollback_error=None,
             ),
         )
 
@@ -994,6 +941,22 @@ def execute_rollback(
         record_preflight_failure(str(exc))
         raise
 
+    timestamp = rollback_at.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    pre_rollback_path = (
+        backup_directory
+        / f"{database.stem}_pre_manual_rollback_{timestamp}{database.suffix}"
+    )
+    pre_rollback_sha256_path = pre_rollback_path.with_suffix(
+        pre_rollback_path.suffix + ".sha256"
+    )
+    if pre_rollback_path.exists() or pre_rollback_sha256_path.exists():
+        message = (
+            "Pre-rollback backup destination already exists: "
+            f"{pre_rollback_path}"
+        )
+        record_preflight_failure(message)
+        raise CutoverSafetyError(message)
+
     pre_rollback_artifact: BackupArtifact | None = None
     restored: DatabaseVerification | None = None
     failure_stage = "service-stop"
@@ -1003,11 +966,6 @@ def execute_rollback(
             _stop_services(all_services, dependencies.stop_service)
 
             failure_stage = "pre-rollback-backup"
-            timestamp = rollback_at.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            pre_rollback_path = (
-                backup_directory
-                / f"{database.stem}_pre_manual_rollback_{timestamp}{database.suffix}"
-            )
             pre_rollback_artifact = create_sqlite_backup(database, pre_rollback_path)
 
             failure_stage = "database-restore"
@@ -1103,6 +1061,12 @@ def execute_rollback(
                 services_after=services_after,
                 failure_stage=failure_stage,
                 error=error_message,
+                primary_error=str(exc),
+                rollback_attempted=True,
+                rollback_succeeded=not recovery_errors,
+                rollback_error=(
+                    "; ".join(recovery_errors) if recovery_errors else None
+                ),
             )
             _write_report(result_path, report)
             raise CutoverExecutionError(error_message) from exc

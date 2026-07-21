@@ -28,6 +28,7 @@
 → Cutover Checkpoint DB 함수 호출
 → DB 재검증
 → 신규 서비스 시작
+→ 기존·신규·Writer 서비스 실제 상태 검증
 → JSON 결과 기록
 ```
 
@@ -82,6 +83,12 @@ Runner는 반환 요약과 DB Row의 Key·`last_processed_id`·UTC 완료 Window
 - 기존·신규·Writer Unit의 작업 전 active/inactive 상태를 JSON에 기록한다. 실패 시에는
   작업 전 active였던 Unit만 다시 활성화하고 원래 inactive였던 Unit은 시작하지 않는다.
 - DB별 Lock 파일로 Cutover·Smoke·Rollback의 동시 실행을 차단한다.
+- POSIX에서는 `flock`이 사용하는 Lock 파일을 해제 후에도 삭제하지 않는다. 동일 경로의
+  동일 inode를 다음 실행에서도 재사용하는 것이 정상이다.
+- Execute·Smoke 직전에는 `discover_migrations()`로 전체 Migration 이름·연속 Version·SQL
+  완결성을 검증하며, Version 3은 정확히 한 개여야 한다.
+- 서비스 중지 전 운영 DB·Backup·결과·Pre-rollback 출력 경로별로 충돌, 쓰기 Probe와
+  `fsync`, 실제 파일시스템 여유 공간을 확인한다. Dry Run은 파일·디렉터리를 만들지 않는다.
 - 로그와 결과 파일에 비밀번호, Token, SSH Key, `.env` 전체 내용을 남기지 않는다.
 
 ## 4. 사전 기록
@@ -147,14 +154,17 @@ python -m edge.scripts.run_phase4_cutover \
 
 확인 기준:
 
-- 원본 운영 DB SHA256과 Row 수가 실행 전후 동일함
-- `source_sha256_before`, `source_sha256_after`, `source_unchanged=true`임
+- 원본 운영 DB는 실행 전·후 각각 SQLite Backup API로 논리 Snapshot을 생성함
+- `source_snapshot_before`, `source_snapshot_after`와 각 SHA256 Manifest가 별도 보존됨
+- 두 논리 Snapshot의 SHA256과 Table별 Row 수가 같고 `source_unchanged=true`임
 - Migration 전 Smoke Snapshot Manifest와 Migration 후 Manifest가 별도 파일로 보존됨
 - Smoke DB에 Migration 003 기록이 존재함
 - `foreign_key_check` 결과가 0건임
 - `integrity_check` 결과가 `ok`임
 - Source별 Cutover Watermark와 Checkpoint 7개가 JSON 결과에 기록됨
-- 기존 Segment ID·Packet Feature FK·Event Row가 보존됨
+- 기존 Segment Row 수·ID Digest와 Packet Feature Row 수가 보존되고 고아 FK가 0건임
+- 기존 주요 Table Row 수와 기존 Detection Event Row 수가 감소하지 않음
+- 위 보존 검사가 실패하면 `failure_stage=data-preservation-check`로 기록됨
 
 기존 Smoke DB를 재사용하지 말고 실행별 새 경로를 사용한다. 실패한 Smoke DB와 결과 JSON은
 삭제하지 않고 원인 분석용으로 보존한다.
@@ -195,7 +205,9 @@ sudo /home/pi/iot-edge-zero-trust/venv/bin/python \
 - FK·Integrity 결과
 - 중지한 기존 서비스와 시작한 신규 서비스
 - Writer를 포함한 전체 Unit의 작업 전·후 active 상태
-- 실패 시 `failure_stage`, 최초 오류, 자동 복원 결과
+- 성공 판정 시 기존 Unit은 inactive, 신규 Unit은 active, Writer는 작업 전 상태와 일치함
+- 실패 시 `failure_stage`, `primary_error`, `rollback_attempted`, `rollback_succeeded`,
+  `rollback_error`와 하위 호환용 `error` 요약
 
 도중 실패하면 도구가 생성한 Backup을 검증해 자동 복원을 시도하고 기존 systemd Unit을
 재시작한다. 결과 상태가 `rolled_back`인지 확인한다. `rollback_failed`이면 서비스를 임의로

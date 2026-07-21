@@ -40,7 +40,9 @@
 
 | 항목 | 실행 전 | 실행 후 |
 | --- | --- | --- |
-| 운영 원본 SHA256 |  |  |
+| 운영 원본 논리 Snapshot 경로 |  |  |
+| 운영 원본 논리 Snapshot SHA256 Manifest |  |  |
+| 운영 원본 논리 Snapshot SHA256 |  |  |
 | 운영 원본 Table별 Row 수 |  |  |
 | Smoke DB SHA256 | Migration 전 | Migration 후 |
 | Segment ID Digest |  |  |
@@ -76,7 +78,10 @@
 - 실제 결과:
 - 오류·경고:
 - 실패 단계(`failure_stage`):
-- 자동 Rollback 여부:
+- 최초 오류(`primary_error`):
+- 자동 Rollback 시도(`rollback_attempted`):
+- 자동 Rollback 성공(`rollback_succeeded`):
+- 자동 Rollback 오류(`rollback_error`):
 - 수동 조치:
 - 남은 미검증 항목:
 
@@ -91,7 +96,7 @@
 - [ ] 신규 서비스 정상 시작
 - [ ] Writer 서비스 작업 전 상태 복구
 - [ ] 반환 Checkpoint와 DB 7개 Row 일치
-- [ ] Smoke 원본 SHA256·Row 수 불변
+- [ ] Smoke 원본 논리 Snapshot SHA256·Row 수 불변
 - [ ] 기존 Cron과 신규 Orchestrator 동시 실행 없음
 
 **판단:** 진행 / Rollback 유지 / 추가 수정 필요

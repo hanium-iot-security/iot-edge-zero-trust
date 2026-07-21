@@ -8,8 +8,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from edge.scripts import rollback_phase4_cutover as rollback_cli
-from edge.scripts import run_phase4_cutover as cutover_cli
+from edge.scripts import phase4_cutover as cutover_runtime
 from edge.scripts.phase4_cutover import (
     CutoverConfig,
     CutoverDependencies,
@@ -22,191 +21,15 @@ from edge.scripts.phase4_cutover import (
     create_sqlite_backup,
     execute_cutover,
     execute_rollback,
-    restore_sqlite_backup,
     run_cutover_smoke_test,
 )
-
-
-CHECKPOINT_KEYS = (
-    "mqtt_feature_builder+mqtt_logs",
-    "mqtt_feature_rule+feature_logs",
-    "mqtt_message_rule+mqtt_logs",
-    "mqtt_if+feature_logs",
-    "packet_rule+packet_feature_logs",
-    "packet_if+packet_feature_logs",
-    "trust_score_v2+detection_events",
+from tests.phase4_cutover_test_support import (
+    CHECKPOINT_KEYS,
+    complete_checkpoint_summary as _complete_checkpoint_summary,
+    create_phase3b_evidence_tables as _create_phase3b_evidence_tables,
+    create_source_database as _create_source_database,
+    persist_checkpoint_summary as _persist_checkpoint_summary,
 )
-
-
-def _complete_checkpoint_summary() -> dict[str, object]:
-    return {
-        "legacy_migration_event_count": 0,
-        "checkpoints": {
-            key: {
-                "last_processed_id": None,
-                "last_completed_window_end": "2026-07-21T04:30:00Z",
-            }
-            for key in CHECKPOINT_KEYS
-        },
-    }
-
-
-def _create_source_database(path: Path) -> None:
-    with sqlite3.connect(path) as connection:
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute(
-            """
-            CREATE TABLE parent (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE child (
-                id INTEGER PRIMARY KEY,
-                parent_id INTEGER NOT NULL REFERENCES parent(id)
-            )
-            """
-        )
-        connection.execute("INSERT INTO parent (id, name) VALUES (1, 'before-cutover')")
-        connection.execute("INSERT INTO child (id, parent_id) VALUES (1, 1)")
-        connection.execute(
-            """
-            CREATE TABLE detector_checkpoints (
-                detector_name TEXT NOT NULL,
-                source_table TEXT NOT NULL,
-                last_processed_id INTEGER,
-                last_completed_window_end DATETIME,
-                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (detector_name, source_table)
-            )
-            """
-        )
-
-
-def _persist_checkpoint_summary(
-    database: Path,
-    summary: dict[str, object] | None = None,
-) -> dict[str, object]:
-    result = summary or _complete_checkpoint_summary()
-    checkpoints = result["checkpoints"]
-    assert isinstance(checkpoints, dict)
-    with sqlite3.connect(database) as connection:
-        for key, value in checkpoints.items():
-            assert isinstance(value, dict)
-            detector_name, source_table = key.split("+", 1)
-            connection.execute(
-                """
-                INSERT OR REPLACE INTO detector_checkpoints (
-                    detector_name,
-                    source_table,
-                    last_processed_id,
-                    last_completed_window_end
-                ) VALUES (?, ?, ?, ?)
-                """,
-                (
-                    detector_name,
-                    source_table,
-                    value["last_processed_id"],
-                    value["last_completed_window_end"],
-                ),
-            )
-    return result
-
-
-def test_create_sqlite_backup_writes_consistent_snapshot_and_sha256(tmp_path: Path) -> None:
-    source = tmp_path / "operational.db"
-    backup = tmp_path / "backups" / "operational_before_phase4.db"
-    _create_source_database(source)
-
-    result = create_sqlite_backup(source, backup)
-
-    assert result.database_path == backup.resolve()
-    assert result.sha256_path == backup.with_suffix(backup.suffix + ".sha256").resolve()
-    assert result.sha256 == hashlib.sha256(backup.read_bytes()).hexdigest()
-    assert result.integrity_check == "ok"
-    assert result.foreign_key_violations == ()
-    assert result.sha256_path.read_text(encoding="utf-8") == (
-        f"{result.sha256}  {backup.name}\n"
-    )
-
-    with sqlite3.connect(backup) as connection:
-        assert connection.execute("SELECT name FROM parent WHERE id = 1").fetchone()[0] == (
-            "before-cutover"
-        )
-
-
-def test_create_sqlite_backup_rejects_source_as_destination(tmp_path: Path) -> None:
-    source = tmp_path / "operational.db"
-    _create_source_database(source)
-
-    with pytest.raises(CutoverSafetyError, match="different paths"):
-        create_sqlite_backup(source, source)
-
-
-def test_create_sqlite_backup_rejects_missing_source_and_existing_destination(
-    tmp_path: Path,
-) -> None:
-    source = tmp_path / "operational.db"
-    backup = tmp_path / "operational.before.db"
-
-    with pytest.raises(CutoverSafetyError, match="does not exist"):
-        create_sqlite_backup(source, backup)
-    assert not source.exists()
-
-    _create_source_database(source)
-    backup.write_bytes(b"existing evidence")
-    with pytest.raises(CutoverSafetyError, match="already exists"):
-        create_sqlite_backup(source, backup)
-    assert backup.read_bytes() == b"existing evidence"
-
-    backup.unlink()
-    checksum_manifest = backup.with_suffix(backup.suffix + ".sha256")
-    checksum_manifest.write_text("existing manifest\n", encoding="utf-8")
-    with pytest.raises(CutoverSafetyError, match="SHA256 destination already exists"):
-        create_sqlite_backup(source, backup)
-    assert not backup.exists()
-    assert checksum_manifest.read_text(encoding="utf-8") == "existing manifest\n"
-
-
-def test_restore_sqlite_backup_rejects_checksum_mismatch(tmp_path: Path) -> None:
-    source = tmp_path / "operational.db"
-    backup = tmp_path / "operational.before.db"
-    _create_source_database(source)
-    artifact = create_sqlite_backup(source, backup)
-    backup.write_bytes(backup.read_bytes() + b"tampered")
-
-    with pytest.raises(CutoverSafetyError, match="SHA256 mismatch"):
-        restore_sqlite_backup(
-            target_path=source,
-            backup_path=backup,
-            sha256_path=artifact.sha256_path,
-        )
-
-
-def test_restore_sqlite_backup_replaces_database_after_verification(tmp_path: Path) -> None:
-    target = tmp_path / "operational.db"
-    backup = tmp_path / "operational.before.db"
-    _create_source_database(target)
-    artifact = create_sqlite_backup(target, backup)
-
-    with sqlite3.connect(target) as connection:
-        connection.execute("UPDATE parent SET name = 'after-cutover' WHERE id = 1")
-
-    restored = restore_sqlite_backup(
-        target_path=target,
-        backup_path=backup,
-        sha256_path=artifact.sha256_path,
-    )
-
-    assert restored.integrity_check == "ok"
-    assert restored.foreign_key_violations == ()
-    with sqlite3.connect(target) as connection:
-        assert connection.execute("SELECT name FROM parent WHERE id = 1").fetchone()[0] == (
-            "before-cutover"
-        )
 
 
 def test_execute_cutover_uses_safe_order_and_records_result(tmp_path: Path) -> None:
@@ -215,12 +38,20 @@ def test_execute_cutover_uses_safe_order_and_records_result(tmp_path: Path) -> N
     _create_source_database(database)
     events: list[str] = []
     cutover_at = datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc)
+    active = {
+        "rule-detector.service": True,
+        "trust-score.service": True,
+        "detection-orchestrator.service": False,
+        "firewall-worker.service": False,
+    }
 
     def stop_service(service: str) -> None:
         events.append(f"stop:{service}")
+        active[service] = False
 
     def start_service(service: str) -> None:
         events.append(f"start:{service}")
+        active[service] = True
 
     def migrate(db_path: Path, migrations_dir: Path) -> dict[str, object]:
         assert db_path == database.resolve()
@@ -251,10 +82,7 @@ def test_execute_cutover_uses_safe_order_and_records_result(tmp_path: Path) -> N
         CutoverDependencies(
             stop_service=stop_service,
             start_service=start_service,
-            is_service_active=lambda service: service in {
-                "rule-detector.service",
-                "trust-score.service",
-            },
+            is_service_active=lambda service: active[service],
             apply_migrations=migrate,
             initialize_checkpoints=initialize_checkpoints,
             now=now,
@@ -540,103 +368,6 @@ def test_execute_rollback_verifies_backup_then_restores_and_starts_legacy_servic
     assert saved["integrity_check"] == "ok"
 
 
-def test_cutover_cli_dry_run_has_no_database_or_service_side_effects(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    database = tmp_path / "operational.db"
-    backup_directory = tmp_path / "backups"
-    result_path = tmp_path / "results" / "cutover.json"
-    _create_source_database(database)
-
-    exit_code = cutover_cli.main(
-        [
-            "--database",
-            str(database),
-            "--backup-dir",
-            str(backup_directory),
-            "--result",
-            str(result_path),
-            "--git-sha",
-            "3e30d0d",
-            "--legacy-service",
-            "rule-detector.service",
-            "--new-service",
-            "detection-orchestrator.service",
-            "--dry-run",
-        ]
-    )
-
-    output = json.loads(capsys.readouterr().out)
-    assert exit_code == 0
-    assert output["mode"] == "dry-run"
-    assert output["will_modify_database"] is False
-    assert output["database"] == str(database.resolve())
-    assert not backup_directory.exists()
-    assert not result_path.exists()
-    with sqlite3.connect(database) as connection:
-        assert connection.execute("SELECT name FROM parent WHERE id = 1").fetchone()[0] == (
-            "before-cutover"
-        )
-
-
-def test_cutover_cli_execute_requires_explicit_confirmation(tmp_path: Path) -> None:
-    database = tmp_path / "operational.db"
-    _create_source_database(database)
-
-    with pytest.raises(CutoverSafetyError, match="PHASE4-CUTOVER"):
-        cutover_cli.main(
-            [
-                "--database",
-                str(database),
-                "--backup-dir",
-                str(tmp_path / "backups"),
-                "--result",
-                str(tmp_path / "cutover.json"),
-                "--git-sha",
-                "3e30d0d",
-                "--execute",
-            ]
-        )
-
-
-def test_rollback_cli_dry_run_does_not_restore_database(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    database = tmp_path / "operational.db"
-    backup = tmp_path / "operational.before.db"
-    _create_source_database(database)
-    artifact = create_sqlite_backup(database, backup)
-    with sqlite3.connect(database) as connection:
-        connection.execute("UPDATE parent SET name = 'current-state' WHERE id = 1")
-
-    exit_code = rollback_cli.main(
-        [
-            "--database",
-            str(database),
-            "--backup",
-            str(backup),
-            "--sha256",
-            str(artifact.sha256_path),
-            "--result",
-            str(tmp_path / "rollback.json"),
-            "--git-sha",
-            "3e30d0d",
-            "--dry-run",
-        ]
-    )
-
-    output = json.loads(capsys.readouterr().out)
-    assert exit_code == 0
-    assert output["mode"] == "dry-run"
-    assert output["will_restore_database"] is False
-    with sqlite3.connect(database) as connection:
-        assert connection.execute("SELECT name FROM parent WHERE id = 1").fetchone()[0] == (
-            "current-state"
-        )
-
-
 def test_execute_rollback_rejects_missing_operational_database_before_services_change(
     tmp_path: Path,
 ) -> None:
@@ -672,6 +403,10 @@ def test_execute_rollback_rejects_missing_operational_database_before_services_c
     saved = json.loads(result_path.read_text(encoding="utf-8"))
     assert saved["status"] == "failed"
     assert saved["failure_stage"] == "preflight"
+    assert saved["primary_error"]
+    assert saved["rollback_attempted"] is False
+    assert saved["rollback_succeeded"] is None
+    assert saved["rollback_error"] is None
 
 
 def test_cutover_failure_restores_only_originally_active_services_and_writers(
@@ -730,6 +465,61 @@ def test_cutover_failure_restores_only_originally_active_services_and_writers(
     assert active["detection-orchestrator.service"] is False
     assert "start:trust-score.service" not in events
     assert "start:packet-capture.service" not in events
+    saved = json.loads((tmp_path / "cutover.json").read_text(encoding="utf-8"))
+    assert saved["primary_error"] == "checkpoint failed"
+    assert saved["rollback_attempted"] is True
+    assert saved["rollback_succeeded"] is True
+    assert saved["rollback_error"] is None
+
+
+def test_cutover_report_separates_primary_and_database_restore_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "operational.db"
+    result_path = tmp_path / "cutover.json"
+    _create_source_database(database)
+    active = {"legacy.service": True, "new.service": False}
+
+    def stop(service: str) -> None:
+        active[service] = False
+
+    def start(service: str) -> None:
+        active[service] = True
+
+    monkeypatch.setattr(
+        cutover_runtime,
+        "restore_sqlite_backup",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("restore IO failed")),
+    )
+
+    with pytest.raises(CutoverExecutionError, match="checkpoint failed"):
+        execute_cutover(
+            CutoverConfig(
+                database_path=database,
+                backup_directory=tmp_path / "backups",
+                migrations_directory=tmp_path / "migrations",
+                result_path=result_path,
+                git_sha="2e833fa",
+                legacy_services=("legacy.service",),
+                new_services=("new.service",),
+            ),
+            CutoverDependencies(
+                stop_service=stop,
+                start_service=start,
+                is_service_active=lambda service: active[service],
+                apply_migrations=lambda *_: {"applied_versions": [3]},
+                initialize_checkpoints=lambda *_: (_ for _ in ()).throw(
+                    RuntimeError("checkpoint failed")
+                ),
+            ),
+        )
+
+    saved = json.loads(result_path.read_text(encoding="utf-8"))
+    assert saved["primary_error"] == "checkpoint failed"
+    assert saved["rollback_attempted"] is True
+    assert saved["rollback_succeeded"] is False
+    assert saved["rollback_error"] == "restore IO failed"
 
 
 def test_manual_rollback_stops_all_writers_and_preserves_current_database_backup(
@@ -791,6 +581,49 @@ def test_manual_rollback_stops_all_writers_and_preserves_current_database_backup
     assert active["rule-detector.service"] is True
     assert active["detection-orchestrator.service"] is False
     assert active["gateway-metrics.service"] is True
+
+
+def test_manual_rollback_rejects_prebackup_collision_before_services_stop(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "operational.db"
+    selected_backup = tmp_path / "selected.db"
+    pre_rollback_directory = tmp_path / "pre-rollback"
+    result_path = tmp_path / "rollback.json"
+    _create_source_database(database)
+    artifact = create_sqlite_backup(database, selected_backup)
+    pre_rollback_directory.mkdir()
+    collision = (
+        pre_rollback_directory
+        / "operational_pre_manual_rollback_20260721T050000Z.db"
+    )
+    collision.write_bytes(b"existing evidence")
+    events: list[str] = []
+
+    with pytest.raises(CutoverSafetyError, match="already exists"):
+        execute_rollback(
+            RollbackConfig(
+                database_path=database,
+                backup_path=selected_backup,
+                sha256_path=artifact.sha256_path,
+                backup_directory=pre_rollback_directory,
+                result_path=result_path,
+                git_sha="2e833fa",
+                legacy_services=("legacy.service",),
+            ),
+            RollbackDependencies(
+                stop_service=lambda service: events.append(f"stop:{service}"),
+                start_service=lambda service: events.append(f"start:{service}"),
+                is_service_active=lambda _: True,
+                now=lambda: datetime(2026, 7, 21, 5, 0, tzinfo=timezone.utc),
+            ),
+        )
+
+    assert events == []
+    assert collision.read_bytes() == b"existing evidence"
+    saved = json.loads(result_path.read_text(encoding="utf-8"))
+    assert saved["failure_stage"] == "preflight"
+    assert saved["rollback_attempted"] is False
 
 
 def test_smoke_test_records_source_evidence_and_rejects_source_mutation(
@@ -869,6 +702,7 @@ def test_datetime_checkpoint_summary_is_json_serializable_after_database_match(
     for value in checkpoints.values():
         assert isinstance(value, dict)
         value["last_completed_window_end"] = completed_at
+    active = {"detection-orchestrator.service": False}
 
     report = execute_cutover(
         CutoverConfig(
@@ -880,9 +714,9 @@ def test_datetime_checkpoint_summary_is_json_serializable_after_database_match(
             new_services=("detection-orchestrator.service",),
         ),
         CutoverDependencies(
-            stop_service=lambda _: None,
-            start_service=lambda _: None,
-            is_service_active=lambda _: False,
+            stop_service=lambda service: active.__setitem__(service, False),
+            start_service=lambda service: active.__setitem__(service, True),
+            is_service_active=lambda service: active[service],
             apply_migrations=lambda *_: {"applied_versions": [3]},
             initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db, summary),
             now=lambda: completed_at,
@@ -945,6 +779,10 @@ def test_cutover_service_stop_failure_still_restores_other_service_states(
     saved = json.loads((tmp_path / "cutover.json").read_text(encoding="utf-8"))
     assert saved["status"] == "rollback_failed"
     assert saved["failure_stage"] == "service-stop"
+    assert saved["primary_error"]
+    assert saved["rollback_attempted"] is True
+    assert saved["rollback_succeeded"] is False
+    assert saved["rollback_error"]
 
 
 def test_cutover_rejects_concurrent_operation_lock_before_services_change(
@@ -975,23 +813,6 @@ def test_cutover_rejects_concurrent_operation_lock_before_services_change(
             )
 
     assert events == []
-
-
-def test_sqlite_backup_preserves_wal_mode_committed_rows(tmp_path: Path) -> None:
-    source = tmp_path / "wal-operational.db"
-    backup = tmp_path / "wal-backup.db"
-    with sqlite3.connect(source) as connection:
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("CREATE TABLE samples (id INTEGER PRIMARY KEY, value TEXT)")
-        connection.execute("INSERT INTO samples (value) VALUES ('committed-in-wal')")
-        connection.commit()
-        artifact = create_sqlite_backup(source, backup)
-
-    assert artifact.integrity_check == "ok"
-    with sqlite3.connect(backup) as connection:
-        assert connection.execute("SELECT value FROM samples").fetchone()[0] == (
-            "committed-in-wal"
-        )
 
 
 def test_cutover_backup_collision_is_rejected_before_services_stop(tmp_path: Path) -> None:
@@ -1025,3 +846,202 @@ def test_cutover_backup_collision_is_rejected_before_services_stop(tmp_path: Pat
 
     assert events == []
     assert collision.read_bytes() == b"existing evidence"
+    saved = json.loads((tmp_path / "cutover.json").read_text(encoding="utf-8"))
+    assert saved["failure_stage"] == "preflight"
+    assert saved["rollback_attempted"] is False
+    assert saved["primary_error"]
+
+
+def test_cutover_rolls_back_when_new_service_exits_after_successful_start(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "operational.db"
+    result_path = tmp_path / "cutover.json"
+    _create_source_database(database)
+    active = {
+        "legacy.service": True,
+        "orchestrator.service": False,
+        "writer.service": True,
+    }
+
+    def stop(service: str) -> None:
+        active[service] = False
+
+    def start(service: str) -> None:
+        if service != "orchestrator.service":
+            active[service] = True
+
+    def migrate(path: Path, _: Path) -> dict[str, object]:
+        with sqlite3.connect(path) as connection:
+            connection.execute("UPDATE parent SET name = 'migrated' WHERE id = 1")
+        return {"applied_versions": [3]}
+
+    with pytest.raises(CutoverExecutionError, match="service state verification"):
+        execute_cutover(
+            CutoverConfig(
+                database_path=database,
+                backup_directory=tmp_path / "backups",
+                migrations_directory=tmp_path / "migrations",
+                result_path=result_path,
+                git_sha="2e833fa",
+                legacy_services=("legacy.service",),
+                new_services=("orchestrator.service",),
+                paused_writer_services=("writer.service",),
+            ),
+            CutoverDependencies(
+                stop_service=stop,
+                start_service=start,
+                is_service_active=lambda service: active[service],
+                apply_migrations=migrate,
+                initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+                now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+            ),
+        )
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT name FROM parent WHERE id = 1").fetchone()[0] == (
+            "before-cutover"
+        )
+    assert active == {
+        "legacy.service": True,
+        "orchestrator.service": False,
+        "writer.service": True,
+    }
+    saved = json.loads(result_path.read_text(encoding="utf-8"))
+    assert saved["status"] == "rolled_back"
+    assert saved["failure_stage"] == "post-service-verification"
+    assert "orchestrator.service" in saved["error"]
+
+
+def test_smoke_snapshot_detects_wal_row_value_change_with_equal_row_count(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "wal-source.db"
+    smoke = tmp_path / "smoke.db"
+    result = tmp_path / "smoke.json"
+    _create_source_database(source)
+    keeper = sqlite3.connect(source)
+    keeper.execute("PRAGMA journal_mode = WAL")
+    keeper.commit()
+
+    def mutate_source(_: Path, __: Path) -> dict[str, object]:
+        with sqlite3.connect(source) as connection:
+            connection.execute("UPDATE parent SET name = 'wal-only-change' WHERE id = 1")
+        return {"applied_versions": [3]}
+
+    try:
+        with pytest.raises(CutoverExecutionError, match="source database changed"):
+            run_cutover_smoke_test(
+                SmokeTestConfig(
+                    source_database_path=source,
+                    smoke_database_path=smoke,
+                    migrations_directory=tmp_path / "migrations",
+                    result_path=result,
+                    git_sha="2e833fa",
+                ),
+                apply_migrations=mutate_source,
+                initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+                now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+            )
+    finally:
+        keeper.close()
+
+    saved = json.loads(result.read_text(encoding="utf-8"))
+    assert saved["source_unchanged"] is False
+    assert saved["source_snapshot_sha256_before"] != saved[
+        "source_snapshot_sha256_after"
+    ]
+    assert Path(saved["source_snapshot_before"]).is_file()
+    assert Path(saved["source_snapshot_after"]).is_file()
+
+
+@pytest.mark.parametrize(
+    ("mutation_sql", "expected_error"),
+    [
+        (
+            "UPDATE packet_capture_segments SET id = 11 WHERE id = 10",
+            "segment IDs changed",
+        ),
+        (
+            "DELETE FROM packet_feature_logs WHERE id = 20",
+            "packet feature rows decreased",
+        ),
+        (
+            "INSERT INTO packet_feature_logs (id, capture_segment_id) VALUES (21, 10)",
+            "packet feature rows changed",
+        ),
+        (
+            "UPDATE packet_feature_logs SET capture_segment_id = 999 WHERE id = 20",
+            "orphan packet feature foreign keys",
+        ),
+        (
+            "DELETE FROM detection_events WHERE id = 30",
+            "detection event rows decreased",
+        ),
+    ],
+)
+def test_smoke_rejects_phase3b_data_preservation_violation(
+    tmp_path: Path,
+    mutation_sql: str,
+    expected_error: str,
+) -> None:
+    source = tmp_path / "source.db"
+    smoke = tmp_path / "smoke.db"
+    result = tmp_path / "smoke.json"
+    _create_source_database(source)
+    _create_phase3b_evidence_tables(source)
+
+    def migrate(path: Path, _: Path) -> dict[str, object]:
+        with sqlite3.connect(path) as connection:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute(mutation_sql)
+        return {"applied_versions": [3]}
+
+    with pytest.raises(CutoverExecutionError, match=expected_error):
+        run_cutover_smoke_test(
+            SmokeTestConfig(
+                source_database_path=source,
+                smoke_database_path=smoke,
+                migrations_directory=tmp_path / "migrations",
+                result_path=result,
+                git_sha="2e833fa",
+            ),
+            apply_migrations=migrate,
+            initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+            now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+        )
+
+    saved = json.loads(result.read_text(encoding="utf-8"))
+    assert saved["failure_stage"] == "data-preservation-check"
+    assert saved["database_evidence"]["smoke_before"]
+    assert saved["database_evidence"]["smoke_after"]
+
+
+def test_smoke_allows_legacy_detection_event_addition(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    smoke = tmp_path / "smoke.db"
+    _create_source_database(source)
+    _create_phase3b_evidence_tables(source)
+
+    def migrate(path: Path, _: Path) -> dict[str, object]:
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                "INSERT INTO detection_events (id, event_type) VALUES (31, 'LEGACY_MIGRATION')"
+            )
+        return {"applied_versions": [3]}
+
+    report = run_cutover_smoke_test(
+        SmokeTestConfig(
+            source_database_path=source,
+            smoke_database_path=smoke,
+            migrations_directory=tmp_path / "migrations",
+            result_path=tmp_path / "smoke.json",
+            git_sha="2e833fa",
+        ),
+        apply_migrations=migrate,
+        initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+        now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
+    )
+
+    assert report.status == "succeeded"
+    assert report.database_evidence["smoke_after"]["detection_event_count"] == 2

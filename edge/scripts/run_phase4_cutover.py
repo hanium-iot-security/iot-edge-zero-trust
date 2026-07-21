@@ -11,9 +11,14 @@ import re
 import subprocess
 import sys
 import shutil
+import tempfile
 from typing import Callable, Mapping, Sequence
 
-from db.migration_runner import apply_migrations
+from db.migration_runner import (
+    MigrationError,
+    apply_migrations,
+    discover_migrations,
+)
 from edge.scripts.phase4_cutover import (
     CutoverConfig,
     CutoverDependencies,
@@ -91,15 +96,47 @@ def _validate_operational_preflight(
     database: Path,
     migrations_directory: Path,
     services: tuple[str, ...],
+    *,
+    backup_directory: Path | None = None,
+    result_path: Path | None = None,
 ) -> None:
     migrations = migrations_directory.expanduser().resolve()
-    if not migrations.is_dir():
-        raise CutoverSafetyError(f"Migration directory does not exist: {migrations}")
-    if not any(path.name.startswith("003_") for path in migrations.glob("003_*.sql")):
-        raise CutoverSafetyError(f"Migration 003 SQL is missing: {migrations}")
+    try:
+        discovered = discover_migrations(migrations)
+    except MigrationError as exc:
+        raise CutoverSafetyError(f"Migration preflight failed: {exc}") from exc
+    version_3 = [migration for migration in discovered if migration.version == 3]
+    if len(version_3) != 1:
+        raise CutoverSafetyError(
+            "Migration set must contain exactly one version 3; "
+            f"found={len(version_3)}"
+        )
+
+    resolved_database = database.expanduser().resolve()
+    directories = {resolved_database.parent}
+    if backup_directory is not None:
+        directories.add(backup_directory.expanduser().resolve())
+    if result_path is not None:
+        resolved_result = result_path.expanduser().resolve()
+        if resolved_result.exists():
+            raise CutoverSafetyError(f"Cutover result already exists: {resolved_result}")
+        directories.add(resolved_result.parent)
+
     required_bytes = max(database.stat().st_size * 3, 10 * 1024 * 1024)
-    if shutil.disk_usage(database.parent).free < required_bytes:
-        raise CutoverSafetyError("Insufficient disk space for backup, migration, and rollback")
+    checked_filesystems: set[int] = set()
+    for directory in sorted(directories, key=str):
+        _probe_writable_directory(directory)
+        disk_path = directory
+        while not disk_path.exists() and disk_path != disk_path.parent:
+            disk_path = disk_path.parent
+        device = disk_path.stat().st_dev
+        if device in checked_filesystems:
+            continue
+        checked_filesystems.add(device)
+        if shutil.disk_usage(disk_path).free < required_bytes:
+            raise CutoverSafetyError(
+                f"Insufficient disk space for Phase 4 output path: {directory}"
+            )
     for service in services:
         result = subprocess.run(
             ["systemctl", "show", service, "--property=LoadState", "--value"],
@@ -109,6 +146,35 @@ def _validate_operational_preflight(
         )
         if result.returncode != 0 or result.stdout.strip() == "not-found":
             raise CutoverSafetyError(f"systemd service unit is unavailable: {service}")
+
+
+def _probe_writable_directory(directory: Path) -> None:
+    """Create, fsync, and remove a probe in an actual operation output directory."""
+
+    descriptor: int | None = None
+    probe_path: Path | None = None
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        descriptor, probe_name = tempfile.mkstemp(
+            prefix=".phase4-preflight-",
+            suffix=".tmp",
+            dir=directory,
+        )
+        probe_path = Path(probe_name)
+        os.write(descriptor, b"phase4-preflight\n")
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise CutoverSafetyError(
+            f"Phase 4 output directory is not writable: {directory}: {exc}"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if probe_path is not None:
+            try:
+                probe_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _require_root_for_operational_cutover() -> None:
@@ -173,7 +239,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.smoke_test:
         if args.smoke_database is None:
             raise CutoverSafetyError("--smoke-test requires --smoke-database")
-        _validate_operational_preflight(database, args.migrations_dir, ())
+        _validate_operational_preflight(
+            database,
+            args.migrations_dir,
+            (),
+            backup_directory=args.smoke_database.parent,
+            result_path=result_path,
+        )
         initializer = _load_initializer(args.checkpoint_initializer)
         report = run_cutover_smoke_test(
             SmokeTestConfig(
@@ -199,6 +271,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         database,
         args.migrations_dir,
         legacy_services + new_services + writer_services,
+        backup_directory=backup_directory,
+        result_path=result_path,
     )
     report = execute_cutover(
         CutoverConfig(
