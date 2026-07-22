@@ -199,7 +199,7 @@ def start_new_session(
     """새 Session을 생성하고 first_window_start·Capture Gap을 기록합니다.
 
     fallback_gap_start: 이 interface에 대해 DB에 기록된 Segment가 전혀 없을 때
-    Gap 시작점으로 사용할 값입니다. 만료된 Window로 인해 Session이 전환되는 경우, 
+    Gap 시작점으로 사용할 값입니다. 만료된 Window로 인해 Session이 전환되는 경우,
     놓친 window_start를 여기로 넘기면 "이전 Segment가 하나도 없어 Gap을 계산 못 하는" 상황에서도 공백이 누락되지 않습니다.
 
     Returns:

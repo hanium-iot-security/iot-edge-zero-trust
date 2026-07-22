@@ -291,7 +291,8 @@ diff <(sha256sum tests/fixtures/packet/pcap/partial_capture.pcap | cut -d' ' -f1
 **Extractor 테스트와의 연결 상태 (2026-07-20 기준)**: `test_packet_feature_extractor.py`의
 `test_failed_partial_capture_when_some_packets_corrupted` 등도 이 파일을 직접 쓰지 않고
 자체 fixture로 손상 시나리오를 검증하고 있습니다. `empty_window.pcap`과 마찬가지로,
-Capture Wrapper의 재시작 복구(`.pcap.tmp` → `PARTIAL_CAPTURE`) 검증에는 이미 쓰이고 있지만
+Capture Wrapper의 재시작 복구(`.pcap.tmp` → `PARTIAL_CAPTURE`) 테스트도 별도의 임시 바이트
+파일로 동일한 실패 시나리오를 검증하며, 커밋된 이 파일을 직접 사용하지는 않습니다.
 Extractor 쪽 연결은 추후 정종민 님과 협의해서 결정합니다.
 
 ## 5. 참고 문서
