@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import logging
 from math import isfinite
 import os
 from pathlib import Path
@@ -16,6 +17,8 @@ from typing import Protocol
 import subprocess
 
 from edge.packet.pcap_naming import build_pcap_filename, tmp_filename_to_ready
+
+logger = logging.getLogger(__name__)
 
 TERMINATE_GRACE_SECONDS = 5.0
 
@@ -160,14 +163,8 @@ def execute_capture_window(
     session_id: str,
     window_start: datetime,
     window_end: datetime,
+    capture_started_at: datetime | None = None,
 ) -> CaptureWindowResult:
-    """하나의 UTC 10초 Window를 캡처하고 결과에 따라 ready/failed로 원자적으로 이동시킵니다.
-
-    반환된 CaptureWindowResult.success == True 이면 파일은 이미 ready_dir에 있고,
-    호출자(run_packet_capture.py)는 capture_session_repository.insert_ready_segment()를
-    호출해 READY row를 만들면 됩니다. False이면 failed_dir로 이미 이동되어 있으므로
-    호출자는 insert_failed_segment()를 호출합니다.
-    """
     tmp_filename = build_pcap_filename(
         session_id=session_id,
         interface=config.capture_interface,
@@ -176,15 +173,34 @@ def execute_capture_window(
         tmp=True,
     )
     tmp_path = config.incoming_dir / tmp_filename
-    window_seconds = (window_end - window_start).total_seconds()
+
+    if capture_started_at is not None:
+        window_seconds = max(0.0, (window_end - capture_started_at).total_seconds())
+    else:
+        window_seconds = (window_end - window_start).total_seconds()
+
+    ready_filename = tmp_filename_to_ready(tmp_filename)
+
+    if window_seconds <= 0:
+        logger.warning(
+            "window_seconds<=0(%.3f)로 tcpdump 실행을 건너뜀: window_start=%s window_end=%s "
+            "capture_started_at=%s",
+            window_seconds, window_start, window_end, capture_started_at,
+        )
+        return CaptureWindowResult(
+            success=False,
+            file_name=ready_filename,
+            final_path=tmp_path,
+            exit_code=None,
+            error_code=PARTIAL_CAPTURE,
+            error_message="window already expired before capture could start (window_seconds<=0)",
+        )
 
     outcome = process.capture_window(
         interface=config.capture_interface,
         output_path=tmp_path,
         window_seconds=window_seconds,
     )
-
-    ready_filename = tmp_filename_to_ready(tmp_filename)
 
     if outcome.completed_full_window and outcome.terminated_cleanly:
         final_path = _atomic_rename_same_filesystem(tmp_path, config.ready_dir / ready_filename)

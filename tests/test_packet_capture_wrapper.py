@@ -220,6 +220,84 @@ class TestCaptureRuntimeConfigWindowSecondsValidation:
         assert config.window_seconds == 10
 
 
+class TestExecuteCaptureWindowDriftCorrection:
+    """PR #18 후속 리뷰: UTC Window 실행 지연이 연속 Capture에서 누적되는 문제 보완.
+
+    capture_started_at을 주면, window_start 기준 고정 10초가 아니라
+    window_end까지 남은 시간만큼만 tcpdump에 요청해야 한다.
+    """
+
+    def test_no_drift_requests_full_window_seconds(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        window_start = _utc(2026, 7, 15, 10, 0, 10)
+        window_end = _utc(2026, 7, 15, 10, 0, 20)
+        process = FakeCaptureProcess(outcome=CaptureOutcome(completed_full_window=True, exit_code=-15))
+
+        execute_capture_window(
+            process, config, session_id=SESSION_ID,
+            window_start=window_start, window_end=window_end,
+            capture_started_at=window_start,  # 지연 없음
+        )
+
+        assert process.last_call["window_seconds"] == 10.0
+
+    def test_late_start_shrinks_requested_duration_to_avoid_accumulation(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        window_start = _utc(2026, 7, 15, 10, 0, 10)
+        window_end = _utc(2026, 7, 15, 10, 0, 20)
+        capture_started_at = window_start.replace(microsecond=300_000)  # 0.3초 늦게 시작
+        process = FakeCaptureProcess(outcome=CaptureOutcome(completed_full_window=True, exit_code=-15))
+
+        execute_capture_window(
+            process, config, session_id=SESSION_ID,
+            window_start=window_start, window_end=window_end,
+            capture_started_at=capture_started_at,
+        )
+
+        # 10초가 아니라 window_end까지 남은 9.7초만 요청해야, 다음 Window로 지연이
+        # 이어지지 않고 이번 Window 안에서 자체 보정된다.
+        assert process.last_call["window_seconds"] == pytest.approx(9.7, abs=1e-6)
+
+    def test_capture_started_at_omitted_falls_back_to_fixed_window_seconds(self, tmp_path: Path) -> None:
+        """capture_started_at을 안 주면 기존 방식(window_end - window_start)으로 동작한다."""
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        window_start = _utc(2026, 7, 15, 10, 0, 10)
+        window_end = _utc(2026, 7, 15, 10, 0, 20)
+        process = FakeCaptureProcess(outcome=CaptureOutcome(completed_full_window=True, exit_code=-15))
+
+        execute_capture_window(
+            process, config, session_id=SESSION_ID,
+            window_start=window_start, window_end=window_end,
+        )
+
+        assert process.last_call["window_seconds"] == 10.0
+
+    def test_capture_started_at_past_window_end_does_not_invoke_process(self, tmp_path: Path) -> None:
+        """window_seconds<=0이면 tcpdump조차 실행하지 않고
+        즉시 실패로 처리해야 한다. 남은 시간이 없는 캡처가 정상 READY Segment로
+        저장되는 일을 막기 위한 방어 코드다."""
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        window_start = _utc(2026, 7, 15, 10, 0, 10)
+        window_end = _utc(2026, 7, 15, 10, 0, 20)
+        process = FakeCaptureProcess(outcome=CaptureOutcome(completed_full_window=True, exit_code=-15))
+
+        result = execute_capture_window(
+            process, config, session_id=SESSION_ID,
+            window_start=window_start, window_end=window_end,
+            capture_started_at=_utc(2026, 7, 15, 10, 0, 25),  # window_end보다도 늦음
+        )
+
+        assert process.last_call is None  # capture_window()가 호출되지 않음
+        assert result.success is False
+        assert result.error_code == "PARTIAL_CAPTURE"
+        assert not (config.ready_dir / result.file_name).exists()
+        assert not (config.failed_dir / result.file_name).exists()  # 파일 자체가 생성되지 않음
+
+
 class TestExecuteCaptureWindowSuccess:
     def test_moves_file_to_ready_and_strips_tmp_suffix(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path)
