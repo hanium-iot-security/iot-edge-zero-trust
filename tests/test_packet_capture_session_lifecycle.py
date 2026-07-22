@@ -500,6 +500,47 @@ class TestRunCaptureLoop:
         assert row["capture_gap_start"] == "2026-07-15T10:00:10Z"
         assert row["capture_gap_end"] == "2026-07-15T10:00:30Z"
 
+    def test_first_ever_window_expiring_still_records_capture_gap(self, db_session, tmp_path) -> None:
+        config = _make_config(tmp_path)
+        # 세션은 있지만(막 create_session만 한 상태), Segment는 이 interface에 대해
+        # 이 DB 전체에서 단 하나도 없다 -- find_last_segment_window_end가 None을 반환.
+        session_pk = repo.create_session(
+            db_session, session_id=SESSION_ID_A, capture_interface="eth0",
+            started_at=_utc(2026, 7, 15, 10, 0, 3),
+        )
+        db_session.commit()
+        assert repo.find_last_segment_window_end(db_session, "eth0") is None
+
+        first_window_start = _utc(2026, 7, 15, 10, 0, 10)  # 첫 Window부터
+        process = FakeCaptureProcess(
+            outcomes=[CaptureOutcome(completed_full_window=True, exit_code=-15)]
+        )
+        shutdown = GracefulShutdown()
+
+        run_capture_loop(
+            db_session, process, config,
+            session_pk=session_pk, session_id=SESSION_ID_A,
+            first_window_start=first_window_start,
+            shutdown=shutdown, max_windows=1,
+            clock=lambda: _utc(2026, 7, 15, 10, 0, 25),  # window_end(10:00:20)를 이미 지남
+            sleep=lambda _seconds: None,
+        )
+
+        segment = db_session.execute(
+            text("SELECT capture_session_id FROM packet_capture_segments")
+        ).mappings().first()
+        new_session_pk = segment["capture_session_id"]
+
+        row = db_session.execute(
+            text("SELECT capture_gap_start, capture_gap_end FROM packet_capture_sessions WHERE id = :id"),
+            {"id": new_session_pk},
+        ).mappings().first()
+
+        # 이전 Segment가 전혀 없었지만, 놓친 첫 Window(10:00:10)부터 새 Session의
+        # first_window_start(10:00:30)까지가 정확히 Gap으로 기록돼야 한다.
+        assert row["capture_gap_start"] == "2026-07-15T10:00:10Z"
+        assert row["capture_gap_end"] == "2026-07-15T10:00:30Z"
+
     def test_late_wakeup_after_sleep_transitions_to_new_session(self, db_session, tmp_path) -> None:
         config = _make_config(tmp_path)
         session_pk, session_id, first_window_start = start_new_session(

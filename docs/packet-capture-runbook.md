@@ -1,6 +1,6 @@
 # Packet Capture Runbook
 
-Packet Capture Runtime(`edge/packet/`)의 실행 방법과, 병렬 개발·회귀 테스트용
+Phase 3-B Packet Capture Runtime(`edge/packet/`)의 실행 방법과, 병렬 개발·회귀 테스트용
 Test Pack(`tests/fixtures/packet/pcap/`) 수집 절차·검증 기준을 정리합니다.
 
 > 이 문서는 Capture Wrapper 담당 기준 초안입니다. 실제 Raspberry Pi·ESP32에서의
@@ -161,7 +161,7 @@ sudo tcpdump -i eth0 -w tests/fixtures/packet/pcap/normal_mqtt.pcap "tcp or udp"
 | 항목 | 값 |
 | --- | --- |
 | 대상 IP | Pi #1의 `eth0` IP (`192.168.0.20`) |
-| 스캔 Port 범위 | `1-1000` (MQTT 1883 포함하려면 `1-2000`) |
+| 스캔 Port 범위 | `1-2000` (MQTT 1883 포함) |
 | 스캔 노드 | Pi #2 또는 관리자 노트북 (Pi #1과 같은 내부 LAN) |
 | 캡처 시간 | 스캔 시작 5초 전부터 스캔 종료 5초 후까지 (여유 포함 약 30~40초) |
 | 반복 횟수 | 1회 (재현성 확인용으로 2회차를 별도 파일로 추가 수집해도 무방) |
@@ -244,8 +244,15 @@ python tests/fixtures/packet/generate_synthetic_pcaps.py
 ```
 
 **검증 기준**: `tests/test_generate_synthetic_pcaps.py`가 구조를 고정 검증합니다
-(24바이트 global header만 있고 패킷 레코드 0개). Extractor 쪽 검증(Segment EMPTY 처리)은
-`tests/test_packet_feature_extractor.py`(정종민 담당)에서 이 파일을 입력으로 사용합니다.
+(24바이트 global header만 있고 패킷 레코드 0개).
+
+**Extractor 테스트와의 연결 상태 (2026-07-20 기준)**: `tests/test_packet_feature_extractor.py`는
+현재 이 파일을 직접 사용하지 않습니다. 대신 `_write_pcap()` 헬퍼로 자체 fixture를 그때그때
+만들어서 EMPTY 케이스(`test_empty_when_no_pi_related_packets` 등)를 검증하고 있습니다 —
+정확히는 "패킷이 0개"가 아니라 "패킷은 있지만 Pi #1과 무관한 경우"를 EMPTY로 처리하는지
+보는 테스트라, 이 파일이 표현하는 "패킷 레코드 자체가 0개"인 시나리오와는 조건이 다릅니다.
+`empty_window.pcap`을 Extractor 테스트에 실제로 연결할지, 지금처럼 각자 fixture를 따로
+쓸지는 정종민님과 협의해서 추후 결정합니다.
 
 **커밋된 파일과의 일치 확인**: 생성 스크립트는 랜덤 요소가 전혀 없는 결정적(deterministic)
 스크립트이므로, 재생성한 파일과 저장소에 커밋된 파일의 SHA256은 항상 동일해야 합니다.
@@ -281,8 +288,11 @@ diff <(sha256sum tests/fixtures/packet/pcap/partial_capture.pcap | cut -d' ' -f1
      <(sha256sum /tmp/regenerated/partial_capture.pcap | cut -d' ' -f1)
 ```
 
-두 합성 pcap 모두 Extractor/Parser 테스트(정종민 담당)에서 `tests/fixtures/packet/pcap/`
-경로로 직접 입력 파일로 사용할 수 있습니다 (별도 복사 불필요).
+**Extractor 테스트와의 연결 상태 (2026-07-20 기준)**: `test_packet_feature_extractor.py`의
+`test_failed_partial_capture_when_some_packets_corrupted` 등도 이 파일을 직접 쓰지 않고
+자체 fixture로 손상 시나리오를 검증하고 있습니다. `empty_window.pcap`과 마찬가지로,
+Capture Wrapper의 재시작 복구(`.pcap.tmp` → `PARTIAL_CAPTURE`) 검증에는 이미 쓰이고 있지만
+Extractor 쪽 연결은 추후 정종민 님과 협의해서 결정합니다.
 
 ## 5. 참고 문서
 

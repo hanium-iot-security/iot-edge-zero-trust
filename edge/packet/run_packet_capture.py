@@ -193,8 +193,14 @@ def start_new_session(
     db: Session,
     config: CaptureRuntimeConfig,
     now: datetime,
+    *,
+    fallback_gap_start: datetime | None = None,
 ) -> tuple[int, str, datetime]:
-    """새 Session을 생성하고 first_window_start·Capture Gap을 기록합니다 (4.2 절).
+    """새 Session을 생성하고 first_window_start·Capture Gap을 기록합니다.
+
+    fallback_gap_start: 이 interface에 대해 DB에 기록된 Segment가 전혀 없을 때
+    Gap 시작점으로 사용할 값입니다. 만료된 Window로 인해 Session이 전환되는 경우, 
+    놓친 window_start를 여기로 넘기면 "이전 Segment가 하나도 없어 Gap을 계산 못 하는" 상황에서도 공백이 누락되지 않습니다.
 
     Returns:
         (session_pk, session_id, first_window_start)
@@ -211,6 +217,8 @@ def start_new_session(
     repo.set_first_window_start(db, session_pk, first_window_start)
 
     previous_window_end = repo.find_last_segment_window_end(db, config.capture_interface)
+    if previous_window_end is None:
+        previous_window_end = fallback_gap_start
     if previous_window_end is not None and previous_window_end < first_window_start:
         repo.record_capture_gap(db, session_pk, previous_window_end, first_window_start)
         logger.info(
@@ -242,7 +250,6 @@ def run_capture_loop(
     """first_window_start부터 연속으로 10초 Window를 캡처합니다.
 
     Window 경계(window_start)까지 대기한 뒤 캡처를 시작하고, 캡처 자체가
-    window_seconds만큼 블로킹되므로 window_end에 자연스럽게 끝납니다.
 
     max_windows가 주어지면 그만큼만 캡처하고 반환합니다 (수동 테스트/`--windows` 옵션용).
     max_windows 카운트에는 만료로 건너뛴 Window는 포함하지 않습니다.
@@ -259,8 +266,11 @@ def run_capture_loop(
 
     def _transition_to_new_session(now: datetime) -> None:
         nonlocal session_pk, session_id, window_start
+        missed_window_start = window_start  # 전환 전, 놓친 Window의 시작 시각을 보존
         _close_current_session(now, "COMPLETED")
-        session_pk, session_id, window_start = start_new_session(db, config, now)
+        session_pk, session_id, window_start = start_new_session(
+            db, config, now, fallback_gap_start=missed_window_start
+        )
 
     try:
         while not shutdown.requested:
