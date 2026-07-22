@@ -75,7 +75,13 @@ def _calculate_cutover_checkpoints(
         detector_name="mqtt_feature_builder",
         source_table="mqtt_logs",
     )
-    packet_processed_id, packet_ready_through = _packet_feature_checkpoint(connection)
+    if mqtt_ready_through is not None and mqtt_ready_through > cutover_at:
+        raise ValueError("mqtt producer watermark exceeds phase4_cutover_at")
+
+    packet_processed_id, packet_ready_through = _packet_feature_checkpoint(
+        connection,
+        cutover_at,
+    )
     trust_processed_id = _max_detection_event_id_before_cutover(connection, cutover_at)
 
     values = _empty_checkpoint_values()
@@ -169,6 +175,7 @@ def _max_feature_log_id_through(
 
 def _packet_feature_checkpoint(
     connection: sqlite3.Connection,
+    cutover_at: datetime,
 ) -> tuple[int | None, datetime | None]:
     completed_segment_ids: list[int] = []
     latest_ready_through: datetime | None = None
@@ -186,6 +193,7 @@ def _packet_feature_checkpoint(
             connection,
             capture_session_id=int(session["id"]),
             first_window_start=_parse_db_utc(session["first_window_start"]),
+            cutover_at=cutover_at,
             completed_segment_ids=completed_segment_ids,
         )
         if session_ready_through is not None and (
@@ -205,6 +213,7 @@ def _completed_prefix_for_session(
     *,
     capture_session_id: int,
     first_window_start: datetime,
+    cutover_at: datetime,
     completed_segment_ids: list[int],
 ) -> datetime | None:
     expected_window_start = first_window_start
@@ -230,6 +239,8 @@ def _completed_prefix_for_session(
         window_end = _parse_db_utc(row["window_end"])
         if window_end != window_start + timedelta(seconds=10):
             break
+        if window_end > cutover_at:
+            raise ValueError("packet completed watermark exceeds phase4_cutover_at")
 
         completed_segment_ids.append(int(row["id"]))
         ready_through = window_end
@@ -334,4 +345,6 @@ def _require_utc(value: datetime, field_name: str) -> datetime:
         raise ValueError(f"{field_name} must be timezone-aware UTC")
     if value.utcoffset() != timedelta(0):
         raise ValueError(f"{field_name} must use UTC offset")
+    if value.microsecond != 0:
+        raise ValueError(f"{field_name} must use whole-second precision")
     return value.astimezone(timezone.utc).replace(microsecond=0)

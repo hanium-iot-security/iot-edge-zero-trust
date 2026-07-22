@@ -91,7 +91,7 @@ def initialize_phase4_cutover(
 Input contract:
 
 - `database_path` must already exist.
-- `phase4_cutover_at` must be timezone-aware UTC.
+- `phase4_cutover_at` must be timezone-aware UTC with whole-second precision.
 - The function does not run migrations.
 - The function does not control systemd, runtime services, or operating system state.
 
@@ -113,13 +113,15 @@ On failure it rolls back the whole transaction. Partial checkpoint rows and part
 
 ## Watermark Policy
 
-MQTT detector checkpoints are initialized only from an existing verified `mqtt_feature_builder+mqtt_logs` completion watermark. If there is no completed producer watermark, the MQTT-related detector checkpoints remain `NULL`.
+MQTT detector checkpoints are initialized only from an existing verified `mqtt_feature_builder+mqtt_logs` completion watermark. If there is no completed producer watermark, the MQTT-related detector checkpoints remain `NULL`. If the existing MQTT producer watermark is later than `phase4_cutover_at`, initialization fails because the DB snapshot is newer than the declared cutover boundary.
 
 Packet detector checkpoints are calculated from each capture session's contiguous completed prefix:
 
 - Start at `first_window_start`
 - Include only `PROCESSED` and `EMPTY`
+- Include only windows whose `window_end <= phase4_cutover_at`
 - Stop at `READY`, `FAILED`, or a missing 10 second window
+- Fail if a contiguous completed packet watermark would exceed `phase4_cutover_at`
 - Use feature row IDs only from included segments
 - Allow `EMPTY` segments to advance the completed watermark without a source feature ID
 
