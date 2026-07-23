@@ -1,8 +1,17 @@
-"""Rule 기반 및 AI 탐지 결과를 detection_events에 저장합니다."""
+"""Detection event writer helpers."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+import json
+from typing import Any, Mapping
+
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from edge.detection.phase4_time import format_db_utc
 from edge.detection.rule_detector import (
     AI_EVENT_TYPES,
     DETECTOR_AI,
@@ -29,6 +38,201 @@ _VALID_DETECTOR_EVENTS: dict[str, set[str]] = {
 }
 
 _VALID_SEVERITIES = {"low", "medium", "high"}
+
+
+@dataclass(frozen=True)
+class DetectionEventWriteResult:
+    event_id: int | None
+    inserted: bool
+    duplicate: bool
+
+
+def build_dedupe_key(
+    *,
+    detector_name: str,
+    source_table: str,
+    source_id: int,
+    event_type: str,
+    policy_version: str,
+) -> str:
+    return f"{detector_name}:{source_table}:{source_id}:{event_type}:{policy_version}"
+
+
+def write_detection_event(
+    db: Session,
+    *,
+    device_id: str | None,
+    detector_name: str,
+    source_table: str,
+    source_id: int,
+    detector_type: str,
+    event_type: str,
+    severity: str,
+    description: str,
+    policy_version: str,
+    detected_at: datetime,
+    analysis_window_start: datetime,
+    analysis_window_end: datetime,
+    incident_family: str | None = None,
+    subject_ip: str | None = None,
+    evidence: Mapping[str, Any] | None = None,
+    evidence_schema_version: int = 1,
+    score_delta: int | None = None,
+    feature_log_id: int | None = None,
+    mqtt_log_id: int | None = None,
+    packet_feature_log_id: int | None = None,
+) -> DetectionEventWriteResult:
+    """Insert a Phase 4 detection event without committing the caller transaction."""
+    _validate_phase4_event(
+        severity=severity,
+        feature_log_id=feature_log_id,
+        mqtt_log_id=mqtt_log_id,
+        packet_feature_log_id=packet_feature_log_id,
+    )
+    source_fk_values = {
+        "feature_logs": feature_log_id,
+        "mqtt_logs": mqtt_log_id,
+        "packet_feature_logs": packet_feature_log_id,
+    }
+    if source_fk_values.get(source_table) != source_id:
+        raise ValueError("source_table/source_id must match the populated source FK")
+
+    dedupe_key = build_dedupe_key(
+        detector_name=detector_name,
+        source_table=source_table,
+        source_id=source_id,
+        event_type=event_type,
+        policy_version=policy_version,
+    )
+    evidence_json = _serialize_evidence(evidence)
+    delta = score_delta_for_event(event_type) if score_delta is None else score_delta
+
+    try:
+        result = db.execute(
+            text(
+                """
+                INSERT INTO detection_events (
+                    device_id,
+                    feature_log_id,
+                    mqtt_log_id,
+                    packet_feature_log_id,
+                    detector_type,
+                    event_type,
+                    severity,
+                    score_delta,
+                    applied_to_score,
+                    description,
+                    detected_at,
+                    analysis_window_start,
+                    analysis_window_end,
+                    incident_family,
+                    subject_ip,
+                    evidence_json,
+                    evidence_schema_version,
+                    dedupe_key,
+                    policy_version,
+                    processed_at,
+                    processing_reason
+                )
+                VALUES (
+                    :device_id,
+                    :feature_log_id,
+                    :mqtt_log_id,
+                    :packet_feature_log_id,
+                    :detector_type,
+                    :event_type,
+                    :severity,
+                    :score_delta,
+                    0,
+                    :description,
+                    :detected_at,
+                    :analysis_window_start,
+                    :analysis_window_end,
+                    :incident_family,
+                    :subject_ip,
+                    :evidence_json,
+                    :evidence_schema_version,
+                    :dedupe_key,
+                    :policy_version,
+                    NULL,
+                    NULL
+                )
+                ON CONFLICT(dedupe_key)
+                WHERE dedupe_key IS NOT NULL
+                DO NOTHING
+                """
+            ),
+            {
+                "device_id": device_id,
+                "feature_log_id": feature_log_id,
+                "mqtt_log_id": mqtt_log_id,
+                "packet_feature_log_id": packet_feature_log_id,
+                "detector_type": detector_type,
+                "event_type": event_type,
+                "severity": severity,
+                "score_delta": delta,
+                "description": description,
+                "detected_at": format_db_utc(detected_at),
+                "analysis_window_start": format_db_utc(analysis_window_start),
+                "analysis_window_end": format_db_utc(analysis_window_end),
+                "incident_family": incident_family,
+                "subject_ip": subject_ip,
+                "evidence_json": evidence_json,
+                "evidence_schema_version": evidence_schema_version,
+                "dedupe_key": dedupe_key,
+                "policy_version": policy_version,
+            },
+        )
+    except IntegrityError:
+        raise
+
+    if result.rowcount == 0:
+        return DetectionEventWriteResult(
+            event_id=_find_event_id_by_dedupe_key(db, dedupe_key),
+            inserted=False,
+            duplicate=True,
+        )
+    return DetectionEventWriteResult(
+        event_id=int(result.lastrowid),
+        inserted=True,
+        duplicate=False,
+    )
+
+
+def _validate_phase4_event(
+    *,
+    severity: str,
+    feature_log_id: int | None,
+    mqtt_log_id: int | None,
+    packet_feature_log_id: int | None,
+) -> None:
+    if severity not in _VALID_SEVERITIES:
+        raise ValueError(f"invalid severity: {severity!r}")
+    source_count = sum(
+        value is not None
+        for value in (feature_log_id, mqtt_log_id, packet_feature_log_id)
+    )
+    if source_count != 1:
+        raise ValueError("exactly one source FK must be provided")
+
+
+def _serialize_evidence(evidence: Mapping[str, Any] | None) -> str | None:
+    if evidence is None:
+        return None
+    return json.dumps(
+        evidence,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _find_event_id_by_dedupe_key(db: Session, dedupe_key: str) -> int | None:
+    row = db.execute(
+        text("SELECT id FROM detection_events WHERE dedupe_key = :dedupe_key"),
+        {"dedupe_key": dedupe_key},
+    ).first()
+    return int(row[0]) if row is not None else None
 
 
 def insert_detection_event(
