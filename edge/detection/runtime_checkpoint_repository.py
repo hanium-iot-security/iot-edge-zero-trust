@@ -75,6 +75,16 @@ def upsert_detector_checkpoint(
     validate_checkpoint_key(detector_name, source_table)
     if last_processed_id is not None and last_processed_id < 0:
         raise ValueError("last_processed_id must be non-negative")
+    existing = get_detector_checkpoint(
+        db,
+        detector_name=detector_name,
+        source_table=source_table,
+    )
+    _validate_checkpoint_progress(
+        existing,
+        last_processed_id=last_processed_id,
+        last_completed_window_end=last_completed_window_end,
+    )
 
     db.execute(
         text(
@@ -113,6 +123,36 @@ def upsert_detector_checkpoint(
             ),
         },
     )
+
+
+def _validate_checkpoint_progress(
+    existing: dict[str, Any] | None,
+    *,
+    last_processed_id: int | None,
+    last_completed_window_end: datetime | None,
+) -> None:
+    if existing is None:
+        return
+
+    existing_window_end = (
+        parse_db_utc(
+            existing["last_completed_window_end"],
+            "last_completed_window_end",
+        )
+        if existing["last_completed_window_end"] is not None
+        else None
+    )
+    if existing_window_end is not None:
+        if last_completed_window_end is None:
+            raise ValueError("detector checkpoint cannot move backwards")
+        if last_completed_window_end < existing_window_end:
+            raise ValueError("detector checkpoint cannot move backwards")
+
+    existing_id = existing["last_processed_id"]
+    if existing_id is not None and (
+        last_processed_id is None or last_processed_id < int(existing_id)
+    ):
+        raise ValueError("detector checkpoint last_processed_id cannot move backwards")
 
 
 def list_phase4_checkpoint_summary(db: Session) -> dict[str, dict[str, Any]]:

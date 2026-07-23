@@ -118,7 +118,9 @@ MVP에서는 중복 endpoint를 줄이기 위해 기기별 feature/event 조회�
 ```json
 {
   "status": "ok",
-  "database": "ok"
+  "database": "ok",
+  "db_connected": true,
+  "server_time": "2026-05-26T05:35:00Z"
 }
 ```
 
@@ -127,8 +129,19 @@ DB 연결 오류 시 실제 DB 경로, SQL, stack trace, 환경변수, secret은
 ```json
 {
   "status": "degraded",
-  "database": "error"
+  "database": "error",
+  "db_connected": false,
+  "server_time": "2026-05-26T05:35:00Z"
 }
+```
+
+`db_connected`와 `server_time`은 기존 Dashboard 호환성을 위해 유지합니다. `server_time`은 UTC `Z` 형식입니다.
+
+API CORS 설정은 `.env.example`의 다음 값을 기준으로 합니다.
+
+```text
+API_ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+API_ALLOW_CREDENTIALS=true
 ```
 
 ## Detection Events
@@ -155,7 +168,7 @@ Response items include Phase 4 source FK fields, Trust processing metadata, UTC 
 evidence_json -> evidence object
 ```
 
-Input validation errors return `422`. Stored JSON or timestamp conversion errors return `500`.
+Input validation errors return `422`. Stored JSON or timestamp conversion errors return `500`; malformed stored rows are server data errors, not user request errors.
 
 ## Trust Score History
 
@@ -182,7 +195,7 @@ analysis_window_end DESC, id DESC
   "trust_score": 25,
   "trigger_event_id": 9,
   "trust_score_history_id": 3,
-  "created_at": "2026-05-26 14:35:00"
+  "created_at": "2026-05-26T05:35:00Z"
 }
 ```
 

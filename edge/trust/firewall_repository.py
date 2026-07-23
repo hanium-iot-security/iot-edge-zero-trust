@@ -110,7 +110,7 @@ def list_pending_rules(
 
 def mark_applied(db: Session, *, rule_id: int, applied_at: datetime) -> None:
     applied_utc = require_utc_whole_second(applied_at, "applied_at")
-    db.execute(
+    result = db.execute(
         text(
             """
             UPDATE firewall_rules
@@ -121,10 +121,12 @@ def mark_applied(db: Session, *, rule_id: int, applied_at: datetime) -> None:
                 last_error = NULL,
                 updated_at = :applied_at
             WHERE id = :id
+              AND status = 'PENDING'
             """
         ),
         {"id": rule_id, "applied_at": format_db_utc(applied_utc)},
     )
+    _ensure_one_row_changed(result, f"firewall rule is not PENDING: {rule_id}")
 
 
 def record_transient_failure(
@@ -136,7 +138,7 @@ def record_transient_failure(
     retry_delay_seconds: int = 30,
 ) -> None:
     attempted_utc = require_utc_whole_second(attempted_at, "attempted_at")
-    current_retry = _current_retry_count(db, rule_id)
+    current_retry = _current_retry_count(db, rule_id, required_status=PENDING)
     retry_count = current_retry + 1
     status = FAILED if retry_count >= MAX_TRANSIENT_RETRIES else PENDING
     next_retry_at = (
@@ -144,7 +146,7 @@ def record_transient_failure(
         if status == FAILED
         else attempted_utc + timedelta(seconds=retry_delay_seconds)
     )
-    db.execute(
+    result = db.execute(
         text(
             """
             UPDATE firewall_rules
@@ -155,6 +157,7 @@ def record_transient_failure(
                 last_error = :last_error,
                 updated_at = :last_attempted_at
             WHERE id = :id
+              AND status = 'PENDING'
             """
         ),
         {
@@ -166,6 +169,7 @@ def record_transient_failure(
             "last_error": error,
         },
     )
+    _ensure_one_row_changed(result, f"firewall rule is not PENDING: {rule_id}")
 
 
 def record_validation_failure(
@@ -176,8 +180,8 @@ def record_validation_failure(
     error: str,
 ) -> None:
     attempted_utc = require_utc_whole_second(attempted_at, "attempted_at")
-    retry_count = _current_retry_count(db, rule_id) + 1
-    db.execute(
+    retry_count = _current_retry_count(db, rule_id, required_status=PENDING) + 1
+    result = db.execute(
         text(
             """
             UPDATE firewall_rules
@@ -188,6 +192,7 @@ def record_validation_failure(
                 last_error = :last_error,
                 updated_at = :last_attempted_at
             WHERE id = :id
+              AND status = 'PENDING'
             """
         ),
         {
@@ -197,11 +202,12 @@ def record_validation_failure(
             "last_error": error,
         },
     )
+    _ensure_one_row_changed(result, f"firewall rule is not PENDING: {rule_id}")
 
 
 def mark_removed(db: Session, *, rule_id: int, released_at: datetime) -> None:
     released_utc = require_utc_whole_second(released_at, "released_at")
-    db.execute(
+    result = db.execute(
         text(
             """
             UPDATE firewall_rules
@@ -210,10 +216,12 @@ def mark_removed(db: Session, *, rule_id: int, released_at: datetime) -> None:
                 next_retry_at = NULL,
                 updated_at = :released_at
             WHERE id = :id
+              AND status = 'APPLIED'
             """
         ),
         {"id": rule_id, "released_at": format_db_utc(released_utc)},
     )
+    _ensure_one_row_changed(result, f"firewall rule is not APPLIED: {rule_id}")
 
 
 def reset_failed_to_pending(
@@ -224,7 +232,7 @@ def reset_failed_to_pending(
     reset_retry_count: bool = True,
 ) -> None:
     requested_utc = require_utc_whole_second(requested_at, "requested_at")
-    db.execute(
+    result = db.execute(
         text(
             """
             UPDATE firewall_rules
@@ -243,16 +251,29 @@ def reset_failed_to_pending(
             "requested_at": format_db_utc(requested_utc),
         },
     )
+    _ensure_one_row_changed(result, f"firewall rule is not FAILED: {rule_id}")
 
 
-def _current_retry_count(db: Session, rule_id: int) -> int:
+def _current_retry_count(
+    db: Session,
+    rule_id: int,
+    *,
+    required_status: str | None = None,
+) -> int:
     row = db.execute(
-        text("SELECT retry_count FROM firewall_rules WHERE id = :id"),
+        text("SELECT retry_count, status FROM firewall_rules WHERE id = :id"),
         {"id": rule_id},
-    ).first()
+    ).mappings().first()
     if row is None:
         raise ValueError(f"firewall rule not found: {rule_id}")
-    return int(row[0])
+    if required_status is not None and row["status"] != required_status:
+        raise ValueError(f"firewall rule is not {required_status}: {rule_id}")
+    return int(row["retry_count"])
+
+
+def _ensure_one_row_changed(result, message: str) -> None:
+    if result.rowcount != 1:
+        raise ValueError(message)
 
 
 def _validate_ip(source_ip: str) -> None:

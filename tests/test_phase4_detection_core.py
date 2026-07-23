@@ -22,6 +22,7 @@ from edge.detection.runtime_checkpoint_repository import (
     upsert_detector_checkpoint,
 )
 from edge.features.collect_feature_logs import produce_mqtt_features_until
+from edge.trust.trust_policy import incident_family_for_event
 
 
 CUTOVER = datetime(2026, 7, 23, 10, 0, 20, tzinfo=timezone.utc)
@@ -78,6 +79,27 @@ def test_runtime_checkpoint_adapter_is_transaction_controlled(SessionLocal) -> N
             )
 
 
+def test_incident_family_mapping_covers_phase4_event_types() -> None:
+    expected = {
+        "UNKNOWN_DEVICE": "IDENTITY",
+        "DEVICE_ID_MISMATCH": "IDENTITY",
+        "LARGE_PAYLOAD": "MESSAGE_POLICY",
+        "MALFORMED_PAYLOAD": "MESSAGE_POLICY",
+        "ABNORMAL_TOPIC": "MESSAGE_POLICY",
+        "ABNORMAL_PUBLISH_RATE": "FLOODING",
+        "PACKET_RATE_ANOMALY": "FLOODING",
+        "BYTE_RATE_ANOMALY": "FLOODING",
+        "BROKER_DOS_SUSPECTED": "FLOODING",
+        "NON_MQTT_TRAFFIC": "NETWORK_POLICY",
+        "PORT_SCAN": "SCAN",
+        "AI_ANOMALY": "AI_ONLY",
+        "AI_PACKET_ANOMALY": "AI_ONLY",
+    }
+
+    for event_type, family in expected.items():
+        assert incident_family_for_event(event_type) == family
+
+
 def test_mqtt_feature_producer_creates_features_and_checkpoint_in_one_transaction(
     SessionLocal,
 ) -> None:
@@ -103,6 +125,17 @@ def test_mqtt_feature_producer_creates_features_and_checkpoint_in_one_transactio
         with db.begin():
             produce_mqtt_features_until(db, producer_cutoff=CUTOVER)
         assert db.execute(text("SELECT COUNT(*) FROM feature_logs")).scalar_one() == 2
+        windows = db.execute(
+            text(
+                """
+                SELECT window_start, window_end
+                FROM feature_logs
+                ORDER BY id
+                """
+            )
+        ).mappings().all()
+        assert windows[0]["window_start"] == "2026-07-23T10:00:00Z"
+        assert windows[0]["window_end"] == "2026-07-23T10:00:10Z"
         checkpoint = get_detector_checkpoint(
             db,
             detector_name="mqtt_feature_builder",
@@ -215,7 +248,8 @@ def test_phase4_detection_writer_dedupes_and_validates_source_fk(SessionLocal) -
 
 def test_mqtt_adapters_create_events_and_advance_checkpoints(SessionLocal, monkeypatch) -> None:
     with SessionLocal() as db:
-        _insert_device(db, "esp32_01")
+        _insert_device(db, "esp32_01", ip_address="192.168.0.10")
+        _insert_device(db, "esp32_02", ip_address="192.168.0.11")
         feature_id = _insert_feature(
             db,
             "esp32_01",
@@ -227,8 +261,8 @@ def test_mqtt_adapters_create_events_and_advance_checkpoints(SessionLocal, monke
             db,
             "esp32_01",
             "2026-07-23T10:00:01Z",
-            topic="iot/rogue_01/sensor",
-            payload='{"device_id":"esp32_01"}',
+            topic="iot/esp32_01/sensor",
+            payload='{"device_id":"esp32_02"}',
         )
         db.commit()
 
@@ -267,7 +301,7 @@ def test_mqtt_adapters_create_events_and_advance_checkpoints(SessionLocal, monke
             text(
                 """
                 SELECT detector_type, event_type, feature_log_id, mqtt_log_id,
-                       processed_at, dedupe_key
+                       incident_family, subject_ip, processed_at, dedupe_key
                 FROM detection_events
                 ORDER BY id ASC
                 """
@@ -277,8 +311,50 @@ def test_mqtt_adapters_create_events_and_advance_checkpoints(SessionLocal, monke
         assert rows[0]["feature_log_id"] == feature_id
         assert rows[1]["mqtt_log_id"] == mqtt_id
         assert rows[2]["event_type"] == "AI_ANOMALY"
+        assert rows[0]["incident_family"] == "FLOODING"
+        assert rows[1]["incident_family"] == "IDENTITY"
+        assert rows[2]["incident_family"] == "AI_ONLY"
+        assert rows[0]["subject_ip"] == "192.168.0.10"
+        assert rows[1]["subject_ip"] == "192.168.0.10"
+        assert rows[2]["subject_ip"] == "192.168.0.10"
         assert all(row["processed_at"] is None for row in rows)
         assert all(row["dedupe_key"] for row in rows)
+
+
+def test_mqtt_adapters_do_not_move_checkpoints_backwards(SessionLocal) -> None:
+    stages = (
+        MqttFeatureRuleStage(),
+        MqttMessageRuleStage(),
+        MqttIsolationForestStage(),
+    )
+    for stage in stages:
+        with SessionLocal() as db:
+            with db.begin():
+                upsert_detector_checkpoint(
+                    db,
+                    detector_name=stage.detector_name,
+                    source_table=stage.source_table,
+                    last_processed_id=10,
+                    last_completed_window_end=CUTOVER,
+                    updated_at=CUTOVER,
+                )
+
+        with SessionLocal() as db:
+            with pytest.raises(ValueError, match="cannot move backwards"):
+                with db.begin():
+                    stage.run_until(
+                        db,
+                        cycle_range_start=RANGE_START,
+                        cycle_cutoff=datetime(2026, 7, 23, 10, 0, 10, tzinfo=timezone.utc),
+                    )
+
+            checkpoint = get_detector_checkpoint(
+                db,
+                detector_name=stage.detector_name,
+                source_table=stage.source_table,
+            )
+            assert checkpoint["last_processed_id"] == 10
+            assert checkpoint["last_completed_window_end"] == "2026-07-23T10:00:20Z"
 
 
 def test_orchestrator_commits_successful_stage_before_later_failure(SessionLocal) -> None:

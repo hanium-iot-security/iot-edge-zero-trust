@@ -220,7 +220,7 @@ PR #14 Gateway Metrics Collector의 `GatewayMetricsSample`은 `collected_at`, `s
 
 ## detector_checkpoints
 
-Detector별 처리 지점을 저장하기 위한 Phase 4용 테이블입니다. 003 이후 `edge.detection.checkpoint_repository`와 `initialize_phase4_cutover()`가 cutover snapshot에 사용하고, runtime에서는 `edge.detection.runtime_checkpoint_repository`가 SQLAlchemy `Session` 기반으로 같은 테이블을 갱신합니다.
+Detector별 처리 지점을 저장하기 위한 Phase 4용 테이블입니다. 003 이후 `edge.detection.checkpoint_repository`와 `initialize_phase4_cutover()`가 cutover snapshot에 사용하고, runtime에서는 `edge.detection.runtime_checkpoint_repository`가 SQLAlchemy `Session` 기반으로 같은 테이블을 갱신합니다. Runtime repository는 `last_completed_window_end`와 `last_processed_id`가 기존 checkpoint보다 과거로 역행하는 update를 거부합니다.
 
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |
@@ -269,7 +269,7 @@ Phase 4용 Trust Score window history 테이블입니다. Window별 실제 점�
 
 ## firewall_rules
 
-Phase 4용 firewall 요청/상태 테이블입니다. 이번 PR은 DB repository와 조회 API만 구현합니다. 격리 진입 시 Trust Score v2 transaction에서 `PENDING` row를 만들 수 있지만, 실제 iptables 실행과 worker reconciliation은 다른 담당 범위입니다.
+Phase 4용 firewall 요청/상태 테이블입니다. 이번 PR은 DB repository와 조회 API만 구현합니다. 격리 진입 시 Trust Score v2 transaction에서 `PENDING` row를 만들 수 있지만, 실제 iptables 실행과 worker reconciliation은 다른 담당 범위입니다. Repository는 `PENDING -> APPLIED`, `PENDING -> PENDING/FAILED`, `APPLIED -> REMOVED`, 관리자 재시도용 `FAILED -> PENDING`만 허용합니다.
 
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |

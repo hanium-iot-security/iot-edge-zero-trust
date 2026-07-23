@@ -24,6 +24,8 @@ trust_score_v2+detection_events
 
 Runtime repository functions do not call `commit()` or `rollback()`. They participate in the caller transaction.
 
+Runtime checkpoint updates must not move backwards. A stage run that tries to replace an existing `last_completed_window_end` or `last_processed_id` with an older value fails instead of silently overwriting the checkpoint.
+
 ## MQTT Feature Producer
 
 `edge.features.collect_feature_logs.produce_mqtt_features_until()` creates MQTT feature rows incrementally.
@@ -36,6 +38,7 @@ Contract:
 - Source rows are read from `mqtt_logs` after the producer checkpoint.
 - Source rows must satisfy `received_at < producer_cutoff`.
 - Feature windows use `[window_start, window_end)`.
+- Phase 4 feature windows are stored as timezone-aware UTC whole-second strings ending in `Z`.
 - Current open windows are not processed.
 - Feature rows and the `mqtt_feature_builder+mqtt_logs` checkpoint are updated in the same transaction.
 - Late source rows older than the completed watermark are consumed and logged as `LATE_SOURCE`, but they do not reopen completed feature windows.
@@ -61,6 +64,8 @@ Implemented adapters:
 
 They keep the existing MQTT rule and Isolation Forest meaning. They add incremental source selection, Phase 4 event writing, deterministic evidence JSON, dedupe keys, and checkpoint updates.
 
+All MQTT adapters use the common event type to incident family mapping in `edge.trust.trust_policy`. Registered device events store `subject_ip` from `devices.ip_address`; unknown-device events may have no subject IP.
+
 ## Detection Event Writer
 
 `write_detection_event()` inserts Phase 4 events without committing.
@@ -83,10 +88,19 @@ The DB partial unique index remains the final duplicate defense. Duplicate inser
 
 Evidence JSON is deterministic and must not contain secrets, credentials, full payloads, or stack traces.
 
-## Orchestrator Core
+## Orchestrator Stage Transaction Foundation
 
 `run_detection_cycle()` runs each stage in an independent SQLAlchemy transaction.
 
 If a later stage fails, previously committed stage results are not rolled back. The failed stage transaction is rolled back and the exception is re-raised.
 
-Runtime runner, systemd integration, Packet Rule implementation, Packet IF implementation, and Firewall Worker execution are outside this PR.
+This PR intentionally implements only the stage transaction foundation. The full P4-4-01 runtime orchestrator remains follow-up work:
+
+- watermark calculation
+- packet ready range selection
+- required barrier handling
+- Trust Score invocation from the runtime loop
+- single-process lock
+- structured runtime logging
+
+Producer runner, environment wiring beyond API CORS settings, systemd integration, Raspberry Pi watermark validation, Packet Rule implementation, Packet IF implementation, and Firewall Worker execution are outside this PR.

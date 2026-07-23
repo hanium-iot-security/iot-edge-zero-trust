@@ -47,7 +47,7 @@ def test_detection_events_phase4_fields_filters_and_evidence(api_client) -> None
     response = client.get(
         "/api/detection-events",
         params={
-            "incident_family": "topic",
+            "incident_family": "MESSAGE_POLICY",
             "subject_ip": "192.168.0.21",
             "processing_reason": "APPLIED_TO_TRUST",
             "window_start_from": "2026-07-23T10:00:00Z",
@@ -60,7 +60,7 @@ def test_detection_events_phase4_fields_filters_and_evidence(api_client) -> None
     assert body["total"] == 1
     item = body["items"][0]
     assert item["packet_feature_log_id"] is None
-    assert item["incident_family"] == "topic"
+    assert item["incident_family"] == "MESSAGE_POLICY"
     assert item["subject_ip"] == "192.168.0.21"
     assert item["evidence"] == {"source_id": 1, "source_type": "feature_logs"}
     assert item["detected_at"] == "2026-07-23T10:00:10Z"
@@ -79,6 +79,18 @@ def test_detection_events_bad_stored_evidence_returns_500(api_client) -> None:
     assert response.json()["detail"] == "evidence_json must be valid JSON"
 
 
+def test_detection_events_bad_stored_timestamp_returns_500(api_client) -> None:
+    client, db_path = api_client
+    _seed_phase4_api_rows(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("UPDATE detection_events SET detected_at = 'bad timestamp'")
+
+    response = client.get("/api/detection-events")
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "detected_at must be a valid timestamp"
+
+
 def test_trust_isolation_and_firewall_phase4_apis(api_client) -> None:
     client, db_path = api_client
     _seed_phase4_api_rows(db_path)
@@ -92,9 +104,11 @@ def test_trust_isolation_and_firewall_phase4_apis(api_client) -> None:
     assert trust.json()["items"][0]["representative_event_ids"] == [1]
     assert isolation.status_code == 200
     assert isolation.json()["items"][0]["trust_score_history_id"] == 1
+    assert isolation.json()["items"][0]["created_at"] == "2026-07-23T10:00:10Z"
     assert firewall.status_code == 200
     assert firewall.json()["total"] == 1
     assert firewall.json()["items"][0]["retry_count"] == 0
+    assert firewall.json()["items"][0]["created_at"].endswith("Z")
     assert invalid_firewall.status_code == 422
 
 
@@ -123,7 +137,11 @@ def test_health_and_cors_contracts(api_client) -> None:
     response = client.get("/api/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "database": "ok"}
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["database"] == "ok"
+    assert body["db_connected"] is True
+    assert body["server_time"].endswith("Z")
     assert parse_allowed_origins(
         " http://localhost:5173,https://example.com,http://localhost:5173 "
     ) == ["http://localhost:5173", "https://example.com"]
@@ -228,7 +246,7 @@ def _seed_phase4_api_rows(db_path: Path) -> None:
                 '2026-07-23T10:00:10Z',
                 '2026-07-23T10:00:00Z',
                 '2026-07-23T10:00:10Z',
-                'topic',
+                'MESSAGE_POLICY',
                 '192.168.0.21',
                 '{"source_id":1,"source_type":"feature_logs"}',
                 1,

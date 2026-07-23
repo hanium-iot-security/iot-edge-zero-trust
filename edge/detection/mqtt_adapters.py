@@ -25,6 +25,7 @@ from edge.detection.rule_detector import (
     detect_feature_rules,
     detect_mqtt_rules,
 )
+from edge.trust.trust_policy import incident_family_for_event
 
 
 MQTT_FEATURE_RULE_POLICY_VERSION = "mqtt-feature-rule-v1"
@@ -49,6 +50,7 @@ class MqttFeatureRuleStage:
             cycle_cutoff=cycle_cutoff,
         )
         before = _checkpoint_before(db, self.detector_name, self.source_table)
+        device_ips = _registered_device_ips(db)
         rows = _select_feature_rows(
             db,
             last_processed_id=before["last_processed_id"],
@@ -82,7 +84,8 @@ class MqttFeatureRuleStage:
                     analysis_window_end=parse_db_utc(
                         feature_row["window_end"], "window_end"
                     ),
-                    incident_family=event_type,
+                    incident_family=incident_family_for_event(event_type),
+                    subject_ip=device_ips.get(str(feature_row["device_id"])),
                     evidence=_feature_evidence(
                         detector_name=self.detector_name,
                         source_id=source_id,
@@ -134,7 +137,8 @@ class MqttMessageRuleStage:
             cycle_cutoff=cycle_cutoff,
         )
         before = _checkpoint_before(db, self.detector_name, self.source_table)
-        registered_devices = _registered_devices(db)
+        device_ips = _registered_device_ips(db)
+        registered_devices = set(device_ips)
         rows = _select_mqtt_rows(
             db,
             last_processed_id=before["last_processed_id"],
@@ -167,7 +171,8 @@ class MqttMessageRuleStage:
                     detected_at=cutoff,
                     analysis_window_start=window_start,
                     analysis_window_end=window_end,
-                    incident_family=event_type,
+                    incident_family=incident_family_for_event(event_type),
+                    subject_ip=device_ips.get(str(event["device_id"])),
                     evidence={
                         "source_type": self.source_table,
                         "source_id": source_id,
@@ -226,6 +231,7 @@ class MqttIsolationForestStage:
             cycle_cutoff=cycle_cutoff,
         )
         before = _checkpoint_before(db, self.detector_name, self.source_table)
+        device_ips = _registered_device_ips(db)
         rows = _select_feature_rows(
             db,
             last_processed_id=before["last_processed_id"],
@@ -261,7 +267,8 @@ class MqttIsolationForestStage:
                 analysis_window_end=parse_db_utc(
                     feature_row["window_end"], "window_end"
                 ),
-                incident_family=event_type,
+                incident_family=incident_family_for_event(event_type),
+                subject_ip=device_ips.get(str(feature_row["device_id"])),
                 evidence={
                     "source_type": self.source_table,
                     "source_id": source_id,
@@ -401,9 +408,21 @@ def _select_mqtt_rows(
     return [dict(row) for row in rows]
 
 
-def _registered_devices(db: Session) -> set[str]:
-    rows = db.execute(text("SELECT device_id FROM devices")).scalars()
-    return {str(device_id) for device_id in rows}
+def _registered_device_ips(db: Session) -> dict[str, str | None]:
+    rows = db.execute(
+        text(
+            """
+            SELECT device_id, ip_address
+            FROM devices
+            """
+        )
+    ).mappings()
+    return {
+        str(row["device_id"]): (
+            str(row["ip_address"]) if row["ip_address"] else None
+        )
+        for row in rows
+    }
 
 
 def _feature_rule_description(event_type: str, row: dict[str, Any]) -> str:

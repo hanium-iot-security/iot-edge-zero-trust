@@ -14,6 +14,10 @@ from edge.packet.pcap_naming import format_utc_iso
 VALID_FIREWALL_STATUSES = {"PENDING", "APPLIED", "FAILED", "REMOVED"}
 
 
+class FirewallRuleDataError(RuntimeError):
+    """Raised when stored firewall rule rows violate the API contract."""
+
+
 def list_firewall_rules(
     db: Session,
     *,
@@ -88,11 +92,11 @@ def _firewall_item(row: dict[str, Any]) -> dict[str, Any]:
         "created_at",
         "updated_at",
     ):
-        row[field_name] = _format_optional_timestamp(row[field_name])
+        row[field_name] = _format_optional_timestamp(row[field_name], field_name)
     return row
 
 
-def _format_optional_timestamp(value: Any) -> str | None:
+def _format_optional_timestamp(value: Any, field_name: str) -> str | None:
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -101,7 +105,12 @@ def _format_optional_timestamp(value: Any) -> str | None:
         text_value = str(value)
         text_value = text_value[:-1] + "+00:00" if text_value.endswith("Z") else text_value
         text_value = text_value.replace(" ", "T")
-        parsed = datetime.fromisoformat(text_value)
+        try:
+            parsed = datetime.fromisoformat(text_value)
+        except ValueError as exc:
+            raise FirewallRuleDataError(
+                f"{field_name} must be a valid timestamp"
+            ) from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return format_utc_iso(parsed)

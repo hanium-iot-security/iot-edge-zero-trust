@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 from typing import Any
 
@@ -23,6 +23,7 @@ from edge.trust.trust_policy import (
     ISOLATED_STATUS,
     UNKNOWN_DEVICE,
     apply_score_delta,
+    incident_family_for_event,
     score_delta_for_event,
     status_for_trust_score,
 )
@@ -37,8 +38,11 @@ PROCESSING_NOT_REPRESENTATIVE = "NOT_REPRESENTATIVE"
 PROCESSING_ALREADY_ISOLATED = "ALREADY_ISOLATED"
 PROCESSING_UNMAPPED_DEVICE = "UNMAPPED_DEVICE"
 PROCESSING_UNMAPPED_EVENT_TYPE = "UNMAPPED_EVENT_TYPE"
+PROCESSING_LATE_EVENT = "LATE_EVENT"
+PROCESSING_LEGACY_MIGRATION = "LEGACY_MIGRATION"
 AI_WINDOW_CAP = -15
 WINDOW_DELTA_CAP = -30
+SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3}
 
 
 @dataclass(frozen=True)
@@ -75,9 +79,13 @@ class TrustScoreV2RunResult:
 def apply_trust_score_v2_until(
     db: Session,
     *,
+    cycle_range_start: datetime,
     cycle_cutoff: datetime,
 ) -> TrustScoreV2RunResult:
+    range_start = require_utc_window_boundary(cycle_range_start, "cycle_range_start")
     cutoff = require_utc_window_boundary(cycle_cutoff, "cycle_cutoff")
+    if range_start >= cutoff:
+        raise ValueError("cycle_range_start must be before cycle_cutoff")
     checkpoint = checkpoints.get_detector_checkpoint(
         db,
         detector_name=TRUST_DETECTOR_NAME,
@@ -108,13 +116,27 @@ def apply_trust_score_v2_until(
     for event in events:
         last_processed_after = _max_optional_id(last_processed_after, int(event["id"]))
 
+    current_events: list[dict[str, Any]] = []
     changes: list[TrustScoreV2Change] = []
     processed_event_count = 0
     created_history_count = 0
     created_isolation_count = 0
     created_firewall_rule_count = 0
 
-    for group in _group_events(events):
+    for event in events:
+        if _is_before_current_cycle(event, range_start):
+            _mark_events(
+                db,
+                [event],
+                _past_event_processing_reason(event, range_start),
+                cutoff,
+                [],
+            )
+            processed_event_count += 1
+            continue
+        current_events.append(event)
+
+    for group in _group_events(current_events):
         processed_event_count += len(group)
         device_id = group[0]["device_id"]
         if not device_id:
@@ -319,24 +341,58 @@ def _select_representative_events(group: list[dict[str, Any]]) -> list[dict[str,
         if event["detector_type"] == "AI":
             ai_events.append(candidate)
             continue
-        family = str(event.get("incident_family") or event_type)
+        family = str(
+            event.get("incident_family")
+            or incident_family_for_event(event_type)
+            or event_type
+        )
         current = rule_by_family.get(family)
-        if current is None or (delta, int(event["id"])) < (
-            int(current["effective_delta"]),
-            int(current["id"]),
+        if current is None or _representative_sort_key(candidate) < _representative_sort_key(
+            current
         ):
             rule_by_family[family] = candidate
 
     selected = list(rule_by_family.values())
-    if ai_events:
-        ai_rep = min(ai_events, key=lambda event: (event["effective_delta"], int(event["id"])))
-        ai_rep["effective_delta"] = max(
-            sum(int(event["effective_delta"]) for event in ai_events),
-            AI_WINDOW_CAP,
-        )
+    if not selected and ai_events:
+        ai_rep = min(ai_events, key=_representative_sort_key)
+        ai_rep["effective_delta"] = max(int(ai_rep["effective_delta"]), AI_WINDOW_CAP)
         selected.append(ai_rep)
     selected.sort(key=lambda event: int(event["id"]))
     return selected
+
+
+def _representative_sort_key(event: dict[str, Any]) -> tuple[int, int, datetime, int]:
+    return (
+        -abs(int(event["effective_delta"])),
+        -SEVERITY_RANK.get(str(event.get("severity") or "").lower(), 0),
+        _event_detected_at(event),
+        int(event["id"]),
+    )
+
+
+def _event_detected_at(event: dict[str, Any]) -> datetime:
+    if event.get("detected_at"):
+        return parse_db_utc(event["detected_at"], "detected_at")
+    return datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _is_before_current_cycle(event: dict[str, Any], range_start: datetime) -> bool:
+    _, window_end = _event_window(event)
+    return window_end <= range_start
+
+
+def _past_event_processing_reason(
+    event: dict[str, Any],
+    range_start: datetime,
+) -> str:
+    detected_at = (
+        parse_db_utc(event["detected_at"], "detected_at")
+        if event.get("detected_at")
+        else None
+    )
+    if detected_at is None or detected_at < range_start:
+        return PROCESSING_LEGACY_MIGRATION
+    return PROCESSING_LATE_EVENT
 
 
 def _fetch_device(db: Session, device_id: str) -> dict[str, Any] | None:

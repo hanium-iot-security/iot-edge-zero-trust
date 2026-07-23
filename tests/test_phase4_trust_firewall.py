@@ -12,11 +12,15 @@ from edge.trust import firewall_repository
 from edge.trust.trust_score_v2 import (
     PROCESSING_ALREADY_ISOLATED,
     PROCESSING_APPLIED,
+    PROCESSING_LATE_EVENT,
+    PROCESSING_LEGACY_MIGRATION,
     PROCESSING_UNMAPPED_DEVICE,
     apply_trust_score_v2_until,
 )
+from edge.trust.trust_policy import score_delta_for_event
 
 
+CYCLE_START = datetime(2026, 7, 23, 10, 0, 0, tzinfo=timezone.utc)
 CUTOFF = datetime(2026, 7, 23, 10, 0, 10, tzinfo=timezone.utc)
 WINDOW_START = "2026-07-23T10:00:00Z"
 WINDOW_END = "2026-07-23T10:00:10Z"
@@ -34,44 +38,55 @@ def SessionLocal(tmp_path: Path):
         engine.dispose()
 
 
-def test_trust_v2_applies_family_ai_and_window_caps(SessionLocal) -> None:
+def test_trust_v2_suppresses_ai_when_rule_events_exist_and_caps_window(
+    SessionLocal,
+) -> None:
     with SessionLocal() as db:
         _insert_device(db, "esp32_01", trust_score=100)
-        first = _insert_event(db, "esp32_01", "ABNORMAL_TOPIC", incident_family="topic")
+        first = _insert_event(
+            db,
+            "esp32_01",
+            "ABNORMAL_TOPIC",
+            incident_family="MESSAGE_POLICY",
+        )
         duplicate_family = _insert_event(
             db,
             "esp32_01",
-            "ABNORMAL_PUBLISH_RATE",
-            incident_family="topic",
+            "LARGE_PAYLOAD",
+            incident_family="MESSAGE_POLICY",
         )
         mismatch = _insert_event(
             db,
             "esp32_01",
             "DEVICE_ID_MISMATCH",
             detector_type="RULE",
-            incident_family="identity",
+            incident_family="IDENTITY",
         )
         ai = _insert_event(
             db,
             "esp32_01",
             "AI_ANOMALY",
             detector_type="AI",
-            incident_family="ai",
+            incident_family="AI_ONLY",
         )
         db.commit()
 
     with SessionLocal() as db:
         with db.begin():
-            result = apply_trust_score_v2_until(db, cycle_cutoff=CUTOFF)
+            result = apply_trust_score_v2_until(
+                db,
+                cycle_range_start=CYCLE_START,
+                cycle_cutoff=CUTOFF,
+            )
 
         assert result.selected_event_count == 4
         assert result.created_history_count == 1
         change = result.changes[0]
-        assert change.calculated_delta == -60
+        assert change.calculated_delta == -45
         assert change.capped_delta == -30
         assert change.actual_delta == -30
         assert change.new_score == 70
-        assert set(change.representative_event_ids) == {first, mismatch, ai}
+        assert set(change.representative_event_ids) == {first, mismatch}
 
         device = db.execute(
             text("SELECT trust_score, status FROM devices WHERE device_id = 'esp32_01'")
@@ -84,18 +99,23 @@ def test_trust_v2_applies_family_ai_and_window_caps(SessionLocal) -> None:
         reasons = {row["id"]: row["processing_reason"] for row in rows}
         assert reasons[first] == PROCESSING_APPLIED
         assert reasons[duplicate_family] == "NOT_REPRESENTATIVE"
+        assert reasons[ai] == "NOT_REPRESENTATIVE"
 
 
 def test_trust_v2_does_not_isolate_at_exactly_30(SessionLocal) -> None:
     with SessionLocal() as db:
         _insert_device(db, "esp32_01", trust_score=60)
-        _insert_event(db, "esp32_01", "DEVICE_ID_MISMATCH", incident_family="identity")
-        _insert_event(db, "esp32_01", "ABNORMAL_TOPIC", incident_family="topic")
+        _insert_event(db, "esp32_01", "DEVICE_ID_MISMATCH", incident_family="IDENTITY")
+        _insert_event(db, "esp32_01", "ABNORMAL_TOPIC", incident_family="MESSAGE_POLICY")
         db.commit()
 
     with SessionLocal() as db:
         with db.begin():
-            result = apply_trust_score_v2_until(db, cycle_cutoff=CUTOFF)
+            result = apply_trust_score_v2_until(
+                db,
+                cycle_range_start=CYCLE_START,
+                cycle_cutoff=CUTOFF,
+            )
 
         assert result.changes[0].new_score == 30
         assert result.created_isolation_count == 0
@@ -107,16 +127,244 @@ def test_trust_v2_does_not_isolate_at_exactly_30(SessionLocal) -> None:
         assert status == "danger"
 
 
-def test_trust_v2_isolates_below_30_and_creates_firewall_pending(SessionLocal) -> None:
+def test_trust_v2_applies_ai_only_once_when_no_rule_event(SessionLocal) -> None:
     with SessionLocal() as db:
-        _insert_device(db, "esp32_01", trust_score=55, ip_address="192.168.0.21")
-        event_id = _insert_event(db, "esp32_01", "DEVICE_ID_MISMATCH", incident_family="identity")
-        _insert_event(db, "esp32_01", "ABNORMAL_TOPIC", incident_family="topic")
+        _insert_device(db, "esp32_01", trust_score=100)
+        first_ai = _insert_event(
+            db,
+            "esp32_01",
+            "AI_ANOMALY",
+            detector_type="AI",
+            incident_family="AI_ONLY",
+            severity="medium",
+            detected_at="2026-07-23T10:00:04Z",
+        )
+        _insert_event(
+            db,
+            "esp32_01",
+            "AI_PACKET_ANOMALY",
+            detector_type="AI",
+            incident_family="AI_ONLY",
+            severity="medium",
+            detected_at="2026-07-23T10:00:05Z",
+        )
         db.commit()
 
     with SessionLocal() as db:
         with db.begin():
-            result = apply_trust_score_v2_until(db, cycle_cutoff=CUTOFF)
+            result = apply_trust_score_v2_until(
+                db,
+                cycle_range_start=CYCLE_START,
+                cycle_cutoff=CUTOFF,
+            )
+
+        change = result.changes[0]
+        assert change.calculated_delta == -15
+        assert change.new_score == 85
+        assert change.representative_event_ids == [first_ai]
+
+
+def test_trust_v2_packet_event_penalties_affect_scores(SessionLocal) -> None:
+    expected = {
+        "PACKET_RATE_ANOMALY": -20,
+        "BYTE_RATE_ANOMALY": -20,
+        "PORT_SCAN": -20,
+        "BROKER_DOS_SUSPECTED": -25,
+        "AI_PACKET_ANOMALY": -15,
+    }
+    with SessionLocal() as db:
+        for index, (event_type, expected_delta) in enumerate(expected.items(), start=1):
+            device_id = f"esp32_{index:02d}"
+            _insert_device(db, device_id, trust_score=100)
+            _insert_event(
+                db,
+                device_id,
+                event_type,
+                detector_type="AI" if event_type == "AI_PACKET_ANOMALY" else "RULE",
+            )
+            assert score_delta_for_event(event_type) == expected_delta
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            apply_trust_score_v2_until(
+                db,
+                cycle_range_start=CYCLE_START,
+                cycle_cutoff=CUTOFF,
+            )
+
+        rows = db.execute(
+            text(
+                """
+                SELECT device_id, trust_score
+                FROM devices
+                ORDER BY device_id
+                """
+            )
+        ).mappings().all()
+        for row, expected_delta in zip(rows, expected.values(), strict=True):
+            assert row["trust_score"] == 100 + expected_delta
+
+
+def test_trust_v2_representative_tie_break_uses_penalty_severity_time_and_id(
+    SessionLocal,
+) -> None:
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01", trust_score=100)
+        high_smaller_penalty = _insert_event(
+            db,
+            "esp32_01",
+            "LARGE_PAYLOAD",
+            incident_family="MESSAGE_POLICY",
+            severity="high",
+            detected_at="2026-07-23T10:00:01Z",
+        )
+        stronger_penalty = _insert_event(
+            db,
+            "esp32_01",
+            "ABNORMAL_TOPIC",
+            incident_family="MESSAGE_POLICY",
+            severity="low",
+            detected_at="2026-07-23T10:00:05Z",
+        )
+        lower_severity = _insert_event(
+            db,
+            "esp32_01",
+            "PACKET_RATE_ANOMALY",
+            incident_family="FLOODING",
+            severity="medium",
+            detected_at="2026-07-23T10:00:01Z",
+        )
+        higher_severity = _insert_event(
+            db,
+            "esp32_01",
+            "BYTE_RATE_ANOMALY",
+            incident_family="FLOODING",
+            severity="high",
+            detected_at="2026-07-23T10:00:05Z",
+        )
+        later_identity = _insert_event(
+            db,
+            "esp32_01",
+            "DEVICE_ID_MISMATCH",
+            incident_family="IDENTITY",
+            severity="high",
+            detected_at="2026-07-23T10:00:04Z",
+        )
+        earlier_identity = _insert_event(
+            db,
+            "esp32_01",
+            "DEVICE_ID_MISMATCH",
+            incident_family="IDENTITY",
+            severity="high",
+            detected_at="2026-07-23T10:00:03Z",
+        )
+        same_time_larger_id = _insert_event(
+            db,
+            "esp32_01",
+            "DEVICE_ID_MISMATCH",
+            incident_family="IDENTITY",
+            severity="high",
+            detected_at="2026-07-23T10:00:03Z",
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            result = apply_trust_score_v2_until(
+                db,
+                cycle_range_start=CYCLE_START,
+                cycle_cutoff=CUTOFF,
+            )
+
+        representative_ids = set(result.changes[0].representative_event_ids)
+        assert stronger_penalty in representative_ids
+        assert higher_severity in representative_ids
+        assert earlier_identity in representative_ids
+        assert high_smaller_penalty not in representative_ids
+        assert lower_severity not in representative_ids
+        assert later_identity not in representative_ids
+        assert same_time_larger_id not in representative_ids
+
+
+def test_trust_v2_marks_late_and_legacy_events_without_scoring(SessionLocal) -> None:
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01", trust_score=100)
+        legacy_event = _insert_event(
+            db,
+            "esp32_01",
+            "DEVICE_ID_MISMATCH",
+            analysis_window_start="2026-07-23T09:59:50Z",
+            analysis_window_end="2026-07-23T10:00:00Z",
+            detected_at="2026-07-23T09:59:59Z",
+        )
+        late_event = _insert_event(
+            db,
+            "esp32_01",
+            "ABNORMAL_TOPIC",
+            analysis_window_start="2026-07-23T09:59:50Z",
+            analysis_window_end="2026-07-23T10:00:00Z",
+            detected_at="2026-07-23T10:00:10Z",
+        )
+        current_event = _insert_event(db, "esp32_01", "ABNORMAL_TOPIC")
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            result = apply_trust_score_v2_until(
+                db,
+                cycle_range_start=CYCLE_START,
+                cycle_cutoff=CUTOFF,
+            )
+
+        assert result.processed_event_count == 3
+        assert result.changes[0].representative_event_ids == [current_event]
+        assert result.changes[0].new_score == 80
+        events = db.execute(
+            text(
+                """
+                SELECT id, processing_reason, applied_to_score
+                FROM detection_events
+                ORDER BY id
+                """
+            )
+        ).mappings().all()
+        reasons = {row["id"]: row["processing_reason"] for row in events}
+        applied = {row["id"]: row["applied_to_score"] for row in events}
+        assert reasons[legacy_event] == PROCESSING_LEGACY_MIGRATION
+        assert reasons[late_event] == PROCESSING_LATE_EVENT
+        assert reasons[current_event] == PROCESSING_APPLIED
+        assert applied[legacy_event] == 0
+        assert applied[late_event] == 0
+        assert applied[current_event] == 1
+        checkpoint = db.execute(
+            text(
+                """
+                SELECT last_processed_id, last_completed_window_end
+                FROM detector_checkpoints
+                WHERE detector_name = 'trust_score_v2'
+                  AND source_table = 'detection_events'
+                """
+            )
+        ).mappings().one()
+        assert checkpoint["last_processed_id"] == current_event
+        assert checkpoint["last_completed_window_end"] == "2026-07-23T10:00:10Z"
+
+
+def test_trust_v2_isolates_below_30_and_creates_firewall_pending(SessionLocal) -> None:
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01", trust_score=55, ip_address="192.168.0.21")
+        event_id = _insert_event(db, "esp32_01", "DEVICE_ID_MISMATCH", incident_family="IDENTITY")
+        _insert_event(db, "esp32_01", "ABNORMAL_TOPIC", incident_family="MESSAGE_POLICY")
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            result = apply_trust_score_v2_until(
+                db,
+                cycle_range_start=CYCLE_START,
+                cycle_cutoff=CUTOFF,
+            )
 
         change = result.changes[0]
         assert change.new_score == 25
@@ -148,7 +396,11 @@ def test_trust_v2_marks_unmapped_and_already_isolated_without_score_change(
 
     with SessionLocal() as db:
         with db.begin():
-            apply_trust_score_v2_until(db, cycle_cutoff=CUTOFF)
+            apply_trust_score_v2_until(
+                db,
+                cycle_range_start=CYCLE_START,
+                cycle_cutoff=CUTOFF,
+            )
 
         events = db.execute(
             text(
@@ -169,14 +421,18 @@ def test_trust_v2_marks_unmapped_and_already_isolated_without_score_change(
 def test_trust_v2_rolls_back_when_isolation_firewall_ip_is_missing(SessionLocal) -> None:
     with SessionLocal() as db:
         _insert_device(db, "esp32_01", trust_score=55, ip_address=None)
-        _insert_event(db, "esp32_01", "DEVICE_ID_MISMATCH", incident_family="identity")
-        _insert_event(db, "esp32_01", "ABNORMAL_TOPIC", incident_family="topic")
+        _insert_event(db, "esp32_01", "DEVICE_ID_MISMATCH", incident_family="IDENTITY")
+        _insert_event(db, "esp32_01", "ABNORMAL_TOPIC", incident_family="MESSAGE_POLICY")
         db.commit()
 
     with SessionLocal() as db:
         with pytest.raises(ValueError, match="no firewall source IP"):
             with db.begin():
-                apply_trust_score_v2_until(db, cycle_cutoff=CUTOFF)
+                apply_trust_score_v2_until(
+                    db,
+                    cycle_range_start=CYCLE_START,
+                    cycle_cutoff=CUTOFF,
+                )
 
         assert db.execute(text("SELECT COUNT(*) FROM trust_score_history")).scalar_one() == 0
         assert db.execute(text("SELECT COUNT(*) FROM isolation_history")).scalar_one() == 0
@@ -255,6 +511,55 @@ def test_firewall_repository_retry_and_manual_reset_are_transaction_controlled(
         assert row["retry_count"] == 0
 
 
+def test_firewall_repository_rejects_invalid_state_transitions(SessionLocal) -> None:
+    now = datetime(2026, 7, 23, 10, 1, 0, tzinfo=timezone.utc)
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01", trust_score=25, status="isolated")
+        rule_id = firewall_repository.create_pending_rule_for_device(
+            db,
+            device_id="esp32_01",
+            source_ip="192.168.0.21",
+            reason="Trust Score below threshold",
+            trigger_event_id=1,
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        with pytest.raises(ValueError, match="not APPLIED"):
+            firewall_repository.mark_removed(db, rule_id=rule_id, released_at=now)
+        db.rollback()
+
+        firewall_repository.mark_applied(db, rule_id=rule_id, applied_at=now)
+        db.commit()
+
+    with SessionLocal() as db:
+        with pytest.raises(ValueError, match="not PENDING"):
+            firewall_repository.mark_applied(db, rule_id=rule_id, applied_at=now)
+        db.rollback()
+        with pytest.raises(ValueError, match="not PENDING"):
+            firewall_repository.record_transient_failure(
+                db,
+                rule_id=rule_id,
+                attempted_at=now,
+                error="temporary failure",
+            )
+        db.rollback()
+        with pytest.raises(ValueError, match="not PENDING"):
+            firewall_repository.record_validation_failure(
+                db,
+                rule_id=rule_id,
+                attempted_at=now,
+                error="invalid rule",
+            )
+        db.rollback()
+        with pytest.raises(ValueError, match="not FAILED"):
+            firewall_repository.reset_failed_to_pending(
+                db,
+                rule_id=rule_id,
+                requested_at=now,
+            )
+
+
 def _insert_device(
     db,
     device_id: str,
@@ -286,6 +591,10 @@ def _insert_event(
     *,
     detector_type: str = "RULE",
     incident_family: str | None = None,
+    severity: str = "high",
+    detected_at: str = WINDOW_END,
+    analysis_window_start: str = WINDOW_START,
+    analysis_window_end: str = WINDOW_END,
 ) -> int:
     result = db.execute(
         text(
@@ -308,7 +617,7 @@ def _insert_event(
                 :device_id,
                 :detector_type,
                 :event_type,
-                'high',
+                :severity,
                 0,
                 0,
                 'phase4 test',
@@ -324,9 +633,10 @@ def _insert_event(
             "device_id": device_id,
             "detector_type": detector_type,
             "event_type": event_type,
-            "detected_at": WINDOW_END,
-            "analysis_window_start": WINDOW_START,
-            "analysis_window_end": WINDOW_END,
+            "severity": severity,
+            "detected_at": detected_at,
+            "analysis_window_start": analysis_window_start,
+            "analysis_window_end": analysis_window_end,
             "incident_family": incident_family,
         },
     )

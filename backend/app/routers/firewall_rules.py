@@ -5,7 +5,10 @@ from sqlalchemy.orm import Session
 
 from backend.app.database import get_db
 from backend.app.schemas.firewall_rule_schema import FirewallRuleListResponse
-from backend.app.services.firewall_rule_query_service import list_firewall_rules
+from backend.app.services.firewall_rule_query_service import (
+    FirewallRuleDataError,
+    list_firewall_rules,
+)
 
 
 router = APIRouter(prefix="/firewall-rules", tags=["firewall-rules"])
@@ -31,3 +34,5 @@ def get_firewall_rules(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except FirewallRuleDataError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc

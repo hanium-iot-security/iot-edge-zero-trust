@@ -6,7 +6,7 @@ The existing MVP `edge.trust.trust_score_service` remains for backward compatibi
 
 ## Processing Range
 
-`apply_trust_score_v2_until()` requires a timezone-aware UTC cutoff with whole-second precision on a 10 second boundary.
+`apply_trust_score_v2_until()` requires timezone-aware UTC `cycle_range_start` and `cycle_cutoff` values with whole-second precision on 10 second boundaries.
 
 Candidate events:
 
@@ -15,7 +15,34 @@ Candidate events:
 - `analysis_window_end <= cycle_cutoff` when analysis window metadata exists
 - legacy rows without analysis windows may fall back to `detected_at < cycle_cutoff`
 
+Events before the current cycle range are processed without score changes:
+
+- `LEGACY_MIGRATION`: previous cutover/legacy events detected before `cycle_range_start`
+- `LATE_EVENT`: late-arriving events whose analysis window is already before the current cycle range
+
+Both cases still set `processed_at` and allow the `trust_score_v2+detection_events` checkpoint to advance.
+
 The function does not commit or rollback. The caller owns the transaction.
+
+## Incident Family and Penalty
+
+Phase 4 uses the common mapping in `edge.trust.trust_policy`.
+
+| event_type | incident_family | score_delta |
+| --- | --- | --- |
+| `UNKNOWN_DEVICE` | `IDENTITY` | 0 |
+| `DEVICE_ID_MISMATCH` | `IDENTITY` | -25 |
+| `LARGE_PAYLOAD` | `MESSAGE_POLICY` | -15 |
+| `MALFORMED_PAYLOAD` | `MESSAGE_POLICY` | -10 |
+| `ABNORMAL_TOPIC` | `MESSAGE_POLICY` | -20 |
+| `ABNORMAL_PUBLISH_RATE` | `FLOODING` | -20 |
+| `PACKET_RATE_ANOMALY` | `FLOODING` | -20 |
+| `BYTE_RATE_ANOMALY` | `FLOODING` | -20 |
+| `BROKER_DOS_SUSPECTED` | `FLOODING` | -25 |
+| `NON_MQTT_TRAFFIC` | `NETWORK_POLICY` | -15 |
+| `PORT_SCAN` | `SCAN` | -20 |
+| `AI_ANOMALY` | `AI_ONLY` | -15 |
+| `AI_PACKET_ANOMALY` | `AI_ONLY` | -15 |
 
 ## Incident Family and Representative Events
 
@@ -31,9 +58,16 @@ Within one device window:
 
 - Same rule incident family is represented once.
 - Different rule incident families can be summed.
-- AI events are capped to `-15` per window.
+- If one or more rule events affect score, AI events remain evidence only and are not applied to Trust Score.
+- If no rule event affects score, one AI representative event can apply up to `-15`.
 - Total window delta is capped to `-30`.
 - Trust Score is clamped to `0..100`.
+
+Rule and AI representatives use the same tie-break order:
+
+```text
+Penalty absolute value -> Severity -> earliest detected_at -> smallest ID
+```
 
 Representative event IDs are stored in `trust_score_history.representative_event_ids_json`.
 

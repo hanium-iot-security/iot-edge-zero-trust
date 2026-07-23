@@ -92,6 +92,8 @@ def build_feature_row(
     window_start: datetime,
     window_end: datetime,
     rows: list[dict[str, Any]],
+    *,
+    timestamp_formatter=format_db_datetime,
 ) -> dict[str, Any]:
     payload_sizes = [int(row["payload_size"] or 0) for row in rows]
     intervals = _intervals_seconds(rows)
@@ -100,8 +102,8 @@ def build_feature_row(
 
     return {
         "device_id": device_id,
-        "window_start": format_db_datetime(window_start),
-        "window_end": format_db_datetime(window_end),
+        "window_start": timestamp_formatter(window_start),
+        "window_end": timestamp_formatter(window_end),
         "publish_count": len(rows),
         "avg_payload_size": sum(payload_sizes) / len(payload_sizes),
         "max_payload_size": max(payload_sizes),
@@ -295,7 +297,13 @@ def produce_mqtt_features_until(
 
     inserted_count = 0
     for (device_id, window_start, window_end), window_rows in grouped.items():
-        feature_row = build_feature_row(device_id, window_start, window_end, window_rows)
+        feature_row = build_feature_row(
+            device_id,
+            window_start,
+            window_end,
+            window_rows,
+            timestamp_formatter=format_db_utc,
+        )
         if _insert_feature_row(db, feature_row):
             inserted_count += 1
 
