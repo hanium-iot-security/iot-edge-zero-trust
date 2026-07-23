@@ -67,7 +67,10 @@ def test_execute_cutover_uses_safe_order_and_records_result(tmp_path: Path) -> N
     result_path = tmp_path / "results" / "cutover.json"
     _create_source_database(database)
     events: list[str] = []
-    cutover_at = datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc)
+    wall_clock = datetime(
+        2026, 7, 21, 4, 30, 0, 123_456, tzinfo=timezone.utc
+    )
+    cutover_at = wall_clock.replace(microsecond=0)
     active = {
         "rule-detector.service": True,
         "trust-score.service": True,
@@ -97,7 +100,7 @@ def test_execute_cutover_uses_safe_order_and_records_result(tmp_path: Path) -> N
 
     def now() -> datetime:
         events.append("cutover-timestamp")
-        return cutover_at
+        return wall_clock
 
     report = execute_cutover(
         CutoverConfig(
@@ -240,7 +243,10 @@ def test_cutover_smoke_test_uses_copy_and_preserves_source(tmp_path: Path) -> No
     smoke_database = tmp_path / "smoke" / "phase4-smoke.db"
     result_path = tmp_path / "results" / "smoke.json"
     _create_source_database(database)
-    cutover_at = datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc)
+    wall_clock = datetime(
+        2026, 7, 21, 4, 30, 0, 123_456, tzinfo=timezone.utc
+    )
+    cutover_at = wall_clock.replace(microsecond=0)
 
     def migrate(db_path: Path, _: Path) -> dict[str, object]:
         assert db_path == smoke_database.resolve()
@@ -248,7 +254,8 @@ def test_cutover_smoke_test_uses_copy_and_preserves_source(tmp_path: Path) -> No
             connection.execute("UPDATE parent SET name = 'smoke-migrated' WHERE id = 1")
         return {"applied_versions": [3]}
 
-    def initialize(db_path: Path, _: datetime) -> dict[str, object]:
+    def initialize(db_path: Path, timestamp: datetime) -> dict[str, object]:
+        assert timestamp == cutover_at
         with sqlite3.connect(db_path) as connection:
             connection.execute("CREATE TABLE checkpoint_smoke (id INTEGER PRIMARY KEY)")
         return _persist_checkpoint_summary(db_path)
@@ -263,7 +270,7 @@ def test_cutover_smoke_test_uses_copy_and_preserves_source(tmp_path: Path) -> No
         ),
         apply_migrations=migrate,
         initialize_checkpoints=initialize,
-        now=lambda: cutover_at,
+        now=lambda: wall_clock,
     )
 
     assert report.status == "succeeded"

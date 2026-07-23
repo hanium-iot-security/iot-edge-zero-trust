@@ -215,6 +215,12 @@ def _utc_iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _whole_second_utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise CutoverSafetyError("Cutover timestamps must be timezone-aware")
+    return value.astimezone(timezone.utc).replace(microsecond=0)
+
+
 def _summary(value: object) -> Mapping[str, object]:
     if isinstance(value, Mapping):
         return dict(value)
@@ -515,7 +521,7 @@ def execute_cutover(
     if not database.is_file():
         raise CutoverSafetyError(f"Operational database does not exist: {database}")
     verify_phase3b_database_identity(database)
-    cutover_at = dependencies.now()
+    cutover_at = _whole_second_utc(dependencies.now())
     cutover_at_iso = _utc_iso(cutover_at)
     backup_path = backup_directory / _backup_name(database, cutover_at)
     backup_sha256_path = backup_path.with_suffix(backup_path.suffix + ".sha256")
@@ -826,7 +832,7 @@ def run_cutover_smoke_test(
         }
     )
 
-    cutover_at = now()
+    cutover_at = _whole_second_utc(now())
     cutover_at_iso = _utc_iso(cutover_at)
     source_sha_before = _sha256_file(source)
     source_counts_before: Mapping[str, int] = {}
