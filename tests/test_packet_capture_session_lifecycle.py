@@ -4,8 +4,8 @@
 - run_packet_capture.py: Session 생성, Gap 기록, 캡처 루프, Crash Recovery 전체 흐름
 """
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -17,7 +17,7 @@ from backend.app.database import SessionLocal
 from db.migration_runner import apply_migrations
 from edge.packet import capture_session_repository as repo
 from edge.packet.capture_runtime import CaptureOutcome, CaptureRuntimeConfig
-from edge.packet.pcap_naming import build_pcap_filename, format_utc_iso
+from edge.packet.pcap_naming import build_pcap_filename, format_utc_iso, parse_utc_iso
 from edge.packet.run_packet_capture import (
     GracefulShutdown,
     reconcile_leftover_tmp_files,
@@ -70,6 +70,38 @@ class FakeCaptureProcess:
         if self.write_file:
             output_path.write_bytes(b"fake-pcap-bytes")
         return outcome
+
+
+@dataclass
+class _MutableClock:
+    """테스트에서 clock()/sleep() 둘 다 같은 가짜 시계를 공유하게 만드는 헬퍼."""
+
+    value: datetime
+
+    def now(self) -> datetime:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += timedelta(seconds=seconds)
+
+
+@dataclass
+class _OverheadCaptureProcess:
+    """실제 tcpdump 대신, '요청받은 시간만큼 캡처 + 매 호출마다 고정 오버헤드'를
+    가짜 시계에 반영하는 프로세스. DB commit·로깅 등 부수 작업 시간을 흉내낸다.
+
+    PR #18 후속 리뷰: UTC Window 실행 지연이 연속 Capture에서 누적되는지 검증할 때 사용.
+    """
+
+    clock: _MutableClock
+    overhead_seconds: float
+    calls: list = field(default_factory=list)
+
+    def capture_window(self, *, interface, output_path, window_seconds):
+        self.calls.append(window_seconds)
+        output_path.write_bytes(b"fake-pcap-bytes")
+        self.clock.advance(window_seconds + self.overhead_seconds)
+        return CaptureOutcome(completed_full_window=True, exit_code=-15)
 
 
 # ---------------------------------------------------------------------------
@@ -370,14 +402,12 @@ class TestRunCaptureLoop:
 
         assert windows_captured == 0
 
-    def test_expired_window_is_skipped_and_realigned_to_fresh_boundary(self, db_session, tmp_path) -> None:
-        """대기하는 동안 이미 지나가 버린 Window는 캡처를 시도하지 않고
-        현재 시각 기준 다음 신선한 경계로 재정렬해야 한다 (리뷰 항목 2)."""
+    def test_expired_window_transitions_to_new_session(self, db_session, tmp_path) -> None:
         config = _make_config(tmp_path)
         # first_window_start=10:00:10 이지만, "현재 시각"은 이미 10:00:25로
         # window_end(10:00:20)를 지나버린 상황을 흉내낸다.
         first_window_start = _utc(2026, 7, 15, 10, 0, 10)
-        session_pk = repo.create_session(
+        original_session_pk = repo.create_session(
             db_session, session_id=SESSION_ID_A, capture_interface="eth0",
             started_at=_utc(2026, 7, 15, 10, 0, 3),
         )
@@ -390,7 +420,7 @@ class TestRunCaptureLoop:
 
         windows_captured = run_capture_loop(
             db_session, process, config,
-            session_pk=session_pk, session_id=SESSION_ID_A,
+            session_pk=original_session_pk, session_id=SESSION_ID_A,
             first_window_start=first_window_start,
             shutdown=shutdown, max_windows=1,
             clock=lambda: _utc(2026, 7, 15, 10, 0, 25),
@@ -398,18 +428,171 @@ class TestRunCaptureLoop:
         )
 
         assert windows_captured == 1
+
+        # 원래 Session은 COMPLETED로 마감됐어야 한다 (RUNNING으로 방치되지 않음).
+        original_row = db_session.execute(
+            text("SELECT status FROM packet_capture_sessions WHERE id = :id"),
+            {"id": original_session_pk},
+        ).mappings().first()
+        assert original_row["status"] == "COMPLETED"
+
         segments = db_session.execute(
-            text("SELECT window_start, status FROM packet_capture_segments ORDER BY window_start")
+            text("SELECT capture_session_id, window_start, status FROM packet_capture_segments ORDER BY window_start")
         ).fetchall()
         # 만료된 10:00:10 Window는 캡처를 시도하지 않아 row가 없어야 하고,
         # 실제로 캡처된 Window는 10:00:30(다음 신선한 경계)이어야 한다.
         assert len(segments) == 1
-        assert segments[0][0] == "2026-07-15T10:00:30Z"
-        assert segments[0][1] == "READY"
+        captured_session_pk, captured_window_start, captured_status = segments[0]
+        assert captured_window_start == "2026-07-15T10:00:30Z"
+        assert captured_status == "READY"
+        # 그리고 그 Segment는 원래 Session이 아니라 새로 만들어진 Session에 연결됐어야 한다.
+        assert captured_session_pk != original_session_pk
+
+        # 새 Session도 max_windows 도달로 정상 종료되어 COMPLETED로 마감돼야 한다.
+        new_session_row = db_session.execute(
+            text("SELECT status FROM packet_capture_sessions WHERE id = :id"),
+            {"id": captured_session_pk},
+        ).mappings().first()
+        assert new_session_row["status"] == "COMPLETED"
+
+    def test_expired_window_transition_records_capture_gap_on_new_session(self, db_session, tmp_path) -> None:
+        config = _make_config(tmp_path)
+        old_session_pk = repo.create_session(
+            db_session, session_id=SESSION_ID_A, capture_interface="eth0",
+            started_at=_utc(2026, 7, 15, 10, 0, 0),
+        )
+        # 이전 Session에서 실제로 정상 캡처된 Segment가 하나 있다고 가정한다
+        # (10:00:00~10:00:10). 다음 Window(10:00:10~10:00:20)가 만료되어 발견된다.
+        repo.insert_ready_segment(
+            db_session, capture_session_pk=old_session_pk, file_name="prior.pcap",
+            capture_interface="eth0",
+            window_start=_utc(2026, 7, 15, 10, 0, 0), window_end=_utc(2026, 7, 15, 10, 0, 10),
+        )
+        db_session.commit()
+
+        first_window_start = _utc(2026, 7, 15, 10, 0, 10)
+        process = FakeCaptureProcess(
+            outcomes=[CaptureOutcome(completed_full_window=True, exit_code=-15)]
+        )
+        shutdown = GracefulShutdown()
+
+        run_capture_loop(
+            db_session, process, config,
+            session_pk=old_session_pk, session_id=SESSION_ID_A,
+            first_window_start=first_window_start,
+            shutdown=shutdown, max_windows=1,
+            clock=lambda: _utc(2026, 7, 15, 10, 0, 25),  # window_end(10:00:20)를 이미 지남
+            sleep=lambda _seconds: None,
+        )
+
+        segment = db_session.execute(
+            text("SELECT capture_session_id FROM packet_capture_segments WHERE window_start = '2026-07-15T10:00:30Z'")
+        ).mappings().first()
+        new_session_pk = segment["capture_session_id"]
+
+        row = db_session.execute(
+            text("SELECT capture_gap_start, capture_gap_end FROM packet_capture_sessions WHERE id = :id"),
+            {"id": new_session_pk},
+        ).mappings().first()
+
+        # 이전 Segment의 window_end(10:00:10)부터 새 Session의 first_window_start(10:00:30)
+        # 까지가 정확히 Capture Gap으로 기록돼야 한다.
+        assert row["capture_gap_start"] == "2026-07-15T10:00:10Z"
+        assert row["capture_gap_end"] == "2026-07-15T10:00:30Z"
+
+    def test_first_ever_window_expiring_still_records_capture_gap(self, db_session, tmp_path) -> None:
+        config = _make_config(tmp_path)
+        # 세션은 있지만(막 create_session만 한 상태), Segment는 이 interface에 대해
+        # 이 DB 전체에서 단 하나도 없다 -- find_last_segment_window_end가 None을 반환.
+        session_pk = repo.create_session(
+            db_session, session_id=SESSION_ID_A, capture_interface="eth0",
+            started_at=_utc(2026, 7, 15, 10, 0, 3),
+        )
+        db_session.commit()
+        assert repo.find_last_segment_window_end(db_session, "eth0") is None
+
+        first_window_start = _utc(2026, 7, 15, 10, 0, 10)  # 첫 Window부터
+        process = FakeCaptureProcess(
+            outcomes=[CaptureOutcome(completed_full_window=True, exit_code=-15)]
+        )
+        shutdown = GracefulShutdown()
+
+        run_capture_loop(
+            db_session, process, config,
+            session_pk=session_pk, session_id=SESSION_ID_A,
+            first_window_start=first_window_start,
+            shutdown=shutdown, max_windows=1,
+            clock=lambda: _utc(2026, 7, 15, 10, 0, 25),  # window_end(10:00:20)를 이미 지남
+            sleep=lambda _seconds: None,
+        )
+
+        segment = db_session.execute(
+            text("SELECT capture_session_id FROM packet_capture_segments")
+        ).mappings().first()
+        new_session_pk = segment["capture_session_id"]
+
+        row = db_session.execute(
+            text("SELECT capture_gap_start, capture_gap_end FROM packet_capture_sessions WHERE id = :id"),
+            {"id": new_session_pk},
+        ).mappings().first()
+
+        # 이전 Segment가 전혀 없었지만, 놓친 첫 Window(10:00:10)부터 새 Session의
+        # first_window_start(10:00:30)까지가 정확히 Gap으로 기록돼야 한다.
+        assert row["capture_gap_start"] == "2026-07-15T10:00:10Z"
+        assert row["capture_gap_end"] == "2026-07-15T10:00:30Z"
+
+    def test_late_wakeup_after_sleep_transitions_to_new_session(self, db_session, tmp_path) -> None:
+        config = _make_config(tmp_path)
+        session_pk, session_id, first_window_start = start_new_session(
+            db_session, config, _utc(2026, 7, 15, 10, 0, 3)
+        )  # first_window_start == 10:00:10, window_end == 10:00:20
+
+        clock = _MutableClock(_utc(2026, 7, 15, 10, 0, 5))  # 아직 window_start 전, 만료 아님
+
+        def oversleep(seconds: float) -> None:
+            # 요청받은 것보다 20초 더 걸려서 깨어난 상황을 흉내낸다
+            # (OS 스케줄링 지연·시스템 부하 시뮬레이션).
+            clock.advance(seconds + 20)
+
+        process = FakeCaptureProcess(
+            outcomes=[CaptureOutcome(completed_full_window=True, exit_code=-15)]
+        )
+        shutdown = GracefulShutdown()
+
+        windows_captured = run_capture_loop(
+            db_session, process, config,
+            session_pk=session_pk, session_id=session_id,
+            first_window_start=first_window_start,
+            shutdown=shutdown, max_windows=1,
+            clock=clock.now,
+            sleep=oversleep,
+        )
+
+        # 만료된 Window(10:00:10~10:00:20)는 건너뛰고, 다음 신선한 경계(10:00:30~)의
+        # Window 딱 1개만 실제로 캡처됐어야 한다.
+        assert windows_captured == 1
+        assert process.outcomes == []  # 큐에 넣어둔 outcome이 정확히 1번만 소비됨
+                                        # (만료된 Window에서는 capture_window()가 호출 안 됨)
+
+        original_row = db_session.execute(
+            text("SELECT status FROM packet_capture_sessions WHERE id = :id"),
+            {"id": session_pk},
+        ).mappings().first()
+        assert original_row["status"] == "COMPLETED"
+
+        segments = db_session.execute(
+            text("SELECT capture_session_id, window_start, status FROM packet_capture_segments")
+        ).fetchall()
+        assert len(segments) == 1  # 만료된 Window에 대한 Segment는 생성되지 않음
+        captured_session_pk, captured_window_start, captured_status = segments[0]
+        assert captured_session_pk != session_pk  # 새 Session에 연결됨
+        assert captured_window_start == "2026-07-15T10:00:30Z"
+        assert captured_status == "READY"
+
 
     def test_shutdown_requested_during_sleep_stops_before_capturing(self, db_session, tmp_path) -> None:
         """window_start까지 대기하는 도중 종료 신호가 오면, 대기가 끝나도
-        새 캡처를 시작하지 않고 즉시 빠져나가야 한다 (리뷰 항목 3)."""
+        새 캡처를 시작하지 않고 즉시 빠져나가야 한다."""
         config = _make_config(tmp_path)
         session_pk, session_id, first_window_start = start_new_session(
             db_session, config, _utc(2026, 7, 15, 10, 0, 3)
@@ -434,6 +617,115 @@ class TestRunCaptureLoop:
 
         assert windows_captured == 0
         assert process.outcomes == [CaptureOutcome(completed_full_window=True, exit_code=-15)]  # 소비 안 됨
+
+    def test_normal_exit_closes_session_as_completed(self, db_session, tmp_path) -> None:
+        """max_windows 도달로 정상 종료되면, run_capture_loop 자신이 현재 활성
+        Session을 COMPLETED로 마감해야 한다 (main()이 더 이상 이 책임을 갖지 않음)."""
+        config = _make_config(tmp_path)
+        session_pk, session_id, first_window_start = start_new_session(
+            db_session, config, _utc(2026, 7, 15, 10, 0, 3)
+        )
+        process = FakeCaptureProcess(
+            outcomes=[CaptureOutcome(completed_full_window=True, exit_code=-15)]
+        )
+        shutdown = GracefulShutdown()
+
+        run_capture_loop(
+            db_session, process, config,
+            session_pk=session_pk, session_id=session_id,
+            first_window_start=first_window_start,
+            shutdown=shutdown, max_windows=1,
+            clock=lambda: _utc(2026, 7, 15, 10, 0, 30),
+            sleep=lambda _seconds: None,
+        )
+
+        row = db_session.execute(
+            text("SELECT status FROM packet_capture_sessions WHERE id = :id"),
+            {"id": session_pk},
+        ).mappings().first()
+        assert row["status"] == "COMPLETED"
+
+    def test_exception_marks_current_session_as_failed_and_reraises(self, db_session, tmp_path) -> None:
+        """루프 도중 처리되지 않은 예외가 발생하면, 그 시점에 활성화돼 있던 Session을
+        FAILED로 마감한 뒤 예외를 다시 던져야 한다 (systemd Restart=on-failure 유도)."""
+        config = _make_config(tmp_path)
+        session_pk, session_id, first_window_start = start_new_session(
+            db_session, config, _utc(2026, 7, 15, 10, 0, 3)
+        )
+
+        class ExplodingCaptureProcess:
+            def capture_window(self, *, interface, output_path, window_seconds):
+                raise RuntimeError("simulated tcpdump launch failure")
+
+        shutdown = GracefulShutdown()
+
+        with pytest.raises(RuntimeError, match="simulated tcpdump launch failure"):
+            run_capture_loop(
+                db_session, ExplodingCaptureProcess(), config,
+                session_pk=session_pk, session_id=session_id,
+                first_window_start=first_window_start,
+                shutdown=shutdown, max_windows=1,
+                # window_start와 정확히 같은 시각으로 둬서, "만료된 Window" 경로가
+                # 먼저 발동하지 않고 원래 Session이 여전히 활성인 상태에서 예외가
+                # 발생하도록 한다.
+                clock=lambda: first_window_start,
+                sleep=lambda _seconds: None,
+            )
+
+        row = db_session.execute(
+            text("SELECT status FROM packet_capture_sessions WHERE id = :id"),
+            {"id": session_pk},
+        ).mappings().first()
+        assert row["status"] == "FAILED"
+
+
+class TestCumulativeDriftDoesNotAccumulate:
+    """PR #18 후속 리뷰: UTC Window의 실행 지연이 연속 Capture에서 누적될 수 있는 문제 보완.
+
+    매 Window마다 일정한 오버헤드(DB commit·로깅 등, 예: 0.3초)가 있어도,
+    execute_capture_window의 self-correcting duration 덕분에 지연이 다음 Window로
+    누적되지 않고, 5개 Window 모두 정확히 10초 간격의 UTC 경계에 기록되어야 한다.
+    """
+
+    def test_repeated_overhead_does_not_skip_windows_or_drift_labels(self, db_session, tmp_path) -> None:
+        config = _make_config(tmp_path)
+        session_pk, session_id, first_window_start = start_new_session(
+            db_session, config, _utc(2026, 7, 15, 10, 0, 3)
+        )
+        clock = _MutableClock(first_window_start)
+        process = _OverheadCaptureProcess(clock=clock, overhead_seconds=0.3)
+        shutdown = GracefulShutdown()
+
+        windows_captured = run_capture_loop(
+            db_session, process, config,
+            session_pk=session_pk, session_id=session_id,
+            first_window_start=first_window_start,
+            shutdown=shutdown, max_windows=5,
+            clock=clock.now,
+            sleep=clock.advance,
+        )
+
+        assert windows_captured == 5
+
+        rows = db_session.execute(
+            text("SELECT window_start FROM packet_capture_segments ORDER BY window_start")
+        ).fetchall()
+        starts = [parse_utc_iso(row[0]) for row in rows]
+
+        # 5개 모두 캡처됐다 (기존 버그였다면 반복 40회 중 34회쯤에서 하나가 통째로 스킵됨).
+        assert len(starts) == 5
+        assert starts[0] == first_window_start
+        # 각 Window는 서로 정확히 10초 간격의 UTC 경계여야 한다 -- 라벨 자체는
+        # 지연과 무관하게 항상 고정 산술로 계산되므로 절대 어긋나지 않는다.
+        for i in range(1, len(starts)):
+            assert (starts[i] - starts[i - 1]).total_seconds() == 10.0
+
+        # 실제로 tcpdump에 요청한 duration이 self-correcting되어, 첫 Window만 정상
+        # 10초이고 이후로는 오버헤드(0.3초)만큼 줄어든 채로 안정화되어야 한다
+        # (계속 줄어들며 누적되는 게 아니라 일정 수준에서 멈춰야 함).
+        assert process.calls[0] == pytest.approx(10.0, abs=1e-6)
+        for later_call in process.calls[1:]:
+            assert later_call == pytest.approx(9.7, abs=1e-6)
 
 
 class TestCrashRecovery:

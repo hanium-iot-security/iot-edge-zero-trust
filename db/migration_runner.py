@@ -13,6 +13,7 @@ DB_PATH = Path("backend/data/iot_security.db")
 MIGRATIONS_DIR = Path("db/migrations")
 SCHEMA_MIGRATIONS_TABLE = "schema_migrations"
 MIGRATION_FILE_PATTERN = re.compile(r"^(?P<version>\d+)_(?P<name>[A-Za-z0-9_]+)\.sql$")
+FOREIGN_KEY_REBUILD_MIGRATIONS = {(3, "phase4_detection")}
 LEGACY_001_TABLES = {
     "devices",
     "mqtt_logs",
@@ -405,6 +406,9 @@ def _format_legacy_001_error(inspection: Legacy001Inspection) -> str:
 def _apply_single_migration(connection: sqlite3.Connection, migration: Migration) -> None:
     logger.info("Applying migration %03d_%s", migration.version, migration.name)
     statements = list(_iter_sql_statements(migration.path.read_text(encoding="utf-8")))
+    if (migration.version, migration.name) in FOREIGN_KEY_REBUILD_MIGRATIONS:
+        _apply_single_migration_with_foreign_keys_off(connection, migration, statements)
+        return
 
     connection.execute("BEGIN;")
     try:
@@ -424,6 +428,54 @@ def _apply_single_migration(connection: sqlite3.Connection, migration: Migration
         raise MigrationError(
             f"Failed to apply migration {migration.version:03d}_{migration.name}: {exc}"
         ) from exc
+
+
+def _apply_single_migration_with_foreign_keys_off(
+    connection: sqlite3.Connection,
+    migration: Migration,
+    statements: list[str],
+) -> None:
+    original_foreign_keys = int(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    connection.execute("PRAGMA foreign_keys = OFF;")
+    connection.execute("BEGIN;")
+    try:
+        for statement in statements:
+            connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO schema_migrations (version, name)
+            VALUES (?, ?)
+            """,
+            (migration.version, migration.name),
+        )
+        _assert_database_checks_pass(connection)
+        connection.execute("COMMIT;")
+    except sqlite3.Error as exc:
+        connection.execute("ROLLBACK;")
+        logger.exception("Failed to apply migration %03d_%s", migration.version, migration.name)
+        raise MigrationError(
+            f"Failed to apply migration {migration.version:03d}_{migration.name}: {exc}"
+        ) from exc
+    except Exception:
+        connection.execute("ROLLBACK;")
+        raise
+    finally:
+        connection.execute(
+            f"PRAGMA foreign_keys = {'ON' if original_foreign_keys else 'OFF'};"
+        )
+
+
+def _assert_database_checks_pass(connection: sqlite3.Connection) -> None:
+    foreign_key_violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if foreign_key_violations:
+        raise MigrationError(
+            f"foreign_key_check failed with {len(foreign_key_violations)} violation(s)"
+        )
+
+    integrity_rows = connection.execute("PRAGMA integrity_check").fetchall()
+    integrity_errors = [row[0] for row in integrity_rows if row[0] != "ok"]
+    if integrity_errors:
+        raise MigrationError(f"integrity_check failed: {integrity_errors}")
 
 
 def _validate_migration_has_statements(migration: Migration) -> None:
