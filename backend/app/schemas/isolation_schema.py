@@ -10,6 +10,7 @@ class IsolationHistoryItem(BaseModel):
     reason: str | None = None
     trust_score: int | None = None
     trigger_event_id: int | None = None
+    trust_score_history_id: int | None = None
     created_at: str | None = None
 
 

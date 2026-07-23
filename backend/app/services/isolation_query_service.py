@@ -19,6 +19,12 @@ def list_isolation_history(
         "limit": limit,
         "offset": offset,
     }
+    columns = _column_names(db, "isolation_history")
+    trust_history_column = (
+        "trust_score_history_id"
+        if "trust_score_history_id" in columns
+        else "NULL AS trust_score_history_id"
+    )
 
     total = db.execute(
         text(
@@ -40,6 +46,7 @@ def list_isolation_history(
                 reason,
                 trust_score,
                 trigger_event_id,
+                {trust_history_column},
                 created_at
             FROM isolation_history
             WHERE (:device_id IS NULL OR device_id = :device_id)
@@ -51,3 +58,8 @@ def list_isolation_history(
     ).mappings().all()
 
     return {"items": _rows_to_dicts(rows), "total": int(total)}
+
+
+def _column_names(db: Session, table_name: str) -> set[str]:
+    rows = db.execute(text(f"PRAGMA table_info({table_name})")).mappings().all()
+    return {str(row["name"]) for row in rows}

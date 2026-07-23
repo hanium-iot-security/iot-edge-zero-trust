@@ -25,6 +25,14 @@ class PacketFeatureItem(BaseModel):
     non_mqtt_tcp_udp_packet_count: int
     packets_per_second: float
     bytes_per_second: float
+    nominal_packets_per_second: float
+    nominal_bytes_per_second: float
+    effective_packets_per_second: float | None = None
+    effective_bytes_per_second: float | None = None
+    captured_duration_seconds: float | None = None
+    coverage_ratio: float | None = None
+    capture_eligible: bool | None = None
+    capture_exclusion_reason: str | None = None
     capture_scope: str | None = None
     created_at: str
 

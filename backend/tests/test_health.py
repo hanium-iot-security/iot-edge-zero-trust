@@ -11,5 +11,6 @@ def test_health_check() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "ok"
-    assert body["db_connected"] is True
-    assert isinstance(body["server_time"], str)
+    assert body["database"] == "ok"
+    assert "db_connected" not in body
+    assert "server_time" not in body
