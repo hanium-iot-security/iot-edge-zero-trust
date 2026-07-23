@@ -220,7 +220,7 @@ PR #14 Gateway Metrics Collector의 `GatewayMetricsSample`은 `collected_at`, `s
 
 ## detector_checkpoints
 
-Detector별 처리 지점을 저장하기 위한 Phase 4용 테이블입니다. 003 이후 `edge.detection.checkpoint_repository`와 `initialize_phase4_cutover()`가 이 테이블을 사용합니다.
+Detector별 처리 지점을 저장하기 위한 Phase 4용 테이블입니다. 003 이후 `edge.detection.checkpoint_repository`와 `initialize_phase4_cutover()`가 cutover snapshot에 사용하고, runtime에서는 `edge.detection.runtime_checkpoint_repository`가 SQLAlchemy `Session` 기반으로 같은 테이블을 갱신합니다.
 
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |
@@ -248,7 +248,7 @@ Source row가 없거나 검증된 완료 watermark가 없으면 `last_processed_
 
 ## trust_score_history
 
-Phase 4용 Trust Score window history 테이블입니다. Window별 실제 점수 변화 결과를 저장하기 위한 구조입니다. 이번 단계에서는 row를 자동 생성하지 않으며, 기존 `GET /api/trust-score/{device_id}/history`는 계속 `detection_events`를 원본으로 사용합니다.
+Phase 4용 Trust Score window history 테이블입니다. Window별 실제 점수 변화 결과를 저장하기 위한 구조입니다. `edge.trust.trust_score_v2.apply_trust_score_v2_until()`이 detection event 처리, device score 변경, isolation 기록, firewall PENDING 생성과 같은 transaction 안에서 row를 생성합니다. `GET /api/trust-score/{device_id}/history`는 Phase 4 DB에서 이 테이블을 원본으로 조회하며 `detection_events.score_delta`를 재합산하지 않습니다.
 
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |
@@ -269,7 +269,7 @@ Phase 4용 Trust Score window history 테이블입니다. Window별 실제 점�
 
 ## firewall_rules
 
-Phase 4용 firewall 요청/상태 테이블입니다. 이번 단계에서는 row 생성이나 iptables 실행을 구현하지 않습니다.
+Phase 4용 firewall 요청/상태 테이블입니다. 이번 PR은 DB repository와 조회 API만 구현합니다. 격리 진입 시 Trust Score v2 transaction에서 `PENDING` row를 만들 수 있지만, 실제 iptables 실행과 worker reconciliation은 다른 담당 범위입니다.
 
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |
