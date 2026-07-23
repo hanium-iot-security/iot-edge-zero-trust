@@ -88,6 +88,10 @@ Runner는 반환 요약과 DB Row의 Key·`last_processed_id`·UTC 완료 Window
   발생했다면 동일한 자동 Rollback 경로를 실행한다.
 - DB 변경 후 복원과 무결성·FK 검증이 성공한 경우에만 기존·Writer 서비스를 재시작한다.
   DB 안전성을 확인할 수 없으면 관련 Unit을 중지 상태로 유지하고 수동 복구한다.
+- 자동·명시적 Rollback에서 DB를 복원하기 직전에 기존·신규·Writer 등 전달된 전체 DB 사용
+  Unit을 다시 중지하고 모두 inactive인지 확인한다. 한 Unit이라도 비활성 상태를 확인할 수
+  없으면 DB 복원을 실행하지 않으며, Backup 복원과 DB 검증이 성공한 뒤에만 작업 전 상태로
+  서비스를 복구한다.
 - DB별 Lock 파일로 Cutover·Smoke·Rollback의 동시 실행을 차단한다.
 - POSIX에서는 `flock`이 사용하는 Lock 파일을 해제 후에도 삭제하지 않는다. 동일 경로의
   동일 inode를 다음 실행에서도 재사용하는 것이 정상이다.
@@ -165,6 +169,8 @@ python -m edge.scripts.run_phase4_cutover \
 
 - 전달한 Writer Unit을 작업 전 상태로 기록하고 Smoke 동안 중지한 뒤 작업 전 상태로 복구함
 - Writer가 중지된 안정된 원본 운영 DB에서 실행 전·후 각각 SQLite Backup API로 논리 Snapshot을 생성함
+- 성공·실패와 관계없이 사후 Snapshot·SHA256·Row 수 비교를 Writer 복구보다 먼저 완료하여,
+  Writer 재시작 직후 발생한 정상 적재를 Smoke의 원본 변경으로 오인하지 않음
 - `source_snapshot_before`, `source_snapshot_after`와 각 SHA256 Manifest가 별도 보존됨
 - 두 논리 Snapshot의 SHA256과 Table별 Row 수가 같고 `source_unchanged=true`임
 - Migration 전 Smoke Snapshot Manifest와 Migration 후 Manifest가 별도 파일로 보존됨

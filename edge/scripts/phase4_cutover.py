@@ -437,6 +437,21 @@ def _stop_services(
         raise CutoverSafetyError("Failed to stop services: " + "; ".join(errors))
 
 
+def _stop_and_verify_services_inactive(
+    services: tuple[str, ...],
+    *,
+    stop_service: Callable[[str], None],
+    is_service_active: Callable[[str], bool],
+    context: str,
+) -> None:
+    _stop_services(services, stop_service)
+    _validate_service_states(
+        _service_states(services, is_service_active),
+        {service: False for service in services},
+        context=context,
+    )
+
+
 def _restore_service_states(
     states: Mapping[str, bool],
     *,
@@ -591,7 +606,12 @@ def execute_cutover(
 
     with _operation_lock(database):
         try:
-            _stop_services(all_services, dependencies.stop_service)
+            _stop_and_verify_services_inactive(
+                all_services,
+                stop_service=dependencies.stop_service,
+                is_service_active=dependencies.is_service_active,
+                context="cutover pre-backup inactive verification",
+            )
 
             failure_stage = "backup"
             artifact = create_sqlite_backup(database, backup_path)
@@ -683,21 +703,27 @@ def execute_cutover(
             rollback_verification: Mapping[str, object] = {}
             rollback_errors: list[str] = []
             database_safe = not database_mutation_started
-            try:
-                _stop_services(config.new_services, dependencies.stop_service)
-            except Exception as stop_exc:  # noqa: BLE001
-                rollback_errors.append(str(stop_exc))
             if artifact is not None and database_mutation_started:
                 try:
-                    restored = restore_sqlite_backup(
-                        target_path=database,
-                        backup_path=artifact.database_path,
-                        sha256_path=artifact.sha256_path,
+                    _stop_and_verify_services_inactive(
+                        all_services,
+                        stop_service=dependencies.stop_service,
+                        is_service_active=dependencies.is_service_active,
+                        context="automatic rollback pre-restore inactive verification",
                     )
-                    rollback_verification = _verification_mapping(restored)
-                    database_safe = True
-                except Exception as restore_exc:  # noqa: BLE001
-                    rollback_errors.append(str(restore_exc))
+                except Exception as stop_exc:  # noqa: BLE001
+                    rollback_errors.append(str(stop_exc))
+                else:
+                    try:
+                        restored = restore_sqlite_backup(
+                            target_path=database,
+                            backup_path=artifact.database_path,
+                            sha256_path=artifact.sha256_path,
+                        )
+                        rollback_verification = _verification_mapping(restored)
+                        database_safe = True
+                    except Exception as restore_exc:  # noqa: BLE001
+                        rollback_errors.append(str(restore_exc))
             if database_safe:
                 try:
                     _restore_service_states(
@@ -1009,6 +1035,23 @@ def run_cutover_smoke_test(
             return report
         except (Exception, KeyboardInterrupt) as exc:
             writer_restore_error: str | None = None
+            source_sha_after = _sha256_file(source)
+            if source_snapshot_after_artifact is None:
+                try:
+                    source_snapshot_after_artifact = create_sqlite_backup(
+                        source, source_snapshot_after
+                    )
+                except Exception:  # noqa: BLE001 - preserve the primary smoke failure
+                    source_snapshot_after_artifact = None
+            if source_snapshot_after_artifact is not None:
+                source_counts_after = _table_row_counts(source_snapshot_after)
+            source_unchanged = (
+                source_snapshot_before_artifact is not None
+                and source_snapshot_after_artifact is not None
+                and source_snapshot_before_artifact.sha256
+                == source_snapshot_after_artifact.sha256
+                and source_counts_before == source_counts_after
+            )
             if writer_pause_attempted:
                 assert start_service is not None
                 assert stop_service is not None
@@ -1029,23 +1072,6 @@ def run_cutover_smoke_test(
                     )
                 except Exception as writer_exc:  # noqa: BLE001
                     writer_restore_error = str(writer_exc)
-            source_sha_after = _sha256_file(source)
-            if source_snapshot_after_artifact is None:
-                try:
-                    source_snapshot_after_artifact = create_sqlite_backup(
-                        source, source_snapshot_after
-                    )
-                except Exception:  # noqa: BLE001 - preserve the primary smoke failure
-                    source_snapshot_after_artifact = None
-            if source_snapshot_after_artifact is not None:
-                source_counts_after = _table_row_counts(source_snapshot_after)
-            source_unchanged = (
-                source_snapshot_before_artifact is not None
-                and source_snapshot_after_artifact is not None
-                and source_snapshot_before_artifact.sha256
-                == source_snapshot_after_artifact.sha256
-                and source_counts_before == source_counts_after
-            )
             report = SmokeTestReport(
                 status="failed",
                 mode="smoke-test",
@@ -1239,7 +1265,12 @@ def execute_rollback(
 
     with _operation_lock(database):
         try:
-            _stop_services(all_services, dependencies.stop_service)
+            _stop_and_verify_services_inactive(
+                all_services,
+                stop_service=dependencies.stop_service,
+                is_service_active=dependencies.is_service_active,
+                context="manual rollback pre-backup inactive verification",
+            )
 
             failure_stage = "pre-rollback-backup"
             pre_rollback_artifact = create_sqlite_backup(database, pre_rollback_path)
@@ -1304,14 +1335,24 @@ def execute_rollback(
             database_safe = not database_mutation_started
             if pre_rollback_artifact is not None and database_mutation_started:
                 try:
-                    restore_sqlite_backup(
-                        target_path=database,
-                        backup_path=pre_rollback_artifact.database_path,
-                        sha256_path=pre_rollback_artifact.sha256_path,
+                    _stop_and_verify_services_inactive(
+                        all_services,
+                        stop_service=dependencies.stop_service,
+                        is_service_active=dependencies.is_service_active,
+                        context="manual rollback recovery pre-restore inactive verification",
                     )
-                    database_safe = True
-                except Exception as restore_exc:  # noqa: BLE001
-                    recovery_errors.append(str(restore_exc))
+                except Exception as stop_exc:  # noqa: BLE001
+                    recovery_errors.append(str(stop_exc))
+                else:
+                    try:
+                        restore_sqlite_backup(
+                            target_path=database,
+                            backup_path=pre_rollback_artifact.database_path,
+                            sha256_path=pre_rollback_artifact.sha256_path,
+                        )
+                        database_safe = True
+                    except Exception as restore_exc:  # noqa: BLE001
+                        recovery_errors.append(str(restore_exc))
             if database_safe:
                 try:
                     _restore_service_states(

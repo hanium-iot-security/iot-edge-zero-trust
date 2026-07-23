@@ -106,6 +106,8 @@
 - 자동 Rollback 오류(`rollback_error`):
 - SIGINT·SIGTERM 중단 단계와 자동 Rollback 결과:
 - DB 복구 검증 전 서비스 재시작 차단 여부:
+- DB 복원 직전 전체 DB 사용 Unit inactive 확인 결과:
+- Smoke 사후 Snapshot 완료 후 Writer 복구 순서 확인:
 - Rollback 후 실제 Unit 상태와 기대 상태 비교:
 - 수동 조치:
 - 남은 미검증 항목:
@@ -122,6 +124,8 @@
 - [ ] 신규 서비스 정상 시작
 - [ ] Writer 서비스 작업 전 상태 복구
 - [ ] 복구 실패 시 관련 서비스 중지 유지
+- [ ] DB 복원 직전 전체 DB 사용 Unit inactive 확인
+- [ ] Smoke 사후 Snapshot·SHA256·Row 수 비교 후 Writer 복구
 - [ ] 반환 Checkpoint와 DB 7개 Row 일치
 - [ ] Smoke 원본 논리 Snapshot SHA256·Row 수 불변
 - [ ] 기존 Cron과 신규 Orchestrator 동시 실행 없음

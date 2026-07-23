@@ -148,7 +148,20 @@ def test_execute_cutover_restores_backup_and_legacy_services_on_failure(tmp_path
     result_path = tmp_path / "results" / "cutover.json"
     _create_source_database(database)
     events: list[str] = []
+    active = {
+        "rule-detector.service": True,
+        "detection-orchestrator.service": False,
+        "firewall-worker.service": False,
+    }
     cutover_at = datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc)
+
+    def stop(service: str) -> None:
+        events.append(f"stop:{service}")
+        active[service] = False
+
+    def start(service: str) -> None:
+        events.append(f"start:{service}")
+        active[service] = True
 
     def migrate(db_path: Path, _: Path) -> dict[str, object]:
         events.append("migrate")
@@ -172,25 +185,26 @@ def test_execute_cutover_restores_backup_and_legacy_services_on_failure(tmp_path
                 new_services=("detection-orchestrator.service", "firewall-worker.service"),
             ),
             CutoverDependencies(
-                stop_service=lambda service: events.append(f"stop:{service}"),
-                start_service=lambda service: events.append(f"start:{service}"),
-                is_service_active=lambda service: service == "rule-detector.service",
+                stop_service=stop,
+                start_service=start,
+                is_service_active=lambda service: active[service],
                 apply_migrations=migrate,
                 initialize_checkpoints=fail_checkpoint_initialization,
                 now=lambda: cutover_at,
             ),
         )
 
-    assert events[:7] == [
+    assert events[:8] == [
         "stop:rule-detector.service",
         "stop:detection-orchestrator.service",
         "stop:firewall-worker.service",
         "migrate",
         "initialize",
+        "stop:rule-detector.service",
         "stop:detection-orchestrator.service",
         "stop:firewall-worker.service",
     ]
-    assert "start:rule-detector.service" in events[7:]
+    assert "start:rule-detector.service" in events[8:]
     assert "start:detection-orchestrator.service" not in events
     assert "start:firewall-worker.service" not in events
     with sqlite3.connect(database) as connection:
@@ -328,6 +342,18 @@ def test_execute_cutover_rolls_back_when_phase4_contract_is_incomplete(
     database = tmp_path / "operational.db"
     _create_source_database(database)
     events: list[str] = []
+    active = {
+        "rule-detector.service": True,
+        "detection-orchestrator.service": False,
+    }
+
+    def stop(service: str) -> None:
+        events.append(f"stop:{service}")
+        active[service] = False
+
+    def start(service: str) -> None:
+        events.append(f"start:{service}")
+        active[service] = True
 
     with pytest.raises(CutoverExecutionError, match=expected_error):
         execute_cutover(
@@ -341,9 +367,9 @@ def test_execute_cutover_rolls_back_when_phase4_contract_is_incomplete(
                 new_services=("detection-orchestrator.service",),
             ),
             CutoverDependencies(
-                stop_service=lambda service: events.append(f"stop:{service}"),
-                start_service=lambda service: events.append(f"start:{service}"),
-                is_service_active=lambda service: service == "rule-detector.service",
+                stop_service=stop,
+                start_service=start,
+                is_service_active=lambda service: active[service],
                 apply_migrations=lambda *_: migration_summary,
                 initialize_checkpoints=lambda *_: checkpoint_summary or {},
                 now=lambda: datetime(2026, 7, 21, 4, 30, tzinfo=timezone.utc),
@@ -1289,6 +1315,9 @@ def test_manual_rollback_rejects_post_restore_service_state_mismatch(
         "orchestrator.service": True,
     }
 
+    def stop(service: str) -> None:
+        active[service] = False
+
     with pytest.raises(CutoverExecutionError, match="service state verification"):
         execute_rollback(
             RollbackConfig(
@@ -1301,7 +1330,7 @@ def test_manual_rollback_rejects_post_restore_service_state_mismatch(
                 new_services=("orchestrator.service",),
             ),
             RollbackDependencies(
-                stop_service=lambda _: None,
+                stop_service=stop,
                 start_service=lambda _: None,
                 is_service_active=lambda service: active[service],
                 now=lambda: datetime(2026, 7, 21, 5, 0, tzinfo=timezone.utc),
@@ -1309,7 +1338,7 @@ def test_manual_rollback_rejects_post_restore_service_state_mismatch(
         )
 
     saved = json.loads(result_path.read_text(encoding="utf-8"))
-    assert saved["status"] == "failed"
+    assert saved["status"] == "recovery_failed"
     assert saved["failure_stage"] == "post-service-verification"
 
 
@@ -1876,3 +1905,264 @@ def test_manual_rollback_does_not_restart_services_when_database_recovery_fails(
     assert restore_attempts == 2
     assert started == []
     assert active == {"legacy.service": False, "new.service": False}
+
+
+def test_cutover_automatic_rollback_stops_all_database_services_before_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "operational.db"
+    _create_source_database(database)
+    active = {
+        "legacy.service": True,
+        "orchestrator.service": False,
+        "writer.service": True,
+    }
+    restore_states: list[dict[str, bool]] = []
+    real_restore = cutover_runtime.restore_sqlite_backup
+
+    def stop(service: str) -> None:
+        active[service] = False
+
+    def start(service: str) -> None:
+        active[service] = True
+        if service == "writer.service":
+            raise RuntimeError("writer start failed after activation")
+
+    def record_restore(**kwargs):
+        restore_states.append(dict(active))
+        return real_restore(**kwargs)
+
+    monkeypatch.setattr(cutover_runtime, "restore_sqlite_backup", record_restore)
+
+    with pytest.raises(CutoverExecutionError, match="writer start failed"):
+        execute_cutover(
+            CutoverConfig(
+                database_path=database,
+                backup_directory=tmp_path / "backups",
+                migrations_directory=tmp_path / "migrations",
+                result_path=tmp_path / "cutover.json",
+                git_sha="review-fix",
+                legacy_services=("legacy.service",),
+                new_services=("orchestrator.service",),
+                paused_writer_services=("writer.service",),
+            ),
+            CutoverDependencies(
+                stop_service=stop,
+                start_service=start,
+                is_service_active=lambda service: active[service],
+                apply_migrations=lambda *_: {"applied_versions": [3]},
+                initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+            ),
+        )
+
+    assert restore_states == [
+        {
+            "legacy.service": False,
+            "orchestrator.service": False,
+            "writer.service": False,
+        }
+    ]
+
+
+def test_cutover_automatic_rollback_refuses_restore_when_writer_remains_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "operational.db"
+    _create_source_database(database)
+    active = {
+        "legacy.service": True,
+        "writer.service": True,
+    }
+    restore_called = False
+    writer_stop_blocked = False
+
+    def stop(service: str) -> None:
+        if service == "writer.service" and writer_stop_blocked:
+            return
+        active[service] = False
+
+    def start(service: str) -> None:
+        nonlocal writer_stop_blocked
+        active[service] = True
+        if service == "writer.service":
+            writer_stop_blocked = True
+            raise RuntimeError("writer start failed after activation")
+
+    def record_restore(**_):
+        nonlocal restore_called
+        restore_called = True
+        raise AssertionError("database restore must not run")
+
+    monkeypatch.setattr(cutover_runtime, "restore_sqlite_backup", record_restore)
+
+    with pytest.raises(CutoverExecutionError, match="writer start failed"):
+        execute_cutover(
+            CutoverConfig(
+                database_path=database,
+                backup_directory=tmp_path / "backups",
+                migrations_directory=tmp_path / "migrations",
+                result_path=tmp_path / "cutover.json",
+                git_sha="review-fix",
+                legacy_services=("legacy.service",),
+                paused_writer_services=("writer.service",),
+            ),
+            CutoverDependencies(
+                stop_service=stop,
+                start_service=start,
+                is_service_active=lambda service: active[service],
+                apply_migrations=lambda *_: {"applied_versions": [3]},
+                initialize_checkpoints=lambda db, _: _persist_checkpoint_summary(db),
+            ),
+        )
+
+    assert restore_called is False
+
+
+def test_manual_rollback_recovery_stops_all_database_services_before_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "operational.db"
+    selected = tmp_path / "selected.db"
+    _create_source_database(database)
+    selected_artifact = create_sqlite_backup(database, selected)
+    active = {
+        "legacy.service": False,
+        "orchestrator.service": True,
+        "writer.service": True,
+    }
+    restore_states: list[dict[str, bool]] = []
+    real_restore = cutover_runtime.restore_sqlite_backup
+
+    def stop(service: str) -> None:
+        active[service] = False
+
+    def start(service: str) -> None:
+        active[service] = True
+        if service == "writer.service":
+            raise RuntimeError("writer start failed after activation")
+
+    def record_restore(**kwargs):
+        restore_states.append(dict(active))
+        return real_restore(**kwargs)
+
+    monkeypatch.setattr(cutover_runtime, "restore_sqlite_backup", record_restore)
+
+    with pytest.raises(CutoverExecutionError, match="writer start failed"):
+        execute_rollback(
+            RollbackConfig(
+                database_path=database,
+                backup_path=selected,
+                sha256_path=selected_artifact.sha256_path,
+                backup_directory=tmp_path / "pre-rollback",
+                result_path=tmp_path / "rollback.json",
+                git_sha="review-fix",
+                legacy_services=("legacy.service",),
+                new_services=("orchestrator.service",),
+                paused_writer_services=("writer.service",),
+            ),
+            RollbackDependencies(
+                stop_service=stop,
+                start_service=start,
+                is_service_active=lambda service: active[service],
+            ),
+        )
+
+    assert restore_states == [
+        {
+            "legacy.service": False,
+            "orchestrator.service": False,
+            "writer.service": False,
+        },
+        {
+            "legacy.service": False,
+            "orchestrator.service": False,
+            "writer.service": False,
+        },
+    ]
+
+
+def test_manual_rollback_refuses_database_restore_when_services_remain_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "operational.db"
+    selected = tmp_path / "selected.db"
+    _create_source_database(database)
+    selected_artifact = create_sqlite_backup(database, selected)
+    restore_called = False
+
+    def record_restore(**_):
+        nonlocal restore_called
+        restore_called = True
+        raise AssertionError("database restore must not run")
+
+    monkeypatch.setattr(cutover_runtime, "restore_sqlite_backup", record_restore)
+
+    with pytest.raises(CutoverExecutionError, match="inactive"):
+        execute_rollback(
+            RollbackConfig(
+                database_path=database,
+                backup_path=selected,
+                sha256_path=selected_artifact.sha256_path,
+                backup_directory=tmp_path / "pre-rollback",
+                result_path=tmp_path / "rollback.json",
+                git_sha="review-fix",
+                paused_writer_services=("writer.service",),
+            ),
+            RollbackDependencies(
+                stop_service=lambda _: None,
+                start_service=lambda _: None,
+                is_service_active=lambda _: True,
+            ),
+        )
+
+    assert restore_called is False
+
+
+def test_smoke_failure_snapshots_source_before_writer_recovery(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "operational.db"
+    result = tmp_path / "smoke.json"
+    _create_source_database(source)
+    active = {"writer.service": True}
+
+    def stop(service: str) -> None:
+        active[service] = False
+
+    def start(service: str) -> None:
+        active[service] = True
+        with sqlite3.connect(source) as connection:
+            connection.execute(
+                "UPDATE parent SET name = 'writer-resumed' WHERE id = 1"
+            )
+
+    with pytest.raises(CutoverExecutionError, match="checkpoint failed"):
+        run_cutover_smoke_test(
+            SmokeTestConfig(
+                source_database_path=source,
+                smoke_database_path=tmp_path / "smoke.db",
+                migrations_directory=tmp_path / "migrations",
+                result_path=result,
+                git_sha="review-fix",
+                paused_writer_services=("writer.service",),
+            ),
+            apply_migrations=lambda *_: {"applied_versions": [3]},
+            initialize_checkpoints=lambda *_: (_ for _ in ()).throw(
+                RuntimeError("checkpoint failed")
+            ),
+            stop_service=stop,
+            start_service=start,
+            is_service_active=lambda service: active[service],
+        )
+
+    saved = json.loads(result.read_text(encoding="utf-8"))
+    assert saved["source_unchanged"] is True
+    assert (
+        saved["source_snapshot_sha256_before"]
+        == saved["source_snapshot_sha256_after"]
+    )
+    assert active["writer.service"] is True
