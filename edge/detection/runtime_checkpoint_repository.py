@@ -12,7 +12,12 @@ from edge.detection.checkpoint_repository import (
     PHASE4_CHECKPOINT_KEYS,
     checkpoint_summary_key,
 )
-from edge.detection.phase4_time import format_db_utc, parse_db_utc, require_utc_whole_second
+from edge.detection.phase4_time import (
+    format_db_utc,
+    parse_db_utc,
+    require_utc_whole_second,
+    require_utc_window_boundary,
+)
 
 
 VALID_CHECKPOINT_KEYS = set(PHASE4_CHECKPOINT_KEYS)
@@ -75,6 +80,14 @@ def upsert_detector_checkpoint(
     validate_checkpoint_key(detector_name, source_table)
     if last_processed_id is not None and last_processed_id < 0:
         raise ValueError("last_processed_id must be non-negative")
+    completed_window_end = (
+        require_utc_window_boundary(
+            last_completed_window_end,
+            "last_completed_window_end",
+        )
+        if last_completed_window_end is not None
+        else None
+    )
     existing = get_detector_checkpoint(
         db,
         detector_name=detector_name,
@@ -83,7 +96,7 @@ def upsert_detector_checkpoint(
     _validate_checkpoint_progress(
         existing,
         last_processed_id=last_processed_id,
-        last_completed_window_end=last_completed_window_end,
+        last_completed_window_end=completed_window_end,
     )
 
     db.execute(
@@ -114,8 +127,8 @@ def upsert_detector_checkpoint(
             "source_table": source_table,
             "last_processed_id": last_processed_id,
             "last_completed_window_end": (
-                format_db_utc(last_completed_window_end)
-                if last_completed_window_end is not None
+                format_db_utc(completed_window_end)
+                if completed_window_end is not None
                 else None
             ),
             "updated_at": format_db_utc(

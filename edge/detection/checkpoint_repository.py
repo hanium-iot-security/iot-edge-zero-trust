@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import sqlite3
 from typing import Any
 
+from edge.detection.phase4_time import WINDOW_SECONDS
 from edge.packet.pcap_naming import format_utc_iso
 
 
@@ -121,10 +122,22 @@ def _checkpoint_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 def _format_optional_utc(value: datetime | None, field_name: str) -> str | None:
     if value is None:
         return None
-    return format_utc_iso(_require_aware_utc(value, field_name))
+    return format_utc_iso(_require_window_boundary(value, field_name))
 
 
 def _require_aware_utc(value: datetime, field_name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must be timezone-aware")
-    return value.astimezone(timezone.utc)
+    if value.utcoffset() != timedelta(0):
+        raise ValueError(f"{field_name} must use UTC offset")
+    normalized = value.astimezone(timezone.utc)
+    if normalized.microsecond != 0:
+        raise ValueError(f"{field_name} must use whole-second precision")
+    return normalized
+
+
+def _require_window_boundary(value: datetime, field_name: str) -> datetime:
+    normalized = _require_aware_utc(value, field_name)
+    if normalized.second % WINDOW_SECONDS != 0:
+        raise ValueError(f"{field_name} must align to a 10 second boundary")
+    return normalized

@@ -71,8 +71,25 @@ def score_delta_for_event(event_type: str) -> int:
     return SCORE_DELTA_BY_EVENT.get(event_type, 0)
 
 
+def has_event_policy(event_type: str) -> bool:
+    return event_type in SCORE_DELTA_BY_EVENT
+
+
+def require_score_delta_for_event(event_type: str) -> int:
+    if event_type not in SCORE_DELTA_BY_EVENT:
+        raise ValueError(f"unknown event_type policy: {event_type!r}")
+    return SCORE_DELTA_BY_EVENT[event_type]
+
+
 def incident_family_for_event(event_type: str) -> str | None:
     return INCIDENT_FAMILY_BY_EVENT.get(event_type)
+
+
+def require_incident_family_for_event(event_type: str) -> str:
+    family = incident_family_for_event(event_type)
+    if family is None:
+        raise ValueError(f"unknown incident family policy: {event_type!r}")
+    return family
 
 
 def clamp_trust_score(trust_score: int) -> int:

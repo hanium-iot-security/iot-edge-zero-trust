@@ -53,7 +53,6 @@ class MqttFeatureRuleStage:
         device_ips = _registered_device_ips(db)
         rows = _select_feature_rows(
             db,
-            last_processed_id=before["last_processed_id"],
             range_start=range_start,
             cutoff=cutoff,
         )
@@ -141,7 +140,6 @@ class MqttMessageRuleStage:
         registered_devices = set(device_ips)
         rows = _select_mqtt_rows(
             db,
-            last_processed_id=before["last_processed_id"],
             range_start=range_start,
             cutoff=cutoff,
         )
@@ -234,7 +232,6 @@ class MqttIsolationForestStage:
         device_ips = _registered_device_ips(db)
         rows = _select_feature_rows(
             db,
-            last_processed_id=before["last_processed_id"],
             range_start=range_start,
             cutoff=cutoff,
         )
@@ -354,7 +351,6 @@ def _advance_checkpoint(
 def _select_feature_rows(
     db: Session,
     *,
-    last_processed_id: int | None,
     range_start: datetime,
     cutoff: datetime,
 ) -> list[dict[str, Any]]:
@@ -366,14 +362,12 @@ def _select_feature_rows(
                    avg_message_interval, min_message_interval,
                    topic_count, abnormal_topic_count, malformed_payload_count
             FROM feature_logs
-            WHERE (:last_processed_id IS NULL OR id > :last_processed_id)
-              AND unixepoch(window_start) >= unixepoch(:range_start)
+            WHERE unixepoch(window_start) >= unixepoch(:range_start)
               AND unixepoch(window_end) <= unixepoch(:cutoff)
             ORDER BY id ASC
             """
         ),
         {
-            "last_processed_id": last_processed_id,
             "range_start": format_db_utc(range_start),
             "cutoff": format_db_utc(cutoff),
         },
@@ -384,7 +378,6 @@ def _select_feature_rows(
 def _select_mqtt_rows(
     db: Session,
     *,
-    last_processed_id: int | None,
     range_start: datetime,
     cutoff: datetime,
 ) -> list[dict[str, Any]]:
@@ -393,14 +386,12 @@ def _select_mqtt_rows(
             """
             SELECT id, device_id, topic, payload, received_at
             FROM mqtt_logs
-            WHERE (:last_processed_id IS NULL OR id > :last_processed_id)
-              AND unixepoch(received_at) >= unixepoch(:range_start)
+            WHERE unixepoch(received_at) >= unixepoch(:range_start)
               AND unixepoch(received_at) < unixepoch(:cutoff)
             ORDER BY id ASC
             """
         ),
         {
-            "last_processed_id": last_processed_id,
             "range_start": format_db_utc(range_start),
             "cutoff": format_db_utc(cutoff),
         },

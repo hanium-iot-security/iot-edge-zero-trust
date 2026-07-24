@@ -23,6 +23,7 @@ from edge.trust.trust_policy import (
     ISOLATED_STATUS,
     UNKNOWN_DEVICE,
     apply_score_delta,
+    has_event_policy,
     incident_family_for_event,
     score_delta_for_event,
     status_for_trust_score,
@@ -40,6 +41,8 @@ PROCESSING_UNMAPPED_DEVICE = "UNMAPPED_DEVICE"
 PROCESSING_UNMAPPED_EVENT_TYPE = "UNMAPPED_EVENT_TYPE"
 PROCESSING_LATE_EVENT = "LATE_EVENT"
 PROCESSING_LEGACY_MIGRATION = "LEGACY_MIGRATION"
+PROCESSING_INVALID_INCIDENT_FAMILY = "INVALID_INCIDENT_FAMILY"
+PROCESSING_NO_SCORE_EVENT = "NO_SCORE_EVENT"
 AI_WINDOW_CAP = -15
 WINDOW_DELTA_CAP = -30
 SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3}
@@ -109,7 +112,6 @@ def apply_trust_score_v2_until(
 
     events = _fetch_candidate_events(
         db,
-        last_processed_id=last_processed_before,
         cutoff=cutoff,
     )
     last_processed_after = last_processed_before
@@ -151,9 +153,31 @@ def apply_trust_score_v2_until(
             _mark_events(db, group, PROCESSING_ALREADY_ISOLATED, cutoff, [])
             continue
 
-        selected = _select_representative_events(group)
+        invalid_type_events, invalid_family_events, valid_group = _partition_policy_events(
+            group
+        )
+        if invalid_type_events:
+            _mark_events(
+                db,
+                invalid_type_events,
+                PROCESSING_UNMAPPED_EVENT_TYPE,
+                cutoff,
+                [],
+            )
+        if invalid_family_events:
+            _mark_events(
+                db,
+                invalid_family_events,
+                PROCESSING_INVALID_INCIDENT_FAMILY,
+                cutoff,
+                [],
+            )
+        if not valid_group:
+            continue
+
+        selected = _select_representative_events(valid_group)
         if not selected:
-            _mark_events(db, group, PROCESSING_UNMAPPED_EVENT_TYPE, cutoff, [])
+            _mark_events(db, valid_group, PROCESSING_NO_SCORE_EVENT, cutoff, [])
             continue
 
         previous_score = int(device["trust_score"])
@@ -163,7 +187,7 @@ def apply_trust_score_v2_until(
         actual_delta = new_score - previous_score
         new_status = status_for_trust_score(new_score)
         representative_ids = [int(event["id"]) for event in selected]
-        window_start, window_end = _group_window(group)
+        window_start, window_end = _group_window(valid_group)
 
         db.execute(
             text(
@@ -193,7 +217,7 @@ def apply_trust_score_v2_until(
             representative_event_ids=representative_ids,
         )
         created_history_count += 1
-        _mark_events(db, group, PROCESSING_APPLIED, cutoff, representative_ids)
+        _mark_events(db, valid_group, PROCESSING_APPLIED, cutoff, representative_ids)
 
         isolation_history_id: int | None = None
         firewall_rule_id: int | None = None
@@ -262,7 +286,6 @@ def apply_trust_score_v2_until(
 def _fetch_candidate_events(
     db: Session,
     *,
-    last_processed_id: int | None,
     cutoff: datetime,
 ) -> list[dict[str, Any]]:
     rows = db.execute(
@@ -271,7 +294,6 @@ def _fetch_candidate_events(
             SELECT *
             FROM detection_events
             WHERE processed_at IS NULL
-              AND (:last_processed_id IS NULL OR id > :last_processed_id)
               AND (
                   (
                       analysis_window_end IS NOT NULL
@@ -289,7 +311,6 @@ def _fetch_candidate_events(
             """
         ),
         {
-            "last_processed_id": last_processed_id,
             "cutoff": format_db_utc(cutoff),
         },
     ).mappings()
@@ -341,11 +362,7 @@ def _select_representative_events(group: list[dict[str, Any]]) -> list[dict[str,
         if event["detector_type"] == "AI":
             ai_events.append(candidate)
             continue
-        family = str(
-            event.get("incident_family")
-            or incident_family_for_event(event_type)
-            or event_type
-        )
+        family = str(incident_family_for_event(event_type))
         current = rule_by_family.get(family)
         if current is None or _representative_sort_key(candidate) < _representative_sort_key(
             current
@@ -383,16 +400,38 @@ def _is_before_current_cycle(event: dict[str, Any], range_start: datetime) -> bo
 
 def _past_event_processing_reason(
     event: dict[str, Any],
-    range_start: datetime,
+    _range_start: datetime,
 ) -> str:
-    detected_at = (
-        parse_db_utc(event["detected_at"], "detected_at")
-        if event.get("detected_at")
-        else None
-    )
-    if detected_at is None or detected_at < range_start:
+    if (
+        event.get("processing_reason") == PROCESSING_LEGACY_MIGRATION
+        or event.get("event_type") == PROCESSING_LEGACY_MIGRATION
+    ):
         return PROCESSING_LEGACY_MIGRATION
     return PROCESSING_LATE_EVENT
+
+
+def _partition_policy_events(
+    group: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    invalid_type_events: list[dict[str, Any]] = []
+    invalid_family_events: list[dict[str, Any]] = []
+    valid_events: list[dict[str, Any]] = []
+
+    for event in group:
+        event_type = str(event["event_type"])
+        expected_family = incident_family_for_event(event_type)
+        if not has_event_policy(event_type) or expected_family is None:
+            invalid_type_events.append(event)
+            continue
+        stored_family = event.get("incident_family")
+        if stored_family is not None and str(stored_family) != expected_family:
+            invalid_family_events.append(event)
+            continue
+        normalized = dict(event)
+        normalized["incident_family"] = expected_family
+        valid_events.append(normalized)
+
+    return invalid_type_events, invalid_family_events, valid_events
 
 
 def _fetch_device(db: Session, device_id: str) -> dict[str, Any] | None:

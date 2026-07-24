@@ -24,7 +24,7 @@ trust_score_v2+detection_events
 
 Runtime repository functions do not call `commit()` or `rollback()`. They participate in the caller transaction.
 
-Runtime checkpoint updates must not move backwards. A stage run that tries to replace an existing `last_completed_window_end` or `last_processed_id` with an older value fails instead of silently overwriting the checkpoint.
+Runtime checkpoint updates must not move backwards. A stage run that tries to replace an existing `last_completed_window_end` or `last_processed_id` with an older value fails instead of silently overwriting the checkpoint. `last_completed_window_end` must be a timezone-aware UTC timestamp on an exact 10 second boundary.
 
 ## MQTT Feature Producer
 
@@ -65,6 +65,8 @@ Implemented adapters:
 They keep the existing MQTT rule and Isolation Forest meaning. They add incremental source selection, Phase 4 event writing, deterministic evidence JSON, dedupe keys, and checkpoint updates.
 
 All MQTT adapters use the common event type to incident family mapping in `edge.trust.trust_policy`. Registered device events store `subject_ip` from `devices.ip_address`; unknown-device events may have no subject IP.
+
+Adapter source selection uses the cycle window range as the eligibility boundary. It does not rely only on `source_id > last_processed_id`, so a lower-ID source row for a future window can still be processed when that window becomes eligible.
 
 ## Detection Event Writer
 

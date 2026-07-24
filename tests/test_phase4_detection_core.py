@@ -77,6 +77,32 @@ def test_runtime_checkpoint_adapter_is_transaction_controlled(SessionLocal) -> N
                 last_completed_window_end=None,
                 updated_at=datetime(2026, 7, 23, 10, 0, 20, 1, tzinfo=timezone.utc),
             )
+        upsert_detector_checkpoint(
+            db,
+            detector_name="mqtt_message_rule",
+            source_table="mqtt_logs",
+            last_processed_id=None,
+            last_completed_window_end=datetime(2026, 7, 23, 10, 0, 10, tzinfo=timezone.utc),
+            updated_at=CUTOVER,
+        )
+        with pytest.raises(ValueError, match="10 second boundary"):
+            upsert_detector_checkpoint(
+                db,
+                detector_name="mqtt_if",
+                source_table="feature_logs",
+                last_processed_id=None,
+                last_completed_window_end=datetime(2026, 7, 23, 10, 0, 7, tzinfo=timezone.utc),
+                updated_at=CUTOVER,
+            )
+        with pytest.raises(ValueError, match="whole-second"):
+            upsert_detector_checkpoint(
+                db,
+                detector_name="packet_rule",
+                source_table="packet_feature_logs",
+                last_processed_id=None,
+                last_completed_window_end=datetime(2026, 7, 23, 10, 0, 10, 1, tzinfo=timezone.utc),
+                updated_at=CUTOVER,
+            )
 
 
 def test_incident_family_mapping_covers_phase4_event_types() -> None:
@@ -176,6 +202,62 @@ def test_mqtt_feature_producer_consumes_late_source_without_reopening_window(
         assert checkpoint["last_completed_window_end"] == "2026-07-23T10:00:30Z"
 
 
+def test_mqtt_feature_producer_does_not_skip_lower_id_future_source(
+    SessionLocal,
+) -> None:
+    first_cutoff = CUTOVER
+    second_cutoff = datetime(2026, 7, 23, 10, 0, 30, tzinfo=timezone.utc)
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01")
+        _insert_mqtt_log(
+            db,
+            "esp32_01",
+            "2026-07-23T10:00:21Z",
+            payload_size=300,
+            mqtt_id=10,
+        )
+        _insert_mqtt_log(
+            db,
+            "esp32_01",
+            "2026-07-23T10:00:01Z",
+            payload_size=100,
+            mqtt_id=11,
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            first = produce_mqtt_features_until(db, producer_cutoff=first_cutoff)
+
+        assert first.created_feature_count == 1
+        assert db.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM feature_logs
+                WHERE window_start = '2026-07-23T10:00:00Z'
+                  AND window_end = '2026-07-23T10:00:10Z'
+                """
+            )
+        ).scalar_one() == 1
+        db.rollback()
+
+        with db.begin():
+            second = produce_mqtt_features_until(db, producer_cutoff=second_cutoff)
+
+        assert second.created_feature_count == 1
+        assert db.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM feature_logs
+                WHERE window_start = '2026-07-23T10:00:20Z'
+                  AND window_end = '2026-07-23T10:00:30Z'
+                """
+            )
+        ).scalar_one() == 1
+
+
 def test_phase4_detection_writer_dedupes_and_validates_source_fk(SessionLocal) -> None:
     with SessionLocal() as db:
         _insert_device(db, "esp32_01")
@@ -224,10 +306,47 @@ def test_phase4_detection_writer_dedupes_and_validates_source_fk(SessionLocal) -
         assert second.duplicate is True
         assert second.event_id == first.event_id
         assert db.execute(text("SELECT COUNT(*) FROM detection_events")).scalar_one() == 1
-        evidence_json = db.execute(
-            text("SELECT evidence_json FROM detection_events")
-        ).scalar_one()
+        event_row = db.execute(
+            text("SELECT incident_family, evidence_json FROM detection_events")
+        ).mappings().one()
+        assert event_row["incident_family"] == "FLOODING"
+        evidence_json = event_row["evidence_json"]
         assert evidence_json == '{"a":1,"b":2}'
+        with pytest.raises(ValueError, match="incident_family must match"):
+            write_detection_event(
+                db,
+                device_id="esp32_01",
+                detector_name="mqtt_feature_rule",
+                source_table="feature_logs",
+                source_id=feature_id,
+                detector_type="RULE",
+                event_type="ABNORMAL_PUBLISH_RATE",
+                severity="high",
+                description="bad family",
+                policy_version="mqtt-feature-rule-v1",
+                detected_at=CUTOVER,
+                analysis_window_start=RANGE_START,
+                analysis_window_end=datetime(2026, 7, 23, 10, 0, 10, tzinfo=timezone.utc),
+                incident_family="IDENTITY",
+                feature_log_id=feature_id,
+            )
+        with pytest.raises(ValueError, match="unknown incident family policy"):
+            write_detection_event(
+                db,
+                device_id="esp32_01",
+                detector_name="mqtt_feature_rule",
+                source_table="feature_logs",
+                source_id=feature_id,
+                detector_type="RULE",
+                event_type="UNREGISTERED_EVENT",
+                severity="high",
+                description="unknown event",
+                policy_version="mqtt-feature-rule-v1",
+                detected_at=CUTOVER,
+                analysis_window_start=RANGE_START,
+                analysis_window_end=datetime(2026, 7, 23, 10, 0, 10, tzinfo=timezone.utc),
+                feature_log_id=feature_id,
+            )
         with pytest.raises(ValueError, match="exactly one source FK"):
             write_detection_event(
                 db,
@@ -357,6 +476,71 @@ def test_mqtt_adapters_do_not_move_checkpoints_backwards(SessionLocal) -> None:
             assert checkpoint["last_completed_window_end"] == "2026-07-23T10:00:20Z"
 
 
+def test_mqtt_feature_rule_adapter_does_not_skip_lower_id_future_window(
+    SessionLocal,
+) -> None:
+    next_cutoff = datetime(2026, 7, 23, 10, 0, 30, tzinfo=timezone.utc)
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01")
+        future_feature_id = _insert_feature(
+            db,
+            "esp32_01",
+            "2026-07-23T10:00:20Z",
+            "2026-07-23T10:00:30Z",
+            publish_count=20,
+            feature_id=10,
+        )
+        current_feature_id = _insert_feature(
+            db,
+            "esp32_01",
+            "2026-07-23T10:00:00Z",
+            "2026-07-23T10:00:10Z",
+            publish_count=20,
+            feature_id=11,
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            first = MqttFeatureRuleStage().run_until(
+                db,
+                cycle_range_start=RANGE_START,
+                cycle_cutoff=CUTOVER,
+            )
+
+        assert first.created_event_count == 1
+        assert db.execute(
+            text(
+                """
+                SELECT feature_log_id
+                FROM detection_events
+                WHERE feature_log_id = :feature_log_id
+                """
+            ),
+            {"feature_log_id": current_feature_id},
+        ).scalar_one() == current_feature_id
+        db.rollback()
+
+        with db.begin():
+            second = MqttFeatureRuleStage().run_until(
+                db,
+                cycle_range_start=CUTOVER,
+                cycle_cutoff=next_cutoff,
+            )
+
+        assert second.created_event_count == 1
+        assert db.execute(
+            text(
+                """
+                SELECT feature_log_id
+                FROM detection_events
+                WHERE feature_log_id = :feature_log_id
+                """
+            ),
+            {"feature_log_id": future_feature_id},
+        ).scalar_one() == future_feature_id
+
+
 def test_orchestrator_commits_successful_stage_before_later_failure(SessionLocal) -> None:
     class SuccessStage:
         detector_name = "mqtt_feature_rule"
@@ -437,6 +621,7 @@ def _insert_mqtt_log(
     device_id: str,
     received_at: str,
     *,
+    mqtt_id: int | None = None,
     topic: str = "iot/esp32_01/sensor",
     payload: str = '{"device_id":"esp32_01"}',
     payload_size: int = 100,
@@ -445,16 +630,18 @@ def _insert_mqtt_log(
         text(
             """
             INSERT INTO mqtt_logs (
+                id,
                 device_id, topic, payload, payload_size,
                 received_at, is_json_valid, is_topic_valid
             )
             VALUES (
-                :device_id, :topic, :payload, :payload_size,
+                :id, :device_id, :topic, :payload, :payload_size,
                 :received_at, 1, 1
             )
             """
         ),
         {
+            "id": mqtt_id,
             "device_id": device_id,
             "topic": topic,
             "payload": payload,
@@ -472,11 +659,13 @@ def _insert_feature(
     window_end: str,
     *,
     publish_count: int,
+    feature_id: int | None = None,
 ) -> int:
     result = db.execute(
         text(
             """
             INSERT INTO feature_logs (
+                id,
                 device_id,
                 window_start,
                 window_end,
@@ -490,6 +679,7 @@ def _insert_feature(
                 malformed_payload_count
             )
             VALUES (
+                :id,
                 :device_id,
                 :window_start,
                 :window_end,
@@ -505,6 +695,7 @@ def _insert_feature(
             """
         ),
         {
+            "id": feature_id,
             "device_id": device_id,
             "window_start": window_start,
             "window_end": window_end,

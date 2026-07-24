@@ -12,9 +12,11 @@ from edge.trust import firewall_repository
 from edge.trust.trust_score_v2 import (
     PROCESSING_ALREADY_ISOLATED,
     PROCESSING_APPLIED,
+    PROCESSING_INVALID_INCIDENT_FAMILY,
     PROCESSING_LATE_EVENT,
     PROCESSING_LEGACY_MIGRATION,
     PROCESSING_UNMAPPED_DEVICE,
+    PROCESSING_UNMAPPED_EVENT_TYPE,
     apply_trust_score_v2_until,
 )
 from edge.trust.trust_policy import score_delta_for_event
@@ -206,6 +208,91 @@ def test_trust_v2_packet_event_penalties_affect_scores(SessionLocal) -> None:
             assert row["trust_score"] == 100 + expected_delta
 
 
+def test_trust_v2_marks_invalid_family_without_hiding_valid_event(SessionLocal) -> None:
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01", trust_score=100)
+        invalid_family = _insert_event(
+            db,
+            "esp32_01",
+            "ABNORMAL_TOPIC",
+            incident_family="IDENTITY",
+        )
+        valid_event = _insert_event(
+            db,
+            "esp32_01",
+            "DEVICE_ID_MISMATCH",
+            incident_family="IDENTITY",
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            result = apply_trust_score_v2_until(
+                db,
+                cycle_range_start=CYCLE_START,
+                cycle_cutoff=CUTOFF,
+            )
+
+        assert result.changes[0].representative_event_ids == [valid_event]
+        assert result.changes[0].new_score == 75
+        rows = db.execute(
+            text(
+                """
+                SELECT id, processing_reason, applied_to_score
+                FROM detection_events
+                ORDER BY id
+                """
+            )
+        ).mappings().all()
+        reasons = {row["id"]: row["processing_reason"] for row in rows}
+        applied = {row["id"]: row["applied_to_score"] for row in rows}
+        assert reasons[invalid_family] == PROCESSING_INVALID_INCIDENT_FAMILY
+        assert reasons[valid_event] == PROCESSING_APPLIED
+        assert applied[invalid_family] == 0
+        assert applied[valid_event] == 1
+
+
+def test_trust_v2_marks_unknown_event_type_without_hiding_valid_event(
+    SessionLocal,
+) -> None:
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01", trust_score=100)
+        unknown_event = _insert_event(db, "esp32_01", "UNREGISTERED_EVENT")
+        valid_event = _insert_event(
+            db,
+            "esp32_01",
+            "ABNORMAL_TOPIC",
+            incident_family="MESSAGE_POLICY",
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            result = apply_trust_score_v2_until(
+                db,
+                cycle_range_start=CYCLE_START,
+                cycle_cutoff=CUTOFF,
+            )
+
+        assert result.changes[0].representative_event_ids == [valid_event]
+        assert result.changes[0].new_score == 80
+        rows = db.execute(
+            text(
+                """
+                SELECT id, processing_reason, applied_to_score
+                FROM detection_events
+                ORDER BY id
+                """
+            )
+        ).mappings().all()
+        reasons = {row["id"]: row["processing_reason"] for row in rows}
+        applied = {row["id"]: row["applied_to_score"] for row in rows}
+        assert reasons[unknown_event] == PROCESSING_UNMAPPED_EVENT_TYPE
+        assert reasons[valid_event] == PROCESSING_APPLIED
+        assert applied[unknown_event] == 0
+        assert applied[valid_event] == 1
+
+
 def test_trust_v2_representative_tie_break_uses_penalty_severity_time_and_id(
     SessionLocal,
 ) -> None:
@@ -287,10 +374,12 @@ def test_trust_v2_representative_tie_break_uses_penalty_severity_time_and_id(
         assert same_time_larger_id not in representative_ids
 
 
-def test_trust_v2_marks_late_and_legacy_events_without_scoring(SessionLocal) -> None:
+def test_trust_v2_marks_past_window_events_as_late_without_legacy_inference(
+    SessionLocal,
+) -> None:
     with SessionLocal() as db:
         _insert_device(db, "esp32_01", trust_score=100)
-        legacy_event = _insert_event(
+        detected_before_range = _insert_event(
             db,
             "esp32_01",
             "DEVICE_ID_MISMATCH",
@@ -331,10 +420,10 @@ def test_trust_v2_marks_late_and_legacy_events_without_scoring(SessionLocal) -> 
         ).mappings().all()
         reasons = {row["id"]: row["processing_reason"] for row in events}
         applied = {row["id"]: row["applied_to_score"] for row in events}
-        assert reasons[legacy_event] == PROCESSING_LEGACY_MIGRATION
+        assert reasons[detected_before_range] == PROCESSING_LATE_EVENT
         assert reasons[late_event] == PROCESSING_LATE_EVENT
         assert reasons[current_event] == PROCESSING_APPLIED
-        assert applied[legacy_event] == 0
+        assert applied[detected_before_range] == 0
         assert applied[late_event] == 0
         assert applied[current_event] == 1
         checkpoint = db.execute(
@@ -349,6 +438,102 @@ def test_trust_v2_marks_late_and_legacy_events_without_scoring(SessionLocal) -> 
         ).mappings().one()
         assert checkpoint["last_processed_id"] == current_event
         assert checkpoint["last_completed_window_end"] == "2026-07-23T10:00:10Z"
+
+
+def test_trust_v2_keeps_explicit_legacy_migration_marker_without_scoring(
+    SessionLocal,
+) -> None:
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01", trust_score=100)
+        legacy_event = _insert_event(
+            db,
+            "esp32_01",
+            PROCESSING_LEGACY_MIGRATION,
+            analysis_window_start="2026-07-23T09:59:50Z",
+            analysis_window_end="2026-07-23T10:00:00Z",
+            detected_at="2026-07-23T09:59:59Z",
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            result = apply_trust_score_v2_until(
+                db,
+                cycle_range_start=CYCLE_START,
+                cycle_cutoff=CUTOFF,
+            )
+
+        assert result.processed_event_count == 1
+        assert result.created_history_count == 0
+        row = db.execute(
+            text(
+                """
+                SELECT processing_reason, applied_to_score
+                FROM detection_events
+                WHERE id = :id
+                """
+            ),
+            {"id": legacy_event},
+        ).mappings().one()
+        assert row["processing_reason"] == PROCESSING_LEGACY_MIGRATION
+        assert row["applied_to_score"] == 0
+
+
+def test_trust_v2_does_not_permanently_skip_lower_id_future_window_event(
+    SessionLocal,
+) -> None:
+    next_cycle_start = CUTOFF
+    next_cycle_cutoff = datetime(2026, 7, 23, 10, 0, 20, tzinfo=timezone.utc)
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01", trust_score=100)
+        future_event = _insert_event(
+            db,
+            "esp32_01",
+            "DEVICE_ID_MISMATCH",
+            event_id=10,
+            incident_family="IDENTITY",
+            analysis_window_start="2026-07-23T10:00:10Z",
+            analysis_window_end="2026-07-23T10:00:20Z",
+            detected_at="2026-07-23T10:00:11Z",
+        )
+        current_event = _insert_event(
+            db,
+            "esp32_01",
+            "ABNORMAL_TOPIC",
+            event_id=11,
+            incident_family="MESSAGE_POLICY",
+            analysis_window_start=WINDOW_START,
+            analysis_window_end=WINDOW_END,
+            detected_at="2026-07-23T10:00:09Z",
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            first = apply_trust_score_v2_until(
+                db,
+                cycle_range_start=CYCLE_START,
+                cycle_cutoff=CUTOFF,
+            )
+
+        assert first.changes[0].representative_event_ids == [current_event]
+        assert db.execute(
+            text("SELECT processing_reason FROM detection_events WHERE id = :id"),
+            {"id": future_event},
+        ).scalar_one() is None
+        db.rollback()
+
+        with db.begin():
+            second = apply_trust_score_v2_until(
+                db,
+                cycle_range_start=next_cycle_start,
+                cycle_cutoff=next_cycle_cutoff,
+            )
+
+        assert second.changes[0].representative_event_ids == [future_event]
+        assert db.execute(
+            text("SELECT trust_score FROM devices WHERE device_id = 'esp32_01'")
+        ).scalar_one() == 55
 
 
 def test_trust_v2_isolates_below_30_and_creates_firewall_pending(SessionLocal) -> None:
@@ -589,6 +774,7 @@ def _insert_event(
     device_id: str,
     event_type: str,
     *,
+    event_id: int | None = None,
     detector_type: str = "RULE",
     incident_family: str | None = None,
     severity: str = "high",
@@ -600,6 +786,7 @@ def _insert_event(
         text(
             """
             INSERT INTO detection_events (
+                id,
                 device_id,
                 detector_type,
                 event_type,
@@ -614,6 +801,7 @@ def _insert_event(
                 policy_version
             )
             VALUES (
+                :id,
                 :device_id,
                 :detector_type,
                 :event_type,
@@ -630,6 +818,7 @@ def _insert_event(
             """
         ),
         {
+            "id": event_id,
             "device_id": device_id,
             "detector_type": detector_type,
             "event_type": event_type,

@@ -11,16 +11,15 @@ The existing MVP `edge.trust.trust_score_service` remains for backward compatibi
 Candidate events:
 
 - `processed_at IS NULL`
-- `id` is after the `trust_score_v2+detection_events` checkpoint
 - `analysis_window_end <= cycle_cutoff` when analysis window metadata exists
 - legacy rows without analysis windows may fall back to `detected_at < cycle_cutoff`
 
 Events before the current cycle range are processed without score changes:
 
-- `LEGACY_MIGRATION`: previous cutover/legacy events detected before `cycle_range_start`
-- `LATE_EVENT`: late-arriving events whose analysis window is already before the current cycle range
+- `LEGACY_MIGRATION`: events explicitly marked by the cutover process
+- `LATE_EVENT`: cutover-after events whose analysis window is already before the current cycle range
 
-Both cases still set `processed_at` and allow the `trust_score_v2+detection_events` checkpoint to advance.
+Trust Score v2 does not infer legacy status only because `detected_at < cycle_range_start`. Both cases still set `processed_at`. Candidate lookup is based on `processed_at` and window boundaries so a lower-ID future-window event cannot be permanently skipped by a higher-ID current-window event. `last_processed_id` remains a summary watermark, not the only eligibility filter.
 
 The function does not commit or rollback. The caller owns the transaction.
 
@@ -43,6 +42,12 @@ Phase 4 uses the common mapping in `edge.trust.trust_policy`.
 | `PORT_SCAN` | `SCAN` | -20 |
 | `AI_ANOMALY` | `AI_ONLY` | -15 |
 | `AI_PACKET_ANOMALY` | `AI_ONLY` | -15 |
+
+`NON_MQTT_TRAFFIC` is reserved in policy for cross-phase compatibility. It is not activated as a required Phase 4 rule until the packet evidence contract includes destination-port basis.
+
+Detection Event Writer stores the common mapping value. If a caller passes a different `incident_family`, the writer fails. Trust Score v2 also validates stored rows against the common mapping; invalid injected rows are marked as `INVALID_INCIDENT_FAMILY` and are not scored.
+
+Unknown event types are distinct from explicit zero-score events such as `UNKNOWN_DEVICE`. Unknown types are marked as `UNMAPPED_EVENT_TYPE` and cannot be hidden as `NOT_REPRESENTATIVE` by another normal event in the same window.
 
 ## Incident Family and Representative Events
 

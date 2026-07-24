@@ -259,6 +259,7 @@ def produce_mqtt_features_until(
     source_rows = _fetch_mqtt_sources_after_checkpoint(
         db,
         last_processed_id=last_processed_before,
+        completed_before=completed_before,
         cutoff=cutoff,
     )
 
@@ -333,6 +334,7 @@ def _fetch_mqtt_sources_after_checkpoint(
     db: Session,
     *,
     last_processed_id: int | None,
+    completed_before: datetime | None,
     cutoff: datetime,
 ) -> list[dict[str, Any]]:
     rows = db.execute(
@@ -347,13 +349,25 @@ def _fetch_mqtt_sources_after_checkpoint(
                 is_json_valid,
                 is_topic_valid
             FROM mqtt_logs
-            WHERE (:last_processed_id IS NULL OR id > :last_processed_id)
+            WHERE (
+                  :last_processed_id IS NULL
+                  OR id > :last_processed_id
+                  OR (
+                      :completed_before IS NOT NULL
+                      AND unixepoch(received_at) >= unixepoch(:completed_before)
+                  )
+              )
               AND unixepoch(received_at) < unixepoch(:cutoff)
             ORDER BY id ASC
             """
         ),
         {
             "last_processed_id": last_processed_id,
+            "completed_before": (
+                format_db_utc(completed_before)
+                if completed_before is not None
+                else None
+            ),
             "cutoff": format_db_utc(cutoff),
         },
     ).mappings()

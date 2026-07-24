@@ -20,7 +20,11 @@ from edge.detection.rule_detector import (
     RULE_EVENT_TYPES,
     UNKNOWN_DEVICE,
 )
-from edge.trust.trust_policy import incident_family_for_event, score_delta_for_event
+from edge.trust.trust_policy import (
+    require_incident_family_for_event,
+    require_score_delta_for_event,
+    score_delta_for_event,
+)
 
 # feature 기반 이벤트 (feature_log_id 기준)
 _FEATURE_BASED_EVENTS = {
@@ -105,8 +109,13 @@ def write_detection_event(
         policy_version=policy_version,
     )
     evidence_json = _serialize_evidence(evidence)
-    delta = score_delta_for_event(event_type) if score_delta is None else score_delta
-    family = incident_family if incident_family is not None else incident_family_for_event(event_type)
+    expected_family = require_incident_family_for_event(event_type)
+    if incident_family is not None and incident_family != expected_family:
+        raise ValueError(
+            f"incident_family must match event_type policy: "
+            f"{event_type} -> {expected_family}"
+        )
+    delta = require_score_delta_for_event(event_type) if score_delta is None else score_delta
 
     try:
         result = db.execute(
@@ -176,7 +185,7 @@ def write_detection_event(
                 "detected_at": format_db_utc(detected_at),
                 "analysis_window_start": format_db_utc(analysis_window_start),
                 "analysis_window_end": format_db_utc(analysis_window_end),
-                "incident_family": family,
+                "incident_family": expected_family,
                 "subject_ip": subject_ip,
                 "evidence_json": evidence_json,
                 "evidence_schema_version": evidence_schema_version,
