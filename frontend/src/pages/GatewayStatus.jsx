@@ -1,12 +1,22 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
+
 import {
   getGatewayMetrics,
 } from "../api/api";
+
+import EmptyState from "../components/EmptyState";
+import ErrorState from "../components/ErrorState";
+import LoadingState from "../components/LoadingState";
+import MetricCard from "../components/MetricCard";
+import PageHeader from "../components/PageHeader";
+import StatusBadge from "../components/StatusBadge";
+import SummaryCard from "../components/SummaryCard";
 
 const COLLECTION_INTERVAL_SECONDS = 10;
 const ONLINE_THRESHOLD_MULTIPLIER = 3;
@@ -35,16 +45,19 @@ function formatKST(dateString) {
     return "-";
   }
 
-  return new Intl.DateTimeFormat("ko-KR", {
-    timeZone: "Asia/Seoul",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).format(date);
+  return new Intl.DateTimeFormat(
+    "ko-KR",
+    {
+      timeZone: "Asia/Seoul",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }
+  ).format(date);
 }
 
 function formatMetric(
@@ -66,34 +79,101 @@ function formatMetric(
     return "측정 불가";
   }
 
-  return `${number.toLocaleString("ko-KR", {
-    maximumFractionDigits,
-  })}${unit}`;
+  return `${number.toLocaleString(
+    "ko-KR",
+    {
+      maximumFractionDigits,
+    }
+  )}${unit}`;
 }
 
-function getProgressValue(value) {
+function formatInteger(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ""
+  ) {
+    return "측정 불가";
+  }
+
   const number = Number(value);
 
   if (!Number.isFinite(number)) {
-    return 0;
+    return "측정 불가";
   }
 
-  return Math.min(
-    Math.max(number, 0),
-    100
+  return number.toLocaleString(
+    "ko-KR",
+    {
+      maximumFractionDigits: 0,
+    }
   );
 }
 
-function getGatewayStatus(collectedAt) {
+function formatElapsedTime(dateString) {
+  if (!dateString) {
+    return "-";
+  }
+
+  const timestamp =
+    new Date(dateString).getTime();
+
+  if (Number.isNaN(timestamp)) {
+    return "-";
+  }
+
+  const elapsedSeconds =
+    Math.max(
+      0,
+      Math.floor(
+        (Date.now() - timestamp) /
+          1_000
+      )
+    );
+
+  if (elapsedSeconds < 60) {
+    return `${elapsedSeconds}초 전`;
+  }
+
+  const elapsedMinutes =
+    Math.floor(
+      elapsedSeconds / 60
+    );
+
+  if (elapsedMinutes < 60) {
+    return `${elapsedMinutes}분 전`;
+  }
+
+  const elapsedHours =
+    Math.floor(
+      elapsedMinutes / 60
+    );
+
+  return `${elapsedHours}시간 전`;
+}
+
+function getGatewayStatus(
+  collectedAt,
+  hasMetric,
+  hasApiError
+) {
+  if (hasApiError && !hasMetric) {
+    return "API_ERROR";
+  }
+
+  if (!hasMetric) {
+    return "NO_DATA";
+  }
+
   if (!collectedAt) {
-    return "UNKNOWN";
+    return "STALE";
   }
 
   const collectedTime =
     new Date(collectedAt).getTime();
 
   if (Number.isNaN(collectedTime)) {
-    return "UNKNOWN";
+    return "STALE";
   }
 
   const elapsedSeconds =
@@ -106,53 +186,210 @@ function getGatewayStatus(collectedAt) {
     : "STALE";
 }
 
+function getGatewayStatusDescription(
+  gatewayStatus
+) {
+  const descriptions = {
+    ONLINE:
+      "최근 수집 주기 내에 Gateway Metric이 정상적으로 수신되었습니다.",
+
+    STALE:
+      "마지막 Metric 수집 이후 허용 시간이 지났습니다.",
+
+    NO_DATA:
+      "API 요청은 성공했지만 저장된 Gateway Metric이 없습니다.",
+
+    API_ERROR:
+      "Gateway Metric API에 연결할 수 없습니다.",
+  };
+
+  return (
+    descriptions[gatewayStatus] ||
+    "Gateway 상태를 확인할 수 없습니다."
+  );
+}
+
+function getGatewayStatusTheme(
+  gatewayStatus
+) {
+  const themes = {
+    ONLINE: "normal",
+    STALE: "warning",
+    NO_DATA: "unknown",
+    API_ERROR: "danger",
+  };
+
+  return (
+    themes[gatewayStatus] ||
+    "unknown"
+  );
+}
+
+function getResourceStatus(value) {
+  const number = Number(value);
+
+  if (!Number.isFinite(number)) {
+    return "unknown";
+  }
+
+  if (number >= 90) {
+    return "danger";
+  }
+
+  if (number >= 75) {
+    return "warning";
+  }
+
+  return "normal";
+}
+
+function getTemperatureStatus(value) {
+  const number = Number(value);
+
+  if (!Number.isFinite(number)) {
+    return "unknown";
+  }
+
+  if (number >= 80) {
+    return "danger";
+  }
+
+  if (number >= 65) {
+    return "warning";
+  }
+
+  return "normal";
+}
+
 function getInterfaceStatus(
   interfaceData
 ) {
-  if (!interfaceData?.exists) {
+  if (!interfaceData) {
     return {
-      text: "미인식",
-      className: "unknown",
+      status: "missing",
+      label: "미인식",
+      description:
+        "Interface 정보가 응답에 없습니다.",
     };
   }
 
-  if (!interfaceData.is_up) {
+  if (interfaceData.exists === false) {
     return {
-      text: "연결 끊김",
-      className: "stale",
+      status: "missing",
+      label: "미인식",
+      description:
+        "운영체제에서 Interface를 찾지 못했습니다.",
+    };
+  }
+
+  if (
+    interfaceData.exists === true &&
+    interfaceData.is_up === false
+  ) {
+    return {
+      status: "down",
+      label: "DOWN",
+      description:
+        "Interface는 존재하지만 비활성 상태입니다.",
+    };
+  }
+
+  if (
+    interfaceData.exists === true &&
+    interfaceData.is_up === true
+  ) {
+    return {
+      status: "connected",
+      label: "연결됨",
+      description:
+        "Interface가 정상적으로 활성화되어 있습니다.",
     };
   }
 
   return {
-    text: "연결됨",
-    className: "online",
+    status: "unknown",
+    label: "상태 미확인",
+    description:
+      "Interface 상태 필드가 충분하지 않습니다.",
   };
+}
+
+function getInterfaceRate(
+  interfaceData,
+  primaryKey,
+  legacyKey
+) {
+  return (
+    interfaceData?.[primaryKey] ??
+    interfaceData?.[legacyKey] ??
+    null
+  );
 }
 
 function InterfaceCard({
   title,
+  description,
   interfaceData,
 }) {
-  const status =
-    getInterfaceStatus(interfaceData);
+  const interfaceStatus =
+    getInterfaceStatus(
+      interfaceData
+    );
+
+  const rxRate =
+    getInterfaceRate(
+      interfaceData,
+      "rx_bytes_per_second",
+      "rx_bytes_per_sec"
+    );
+
+  const txRate =
+    getInterfaceRate(
+      interfaceData,
+      "tx_bytes_per_second",
+      "tx_bytes_per_sec"
+    );
 
   return (
-    <div className="interface-card">
-      <div className="interface-header">
-        <div>
-          <h3>{title}</h3>
+    <article
+      className={[
+        "interface-card",
+        `interface-card-${interfaceStatus.status}`,
+      ].join(" ")}
+    >
+      <header className="interface-header">
+        <div className="interface-title-area">
+          <div className="interface-title-row">
+            <h3>{title}</h3>
 
-          <p>
-            {interfaceData?.interface_name ||
-              "인터페이스 없음"}
-          </p>
+            <StatusBadge
+              status={
+                interfaceStatus.status
+              }
+              label={
+                interfaceStatus.label
+              }
+              size="small"
+            />
+          </div>
+
+          {description && (
+            <p className="interface-description">
+              {description}
+            </p>
+          )}
         </div>
+      </header>
 
-        <span
-          className={`status-badge ${status.className}`}
-        >
-          {status.text}
+      <div className="interface-name-row">
+        <span>
+          Interface
         </span>
+
+        <strong>
+          {interfaceData?.interface_name ||
+            "미할당"}
+        </strong>
       </div>
 
       <div className="interface-detail-grid">
@@ -192,9 +429,16 @@ function InterfaceCard({
         <div className="metric-item">
           <span>RX 전송률</span>
 
-          <strong>
+          <strong
+            className={
+              rxRate === null ||
+              rxRate === undefined
+                ? "metric-unavailable"
+                : ""
+            }
+          >
             {formatMetric(
-              interfaceData?.rx_bytes_per_sec,
+              rxRate,
               " B/s"
             )}
           </strong>
@@ -203,24 +447,55 @@ function InterfaceCard({
         <div className="metric-item">
           <span>TX 전송률</span>
 
-          <strong>
+          <strong
+            className={
+              txRate === null ||
+              txRate === undefined
+                ? "metric-unavailable"
+                : ""
+            }
+          >
             {formatMetric(
-              interfaceData?.tx_bytes_per_sec,
+              txRate,
               " B/s"
             )}
           </strong>
         </div>
       </div>
-    </div>
+
+      <footer className="interface-footer">
+        <p>
+          {interfaceStatus.description}
+        </p>
+
+        {interfaceData?.exists === true &&
+          interfaceData?.is_up === true &&
+          (rxRate === null ||
+            rxRate === undefined ||
+            txRate === null ||
+            txRate === undefined) && (
+            <StatusBadge
+              status="degraded"
+              label="Rate 계산 불가"
+              size="small"
+              title="Interface는 활성화되어 있지만 전송률을 계산할 수 없습니다."
+            />
+          )}
+      </footer>
+    </article>
   );
 }
 
 export default function GatewayStatus() {
-  const [latestMetric, setLatestMetric] =
-    useState(null);
+  const [
+    latestMetric,
+    setLatestMetric,
+  ] = useState(null);
 
-  const [gatewayStatus, setGatewayStatus] =
-    useState("UNKNOWN");
+  const [
+    gatewayStatus,
+    setGatewayStatus,
+  ] = useState("NO_DATA");
 
   const [loading, setLoading] =
     useState(true);
@@ -233,6 +508,11 @@ export default function GatewayStatus() {
 
   const [pollWarning, setPollWarning] =
     useState("");
+
+  const [
+    lastSuccessfulFetchAt,
+    setLastSuccessfulFetchAt,
+  ] = useState("");
 
   const isFetchingRef =
     useRef(false);
@@ -257,7 +537,10 @@ export default function GatewayStatus() {
 
         try {
           const data =
-            await getGatewayMetrics();
+            await getGatewayMetrics({
+              limit: 1,
+              offset: 0,
+            });
 
           const metric =
             Array.isArray(data?.items)
@@ -266,13 +549,12 @@ export default function GatewayStatus() {
 
           setLatestMetric(metric);
 
-          /*
-           * items가 비어 있어도 API 요청 자체가
-           * 성공했다면 이후 Polling 실패 시
-           * 최초 오류 화면으로 돌아가지 않습니다.
-           */
           hasSuccessfulResponseRef.current =
             true;
+
+          setLastSuccessfulFetchAt(
+            new Date().toISOString()
+          );
 
           setError("");
           setPollWarning("");
@@ -329,7 +611,11 @@ export default function GatewayStatus() {
   useEffect(() => {
     function updateGatewayStatus() {
       setGatewayStatus(
-        getGatewayStatus(collectedAt)
+        getGatewayStatus(
+          collectedAt,
+          Boolean(latestMetric),
+          Boolean(error)
+        )
       );
     }
 
@@ -346,298 +632,463 @@ export default function GatewayStatus() {
         statusTimer
       );
     };
-  }, [collectedAt]);
+  }, [
+    collectedAt,
+    latestMetric,
+    error,
+  ]);
 
   const interfaces =
     latestMetric?.interface_metrics ??
     {};
 
   const internalLan =
-    interfaces.internal_lan ?? null;
+    interfaces.internal_lan ??
+    interfaces.eth0 ??
+    null;
+
+  const wirelessLan =
+    interfaces.wireless_lan ??
+    interfaces.wlan0 ??
+    null;
 
   const usbLan =
-    interfaces.usb_lan ?? null;
+    interfaces.usb_lan ??
+    interfaces.eth1 ??
+    null;
+
+  const interfaceList =
+    useMemo(
+      () => [
+        {
+          key: "internal_lan",
+          title: "내부 LAN",
+          description:
+            "IoT 내부 네트워크와 연결되는 기본 Interface입니다.",
+          data: internalLan,
+        },
+        {
+          key: "wireless_lan",
+          title: "Wireless LAN",
+          description:
+            "무선 연결 상태를 확인합니다.",
+          data: wirelessLan,
+        },
+        {
+          key: "usb_lan",
+          title: "USB LAN",
+          description:
+            "외부 또는 보조 네트워크와 연결되는 USB Interface입니다.",
+          data: usbLan,
+        },
+      ],
+      [
+        internalLan,
+        wirelessLan,
+        usbLan,
+      ]
+    );
+
+  const interfaceSummary =
+    useMemo(() => {
+      let connected = 0;
+      let down = 0;
+      let missing = 0;
+      let unknown = 0;
+
+      interfaceList.forEach(
+        ({ data }) => {
+          const status =
+            getInterfaceStatus(data)
+              .status;
+
+          if (status === "connected") {
+            connected += 1;
+          } else if (
+            status === "down"
+          ) {
+            down += 1;
+          } else if (
+            status === "missing"
+          ) {
+            missing += 1;
+          } else {
+            unknown += 1;
+          }
+        }
+      );
+
+      return {
+        connected,
+        down,
+        missing,
+        unknown,
+      };
+    }, [interfaceList]);
 
   function handleRefresh() {
     loadGatewayMetrics(true);
   }
 
-  let content;
-
-  if (
-    loading &&
-    !hasSuccessfulResponseRef.current
-  ) {
-    content = (
-      <section className="panel">
-        <p>
-          Gateway Metrics를 불러오는
-          중입니다.
-        </p>
-      </section>
+  const gatewayTheme =
+    getGatewayStatusTheme(
+      gatewayStatus
     );
-  } else if (
-    error &&
-    !hasSuccessfulResponseRef.current
-  ) {
-    content = (
-      <section className="panel">
-        <div className="error-box gateway-error-box">
-          <span>{error}</span>
 
-          <button
-            type="button"
-            onClick={() =>
-              loadGatewayMetrics(true)
-            }
-            disabled={refreshing}
-          >
-            {refreshing
-              ? "불러오는 중..."
-              : "다시 시도"}
-          </button>
-        </div>
-      </section>
-    );
-  } else if (!latestMetric) {
-    content = (
-      <section className="panel gateway-empty">
-        <span className="status-badge unknown">
-          UNKNOWN
-        </span>
+  return (
+    <div className="page-container">
+      <PageHeader
+        title="Gateway Status"
+        description="Raspberry Pi Gateway의 시스템 자원, 수집 상태, 네트워크 Interface 상태를 확인합니다."
+        updatedAt={
+          lastSuccessfulFetchAt
+            ? formatKST(
+                lastSuccessfulFetchAt
+              )
+            : undefined
+        }
+        onRefresh={handleRefresh}
+        refreshing={refreshing}
+      />
 
-        <h2>
-          수집된 Gateway Metrics가
-          없습니다.
-        </h2>
-
-        <p>
-          Gateway Metrics Collector가
-          실행 중인지 확인해주세요.
-        </p>
-      </section>
-    );
-  } else {
-    content = (
-      <>
-        <section className="panel gateway-overview">
+      {pollWarning && (
+        <div
+          className="page-warning-banner"
+          role="alert"
+        >
           <div>
-            <span className="section-label">
-              Gateway 상태
-            </span>
+            <strong>
+              최신 데이터 갱신 실패
+            </strong>
 
-            <div className="gateway-status-row">
-              <span
-                className={`status-badge ${gatewayStatus.toLowerCase()}`}
-              >
-                {gatewayStatus}
-              </span>
-
-              <span className="last-collected">
-                마지막 수집:{" "}
-                {formatKST(
-                  latestMetric.collected_at
-                )}
-              </span>
-            </div>
-
-            <p className="threshold-note">
-              수집 주기{" "}
-              {COLLECTION_INTERVAL_SECONDS}초 ×{" "}
-              {ONLINE_THRESHOLD_MULTIPLIER}배 ={" "}
-              {ONLINE_THRESHOLD_SECONDS}초 이내
-              수집되면 ONLINE으로 표시합니다.
+            <p>
+              {pollWarning}
+              {" "}
+              마지막으로 수신한
+              Gateway Metric을 계속
+              표시합니다.
             </p>
           </div>
 
-          <div className="sample-interval">
-            <span>실제 수집 간격</span>
+          <div className="page-warning-actions">
+            <span>
+              {POLLING_INTERVAL_MS /
+                1_000}
+              초마다 자동으로 다시
+              요청합니다.
+            </span>
 
-            <strong>
-              {formatMetric(
-                latestMetric.sample_interval_seconds,
-                "초"
-              )}
-            </strong>
+            <button
+              type="button"
+              className="button button-secondary"
+              onClick={handleRefresh}
+              disabled={refreshing}
+            >
+              지금 다시 시도
+            </button>
           </div>
-        </section>
-
-        <div className="gateway-resource-grid">
-          <div className="resource-card">
-            <span>CPU</span>
-
-            <strong>
-              {formatMetric(
-                latestMetric.cpu_percent,
-                "%"
-              )}
-            </strong>
-
-            <div className="progress-bar">
-              <div
-                className="progress-value"
-                style={{
-                  width: `${getProgressValue(
-                    latestMetric.cpu_percent
-                  )}%`,
-                }}
-              />
-            </div>
-          </div>
-
-          <div className="resource-card">
-            <span>Memory</span>
-
-            <strong>
-              {formatMetric(
-                latestMetric.memory_percent,
-                "%"
-              )}
-            </strong>
-
-            <div className="progress-bar">
-              <div
-                className="progress-value"
-                style={{
-                  width: `${getProgressValue(
-                    latestMetric.memory_percent
-                  )}%`,
-                }}
-              />
-            </div>
-          </div>
-
-          <div className="resource-card">
-            <span>Disk</span>
-
-            <strong>
-              {formatMetric(
-                latestMetric.disk_percent,
-                "%"
-              )}
-            </strong>
-
-            <small>
-              사용량:{" "}
-              {formatMetric(
-                latestMetric.disk_used_mb,
-                " MB"
-              )}
-            </small>
-
-            <div className="progress-bar">
-              <div
-                className="progress-value"
-                style={{
-                  width: `${getProgressValue(
-                    latestMetric.disk_percent
-                  )}%`,
-                }}
-              />
-            </div>
-          </div>
-
-          <div className="resource-card">
-            <span>온도</span>
-
-            <strong>
-              {formatMetric(
-                latestMetric.temperature_c,
-                "℃"
-              )}
-            </strong>
-
-            <small>
-              Raspberry Pi CPU Temperature
-            </small>
-          </div>
-        </div>
-
-        <section className="panel">
-          <div className="panel-header">
-            <div>
-              <h2>
-                Network Interface
-              </h2>
-
-              <p className="panel-description">
-                내부 LAN과 USB LAN을
-                독립적으로 표시합니다.
-              </p>
-            </div>
-          </div>
-
-          <div className="interface-grid">
-            <InterfaceCard
-              title="내부 LAN"
-              interfaceData={
-                internalLan
-              }
-            />
-
-            <InterfaceCard
-              title="USB LAN"
-              interfaceData={usbLan}
-            />
-          </div>
-        </section>
-      </>
-    );
-  }
-
-  return (
-    <div>
-      <div className="page-header">
-        <div>
-          <h1>Gateway Status</h1>
-
-          <p className="page-description">
-            Raspberry Pi Gateway의 시스템
-            자원과 네트워크 상태를
-            확인합니다.
-          </p>
-        </div>
-
-        <button
-          type="button"
-          className="refresh-button"
-          onClick={handleRefresh}
-          disabled={
-            loading || refreshing
-          }
-        >
-          {refreshing
-            ? "새로고침 중..."
-            : "새로고침"}
-        </button>
-      </div>
-
-      {pollWarning && (
-        <div className="warning-box gateway-poll-warning">
-          <span>
-            ⚠ 최신 데이터 갱신 실패:{" "}
-            {pollWarning}
-            {" "}(이전 데이터를 계속
-            표시합니다)
-          </span>
-
-          <span className="retry-indicator">
-            {refreshing
-              ? "재시도 중..."
-              : `${POLLING_INTERVAL_MS / 1000}초마다 자동 재시도합니다.`}
-          </span>
-
-          <button
-            type="button"
-            onClick={handleRefresh}
-            disabled={refreshing}
-          >
-            지금 다시 시도
-          </button>
         </div>
       )}
 
-      {content}
+      {loading &&
+      !hasSuccessfulResponseRef.current ? (
+        <LoadingState
+          title="Gateway Metrics를 불러오는 중입니다."
+          description="Raspberry Pi 시스템 상태와 Interface 정보를 확인하고 있습니다."
+        />
+      ) : error &&
+        !hasSuccessfulResponseRef.current ? (
+        <ErrorState
+          title="Gateway API에 연결할 수 없습니다."
+          message={error}
+          onRetry={handleRefresh}
+        />
+      ) : !latestMetric ? (
+        <>
+          <section className="summary-card-grid">
+            <SummaryCard
+              title="Gateway 상태"
+              value="NO DATA"
+              description="API 요청은 성공했지만 Metric이 없습니다."
+              status="unknown"
+            />
+          </section>
+
+          <EmptyState
+            title="수집된 Gateway Metrics가 없습니다."
+            description="Gateway Metrics Collector가 실행 중인지 확인하고, DB에 Metric이 저장되고 있는지 확인해 주세요."
+            actionLabel="다시 조회"
+            onAction={handleRefresh}
+          />
+        </>
+      ) : (
+        <>
+          <section
+            className="summary-card-grid"
+            aria-label="Gateway 상태 요약"
+          >
+            <SummaryCard
+              title="Gateway 상태"
+              value={gatewayStatus}
+              description={
+                getGatewayStatusDescription(
+                  gatewayStatus
+                )
+              }
+              status={gatewayTheme}
+              footer={
+                <StatusBadge
+                  status={
+                    gatewayStatus
+                  }
+                  size="small"
+                />
+              }
+            />
+
+            <SummaryCard
+              title="마지막 수집"
+              value={formatElapsedTime(
+                latestMetric.collected_at
+              )}
+              description={formatKST(
+                latestMetric.collected_at
+              )}
+              status={
+                gatewayStatus ===
+                "ONLINE"
+                  ? "normal"
+                  : "warning"
+              }
+            />
+
+            <SummaryCard
+              title="실제 수집 간격"
+              value={formatMetric(
+                latestMetric.sample_interval_seconds,
+                "초"
+              )}
+              description={`기준 수집 주기 ${COLLECTION_INTERVAL_SECONDS}초`}
+            />
+
+            <SummaryCard
+              title="연결된 Interface"
+              value={
+                interfaceSummary.connected
+              }
+              description={`DOWN ${interfaceSummary.down} · 미인식 ${interfaceSummary.missing}`}
+              status={
+                interfaceSummary.down > 0 ||
+                interfaceSummary.missing >
+                  0
+                  ? "warning"
+                  : "normal"
+              }
+            />
+          </section>
+
+          <section className="panel gateway-overview">
+            <div className="gateway-overview-main">
+              <span className="section-label">
+                수집 상태
+              </span>
+
+              <div className="gateway-status-row">
+                <StatusBadge
+                  status={gatewayStatus}
+                />
+
+                <span className="last-collected">
+                  마지막 수집:{" "}
+                  {formatKST(
+                    latestMetric.collected_at
+                  )}
+                </span>
+              </div>
+
+              <p className="threshold-note">
+                수집 주기{" "}
+                {
+                  COLLECTION_INTERVAL_SECONDS
+                }
+                초 ×{" "}
+                {
+                  ONLINE_THRESHOLD_MULTIPLIER
+                }
+                배인{" "}
+                {
+                  ONLINE_THRESHOLD_SECONDS
+                }
+                초 이내에 Metric이
+                수집되면 ONLINE으로
+                표시합니다.
+              </p>
+            </div>
+
+            <div className="gateway-overview-detail">
+              <div>
+                <span>
+                  Metric ID
+                </span>
+
+                <strong>
+                  {formatInteger(
+                    latestMetric.id
+                  )}
+                </strong>
+              </div>
+
+              <div>
+                <span>
+                  마지막 API 성공
+                </span>
+
+                <strong>
+                  {formatKST(
+                    lastSuccessfulFetchAt
+                  )}
+                </strong>
+              </div>
+            </div>
+          </section>
+
+          <section>
+            <div className="section-heading">
+              <div>
+                <h2>
+                  시스템 자원
+                </h2>
+
+                <p>
+                  Raspberry Pi의 현재
+                  CPU, Memory, Disk,
+                  Temperature 사용
+                  상태입니다.
+                </p>
+              </div>
+            </div>
+
+            <div className="metric-card-grid">
+              <MetricCard
+                label="CPU"
+                value={
+                  latestMetric.cpu_percent
+                }
+                unit="%"
+                percentage={
+                  latestMetric.cpu_percent
+                }
+                status={getResourceStatus(
+                  latestMetric.cpu_percent
+                )}
+                description="현재 CPU 사용률"
+              />
+
+              <MetricCard
+                label="Memory"
+                value={
+                  latestMetric.memory_percent
+                }
+                unit="%"
+                percentage={
+                  latestMetric.memory_percent
+                }
+                status={getResourceStatus(
+                  latestMetric.memory_percent
+                )}
+                description="현재 Memory 사용률"
+              />
+
+              <MetricCard
+                label="Disk"
+                value={
+                  latestMetric.disk_percent
+                }
+                unit="%"
+                percentage={
+                  latestMetric.disk_percent
+                }
+                status={getResourceStatus(
+                  latestMetric.disk_percent
+                )}
+                description={`사용량 ${formatMetric(
+                  latestMetric.disk_used_mb,
+                  " MB"
+                )}`}
+              />
+
+              <MetricCard
+                label="Temperature"
+                value={
+                  latestMetric.temperature_c
+                }
+                unit="℃"
+                status={getTemperatureStatus(
+                  latestMetric.temperature_c
+                )}
+                description="Raspberry Pi CPU 온도"
+              />
+            </div>
+          </section>
+
+          <section className="panel">
+            <div className="panel-header">
+              <div>
+                <h2>
+                  Network Interface
+                </h2>
+
+                <p className="panel-description">
+                  Interface 미인식과
+                  Interface DOWN 상태를
+                  구분해서 표시합니다.
+                </p>
+              </div>
+
+              <div className="interface-summary-badges">
+                <StatusBadge
+                  status="connected"
+                  label={`연결 ${interfaceSummary.connected}`}
+                  size="small"
+                />
+
+                <StatusBadge
+                  status="down"
+                  label={`DOWN ${interfaceSummary.down}`}
+                  size="small"
+                />
+
+                <StatusBadge
+                  status="missing"
+                  label={`미인식 ${interfaceSummary.missing}`}
+                  size="small"
+                />
+              </div>
+            </div>
+
+            <div className="interface-grid">
+              {interfaceList.map(
+                (interfaceItem) => (
+                  <InterfaceCard
+                    key={
+                      interfaceItem.key
+                    }
+                    title={
+                      interfaceItem.title
+                    }
+                    description={
+                      interfaceItem.description
+                    }
+                    interfaceData={
+                      interfaceItem.data
+                    }
+                  />
+                )
+              )}
+            </div>
+          </section>
+        </>
+      )}
     </div>
   );
 }
