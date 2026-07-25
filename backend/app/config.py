@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     mqtt_feature_builder_interval_seconds: float = 5.0
     mqtt_feature_builder_lock_path: str = ""
 
+    # Detection Orchestrator
+    orchestrator_interval_seconds: float = 5.0
+    orchestrator_enabled_stages: str = "mqtt_feature_rule,mqtt_message_rule"
+    orchestrator_required_stages: str = "mqtt_feature_rule,mqtt_message_rule"
+    orchestrator_lock_path: str = ""
+
     # Gateway Metrics
     gateway_metrics_interval_seconds: float = 10.0
     internal_lan_interface: str = "eth0"
