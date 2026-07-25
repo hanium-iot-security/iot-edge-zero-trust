@@ -10,6 +10,7 @@ import argparse
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 import logging
+from pathlib import Path
 import signal
 from threading import Event
 import time
@@ -18,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.config import Settings, settings
 from backend.app.database import SessionLocal
+from edge.runtime_lock import RuntimeLockError, resolve_lock_path, single_instance_lock
 from edge.trust import firewall_repository
 from edge.trust.firewall_worker import (
     FirewallPolicy,
@@ -93,6 +95,17 @@ def _now() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
 
 
+def firewall_lock_path(app_settings: Settings = settings) -> Path:
+    """DB 상태와 실제 iptables를 함께 바꾸는 작업이 공유하는 Lock 경로입니다."""
+    if app_settings.firewall_lock_path.strip():
+        return Path(app_settings.firewall_lock_path.strip())
+    return resolve_lock_path(
+        app_settings.database_url,
+        suffix=".firewall.lock",
+        fallback="data/firewall-worker.lock",
+    )
+
+
 def run_worker_cycle(
     db: Session,
     *,
@@ -135,24 +148,41 @@ def run_worker_loop(
     session_factory: Callable[[], Session] = SessionLocal,
     max_cycles: int | None = None,
     clock: Callable[[], datetime] = _now,
+    lock_path: Path | None = None,
+    lock_wait_seconds: float = 1.0,
 ) -> int:
     """종료 Signal까지 Cycle을 반복합니다.
 
     Reconciliation은 첫 Cycle에서 한 번 수행합니다. 재부팅 직후 실제 Rule이 사라진
     상태를 가장 먼저 확인해야 하기 때문입니다.
+
+    Lock은 Cycle 단위로 잡고 Cycle 사이에는 놓습니다. 프로세스 전체를 잠그면 상시
+    서비스가 실행되는 동안 관리자 명령(`--release` 등)을 아예 실행할 수 없습니다.
+    관리자 명령이 Lock을 쥔 Cycle은 건너뛰고 다음 Cycle에서 재개합니다.
     """
     if max_cycles is not None and max_cycles <= 0:
         raise ValueError("max_cycles must be positive")
 
+    path = lock_path if lock_path is not None else firewall_lock_path()
     completed = 0
+    reconciled = False
     while not shutdown.requested:
-        with session_factory() as db:
-            run_worker_cycle(
-                db,
-                runner=runner,
-                policy=policy,
-                now=clock(),
-                with_reconcile=(completed == 0),
+        try:
+            with single_instance_lock(path, wait_seconds=lock_wait_seconds):
+                with session_factory() as db:
+                    run_worker_cycle(
+                        db,
+                        runner=runner,
+                        policy=policy,
+                        now=clock(),
+                        with_reconcile=not reconciled,
+                    )
+                # Lock 경쟁으로 건너뛴 Cycle은 Reconciliation을 수행하지 않았으므로
+                # 실제로 실행된 Cycle에서만 완료로 표시한다.
+                reconciled = True
+        except RuntimeLockError:
+            logger.info(
+                "Cycle skipped: another firewall command holds the lock (%s)", path
             )
 
         completed += 1
@@ -221,19 +251,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         else settings.firewall_worker_interval_seconds
     )
 
+    lock_path = firewall_lock_path()
+    lock_wait = settings.firewall_lock_wait_seconds
+
+    # DB 상태와 실제 iptables를 함께 바꾸는 명령은 모두 같은 Lock을 거친다. 상시
+    # 서비스와 동시에 실행되면 중복 DROP Rule 생성이나 "해제 직후 Reconciliation이
+    # 되살리는" 경합이 생긴다. --dry-run과 --status는 상태를 바꾸지 않으므로 제외한다.
     if args.admin_reset_failed is not None:
         if args.confirm != ADMIN_CONFIRM_TOKEN:
             logger.error("관리자 명령에는 --confirm %s 가 필요합니다", ADMIN_CONFIRM_TOKEN)
             return 2
-        with SessionLocal() as db:
-            try:
-                firewall_repository.reset_failed_to_pending(
-                    db, rule_id=args.admin_reset_failed, requested_at=_now()
-                )
-                db.commit()
-            except Exception:
-                db.rollback()
-                raise
+        try:
+            with single_instance_lock(lock_path, wait_seconds=lock_wait):
+                with SessionLocal() as db:
+                    try:
+                        firewall_repository.reset_failed_to_pending(
+                            db, rule_id=args.admin_reset_failed, requested_at=_now()
+                        )
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+                        raise
+        except RuntimeLockError as exc:
+            logger.error("Lock 획득 실패: %s", exc)
+            return 3
         logger.warning(
             "FAILED firewall rule reset to PENDING by admin (rule_id=%s)",
             args.admin_reset_failed,
@@ -254,34 +295,48 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.release is not None:
-        with SessionLocal() as db:
-            try:
-                release_rule(
-                    db,
-                    rule_id=args.release,
-                    runner=runner,
-                    policy=policy,
-                    now=_now(),
-                )
-            except FirewallValidationError as exc:
-                logger.error("Rule 해제 실패: %s", exc)
-                return 2
+        try:
+            with single_instance_lock(lock_path, wait_seconds=lock_wait):
+                with SessionLocal() as db:
+                    release_rule(
+                        db,
+                        rule_id=args.release,
+                        runner=runner,
+                        policy=policy,
+                        now=_now(),
+                    )
+        except FirewallValidationError as exc:
+            logger.error("Rule 해제 실패: %s", exc)
+            return 2
+        except RuntimeLockError as exc:
+            logger.error("Lock 획득 실패: %s", exc)
+            return 3
         return 0
 
     if args.reconcile_only:
-        with SessionLocal() as db:
-            reconcile(db, runner=runner, policy=policy, now=_now())
+        try:
+            with single_instance_lock(lock_path, wait_seconds=lock_wait):
+                with SessionLocal() as db:
+                    reconcile(db, runner=runner, policy=policy, now=_now())
+        except RuntimeLockError as exc:
+            logger.error("Lock 획득 실패: %s", exc)
+            return 3
         return 0
 
     if args.once:
-        with SessionLocal() as db:
-            run_worker_cycle(
-                db,
-                runner=runner,
-                policy=policy,
-                now=_now(),
-                with_reconcile=True,
-            )
+        try:
+            with single_instance_lock(lock_path, wait_seconds=lock_wait):
+                with SessionLocal() as db:
+                    run_worker_cycle(
+                        db,
+                        runner=runner,
+                        policy=policy,
+                        now=_now(),
+                        with_reconcile=True,
+                    )
+        except RuntimeLockError as exc:
+            logger.error("Lock 획득 실패: %s", exc)
+            return 3
         return 0
 
     shutdown = GracefulShutdown()

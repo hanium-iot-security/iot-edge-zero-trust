@@ -95,12 +95,35 @@ sqlite3 backend/data/iot_security.db \
   "SELECT id, device_id, source_ip, status, retry_count, applied_at, last_error
      FROM firewall_rules ORDER BY id DESC LIMIT 5;"
 
-# 5) 실제 차단 확인 (해당 Device에서 MQTT Publish 실패해야 함)
-mosquitto_pub -h 192.168.0.20 -t iot/esp32_02/sensor -m '{"device_id":"esp32_02"}'
+# 5) Rule이 INPUT Chain 맨 앞에 있는지 확인 (선행 ACCEPT보다 앞이어야 함)
+sudo iptables -L INPUT -n --line-numbers | head -5
 ```
 
-기대 결과: `hanium-firewall:{id}` Comment가 붙은 Rule 1건, DB `status=APPLIED`,
-해당 Device의 MQTT 연결·Publish 실패.
+**실제 차단 확인은 반드시 차단 대상 Device 자신에서 해야 합니다.**
+
+Pi에서 `mosquitto_pub`을 실행하면 Source IP가 Pi(=Protected IP)이므로 차단 대상이
+아니고, 검증이 되지 않습니다. 세부계획도 Payload의 `device_id`만 바꾼 결과는 등록
+Device 격리 증거로 인정하지 않습니다.
+
+올바른 검증 방법 두 가지:
+
+```bash
+# (A) 실제 ESP32 #2에서 확인 — 공식 E2E 방식
+#     ESP32 #2를 공격 Test Mode로 실행한 뒤 Serial 로그에서 MQTT 연결·Publish 실패 확인
+#     (firmware/esp32/ 참고)
+
+# (B) 임시 확인 — 차단 대상 IP를 가진 장비에서 직접 실행
+#     예: esp32_02와 같은 192.168.0.5를 쓰는 장비에서
+mosquitto_pub -h 192.168.0.20 -t iot/esp32_02/sensor -m '{"device_id":"esp32_02"}'
+# → 연결 Timeout 또는 Publish 실패가 나와야 정상
+```
+
+기대 결과: `hanium-firewall:{id}` Comment가 붙은 Rule이 **INPUT Chain 1번 위치**에
+존재하고, DB `status=APPLIED`, 해당 Device의 MQTT 연결·Publish 실패.
+
+> **Rule 위치가 중요합니다.** DROP Rule은 `-I INPUT 1`로 Chain 맨 앞에 삽입합니다.
+> 뒤에 붙이면 앞선 ACCEPT Rule(특히 `--ctstate ESTABLISHED,RELATED`)에서 판정이
+> 끝나, 진행 중인 MQTT 연결이 계속 통과하면서 DB만 `APPLIED`가 되는 상태가 됩니다.
 
 ## 6. 격리 해제
 
@@ -154,7 +177,31 @@ sudo iptables -S INPUT | grep hanium-firewall
 `iptables` Rule은 재부팅으로 사라지므로, 재부팅 후 첫 Cycle에서 `restored`로 복구되는
 것이 정상 동작이다.
 
-## 9. 문제 해결
+## 9. 단일 실행 Lock
+
+DB 상태와 실제 iptables를 함께 바꾸는 명령은 모두 같은 Lock을 거칩니다
+(`<db>.firewall.lock`, `FIREWALL_LOCK_PATH`로 변경 가능).
+
+- Lock 대상: `--loop`의 각 Cycle, `--once`, `--release`, `--reconcile-only`,
+  `--admin-reset-failed`
+- Lock 없이 실행: `--dry-run`, `--status` (상태를 바꾸지 않음)
+
+상시 서비스는 **Cycle 단위로만** Lock을 잡고 Cycle 사이에는 놓습니다. 그래서 서비스가
+돌고 있어도 관리자 명령을 실행할 수 있습니다. 관리자 명령은 최대
+`FIREWALL_LOCK_WAIT_SECONDS`(기본 15초)까지 기다립니다.
+
+```bash
+# 서비스 실행 중에도 해제 명령이 동작한다
+python -m edge.trust.run_firewall_worker --release 12
+# Lock 획득 실패 시 종료 코드 3
+```
+
+Lock이 없으면 다음 경합이 발생합니다:
+- 같은 Comment의 DROP Rule이 중복 생성
+- `--release`로 지운 Rule을 서비스의 Reconciliation이 곧바로 되살림
+- DB 상태와 실제 Rule 불일치
+
+## 10. 문제 해결
 
 | 증상 | 확인 |
 |---|---|
@@ -165,11 +212,14 @@ sudo iptables -S INPUT | grep hanium-firewall
 | Rule은 있는데 DB가 PENDING | 정상. 다음 Cycle의 `-C`가 기존 Rule을 찾아 APPLIED로 수렴한다 |
 | iptables 명령 없음 | `FIREWALL_IPTABLES_PATH` 확인 |
 
-## 10. 안전 규칙
+## 11. 안전 규칙
 
 - 허용 범위는 **등록된 사설 IPv4 / TCP / 목적지 Port 1883 / INPUT DROP**뿐이다
 - `shell=True`를 사용하지 않는다. 항상 인자 배열로 실행한다
 - Pi #1·Broker·관리자 IP는 Protected IP로 차단하지 않는다
 - DB에 없는 `hanium-firewall:` Rule을 자동 삭제하지 않는다
 - 적용·확인·삭제·Reconciliation은 항상 동일한 Match Specification을 쓴다
-  (`edge/trust/firewall_worker.py`의 `build_rule_args()` 한 곳에서 생성)
+  (`edge/trust/firewall_worker.py`의 `build_match_args()` 한 곳에서 생성)
+- DROP Rule은 `-I INPUT 1`로 Chain 맨 앞에 넣는다
+- Reconciliation의 Rule 복원도 새 차단과 동일한 검증(Protected IP 포함)을 거친다
+- 상태를 바꾸는 명령은 모두 단일 실행 Lock을 거친다

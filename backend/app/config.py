@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     firewall_iptables_path: str = "/usr/sbin/iptables"
     firewall_sudo_path: str = "/usr/bin/sudo"
     firewall_command_timeout_seconds: float = 10.0
+    firewall_lock_path: str = ""
+    firewall_lock_wait_seconds: float = 15.0
 
     model_config = SettingsConfigDict(env_file=(".env", "../.env"), env_file_encoding="utf-8")
 

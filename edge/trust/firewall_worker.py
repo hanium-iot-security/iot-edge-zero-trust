@@ -5,9 +5,12 @@ Trust Score Transaction은 Device 상태·History와 함께 `firewall_rules`를 
 iptables는 DB처럼 Rollback할 수 없으므로 "먼저 PENDING을 남기고 나중에 적용"하는
 순서를 지켜야 재시도와 복구가 가능합니다.
 
-적용·확인·삭제·Reconciliation은 모두 `build_rule_args()`가 만드는 동일한 Match
+적용·확인·삭제·Reconciliation은 모두 `build_match_args()`가 만드는 동일한 Match
 Specification(Source IP, TCP, 목적지 Port 1883, Comment, DROP)을 사용합니다.
 서로 다른 Specification을 쓰면 "적용은 됐는데 확인·삭제가 안 되는" 상태가 생깁니다.
+
+DROP Rule은 `-I INPUT 1`로 Chain 맨 앞에 넣습니다. 뒤에 붙이면 선행 ACCEPT Rule에서
+판정이 끝나 실제로는 차단되지 않을 수 있습니다.
 """
 
 from __future__ import annotations
@@ -37,9 +40,16 @@ ACTION = "DROP"
 COMMENT_PREFIX = "hanium-firewall:"
 
 CHECK = "-C"
-APPEND = "-A"
+INSERT = "-I"
 DELETE = "-D"
 LIST_RULES = "-S"
+
+# INPUT Chain 맨 앞에 넣는다. `-A`로 뒤에 붙이면 앞선 ACCEPT Rule(특히
+# `--ctstate ESTABLISHED,RELATED`)에서 판정이 끝나 DROP까지 도달하지 않는다. MQTT는
+# 장수명 TCP 연결이므로, 공격이 진행 중인 연결이 계속 통과하면서 DB만 APPLIED가 되는
+# 상태가 만들어진다. 세부계획 2.6-14의 "APPLIED와 실제 MQTT 연결·Publish 실패가 모두
+# 확인된 경우"를 충족하려면 선행 ACCEPT보다 앞서야 한다.
+INSERT_POSITION = "1"
 
 # `iptables -C`는 Rule이 없을 때 종료 코드 1을 사용한다. 2 이상은 실행 자체가
 # 실패한 것이므로 "Rule 없음"으로 오해하면 안 된다.
@@ -119,6 +129,7 @@ class ReconcileResult:
     verified: list[int] = field(default_factory=list)
     restored: list[int] = field(default_factory=list)
     restore_failed: list[int] = field(default_factory=list)
+    validation_failed: list[int] = field(default_factory=list)
     orphan_rule_ids: list[int] = field(default_factory=list)
 
 
@@ -170,13 +181,13 @@ class SudoIptablesRunner:
         )
 
 
-def build_rule_args(spec: FirewallRuleSpec, *, operation: str) -> list[str]:
-    """적용·확인·삭제가 공유하는 단일 Match Specification을 만듭니다."""
-    if operation not in (CHECK, APPEND, DELETE):
-        raise ValueError(f"unsupported iptables operation: {operation!r}")
+def build_match_args(spec: FirewallRuleSpec) -> list[str]:
+    """적용·확인·삭제·Reconciliation이 공유하는 단일 Match Specification입니다.
+
+    이 함수 한 곳만 바꾸면 네 경로가 함께 바뀝니다. 경로마다 다른 Specification을
+    쓰면 "적용은 됐는데 확인·삭제가 안 되는" 상태가 생깁니다.
+    """
     return [
-        operation,
-        CHAIN,
         "-p",
         PROTOCOL,
         "-s",
@@ -190,6 +201,15 @@ def build_rule_args(spec: FirewallRuleSpec, *, operation: str) -> list[str]:
         "-j",
         ACTION,
     ]
+
+
+def build_rule_args(spec: FirewallRuleSpec, *, operation: str) -> list[str]:
+    """Operation과 공유 Match Specification을 합쳐 iptables 인자를 만듭니다."""
+    if operation not in (CHECK, INSERT, DELETE):
+        raise ValueError(f"unsupported iptables operation: {operation!r}")
+    if operation == INSERT:
+        return [operation, CHAIN, INSERT_POSITION, *build_match_args(spec)]
+    return [operation, CHAIN, *build_match_args(spec)]
 
 
 def validate_rule_row(row: dict[str, Any], policy: FirewallPolicy) -> FirewallRuleSpec:
@@ -233,11 +253,12 @@ def rule_exists(runner: IptablesRunner, spec: FirewallRuleSpec) -> bool:
     )
 
 
-def append_rule(runner: IptablesRunner, spec: FirewallRuleSpec) -> None:
-    result = runner.run(build_rule_args(spec, operation=APPEND))
+def insert_rule(runner: IptablesRunner, spec: FirewallRuleSpec) -> None:
+    """INPUT Chain 맨 앞에 DROP Rule을 넣습니다."""
+    result = runner.run(build_rule_args(spec, operation=INSERT))
     if result.returncode != 0:
         raise FirewallTransientError(
-            f"iptables append failed (rc={result.returncode}): {_summarize(result.stderr)}"
+            f"iptables insert failed (rc={result.returncode}): {_summarize(result.stderr)}"
         )
 
 
@@ -302,7 +323,7 @@ def process_pending_rules(
         try:
             already_present = rule_exists(runner, spec)
             if not already_present:
-                append_rule(runner, spec)
+                insert_rule(runner, spec)
         except FirewallTransientError as exc:
             _record_transient_failure(
                 db,
@@ -414,12 +435,27 @@ def reconcile(
     applied_rows = _list_rows_by_status(db, firewall_repository.APPLIED)
     for row in applied_rows:
         rule_id = int(row["id"])
-        spec = FirewallRuleSpec(rule_id=rule_id, source_ip=str(row["source_ip"]))
+        # 복원도 새 차단과 동일한 검증을 거친다. Protected IP 목록이 바뀌거나 DHCP로
+        # IP가 재할당된 뒤 재부팅되면, 예전 APPLIED Row가 지금은 보호 대상인 IP를
+        # 다시 차단할 수 있다.
+        try:
+            spec = validate_rule_row(row, policy)
+        except FirewallValidationError as exc:
+            result.validation_failed.append(rule_id)
+            logger.error(
+                "Refusing to restore firewall rule that fails validation "
+                "(rule_id=%s, source_ip=%s): %s",
+                rule_id,
+                row.get("source_ip"),
+                exc,
+            )
+            continue
+
         try:
             if rule_exists(runner, spec):
                 result.verified.append(rule_id)
                 continue
-            append_rule(runner, spec)
+            insert_rule(runner, spec)
         except FirewallTransientError as exc:
             result.restore_failed.append(rule_id)
             logger.error(
@@ -480,7 +516,7 @@ def plan_pending_rules(
         except FirewallValidationError as exc:
             planned.append((rule_id, f"VALIDATION_FAILURE: {exc}"))
             continue
-        planned.append((rule_id, build_rule_args(spec, operation=APPEND)))
+        planned.append((rule_id, build_rule_args(spec, operation=INSERT)))
     return planned
 
 

@@ -18,14 +18,17 @@ from sqlalchemy.orm import sessionmaker
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
 from edge.trust import firewall_repository
 from edge.trust.firewall_worker import (
-    APPEND,
+    CHAIN,
     CHECK,
     DELETE,
+    INSERT,
+    INSERT_POSITION,
     CommandResult,
     FirewallPolicy,
     FirewallRuleSpec,
     FirewallTransientError,
     FirewallValidationError,
+    build_match_args,
     build_rule_args,
     list_managed_rule_ids,
     plan_pending_rules,
@@ -80,8 +83,10 @@ class FakeIptablesRunner:
         key = _rule_key(args)
         if operation == CHECK:
             return CommandResult(returncode=0 if key in self.installed else 1)
-        if operation == APPEND:
-            self.installed.append(key)
+        if operation == INSERT:
+            # 실제 iptables처럼 지정된 위치(1-based)에 삽입한다.
+            position = int(args[2])
+            self.installed.insert(position - 1, key)
             return CommandResult(returncode=0)
         if operation == DELETE:
             if key not in self.installed:
@@ -95,8 +100,9 @@ class FakeIptablesRunner:
 
 
 def _rule_key(args: Sequence[str]) -> str:
-    """Operation을 뺀 나머지 Match Specification을 커널 Rule 표현으로 씁니다."""
-    return " ".join(args[1:])
+    """Operation·Chain·삽입 위치를 뺀 Match Specification을 커널 Rule 표현으로 씁니다."""
+    match_args = args[3:] if args[0] == INSERT else args[2:]
+    return " ".join(match_args)
 
 
 @pytest.fixture
@@ -157,16 +163,19 @@ def _rule_row(db, rule_id: int) -> dict:
 # --- Match Specification ---------------------------------------------------
 
 
-def test_build_rule_args_is_identical_across_operations():
+def test_all_operations_share_one_match_specification():
     spec = FirewallRuleSpec(rule_id=7, source_ip=DEVICE_IP)
-    check = build_rule_args(spec, operation=CHECK)
-    append = build_rule_args(spec, operation=APPEND)
-    delete = build_rule_args(spec, operation=DELETE)
+    match = build_match_args(spec)
 
-    assert check[1:] == append[1:] == delete[1:]
-    assert append == [
-        "-A",
-        "INPUT",
+    for operation in (CHECK, DELETE):
+        assert build_rule_args(spec, operation=operation) == [operation, CHAIN, *match]
+    assert build_rule_args(spec, operation=INSERT) == [
+        INSERT,
+        CHAIN,
+        INSERT_POSITION,
+        *match,
+    ]
+    assert match == [
         "-p",
         "tcp",
         "-s",
@@ -182,6 +191,14 @@ def test_build_rule_args_is_identical_across_operations():
     ]
 
 
+def test_drop_rule_is_inserted_at_the_top_of_input_chain():
+    """`-A`로 뒤에 붙이면 선행 ACCEPT에서 판정이 끝나 실제로 차단되지 않는다."""
+    spec = FirewallRuleSpec(rule_id=7, source_ip=DEVICE_IP)
+    args = build_rule_args(spec, operation=INSERT)
+    assert args[0] == "-I"
+    assert args[1:3] == [CHAIN, "1"]
+
+
 def test_rule_comment_maps_to_db_row():
     assert FirewallRuleSpec(rule_id=12, source_ip=DEVICE_IP).comment == "hanium-firewall:12"
 
@@ -189,7 +206,7 @@ def test_rule_comment_maps_to_db_row():
 def test_build_rule_args_rejects_unsupported_operation():
     spec = FirewallRuleSpec(rule_id=1, source_ip=DEVICE_IP)
     with pytest.raises(ValueError):
-        build_rule_args(spec, operation="-I")
+        build_rule_args(spec, operation="-A")
 
 
 # --- Validation ------------------------------------------------------------
@@ -246,7 +263,7 @@ def test_process_pending_rules_applies_and_marks_applied(SessionLocal, policy):
         result = process_pending_rules(db, runner=runner, policy=policy, now=NOW)
 
         assert result.applied == [rule_id]
-        assert runner.operations() == [CHECK, APPEND]
+        assert runner.operations() == [CHECK, INSERT]
         row = _rule_row(db, rule_id)
         assert row["status"] == "APPLIED"
         assert row["applied_at"] == "2026-07-25T12:00:00Z"
@@ -260,7 +277,7 @@ def test_process_pending_rules_is_idempotent_when_rule_already_exists(SessionLoc
         rule_id = _create_pending(db)
         spec = FirewallRuleSpec(rule_id=rule_id, source_ip=DEVICE_IP)
         runner = FakeIptablesRunner(
-            installed=[_rule_key(build_rule_args(spec, operation=APPEND))]
+            installed=[_rule_key(build_rule_args(spec, operation=INSERT))]
         )
 
         result = process_pending_rules(db, runner=runner, policy=policy, now=NOW)
@@ -482,7 +499,7 @@ def test_reconcile_does_not_report_pending_rule_as_orphan(SessionLocal, policy):
         rule_id = _create_pending(db)
         spec = FirewallRuleSpec(rule_id=rule_id, source_ip=DEVICE_IP)
         runner = FakeIptablesRunner(
-            installed=[_rule_key(build_rule_args(spec, operation=APPEND))]
+            installed=[_rule_key(build_rule_args(spec, operation=INSERT))]
         )
 
         result = reconcile(db, runner=runner, policy=policy, now=NOW)
@@ -521,8 +538,46 @@ def test_plan_pending_rules_does_not_change_state(SessionLocal, policy):
         planned = plan_pending_rules(db, policy=policy, now=NOW)
 
         assert planned[0][0] == rule_id
-        assert planned[0][1][:2] == [APPEND, "INPUT"]
+        assert planned[0][1][:3] == [INSERT, CHAIN, INSERT_POSITION]
         assert _rule_row(db, rule_id)["status"] == "PENDING"
+
+
+def test_applied_rule_precedes_existing_accept_rules(SessionLocal, policy):
+    """선행 ACCEPT Rule이 있어도 DROP이 그보다 앞에 놓여야 실제로 차단된다."""
+    established_accept = "-p tcp -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+    mqtt_accept = "-p tcp --dport 1883 -j ACCEPT"
+    with SessionLocal() as db:
+        _seed_device(db)
+        rule_id = _create_pending(db)
+        runner = FakeIptablesRunner(installed=[established_accept, mqtt_accept])
+
+        process_pending_rules(db, runner=runner, policy=policy, now=NOW)
+
+        spec = FirewallRuleSpec(rule_id=rule_id, source_ip=DEVICE_IP)
+        drop_key = _rule_key(build_rule_args(spec, operation=INSERT))
+        assert runner.installed[0] == drop_key
+        assert runner.installed.index(drop_key) < runner.installed.index(established_accept)
+
+
+def test_reconcile_refuses_to_restore_now_protected_ip(SessionLocal):
+    """운영 중 Protected IP가 바뀌면 재부팅 후에도 보호 대상을 다시 차단하지 않는다."""
+    permissive = FirewallPolicy(protected_ips=frozenset(), batch_size=10)
+    with SessionLocal() as db:
+        _seed_device(db)
+        rule_id = _create_pending(db)
+        runner = FakeIptablesRunner()
+        process_pending_rules(db, runner=runner, policy=permissive, now=NOW)
+        runner.installed.clear()  # 재부팅으로 실제 Rule 소실
+
+        # 그 사이 해당 IP가 관리자 장비에 재할당되어 Protected 목록에 들어왔다.
+        stricter = FirewallPolicy(protected_ips=frozenset({DEVICE_IP}), batch_size=10)
+        result = reconcile(db, runner=runner, policy=stricter, now=NOW)
+
+        assert result.validation_failed == [rule_id]
+        assert result.restored == []
+        assert runner.installed == []
+        # DB 상태는 관리자가 판단할 수 있도록 그대로 남긴다.
+        assert _rule_row(db, rule_id)["status"] == "APPLIED"
 
 
 def test_plan_pending_rules_reports_validation_failure(SessionLocal, policy):
