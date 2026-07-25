@@ -1,4 +1,8 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from urllib.parse import urlparse
+
+
+DEFAULT_API_ALLOWED_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
 
 
 class Settings(BaseSettings):
@@ -14,6 +18,8 @@ class Settings(BaseSettings):
     feature_window_seconds: int = 10
     initial_trust_score: int = 100
     isolation_threshold: int = 30
+    api_allowed_origins: str = DEFAULT_API_ALLOWED_ORIGINS
+    api_allow_credentials: bool = True
 
     # Gateway Metrics
     gateway_metrics_interval_seconds: float = 10.0
@@ -43,3 +49,36 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def parse_allowed_origins(
+    raw_origins: str,
+    *,
+    allow_credentials: bool = True,
+) -> list[str]:
+    origins: list[str] = []
+    seen: set[str] = set()
+    for part in raw_origins.split(","):
+        origin = part.strip()
+        if not origin:
+            continue
+        if origin == "*":
+            if allow_credentials:
+                raise ValueError("API_ALLOWED_ORIGINS cannot be '*' when credentials are allowed")
+            if origin not in seen:
+                origins.append(origin)
+                seen.add(origin)
+            continue
+
+        parsed = urlparse(origin)
+        if parsed.scheme not in {"http", "https"}:
+            raise ValueError("API_ALLOWED_ORIGINS entries must use http or https")
+        if not parsed.netloc:
+            raise ValueError("API_ALLOWED_ORIGINS entries must include a host")
+        if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
+            raise ValueError("API_ALLOWED_ORIGINS entries must not include path, query, or fragment")
+        normalized = origin.rstrip("/")
+        if normalized not in seen:
+            origins.append(normalized)
+            seen.add(normalized)
+    return origins

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+import logging
 from pathlib import Path
 import sys
 import time
@@ -19,9 +21,33 @@ from sqlalchemy.orm import Session
 
 from backend.app.config import settings
 from backend.app.database import SessionLocal
+from edge.detection import runtime_checkpoint_repository as checkpoints
+from edge.detection.phase4_time import (
+    WINDOW_SECONDS,
+    format_db_utc,
+    floor_window_start as phase4_floor_window_start,
+    parse_db_utc,
+    require_utc_window_boundary,
+)
 
 
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+MQTT_FEATURE_BUILDER = "mqtt_feature_builder"
+MQTT_LOGS_SOURCE = "mqtt_logs"
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ProducerRunResult:
+    source_table: str
+    cutoff: datetime
+    selected_count: int
+    created_feature_count: int
+    late_source_count: int
+    last_processed_id_before: int | None
+    last_processed_id_after: int | None
+    completed_window_end_before: datetime | None
+    completed_window_end_after: datetime
 
 
 def parse_db_datetime(value: str | datetime) -> datetime:
@@ -66,6 +92,8 @@ def build_feature_row(
     window_start: datetime,
     window_end: datetime,
     rows: list[dict[str, Any]],
+    *,
+    timestamp_formatter=format_db_datetime,
 ) -> dict[str, Any]:
     payload_sizes = [int(row["payload_size"] or 0) for row in rows]
     intervals = _intervals_seconds(rows)
@@ -74,8 +102,8 @@ def build_feature_row(
 
     return {
         "device_id": device_id,
-        "window_start": format_db_datetime(window_start),
-        "window_end": format_db_datetime(window_end),
+        "window_start": timestamp_formatter(window_start),
+        "window_end": timestamp_formatter(window_end),
         "publish_count": len(rows),
         "avg_payload_size": sum(payload_sizes) / len(payload_sizes),
         "max_payload_size": max(payload_sizes),
@@ -197,6 +225,153 @@ def collect_feature_windows(
 
     db.commit()
     return inserted_count
+
+
+def produce_mqtt_features_until(
+    db: Session,
+    *,
+    producer_cutoff: datetime,
+) -> ProducerRunResult:
+    """Build mqtt feature windows and checkpoint them in the caller transaction."""
+    cutoff = require_utc_window_boundary(producer_cutoff, "producer_cutoff")
+    checkpoint = checkpoints.get_detector_checkpoint(
+        db,
+        detector_name=MQTT_FEATURE_BUILDER,
+        source_table=MQTT_LOGS_SOURCE,
+    )
+    last_processed_before = (
+        int(checkpoint["last_processed_id"])
+        if checkpoint is not None and checkpoint["last_processed_id"] is not None
+        else None
+    )
+    completed_before = (
+        parse_db_utc(
+            checkpoint["last_completed_window_end"],
+            "last_completed_window_end",
+        )
+        if checkpoint is not None and checkpoint["last_completed_window_end"] is not None
+        else None
+    )
+    if completed_before is not None and completed_before > cutoff:
+        raise ValueError("existing MQTT feature checkpoint exceeds producer_cutoff")
+
+    registered_devices = registered_feature_devices(db)
+    source_rows = _fetch_mqtt_sources_after_checkpoint(
+        db,
+        last_processed_id=last_processed_before,
+        completed_before=completed_before,
+        cutoff=cutoff,
+    )
+
+    grouped: dict[tuple[str, datetime, datetime], list[dict[str, Any]]] = defaultdict(list)
+    late_source_count = 0
+    last_processed_after = last_processed_before
+
+    for row in source_rows:
+        source = dict(row)
+        source_id = int(source["id"])
+        last_processed_after = (
+            source_id
+            if last_processed_after is None
+            else max(last_processed_after, source_id)
+        )
+        received_at = parse_db_utc(source["received_at"], "received_at")
+        window_start = phase4_floor_window_start(received_at)
+        window_end = window_start + timedelta(seconds=WINDOW_SECONDS)
+
+        if completed_before is not None and window_end <= completed_before:
+            late_source_count += 1
+            logger.info(
+                "event=LATE_SOURCE source_table=mqtt_logs source_id=%s "
+                "received_at=%s last_completed_window_end=%s",
+                source_id,
+                format_db_utc(received_at),
+                format_db_utc(completed_before),
+            )
+            continue
+        if window_end > cutoff:
+            continue
+        device_id = str(source["device_id"]) if source["device_id"] is not None else ""
+        if device_id not in registered_devices:
+            continue
+        grouped[(device_id, window_start, window_end)].append(source)
+
+    inserted_count = 0
+    for (device_id, window_start, window_end), window_rows in grouped.items():
+        feature_row = build_feature_row(
+            device_id,
+            window_start,
+            window_end,
+            window_rows,
+            timestamp_formatter=format_db_utc,
+        )
+        if _insert_feature_row(db, feature_row):
+            inserted_count += 1
+
+    checkpoints.upsert_detector_checkpoint(
+        db,
+        detector_name=MQTT_FEATURE_BUILDER,
+        source_table=MQTT_LOGS_SOURCE,
+        last_processed_id=last_processed_after,
+        last_completed_window_end=cutoff,
+        updated_at=cutoff,
+    )
+
+    return ProducerRunResult(
+        source_table=MQTT_LOGS_SOURCE,
+        cutoff=cutoff,
+        selected_count=len(source_rows),
+        created_feature_count=inserted_count,
+        late_source_count=late_source_count,
+        last_processed_id_before=last_processed_before,
+        last_processed_id_after=last_processed_after,
+        completed_window_end_before=completed_before,
+        completed_window_end_after=cutoff,
+    )
+
+
+def _fetch_mqtt_sources_after_checkpoint(
+    db: Session,
+    *,
+    last_processed_id: int | None,
+    completed_before: datetime | None,
+    cutoff: datetime,
+) -> list[dict[str, Any]]:
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                id,
+                device_id,
+                topic,
+                payload_size,
+                received_at,
+                is_json_valid,
+                is_topic_valid
+            FROM mqtt_logs
+            WHERE (
+                  :last_processed_id IS NULL
+                  OR id > :last_processed_id
+                  OR (
+                      :completed_before IS NOT NULL
+                      AND unixepoch(received_at) >= unixepoch(:completed_before)
+                  )
+              )
+              AND unixepoch(received_at) < unixepoch(:cutoff)
+            ORDER BY id ASC
+            """
+        ),
+        {
+            "last_processed_id": last_processed_id,
+            "completed_before": (
+                format_db_utc(completed_before)
+                if completed_before is not None
+                else None
+            ),
+            "cutoff": format_db_utc(cutoff),
+        },
+    ).mappings()
+    return [dict(row) for row in rows]
 
 
 def main() -> None:
