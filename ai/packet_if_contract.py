@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from math import isfinite
-from numbers import Real
+from numbers import Integral, Real
 from typing import Any
 
 import numpy as np
@@ -30,6 +30,14 @@ PACKET_IF_RAW_FEATURES = (
     "captured_duration_seconds",
 )
 
+# 반드시 음이 아닌 정수여야 하는 원본 필드 (bool·소수 거부)
+PACKET_IF_INTEGER_RAW_FEATURES = (
+    "packet_count",
+    "total_bytes",
+    "max_packet_size",
+    "distinct_dest_port_count",
+)
+
 PACKET_IF_FEATURES = (
     "packet_count_10s",
     "total_bytes_10s",
@@ -42,22 +50,24 @@ PACKET_IF_FEATURES = (
 
 def transform_packet_feature_row(row: Mapping[str, Any]) -> dict[str, float]:
     """원본 Packet Feature Row를 검증하고 모델 입력 계약으로 변환합니다."""
-    raw = {
-        name: _require_non_negative_finite_number(row, name)
-        for name in PACKET_IF_RAW_FEATURES
+    int_values = {
+        name: _require_non_negative_integer(row, name)
+        for name in PACKET_IF_INTEGER_RAW_FEATURES
     }
-    duration = raw["captured_duration_seconds"]
-    if duration <= 0:
-        raise ValueError("captured_duration_seconds must be greater than zero")
+    avg_packet_size = _require_non_negative_finite_number(row, "avg_packet_size")
+    mean_inter_arrival_time = _require_non_negative_finite_number(
+        row, "mean_inter_arrival_time"
+    )
+    duration = _require_captured_duration(row)
 
     normalization_factor = PACKET_IF_NOMINAL_WINDOW_SECONDS / duration
     transformed = {
-        "packet_count_10s": raw["packet_count"] * normalization_factor,
-        "total_bytes_10s": raw["total_bytes"] * normalization_factor,
-        "avg_packet_size": raw["avg_packet_size"],
-        "max_packet_size": raw["max_packet_size"],
-        "mean_inter_arrival_time": raw["mean_inter_arrival_time"],
-        "distinct_dest_port_count": raw["distinct_dest_port_count"],
+        "packet_count_10s": int_values["packet_count"] * normalization_factor,
+        "total_bytes_10s": int_values["total_bytes"] * normalization_factor,
+        "avg_packet_size": avg_packet_size,
+        "max_packet_size": int_values["max_packet_size"],
+        "mean_inter_arrival_time": mean_inter_arrival_time,
+        "distinct_dest_port_count": int_values["distinct_dest_port_count"],
     }
     for name, value in transformed.items():
         if not isfinite(value):
@@ -88,6 +98,21 @@ def validate_packet_feature_order(feature_order: Sequence[str]) -> None:
         )
 
 
+def _require_non_negative_integer(
+    row: Mapping[str, Any],
+    field_name: str,
+) -> float:
+    if field_name not in row:
+        raise ValueError(f"missing packet feature field: {field_name}")
+
+    value = row[field_name]
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    if value < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+    return float(value)
+
+
 def _require_non_negative_finite_number(
     row: Mapping[str, Any],
     field_name: str,
@@ -104,4 +129,25 @@ def _require_non_negative_finite_number(
         raise ValueError(f"{field_name} must be finite")
     if numeric_value < 0:
         raise ValueError(f"{field_name} must be non-negative")
+    return numeric_value
+
+
+def _require_captured_duration(row: Mapping[str, Any]) -> float:
+    field_name = "captured_duration_seconds"
+    if field_name not in row:
+        raise ValueError(f"missing packet feature field: {field_name}")
+
+    value = row[field_name]
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{field_name} must be a real number")
+
+    numeric_value = float(value)
+    if not isfinite(numeric_value):
+        raise ValueError(f"{field_name} must be finite")
+    if numeric_value <= 0:
+        raise ValueError(f"{field_name} must be greater than zero")
+    if numeric_value > PACKET_IF_NOMINAL_WINDOW_SECONDS:
+        raise ValueError(
+            f"{field_name} must be at most {PACKET_IF_NOMINAL_WINDOW_SECONDS}"
+        )
     return numeric_value

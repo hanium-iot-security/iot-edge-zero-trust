@@ -38,6 +38,7 @@ def _dataset_rows() -> list[dict[str, object]]:
                 "direction": "INBOUND",
                 "window_start": f"2026-07-23T00:00:{(index - 1) * 10:02d}Z",
                 "window_end": f"2026-07-23T00:00:{index * 10:02d}Z",
+                "peer_ip": "192.168.1.100",
                 "packet_count": 10 + index,
                 "total_bytes": 1_000 + index,
                 "avg_packet_size": 100.0,
@@ -75,6 +76,7 @@ def _manifest_sessions() -> list[dict[str, str]]:
             "split": TEST_SPLIT,
             "traffic_label": ATTACK_LABEL,
             "scenario": "packet_flood",
+            "target_device_id": "esp32_01",
         },
     ]
 
@@ -252,6 +254,22 @@ def test_load_dataset_rejects_duplicate_feature_id(tmp_path: Path) -> None:
         load_packet_if_dataset(dataset_path, manifest_path)
 
 
+@pytest.mark.parametrize("invalid_id", [-1, 1.5, True])
+def test_load_dataset_rejects_invalid_feature_id(
+    tmp_path: Path,
+    invalid_id: object,
+) -> None:
+    rows = _dataset_rows()
+    rows[0]["packet_feature_log_id"] = invalid_id
+    dataset_path, manifest_path = _write_dataset_bundle(tmp_path, rows=rows)
+
+    with pytest.raises(
+        ValueError,
+        match="packet_feature_log_id must be a non-negative integer",
+    ):
+        load_packet_if_dataset(dataset_path, manifest_path)
+
+
 def test_load_dataset_rejects_non_ten_second_window(tmp_path: Path) -> None:
     rows = _dataset_rows()
     rows[0]["window_end"] = "2026-07-23T00:00:09Z"
@@ -270,4 +288,124 @@ def test_load_dataset_applies_packet_feature_validation(tmp_path: Path) -> None:
         ValueError,
         match="captured_duration_seconds must be greater than zero",
     ):
+        load_packet_if_dataset(dataset_path, manifest_path)
+
+
+# ── peer_ip 검증 ──────────────────────────────────────────────────────────────
+
+def test_load_dataset_rejects_missing_peer_ip_column(tmp_path: Path) -> None:
+    rows = [{k: v for k, v in row.items() if k != "peer_ip"} for row in _dataset_rows()]
+    dataset_path, manifest_path = _write_dataset_bundle(tmp_path, rows=rows)
+
+    with pytest.raises(ValueError, match="missing required columns"):
+        load_packet_if_dataset(dataset_path, manifest_path)
+
+
+def test_load_dataset_rejects_null_peer_ip(tmp_path: Path) -> None:
+    rows = _dataset_rows()
+    rows[0]["peer_ip"] = None
+    dataset_path, manifest_path = _write_dataset_bundle(tmp_path, rows=rows)
+
+    with pytest.raises(ValueError, match="non-empty peer_ip"):
+        load_packet_if_dataset(dataset_path, manifest_path)
+
+
+def test_load_dataset_rejects_invalid_peer_ip(tmp_path: Path) -> None:
+    rows = _dataset_rows()
+    rows[0]["peer_ip"] = "not-an-ip"
+    dataset_path, manifest_path = _write_dataset_bundle(tmp_path, rows=rows)
+
+    with pytest.raises(ValueError, match="peer_ip must be a valid IPv4 address"):
+        load_packet_if_dataset(dataset_path, manifest_path)
+
+
+# ── UTC window 형식 검증 ──────────────────────────────────────────────────────
+
+def test_load_dataset_accepts_canonical_utc_window_boundaries(
+    tmp_path: Path,
+) -> None:
+    dataset_path, manifest_path = _write_dataset_bundle(tmp_path)
+
+    dataset = load_packet_if_dataset(dataset_path, manifest_path)
+
+    assert dataset.train.iloc[0]["window_start"].endswith("00Z")
+    assert dataset.train.iloc[0]["window_end"].endswith("10Z")
+
+
+@pytest.mark.parametrize(
+    "bad_timestamp",
+    [
+        "2026-07-25 12:00:00",          # 공백 구분자
+        "2026-07-25T21:00:00+09:00",    # timezone offset
+        "2026-07-25T12:00:00.500Z",     # 소수점 초
+        "2026-07-25T12:00:00",          # Z 없음
+    ],
+)
+def test_load_dataset_rejects_non_utc_window_format(
+    tmp_path: Path,
+    bad_timestamp: str,
+) -> None:
+    rows = _dataset_rows()
+    rows[0]["window_start"] = bad_timestamp
+    dataset_path, manifest_path = _write_dataset_bundle(tmp_path, rows=rows)
+
+    with pytest.raises(ValueError, match="window_start must be in YYYY-MM-DDTHH:MM:SSZ format"):
+        load_packet_if_dataset(dataset_path, manifest_path)
+
+
+def test_load_dataset_rejects_non_utc_window_end_format(tmp_path: Path) -> None:
+    rows = _dataset_rows()
+    rows[0]["window_end"] = "2026-07-23T09:00:10+09:00"
+    dataset_path, manifest_path = _write_dataset_bundle(tmp_path, rows=rows)
+
+    with pytest.raises(
+        ValueError,
+        match="window_end must be in YYYY-MM-DDTHH:MM:SSZ format",
+    ):
+        load_packet_if_dataset(dataset_path, manifest_path)
+
+
+def test_load_dataset_rejects_non_boundary_window_start(tmp_path: Path) -> None:
+    rows = _dataset_rows()
+    rows[0]["window_start"] = "2026-07-23T00:00:03Z"
+    rows[0]["window_end"] = "2026-07-23T00:00:13Z"
+    dataset_path, manifest_path = _write_dataset_bundle(tmp_path, rows=rows)
+
+    with pytest.raises(ValueError, match="window_start must be on a 10-second boundary"):
+        load_packet_if_dataset(dataset_path, manifest_path)
+
+
+# ── target_device_id 계약 ─────────────────────────────────────────────────────
+
+def test_manifest_requires_target_device_id_for_attack_session(tmp_path: Path) -> None:
+    sessions = _manifest_sessions()
+    for session in sessions:
+        if session.get("traffic_label") == ATTACK_LABEL:
+            del session["target_device_id"]
+    _, manifest_path = _write_dataset_bundle(tmp_path, sessions=sessions)
+
+    with pytest.raises(ValueError, match="attack session must specify target_device_id"):
+        load_packet_if_manifest(manifest_path)
+
+
+def test_manifest_rejects_target_device_id_on_normal_session(tmp_path: Path) -> None:
+    sessions = _manifest_sessions()
+    for session in sessions:
+        if session.get("traffic_label") == NORMAL_LABEL:
+            session["target_device_id"] = "esp32_01"
+            break
+    _, manifest_path = _write_dataset_bundle(tmp_path, sessions=sessions)
+
+    with pytest.raises(ValueError, match="normal session must not have target_device_id"):
+        load_packet_if_manifest(manifest_path)
+
+
+def test_load_dataset_rejects_attack_row_with_wrong_device_id(tmp_path: Path) -> None:
+    rows = _dataset_rows()
+    for row in rows:
+        if row["session_id"] == SESSION_IDS["test_attack"]:
+            row["device_id"] = "esp32_02"
+    dataset_path, manifest_path = _write_dataset_bundle(tmp_path, rows=rows)
+
+    with pytest.raises(ValueError, match="not matching target_device_id"):
         load_packet_if_dataset(dataset_path, manifest_path)

@@ -1,7 +1,7 @@
 # Packet Isolation Forest Core 가이드
 
-본 문서는 Phase 4 Detector·Checkpoint 공통 계약이 병합되기 전에 독립적으로
-구현할 수 있는 Packet IF Core의 사용 방법과 계약을 설명합니다.
+본 문서는 Phase 4 Runtime과 분리해 먼저 병합하는 Packet IF Core의 사용 방법과
+계약을 설명합니다.
 
 ## 현재 범위
 
@@ -14,7 +14,7 @@
 - Model Artifact·Metadata 생성
 - Artifact 무결성 검증 및 Offline 추론
 
-Phase 4 공통 계약 병합 후 구현할 범위:
+후속 Packet IF Runtime PR에서 구현할 범위:
 
 - DB Export 단계의 Capture 적격성 필터
 - `run_until(db, cycle_cutoff)` Detector Stage
@@ -45,8 +45,10 @@ packet_count_10s = packet_count * 10 / captured_duration_seconds
 total_bytes_10s = total_bytes * 10 / captured_duration_seconds
 ```
 
-필수값 누락, NULL, 비수치, NaN, Infinity, 음수, 0 이하 Duration은 거부합니다.
-변환 함수는 입력 객체를 변경하지 않습니다.
+필수값 누락, NULL, 비수치, NaN, Infinity, 음수, 0 이하 또는 10초 초과
+Duration은 거부합니다. `packet_count`, `total_bytes`, `max_packet_size`,
+`distinct_dest_port_count`는 0 이상의 정수만 허용합니다. 변환 함수는 입력
+객체를 변경하지 않습니다.
 
 ## Dataset 계약
 
@@ -57,6 +59,7 @@ CSV에는 아래 컬럼이 필요합니다.
 packet_feature_log_id
 session_id
 device_id
+peer_ip
 direction
 window_start
 window_end
@@ -86,9 +89,12 @@ packet_feature_logs.capture_segment_id
   -> packet_capture_sessions.session_id
 ```
 
-Core Dataset Loader는 등록 기기에 매핑된 `INBOUND` Row와 정확한 10초 Window만
-허용합니다. Capture Status·Error·Delay·Duration 적격성은 향후 DB Exporter에서
-공통 `is_capture_eligible()` 정책으로 판정해야 합니다.
+Core Dataset Loader는 등록 기기에 매핑된 `INBOUND` Row와 유효한 IPv4
+`peer_ip`만 허용합니다. Window 시각은 소수점 없는 UTC
+`YYYY-MM-DDTHH:MM:SSZ` 형식이어야 하고, `window_start`는 10초 경계에
+정렬되며 `window_end`는 정확히 10초 후여야 합니다. Capture
+Status·Error·Delay·Duration 적격성은 향후 DB Exporter에서 공통
+`is_capture_eligible()` 정책으로 판정해야 합니다.
 
 ### Session Manifest
 
@@ -122,7 +128,8 @@ Core Dataset Loader는 등록 기기에 매핑된 `INBOUND` Row와 정확한 10�
       "session_id": "44444444-4444-4444-8444-444444444444",
       "split": "test",
       "traffic_label": "attack",
-      "scenario": "packet_flood"
+      "scenario": "packet_flood",
+      "target_device_id": "esp32_02"
     }
   ]
 }
@@ -132,6 +139,8 @@ Core Dataset Loader는 등록 기기에 매핑된 `INBOUND` Row와 정확한 10�
 
 - Train과 Validation Session은 정상 데이터만 허용
 - Test에는 서로 다른 정상·공격 Session이 모두 필요
+- 공격 Session은 `target_device_id`를 필수로 지정하고 해당 Device Row만 포함
+- 정상 Session에는 `target_device_id`를 지정하지 않음
 - 하나의 Session을 여러 Split에 배치하는 것 금지
 - 모든 Manifest Session에 CSV Row가 한 개 이상 존재해야 함
 - 모든 CSV Session이 Manifest에 선언되어야 함
@@ -146,7 +155,7 @@ Repository Root에서 아래 명령을 실행합니다.
 python -m ai.train_packet_isolation_forest \
   --dataset data/exports/packet_if_dataset.csv \
   --manifest data/exports/packet_if_manifest.json \
-  --artifact-dir ai/models/packet_if \
+  --artifact-dir ai/models/packet_if/packet-if-v1 \
   --threshold-percentile 99.0 \
   --git-commit-sha "$SOURCE_COMMIT_SHA"
 ```
@@ -177,7 +186,9 @@ is_anomaly = anomaly_score > threshold
 
 Anomaly Score가 Threshold와 같으면 정상으로 판정합니다.
 
-기존 Artifact는 `--overwrite`를 지정하지 않으면 교체하지 않습니다. 최종 배포용
+기존 Artifact Bundle은 덮어쓰지 않습니다. 같은 Directory에 Model, Metadata,
+Training Report 중 하나라도 있으면 학습을 시작하지 않으므로 재학습할 때는
+`packet-if-v2`처럼 새로운 Version Directory를 사용합니다. 최종 배포용
 Artifact는 기록된 Git SHA가 정확한 구현을 식별할 수 있도록 변경사항을 Commit한
 깨끗한 Source 상태에서 학습해야 합니다.
 
@@ -185,9 +196,10 @@ Artifact는 기록된 Git SHA가 정확한 구현을 식별할 수 있도록 변
 
 ```text
 ai/models/packet_if/
-├── model.joblib
-├── metadata.json
-└── training_report.json
+└── packet-if-v1/
+    ├── model.joblib
+    ├── metadata.json
+    └── training_report.json
 ```
 
 `.gitkeep`을 제외한 위 파일들은 Git에서 제외됩니다. `metadata.json`은 마지막에
@@ -219,7 +231,7 @@ Packet IF Runner는 Event 생성 또는 Checkpoint 전진 전에 Artifact의
 
 ```bash
 python -m ai.predict_packet_isolation_forest \
-  --artifact-dir ai/models/packet_if \
+  --artifact-dir ai/models/packet_if/packet-if-v1 \
   --csv data/exports/packet_if_inference.csv
 ```
 
@@ -241,10 +253,11 @@ git diff --check
 git status --short
 ```
 
-## 통합 전제조건
+## 운영 통합 전제조건
 
-아래 조건을 모두 충족하기 전에는 Packet IF PR을 운영 통합 Ready 상태로
-전환하지 않습니다.
+이 Core PR은 학습·Offline 추론 계약과 테스트가 통과하면 독립적으로 병합할 수
+있습니다. 다만 아래 조건을 모두 충족하기 전에는 Packet IF를 운영 Runtime으로
+활성화하지 않습니다.
 
 - 공통 Capture 적격성 정책
 - Runtime Model·Capture Policy Version 호환성 검사

@@ -34,6 +34,7 @@ SESSION_SPECS = (
         "normal",
         "normal_stable",
         30,
+        None,
     ),
     (
         "22222222-2222-4222-8222-222222222222",
@@ -41,6 +42,7 @@ SESSION_SPECS = (
         "normal",
         "normal_jitter",
         20,
+        None,
     ),
     (
         "33333333-3333-4333-8333-333333333333",
@@ -48,6 +50,7 @@ SESSION_SPECS = (
         "normal",
         "normal_test",
         20,
+        None,
     ),
     (
         "44444444-4444-4444-8444-444444444444",
@@ -55,6 +58,7 @@ SESSION_SPECS = (
         "attack",
         "packet_flood",
         20,
+        "esp32_01",
     ),
 )
 
@@ -65,7 +69,7 @@ def _write_training_bundle(
     attack_multiplier: float = 1.0,
 ) -> tuple[Path, Path]:
     rows: list[dict[str, object]] = []
-    sessions: list[dict[str, str]] = []
+    sessions: list[dict[str, object]] = []
     feature_id = 1
     base_time = datetime(2026, 7, 23, tzinfo=timezone.utc)
 
@@ -75,26 +79,28 @@ def _write_training_bundle(
         traffic_label,
         scenario,
         row_count,
+        target_device_id,
     ) in enumerate(SESSION_SPECS):
-        sessions.append(
-            {
-                "session_id": session_id,
-                "split": split,
-                "traffic_label": traffic_label,
-                "scenario": scenario,
-            }
-        )
+        session_entry: dict[str, object] = {
+            "session_id": session_id,
+            "split": split,
+            "traffic_label": traffic_label,
+            "scenario": scenario,
+        }
+        if target_device_id is not None:
+            session_entry["target_device_id"] = target_device_id
+        sessions.append(session_entry)
         session_start = base_time + timedelta(hours=session_index)
         for row_index in range(row_count):
             is_attack = traffic_label == "attack"
             attack_scale = attack_multiplier if is_attack else 1.0
             packet_count = (
-                (250 + row_index * 3) * attack_scale
+                int((250 + row_index * 3) * attack_scale)
                 if is_attack
                 else 20 + row_index % 5
             )
             total_bytes = (
-                (50_000 + row_index * 500) * attack_scale
+                int((50_000 + row_index * 500) * attack_scale)
                 if is_attack
                 else 2_000 + row_index * 20
             )
@@ -107,6 +113,7 @@ def _write_training_bundle(
                     "direction": "INBOUND",
                     "window_start": _format_utc(window_start),
                     "window_end": _format_utc(window_start + timedelta(seconds=10)),
+                    "peer_ip": "10.0.0.1",
                     "packet_count": packet_count,
                     "total_bytes": total_bytes,
                     "avg_packet_size": 100.0 + row_index % 3,
@@ -338,7 +345,7 @@ def test_train_rejects_invalid_random_state(
         )
 
 
-def test_train_refuses_to_replace_existing_artifact_without_flag(
+def test_train_always_refuses_to_replace_existing_artifact(
     tmp_path: Path,
 ) -> None:
     dataset_path, manifest_path = _write_training_bundle(tmp_path)
@@ -349,27 +356,41 @@ def test_train_refuses_to_replace_existing_artifact_without_flag(
         "git_commit_sha": GIT_COMMIT_SHA,
         "manifest_sha256": file_sha256(manifest_path),
     }
-    train_packet_isolation_forest(dataset, **kwargs)
+    artifacts = train_packet_isolation_forest(dataset, **kwargs)
+    bundle_hashes = {
+        path: file_sha256(path)
+        for path in (
+            artifacts.model_path,
+            artifacts.metadata_path,
+            artifacts.training_report_path,
+        )
+    }
 
     with pytest.raises(FileExistsError, match="artifact already exists"):
         train_packet_isolation_forest(dataset, **kwargs)
 
+    assert {
+        path: file_sha256(path)
+        for path in bundle_hashes
+    } == bundle_hashes
 
-def test_train_can_replace_existing_artifact_with_explicit_flag(
-    tmp_path: Path,
-) -> None:
+
+def test_train_succeeds_in_new_version_directory(tmp_path: Path) -> None:
     dataset_path, manifest_path = _write_training_bundle(tmp_path)
     dataset = load_packet_if_dataset(dataset_path, manifest_path)
-    artifact_dir = tmp_path / "artifacts"
-    kwargs = {
-        "artifact_dir": artifact_dir,
+    common = {
         "git_commit_sha": GIT_COMMIT_SHA,
         "manifest_sha256": file_sha256(manifest_path),
     }
-    first = train_packet_isolation_forest(dataset, **kwargs)
-    second = train_packet_isolation_forest(dataset, overwrite=True, **kwargs)
+    first = train_packet_isolation_forest(
+        dataset, artifact_dir=tmp_path / "packet-if-v1", **common
+    )
+    second = train_packet_isolation_forest(
+        dataset, artifact_dir=tmp_path / "packet-if-v2", **common
+    )
 
-    assert second.model_path == first.model_path
+    assert first.model_path != second.model_path
+    assert first.model_sha256 == file_sha256(first.model_path)
     assert second.model_sha256 == file_sha256(second.model_path)
 
 

@@ -71,7 +71,6 @@ def train_packet_isolation_forest(
     random_state: int = DEFAULT_RANDOM_STATE,
     git_commit_sha: str,
     manifest_sha256: str,
-    overwrite: bool = False,
 ) -> PacketIFTrainingArtifacts:
     """Train으로 학습하고 Validation으로 Threshold를 정한 뒤 Test를 평가합니다."""
     _validate_training_options(
@@ -83,7 +82,7 @@ def train_packet_isolation_forest(
         manifest_sha256=manifest_sha256,
     )
     paths = _artifact_paths(artifact_dir)
-    _prepare_artifact_directory(paths, overwrite=overwrite)
+    _prepare_artifact_directory(paths)
 
     train_matrix = packet_feature_matrix(dataset.train.to_dict(orient="records"))
     validation_matrix = packet_feature_matrix(
@@ -193,7 +192,6 @@ def train_from_files(
     n_estimators: int = DEFAULT_N_ESTIMATORS,
     random_state: int = DEFAULT_RANDOM_STATE,
     git_commit_sha: str | None = None,
-    overwrite: bool = False,
 ) -> PacketIFTrainingArtifacts:
     dataset = load_packet_if_dataset(dataset_path, manifest_path)
     commit_sha = git_commit_sha or current_git_commit_sha()
@@ -206,7 +204,6 @@ def train_from_files(
         random_state=random_state,
         git_commit_sha=commit_sha,
         manifest_sha256=file_sha256(manifest_path),
-        overwrite=overwrite,
     )
 
 
@@ -274,17 +271,13 @@ def _artifact_paths(artifact_dir: Path) -> dict[str, Path]:
     }
 
 
-def _prepare_artifact_directory(
-    paths: dict[str, Path],
-    *,
-    overwrite: bool,
-) -> None:
+def _prepare_artifact_directory(paths: dict[str, Path]) -> None:
     artifact_dir = paths["model"].parent
     artifact_dir.mkdir(parents=True, exist_ok=True)
     existing = [path for path in paths.values() if path.exists()]
-    if existing and not overwrite:
+    if existing:
         raise FileExistsError(
-            "Packet IF artifact already exists; use overwrite=True to replace it: "
+            "Packet IF artifact already exists; use a new version directory to retrain: "
             + ", ".join(str(path) for path in existing)
         )
 
@@ -385,7 +378,6 @@ def main() -> None:
         default=DEFAULT_RANDOM_STATE,
     )
     parser.add_argument("--git-commit-sha", default=None)
-    parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -398,7 +390,6 @@ def main() -> None:
         n_estimators=args.n_estimators,
         random_state=args.random_state,
         git_commit_sha=args.git_commit_sha,
-        overwrite=args.overwrite,
     )
     logger.info("Packet IF model: %s", artifacts.model_path)
     logger.info("Packet IF metadata: %s", artifacts.metadata_path)

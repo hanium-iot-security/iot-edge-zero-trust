@@ -84,16 +84,59 @@ def test_transform_rejects_missing_required_field(field_name: str) -> None:
         transform_packet_feature_row(row)
 
 
-@pytest.mark.parametrize("invalid_value", [None, "1.0", True])
-def test_transform_rejects_non_numeric_values(invalid_value: object) -> None:
-    with pytest.raises(ValueError, match="packet_count must be a real number"):
-        transform_packet_feature_row(_raw_row(packet_count=invalid_value))
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "packet_count",
+        "total_bytes",
+        "max_packet_size",
+        "distinct_dest_port_count",
+    ],
+)
+@pytest.mark.parametrize("invalid_value", [None, "1.0", True, 10.0])
+def test_transform_rejects_non_integer_for_integer_fields(
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match=f"{field_name} must be a non-negative integer",
+    ):
+        transform_packet_feature_row(_raw_row(**{field_name: invalid_value}))
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "packet_count",
+        "total_bytes",
+        "max_packet_size",
+        "distinct_dest_port_count",
+    ],
+)
+def test_transform_rejects_negative_integer_fields(field_name: str) -> None:
+    with pytest.raises(ValueError, match=f"{field_name} must be non-negative"):
+        transform_packet_feature_row(_raw_row(**{field_name: -1}))
+
+
+def test_transform_accepts_numpy_integer_fields() -> None:
+    transformed = transform_packet_feature_row(
+        _raw_row(
+            packet_count=np.int64(90),
+            total_bytes=np.int64(9_000),
+            max_packet_size=np.int64(150),
+            distinct_dest_port_count=np.int64(3),
+        )
+    )
+
+    assert transformed["packet_count_10s"] == 90.0
+    assert transformed["total_bytes_10s"] == 9_000.0
 
 
 @pytest.mark.parametrize("invalid_value", [float("nan"), float("inf"), float("-inf")])
 def test_transform_rejects_non_finite_values(invalid_value: float) -> None:
-    with pytest.raises(ValueError, match="total_bytes must be finite"):
-        transform_packet_feature_row(_raw_row(total_bytes=invalid_value))
+    with pytest.raises(ValueError, match="mean_inter_arrival_time must be finite"):
+        transform_packet_feature_row(_raw_row(mean_inter_arrival_time=invalid_value))
 
 
 def test_transform_rejects_negative_feature() -> None:
@@ -102,14 +145,15 @@ def test_transform_rejects_negative_feature() -> None:
 
 
 def test_transform_rejects_non_finite_normalized_value() -> None:
+    # 정수 packet_count에 매우 작은 duration을 조합하면 정규화 결과가 inf가 됩니다.
     with pytest.raises(
         ValueError,
         match="packet_count_10s must be finite after normalization",
     ):
         transform_packet_feature_row(
             _raw_row(
-                packet_count=1e308,
-                total_bytes=1.0,
+                packet_count=10**308,
+                total_bytes=1,
                 captured_duration_seconds=1e-308,
             )
         )
@@ -117,15 +161,17 @@ def test_transform_rejects_non_finite_normalized_value() -> None:
 
 @pytest.mark.parametrize("duration", [0, -0.1])
 def test_transform_rejects_non_positive_duration(duration: float) -> None:
-    expected = (
-        "captured_duration_seconds must be greater than zero"
-        if duration == 0
-        else "captured_duration_seconds must be non-negative"
-    )
-    with pytest.raises(ValueError, match=expected):
+    with pytest.raises(
+        ValueError, match="captured_duration_seconds must be greater than zero"
+    ):
         transform_packet_feature_row(
             _raw_row(captured_duration_seconds=duration)
         )
+
+
+def test_transform_rejects_duration_exceeding_nominal_window() -> None:
+    with pytest.raises(ValueError, match="captured_duration_seconds must be at most"):
+        transform_packet_feature_row(_raw_row(captured_duration_seconds=10.1))
 
 
 def test_packet_feature_vector_follows_contract_order() -> None:

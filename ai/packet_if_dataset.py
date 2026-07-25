@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import hashlib
+import ipaddress
 import json
+from numbers import Integral
 from pathlib import Path
+import re
 from typing import Any
 from uuid import UUID
 
 import pandas as pd
 
 from ai.packet_if_contract import PACKET_IF_RAW_FEATURES, packet_feature_matrix
+
+_UTC_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
 PACKET_IF_DATASET_VERSION = "packet-if-dataset-v1"
@@ -32,6 +38,7 @@ DATASET_REQUIRED_COLUMNS = (
     "direction",
     "window_start",
     "window_end",
+    "peer_ip",
     *PACKET_IF_RAW_FEATURES,
 )
 
@@ -42,6 +49,7 @@ class PacketIFSessionSpec:
     split: str
     traffic_label: str
     scenario: str
+    target_device_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -183,11 +191,23 @@ def _parse_session_spec(payload: Any) -> PacketIFSessionSpec:
         raise ValueError(f"invalid packet traffic label: {traffic_label!r}")
 
     scenario = _required_non_empty_string(payload, "scenario")
+
+    raw_target = payload.get("target_device_id")
+    if raw_target is None:
+        target_device_id = None
+    elif isinstance(raw_target, str) and raw_target.strip():
+        target_device_id = raw_target.strip()
+    else:
+        raise ValueError(
+            f"target_device_id must be a non-empty string or omitted: {raw_target!r}"
+        )
+
     return PacketIFSessionSpec(
         session_id=session_id,
         split=split,
         traffic_label=traffic_label,
         scenario=scenario,
+        target_device_id=target_device_id,
     )
 
 
@@ -224,6 +244,16 @@ def _validate_manifest_sessions(
             f"missing={sorted(missing_test_labels)}"
         )
 
+    for spec in sessions:
+        if spec.traffic_label == ATTACK_LABEL and not spec.target_device_id:
+            raise ValueError(
+                f"attack session must specify target_device_id: {spec.session_id}"
+            )
+        if spec.traffic_label == NORMAL_LABEL and spec.target_device_id is not None:
+            raise ValueError(
+                f"normal session must not have target_device_id: {spec.session_id}"
+            )
+
 
 def _validate_dataset_columns(frame: pd.DataFrame) -> None:
     missing = [
@@ -241,10 +271,20 @@ def _validate_dataset_rows(
     frame: pd.DataFrame,
     manifest: PacketIFDatasetManifest,
 ) -> None:
-    if frame["packet_feature_log_id"].isna().any():
+    ids = frame["packet_feature_log_id"]
+    if ids.isna().any():
         raise ValueError("packet_feature_log_id must not be null")
-    if frame["packet_feature_log_id"].duplicated().any():
+    if ids.duplicated().any():
         raise ValueError("packet dataset contains duplicate packet_feature_log_id values")
+    for value in ids:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Integral)
+            or value < 0
+        ):
+            raise ValueError(
+                "packet_feature_log_id must be a non-negative integer"
+            )
 
     if frame["session_id"].isna().any():
         raise ValueError("packet dataset session_id must not be null")
@@ -270,11 +310,28 @@ def _validate_dataset_rows(
             f"invalid={sorted(invalid_directions)}"
         )
 
-    window_start = pd.to_datetime(frame["window_start"], utc=True, errors="raise")
-    window_end = pd.to_datetime(frame["window_end"], utc=True, errors="raise")
-    durations = (window_end - window_start).dt.total_seconds()
-    if not durations.eq(10.0).all():
-        raise ValueError("packet dataset windows must be exact 10-second intervals")
+    if (
+        frame["peer_ip"].isna().any()
+        or frame["peer_ip"].astype(str).str.strip().eq("").any()
+    ):
+        raise ValueError("packet dataset requires non-empty peer_ip values")
+    for raw_ip in frame["peer_ip"].astype(str):
+        _validate_ipv4(raw_ip)
+
+    _validate_window_timestamps(frame["window_start"], frame["window_end"])
+
+    session_map = {spec.session_id: spec for spec in manifest.sessions}
+    for session_id, group in frame.groupby("session_id"):
+        spec = session_map.get(str(session_id))
+        if spec is not None and spec.target_device_id is not None:
+            mismatched = group[
+                group["device_id"].astype(str) != spec.target_device_id
+            ]
+            if not mismatched.empty:
+                raise ValueError(
+                    f"attack session {session_id!r} contains rows with device_id "
+                    f"not matching target_device_id {spec.target_device_id!r}"
+                )
 
     packet_feature_matrix(frame.to_dict(orient="records"))
 
@@ -284,6 +341,44 @@ def _split_frame(frame: pd.DataFrame, split: str) -> pd.DataFrame:
     if result.empty:
         raise ValueError(f"packet dataset split has no rows: {split}")
     return result.reset_index(drop=True)
+
+
+def _validate_window_timestamps(
+    start_series: pd.Series,
+    end_series: pd.Series,
+) -> None:
+    for raw_start, raw_end in zip(start_series, end_series, strict=True):
+        start = _parse_canonical_utc(raw_start, "window_start")
+        end = _parse_canonical_utc(raw_end, "window_end")
+        if start.second % 10 != 0:
+            raise ValueError(
+                f"window_start must be on a 10-second boundary: {raw_start!r}"
+            )
+        if end - start != timedelta(seconds=10):
+            raise ValueError("packet dataset windows must be exact 10-second intervals")
+
+
+def _parse_canonical_utc(raw_value: Any, field_name: str) -> datetime:
+    if not isinstance(raw_value, str) or not _UTC_TIMESTAMP_RE.match(raw_value):
+        raise ValueError(
+            f"{field_name} must be in YYYY-MM-DDTHH:MM:SSZ format: {raw_value!r}"
+        )
+    try:
+        parsed = datetime.strptime(raw_value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name} is not a valid UTC datetime: {raw_value!r}"
+        ) from exc
+    return parsed.replace(tzinfo=timezone.utc)
+
+
+def _validate_ipv4(ip_str: str) -> None:
+    try:
+        ipaddress.IPv4Address(ip_str)
+    except ValueError as exc:
+        raise ValueError(
+            f"peer_ip must be a valid IPv4 address: {ip_str!r}"
+        ) from exc
 
 
 def _required_non_empty_string(payload: dict[str, Any], field_name: str) -> str:
