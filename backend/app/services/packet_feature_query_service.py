@@ -67,6 +67,18 @@ def list_packet_features(
 def _packet_feature_item(row: dict[str, Any]) -> dict[str, Any]:
     packet_count = int(row["packet_count"])
     total_bytes = int(row["total_bytes"])
+    captured_duration_seconds = row.get("captured_duration_seconds")
+    effective_packets_per_second = None
+    effective_bytes_per_second = None
+    coverage_ratio = None
+    if captured_duration_seconds is not None:
+        duration = float(captured_duration_seconds)
+        coverage_ratio = duration / PACKET_WINDOW_SECONDS
+        if duration > 0:
+            effective_packets_per_second = packet_count / duration
+            effective_bytes_per_second = total_bytes / duration
+    nominal_packets_per_second = packet_count / PACKET_WINDOW_SECONDS
+    nominal_bytes_per_second = total_bytes / PACKET_WINDOW_SECONDS
     return {
         "id": row["id"],
         "capture_segment_id": row["capture_segment_id"],
@@ -85,8 +97,16 @@ def _packet_feature_item(row: dict[str, Any]) -> dict[str, Any]:
         "tcp_syn_count": row["tcp_syn_count"],
         "mqtt_related_packet_count": row["mqtt_related_packet_count"],
         "non_mqtt_tcp_udp_packet_count": row["non_mqtt_tcp_udp_packet_count"],
-        "packets_per_second": packet_count / PACKET_WINDOW_SECONDS,
-        "bytes_per_second": total_bytes / PACKET_WINDOW_SECONDS,
+        "packets_per_second": nominal_packets_per_second,
+        "bytes_per_second": nominal_bytes_per_second,
+        "nominal_packets_per_second": nominal_packets_per_second,
+        "nominal_bytes_per_second": nominal_bytes_per_second,
+        "effective_packets_per_second": effective_packets_per_second,
+        "effective_bytes_per_second": effective_bytes_per_second,
+        "captured_duration_seconds": captured_duration_seconds,
+        "coverage_ratio": coverage_ratio,
+        "capture_eligible": None,
+        "capture_exclusion_reason": None,
         "capture_scope": row["capture_scope"],
         "created_at": _format_api_timestamp(row["created_at"], "created_at"),
     }

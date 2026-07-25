@@ -68,6 +68,41 @@ def test_checkpoint_repository_rejects_invalid_values(migrated_db: Path) -> None
                 last_completed_window_end=datetime(2026, 7, 21, 4, 30, 0),
                 updated_at=CUTOVER_AT,
             )
+        with pytest.raises(ValueError, match="10 second boundary"):
+            checkpoint_repository.upsert_detector_checkpoint(
+                connection,
+                detector_name="mqtt_feature_rule",
+                source_table="feature_logs",
+                last_processed_id=None,
+                last_completed_window_end=datetime(
+                    2026,
+                    7,
+                    21,
+                    4,
+                    30,
+                    7,
+                    tzinfo=timezone.utc,
+                ),
+                updated_at=CUTOVER_AT,
+            )
+        with pytest.raises(ValueError, match="whole-second"):
+            checkpoint_repository.upsert_detector_checkpoint(
+                connection,
+                detector_name="mqtt_feature_rule",
+                source_table="feature_logs",
+                last_processed_id=None,
+                last_completed_window_end=datetime(
+                    2026,
+                    7,
+                    21,
+                    4,
+                    30,
+                    10,
+                    1,
+                    tzinfo=timezone.utc,
+                ),
+                updated_at=CUTOVER_AT,
+            )
 
 
 def test_initialize_phase4_cutover_rejects_invalid_inputs(tmp_path: Path) -> None:
