@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     api_allowed_origins: str = DEFAULT_API_ALLOWED_ORIGINS
     api_allow_credentials: bool = True
 
+    # MQTT Feature Producer
+    mqtt_feature_builder_interval_seconds: float = 5.0
+
     # Gateway Metrics
     gateway_metrics_interval_seconds: float = 10.0
     internal_lan_interface: str = "eth0"
