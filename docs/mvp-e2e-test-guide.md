@@ -119,7 +119,7 @@ python -m edge.mqtt.subscriber
 ```bash
 cd ~/iot-edge-zero-trust
 source venv/bin/activate
-python -m edge.features.collect_feature_logs --loop --interval 5
+python -m edge.features.run_mqtt_feature_builder --loop
 ```
 
 ### 터미널 3: 공격 및 탐지 실행

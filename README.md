@@ -88,7 +88,7 @@ Edge 진입점 실행:
 
 ```bash
 python edge/mqtt/subscriber.py
-python edge/features/collect_feature_logs.py
+python -m edge.features.run_mqtt_feature_builder --loop
 ```
 
 탐지 및 Trust Score 실행:

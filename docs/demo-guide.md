@@ -11,7 +11,7 @@ sudo systemctl start mosquitto
 python db/create_tables.py
 python db/seed_devices.py
 python edge/mqtt/subscriber.py
-python edge/features/collect_feature_logs.py
+python -m edge.features.run_mqtt_feature_builder --loop
 uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 

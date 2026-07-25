@@ -20,8 +20,12 @@ from edge.features import collect_feature_logs
 from edge.features.collect_feature_logs import MQTT_FEATURE_BUILDER, MQTT_LOGS_SOURCE
 from edge.features.run_mqtt_feature_builder import (
     GracefulShutdown,
+    ProducerBootstrapError,
+    ProducerCheckpointMissingError,
+    bootstrap_producer_checkpoint,
     compute_producer_cutoff,
     produce_once,
+    producer_lock_path,
     run_producer_cycle,
     run_producer_loop,
 )
@@ -50,6 +54,10 @@ def SessionLocal(tmp_path: Path):
             {"device_id": DEVICE_ID},
         )
         db.commit()
+        # Runtime은 Producer Checkpoint 없이는 실행을 거부한다. 신규 DB의 시작 시점을
+        # WINDOW_0_START로 명시해 이후 Window만 처리 대상이 되게 한다.
+        with db.begin():
+            bootstrap_producer_checkpoint(db, now=WINDOW_0_START)
     try:
         yield TestingSessionLocal
     finally:
@@ -278,7 +286,8 @@ def test_feature_insert_failure_rolls_back_checkpoint(SessionLocal, monkeypatch)
 
     with SessionLocal() as db:
         assert _feature_windows(db) == []
-        assert _checkpoint(db) is None
+        # Bootstrap 시점에서 전진하지 않았다.
+        assert _checkpoint(db)["last_completed_window_end"] == "2026-07-25T12:00:00Z"
 
 
 def test_checkpoint_and_feature_are_committed_together(SessionLocal):
@@ -342,7 +351,7 @@ def test_run_producer_loop_exits_immediately_when_shutdown_requested(SessionLoca
 
     assert completed == 0
     with SessionLocal() as db:
-        assert _checkpoint(db) is None
+        assert _checkpoint(db)["last_completed_window_end"] == "2026-07-25T12:00:00Z"
 
 
 @pytest.mark.parametrize("invalid", [0, -1])
@@ -470,5 +479,5 @@ def test_producer_result_reports_window_boundaries(SessionLocal):
         session_factory=SessionLocal,
         now=datetime(2026, 7, 25, 12, 0, 31, tzinfo=timezone.utc),
     )
-    assert result.completed_window_end_before is None
+    assert result.completed_window_end_before == WINDOW_0_START
     assert result.completed_window_end_after == WINDOW_0_END + timedelta(seconds=20)

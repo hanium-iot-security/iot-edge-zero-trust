@@ -374,11 +374,35 @@ def _fetch_mqtt_sources_after_checkpoint(
     return [dict(row) for row in rows]
 
 
+def phase4_producer_checkpoint_exists(db: Session) -> bool:
+    """Phase 4 Producer가 이미 이 DB를 관리하고 있는지 확인합니다."""
+    return (
+        checkpoints.get_detector_checkpoint(
+            db,
+            detector_name=MQTT_FEATURE_BUILDER,
+            source_table=MQTT_LOGS_SOURCE,
+        )
+        is not None
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="mqtt_logs를 10초 feature window로 집계합니다.")
     parser.add_argument("--loop", action="store_true", help="반복 실행합니다.")
     parser.add_argument("--interval", type=float, default=5.0, help="loop 모드 실행 간격, 초 단위")
     args = parser.parse_args()
+
+    # 이 CLI는 MVP 호환 경로이며 Producer Checkpoint를 갱신하지 않는다. Phase 4 전환이
+    # 끝난 DB에서 함께 실행되면 Feature는 늘어나는데 Checkpoint는 그대로여서, 같은
+    # Window를 Phase 4 Producer가 다시 처리하거나 Orchestrator가 잘못된 완료 상태를
+    # 보게 된다. 전환 후에는 edge.features.run_mqtt_feature_builder만 사용한다.
+    with SessionLocal() as db:
+        if phase4_producer_checkpoint_exists(db):
+            raise SystemExit(
+                "이 DB는 Phase 4 MQTT Feature Producer가 관리합니다. "
+                "python -m edge.features.run_mqtt_feature_builder --loop 를 사용하세요. "
+                "(기존 Cron·스크립트는 중지해야 합니다)"
+            )
 
     while True:
         with SessionLocal() as db:

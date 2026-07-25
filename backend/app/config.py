@@ -23,6 +23,7 @@ class Settings(BaseSettings):
 
     # MQTT Feature Producer
     mqtt_feature_builder_interval_seconds: float = 5.0
+    mqtt_feature_builder_lock_path: str = ""
 
     # Gateway Metrics
     gateway_metrics_interval_seconds: float = 10.0
