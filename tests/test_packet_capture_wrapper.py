@@ -278,7 +278,7 @@ class TestExecuteCaptureWindowDriftCorrection:
 
     def test_capture_started_at_past_window_end_does_not_invoke_process(self, tmp_path: Path) -> None:
         """window_end을 이미 지난 채로 발견되면 tcpdump조차 실행하지 않고
-        즉시 LATE_CAPTURE로 처리해야 한다 (Capture 경계 상태표: "Runtime이 현재 Window를 대기하다가 
+        즉시 LATE_CAPTURE로 처리해야 한다 (Capture 경계 상태표: "Runtime이 현재 Window를 대기하다가
         actual_start >= window_end가 됨" -> FAILED/LATE_CAPTURE). file_name은 DB CHECK 제약상 NULL이어야 하므로
         실제 파일이 어디에도 생성되지 않는다."""
         config = _make_config(tmp_path)

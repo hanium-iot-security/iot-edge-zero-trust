@@ -9,7 +9,7 @@
 
 Packet Rule Detector, Packet Behavior Isolation Forest(Train/Validation/Test/
 Inference), Dataset Export는 전부 이 모듈의 `is_capture_eligible()`을 통해서만
-적격 여부를 판정하며, 각자 별도의 판정식을 만들지 않는다 (Packet Rule·Packet IF·Dataset Export는 
+적격 여부를 판정하며, 각자 별도의 판정식을 만들지 않는다 (Packet Rule·Packet IF·Dataset Export는
 동일 공통 함수를 사용하고 API는 별도 판정식을 만들지 않고 동일 결과와 제외 이유를 노출한다).
 
 적격 판정은 반올림된 coverage_ratio가 아니라 원본 Timing Metadata를 기준으로

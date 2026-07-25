@@ -255,7 +255,7 @@ def run_capture_loop(
 
     허용 지연을 초과해 LATE_CAPTURE로 판정되면(Window 대기 중 만료 포함) 감사용
     FAILED/LATE_CAPTURE Segment 한 건만 남기고 현재 Session을 FAILED로 마감한 뒤
-    다음 정수 경계에서 새 Session을 시작합니다. 서비스 시작·재시작 시점에 이미 여러 과거 Window가 지나있는 경우는 
+    다음 정수 경계에서 새 Session을 시작합니다. 서비스 시작·재시작 시점에 이미 여러 과거 Window가 지나있는 경우는
     start_new_session의 Session Gap 기록으로 처리되며, 여기서는 Window별 가짜 Segment를 소급 생성하지 않습니다.
 
     max_windows가 주어지면 그만큼만 캡처하고 반환합니다 (수동 테스트/`--windows` 옵션용).
