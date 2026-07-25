@@ -1,0 +1,26 @@
+# IoT Edge Zero Trust - Firewall Worker sudoers
+#
+# 설치:
+#   sudo cp infra/sudoers/hanium-firewall-worker /etc/sudoers.d/hanium-firewall-worker
+#   sudo chmod 0440 /etc/sudoers.d/hanium-firewall-worker
+#   sudo visudo -c -f /etc/sudoers.d/hanium-firewall-worker
+#
+# Worker는 INPUT Chain의 TCP 1883 DROP Rule만 다룬다. 아래 4개 명령 외의 iptables
+# 사용은 허용하지 않는다. Worker가 항상 -p tcp --dport 1883 -j DROP 형태의 동일한
+# Match Specification을 사용하므로, 명령 형태를 Prefix로 고정해 오용 범위를 줄인다.
+#
+# 주의: sudoers 와일드카드(*)는 인자 전체를 느슨하게 매칭한다. 아래 항목은 Chain을
+# INPUT으로 고정하지만 그 뒤 인자까지 강제하지는 못한다. 실제 인자 검증은 Worker의
+# validate_rule_row()와 build_rule_args()가 담당한다.
+
+Cmnd_Alias HANIUM_FW_CHECK  = /usr/sbin/iptables -C INPUT *
+Cmnd_Alias HANIUM_FW_APPEND = /usr/sbin/iptables -A INPUT *
+Cmnd_Alias HANIUM_FW_DELETE = /usr/sbin/iptables -D INPUT *
+Cmnd_Alias HANIUM_FW_LIST   = /usr/sbin/iptables -S INPUT
+
+pi ALL=(root) NOPASSWD: HANIUM_FW_CHECK, HANIUM_FW_APPEND, HANIUM_FW_DELETE, HANIUM_FW_LIST
+
+Defaults!HANIUM_FW_CHECK  !requiretty
+Defaults!HANIUM_FW_APPEND !requiretty
+Defaults!HANIUM_FW_DELETE !requiretty
+Defaults!HANIUM_FW_LIST   !requiretty

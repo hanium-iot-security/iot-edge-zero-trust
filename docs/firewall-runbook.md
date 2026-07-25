@@ -1,0 +1,175 @@
+# Firewall Worker 운영 가이드
+
+Phase 4 세부계획 §2.6 / P4-6-01 기준. Trust Score가 격리를 결정하면 `firewall_rules`에
+`PENDING` Row가 남고, 이 Worker가 실제 iptables에 TCP 1883 DROP Rule을 적용한다.
+
+## 1. 목적과 책임 경계
+
+| 구분 | 담당 | 내용 |
+|---|---|---|
+| DB 상태·Repository | 정현수 | `firewall_rules` 상태 전이, `create_pending_rule_for_device`, 조회 API |
+| iptables Worker·운영 | 원우민 | 실제 Rule 적용·해제·Reconciliation, sudoers, systemd, 실기기 검증 |
+
+**`devices.status=isolated`는 Trust 정책의 격리 "결정" 상태이고,
+`firewall_rules.status=APPLIED`가 실제 네트워크 차단 "적용" 상태다.**
+공식 격리 성공은 `APPLIED` + 실제 MQTT 연결·Publish 실패가 모두 확인된 경우에만 인정한다.
+
+## 2. 사전 조건
+
+- [ ] Migration 003까지 적용된 DB (`retry_count`, `last_attempted_at`, `next_retry_at` 컬럼)
+- [ ] 테스트 Device(ESP32 #2)가 공유기 DHCP 예약 또는 고정 Lease로 IP 고정
+- [ ] `devices.ip_address`와 실제 Device IP 일치 확인
+
+```bash
+sqlite3 backend/data/iot_security.db \
+  "SELECT device_id, ip_address, status, trust_score FROM devices;"
+ping -c 1 192.168.0.5
+```
+
+- [ ] `.env`의 `FIREWALL_PROTECTED_IPS`에 Broker·관리자 노트북 IP 등록
+      (Pi #1 = `CAPTURE_INTERFACE_IP`는 자동 포함되지만 명시해도 무방)
+- [ ] `iptables` 설치 경로 확인 (`which iptables` → 기본값 `/usr/sbin/iptables`)
+
+> **Protected IP를 반드시 확인할 것.** 관리자 노트북 IP가 빠진 상태에서 그 IP로 Rule이
+> 생성되면 SSH·Dashboard 접근이 끊길 수 있다. Worker는 Protected IP Rule을 즉시
+> `FAILED`로 만들고 iptables까지 보내지 않는다.
+
+## 3. 설치
+
+### sudoers
+
+```bash
+sudo cp infra/sudoers/hanium-firewall-worker /etc/sudoers.d/hanium-firewall-worker
+sudo chmod 0440 /etc/sudoers.d/hanium-firewall-worker
+sudo visudo -c -f /etc/sudoers.d/hanium-firewall-worker   # 반드시 문법 검사
+sudo -n /usr/sbin/iptables -S INPUT                        # 비밀번호 없이 동작 확인
+```
+
+허용 명령은 `iptables -C/-A/-D INPUT ...`과 `iptables -S INPUT` 4개뿐이다.
+
+### systemd
+
+```bash
+sudo cp infra/systemd/firewall-worker.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now firewall-worker
+systemctl status firewall-worker
+journalctl -u firewall-worker -f
+```
+
+> Unit은 `NoNewPrivileges=false`다. `sudo`가 setuid 바이너리라 `true`로 두면 모든
+> iptables 호출이 실패한다. 대신 sudoers로 명령 범위를 좁혀 위험을 줄인다.
+
+## 4. 상태 전이
+
+| 상태 | 의미 | 다음 |
+|---|---|---|
+| `PENDING` | Trust가 격리를 결정, 아직 미적용 | Worker가 적용 → `APPLIED` |
+| `APPLIED` | 실제 iptables Rule 존재 | 해제 → `REMOVED` |
+| `FAILED` | Validation 오류 또는 일시 오류 3회 초과 | 관리자 명령으로만 `PENDING` 복귀 |
+| `REMOVED` | 차단 해제 완료 | 종료 상태 |
+
+- **Validation 오류**(Protected IP, 비사설 IP, 잘못된 Protocol·Port·Action)는
+  재시도해도 결과가 같으므로 **즉시 `FAILED`**.
+- **일시 오류**(iptables 실행 실패·Timeout)는 `retry_count`를 올리며 최대 **3회**까지만
+  자동 재시도하고, 그 뒤에는 자동 재시도하지 않는다. `next_retry_at` 이전에는 다시
+  집어가지 않는다.
+
+## 5. 수동 Smoke Test
+
+```bash
+cd /home/pi/iot-edge-zero-trust
+source venv/bin/activate
+
+# 1) 실행 예정 명령만 확인 (DB·OS 미변경)
+python -m edge.trust.run_firewall_worker --dry-run
+
+# 2) 한 Cycle 실행 (Reconciliation 포함)
+python -m edge.trust.run_firewall_worker --once
+
+# 3) 실제 Rule 확인
+sudo iptables -S INPUT | grep hanium-firewall
+
+# 4) DB 상태 확인
+sqlite3 backend/data/iot_security.db \
+  "SELECT id, device_id, source_ip, status, retry_count, applied_at, last_error
+     FROM firewall_rules ORDER BY id DESC LIMIT 5;"
+
+# 5) 실제 차단 확인 (해당 Device에서 MQTT Publish 실패해야 함)
+mosquitto_pub -h 192.168.0.20 -t iot/esp32_02/sensor -m '{"device_id":"esp32_02"}'
+```
+
+기대 결과: `hanium-firewall:{id}` Comment가 붙은 Rule 1건, DB `status=APPLIED`,
+해당 Device의 MQTT 연결·Publish 실패.
+
+## 6. 격리 해제
+
+```bash
+python -m edge.trust.run_firewall_worker --release <RULE_ID>
+sudo iptables -S INPUT | grep hanium-firewall   # 사라졌는지 확인
+```
+
+동일한 Match Specification으로 `-C` 확인 후 `-D` 삭제하고 `REMOVED`로 기록한다.
+실제 Rule이 이미 없어도 DB는 `REMOVED`로 정리된다(경고 로그 남음).
+
+## 7. 3회 실패한 Rule 재시도 (관리자 전용)
+
+자동 무한 재시도는 하지 않는다. 원인을 먼저 확인하고 명시적으로 되돌린다.
+
+```bash
+# 1) 원인 확인
+sqlite3 backend/data/iot_security.db \
+  "SELECT id, source_ip, retry_count, last_error FROM firewall_rules WHERE status='FAILED';"
+
+# 2) 원인 제거 후 재전환 (확인 토큰 필수)
+python -m edge.trust.run_firewall_worker \
+  --admin-reset-failed <RULE_ID> --confirm RESET-FIREWALL-RULE
+```
+
+Protected IP 때문에 실패한 Rule은 되돌리지 말 것. 그 Rule은 애초에 만들어지면 안 되는
+Rule이며, Trust 쪽 Device·IP 매핑을 확인해야 한다.
+
+## 8. Reconciliation·재부팅
+
+Worker는 기동 후 첫 Cycle에서 자동으로 Reconciliation을 수행한다. 수동 실행:
+
+```bash
+python -m edge.trust.run_firewall_worker --reconcile-only
+```
+
+- `APPLIED`인데 실제 Rule이 없으면 → **동일 Specification으로 재적용**하고 경고 로그
+- 실제 Rule은 있는데 DB에 활성 Row가 없으면 → **자동 삭제하지 않고** Comment와 전체
+  Specification을 경고 로그로 남긴다. 관리자가 직접 판단한다
+
+재부팅 검증:
+
+```bash
+sudo reboot
+# 재부팅 후
+systemctl status firewall-worker
+journalctl -u firewall-worker | grep -i reconcil
+sudo iptables -S INPUT | grep hanium-firewall
+```
+
+`iptables` Rule은 재부팅으로 사라지므로, 재부팅 후 첫 Cycle에서 `restored`로 복구되는
+것이 정상 동작이다.
+
+## 9. 문제 해결
+
+| 증상 | 확인 |
+|---|---|
+| `sudo: a password is required` | sudoers 미설치 또는 사용자 불일치. `sudo -n /usr/sbin/iptables -S INPUT` |
+| 모든 Rule이 즉시 FAILED | `last_error` 확인. Protected IP·비사설 IP·Port 불일치 여부 |
+| `PENDING`인데 처리 안 됨 | `next_retry_at`이 미래인지, `retry_count`가 3인지 확인 |
+| APPLIED인데 차단 안 됨 | `sudo iptables -S INPUT`에 Rule이 있는지, Device 실제 IP가 `source_ip`와 같은지 |
+| Rule은 있는데 DB가 PENDING | 정상. 다음 Cycle의 `-C`가 기존 Rule을 찾아 APPLIED로 수렴한다 |
+| iptables 명령 없음 | `FIREWALL_IPTABLES_PATH` 확인 |
+
+## 10. 안전 규칙
+
+- 허용 범위는 **등록된 사설 IPv4 / TCP / 목적지 Port 1883 / INPUT DROP**뿐이다
+- `shell=True`를 사용하지 않는다. 항상 인자 배열로 실행한다
+- Pi #1·Broker·관리자 IP는 Protected IP로 차단하지 않는다
+- DB에 없는 `hanium-firewall:` Rule을 자동 삭제하지 않는다
+- 적용·확인·삭제·Reconciliation은 항상 동일한 Match Specification을 쓴다
+  (`edge/trust/firewall_worker.py`의 `build_rule_args()` 한 곳에서 생성)

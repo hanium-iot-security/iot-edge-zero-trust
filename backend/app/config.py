@@ -41,6 +41,15 @@ class Settings(BaseSettings):
     failed_pcap_max_storage_mb: int = 256
     failed_pcap_max_files: int = 20
 
+    # Firewall Worker
+    firewall_worker_interval_seconds: float = 5.0
+    firewall_worker_batch_size: int = 20
+    firewall_retry_delay_seconds: int = 30
+    firewall_protected_ips: str = ""
+    firewall_iptables_path: str = "/usr/sbin/iptables"
+    firewall_sudo_path: str = "/usr/bin/sudo"
+    firewall_command_timeout_seconds: float = 10.0
+
     model_config = SettingsConfigDict(env_file=(".env", "../.env"), env_file_encoding="utf-8")
 
 
