@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from edge.packet.capture_policy import CapturePolicy
 from edge.packet.capture_runtime import (
     CaptureOutcome,
     CaptureRuntimeConfig,
@@ -276,9 +277,7 @@ class TestExecuteCaptureWindowDriftCorrection:
         assert process.last_call["window_seconds"] == 10.0
 
     def test_capture_started_at_past_window_end_does_not_invoke_process(self, tmp_path: Path) -> None:
-        """window_seconds<=0이면 tcpdump조차 실행하지 않고
-        즉시 실패로 처리해야 한다. 남은 시간이 없는 캡처가 정상 READY Segment로
-        저장되는 일을 막기 위한 방어 코드다."""
+        
         config = _make_config(tmp_path)
         config.ensure_directories()
         window_start = _utc(2026, 7, 15, 10, 0, 10)
@@ -293,9 +292,60 @@ class TestExecuteCaptureWindowDriftCorrection:
 
         assert process.last_call is None  # capture_window()가 호출되지 않음
         assert result.success is False
-        assert result.error_code == "PARTIAL_CAPTURE"
-        assert not (config.ready_dir / result.file_name).exists()
-        assert not (config.failed_dir / result.file_name).exists()  # 파일 자체가 생성되지 않음
+        assert result.error_code == "LATE_CAPTURE"
+        assert result.file_name is None
+        assert result.final_path is None
+        assert result.captured_duration_seconds == 0.0
+        assert result.actual_capture_started_at is None
+        # incoming/ready/failed 어디에도 파일이 생성되지 않아야 한다.
+        expected_ready_name = build_pcap_filename(
+            session_id=SESSION_ID, interface="eth0",
+            window_start=window_start, window_end=window_end, tmp=False,
+        )
+        assert not (config.ready_dir / expected_ready_name).exists()
+        assert not (config.failed_dir / expected_ready_name).exists()
+
+    def test_start_delay_beyond_policy_but_before_window_end_is_late_capture(self, tmp_path: Path) -> None:
+        """window은 아직 안 끝났어도, 허용 지연(기본 1.0초+epsilon)을 넘겼다면
+        tcpdump를 실행하지 않고 LATE_CAPTURE여야 한다."""
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        window_start = _utc(2026, 7, 15, 10, 0, 10)
+        window_end = _utc(2026, 7, 15, 10, 0, 20)
+        capture_started_at = window_start.replace(microsecond=500_000)  # 0.5초 지연: 허용 초과
+        process = FakeCaptureProcess(outcome=CaptureOutcome(completed_full_window=True, exit_code=-15))
+        policy = CapturePolicy(max_start_delay_seconds=0.3, minimum_duration_seconds=9.5)
+
+        result = execute_capture_window(
+            process, config, session_id=SESSION_ID,
+            window_start=window_start, window_end=window_end,
+            capture_started_at=capture_started_at,
+            policy=policy,
+        )
+
+        assert process.last_call is None
+        assert result.error_code == "LATE_CAPTURE"
+        assert result.start_delay_seconds == pytest.approx(0.5)
+
+    def test_start_delay_within_policy_before_window_end_still_captures(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        window_start = _utc(2026, 7, 15, 10, 0, 10)
+        window_end = _utc(2026, 7, 15, 10, 0, 20)
+        capture_started_at = window_start.replace(microsecond=300_000)  # 0.3초 지연: 기본 정책 허용 범위
+        process = FakeCaptureProcess(outcome=CaptureOutcome(completed_full_window=True, exit_code=-15))
+
+        result = execute_capture_window(
+            process, config, session_id=SESSION_ID,
+            window_start=window_start, window_end=window_end,
+            capture_started_at=capture_started_at,
+        )
+
+        assert process.last_call is not None
+        assert result.success is True
+        assert result.error_code is None
+        assert result.start_delay_seconds == pytest.approx(0.3)
+        assert result.captured_duration_seconds == pytest.approx(9.7, abs=1e-6)
 
 
 class TestExecuteCaptureWindowSuccess:

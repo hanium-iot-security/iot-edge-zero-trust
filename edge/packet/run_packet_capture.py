@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from backend.app.database import SessionLocal
 from edge.packet import capture_session_repository as repo
 from edge.packet.capture_runtime import (
+    LATE_CAPTURE,
     CaptureProcess,
     CaptureRuntimeConfig,
     TcpdumpCaptureProcess,
@@ -199,7 +200,7 @@ def start_new_session(
     """새 Session을 생성하고 first_window_start·Capture Gap을 기록합니다.
 
     fallback_gap_start: 이 interface에 대해 DB에 기록된 Segment가 전혀 없을 때
-    Gap 시작점으로 사용할 값입니다. 만료된 Window로 인해 Session이 전환되는 경우, 
+    Gap 시작점으로 사용할 값입니다. 만료된 Window로 인해 Session이 전환되는 경우,
     놓친 window_start를 여기로 넘기면 "이전 Segment가 하나도 없어 Gap을 계산 못 하는" 상황에서도 공백이 누락되지 않습니다.
 
     Returns:
@@ -249,13 +250,20 @@ def run_capture_loop(
 ) -> int:
     """first_window_start부터 연속으로 10초 Window를 캡처합니다.
 
-    Window 경계(window_start)까지 대기한 뒤 캡처를 시작하고, 캡처 자체가
+    Window 경계(window_start)까지 대기한 뒤 캡처를 시작하고, execute_capture_window가
+    Phase 4 Capture Policy(허용 지연·최소 Duration)에 따라 LATE_CAPTURE 여부를 판정합니다.
+
+    허용 지연을 초과해 LATE_CAPTURE로 판정되면(Window 대기 중 만료 포함) 감사용
+    FAILED/LATE_CAPTURE Segment 한 건만 남기고 현재 Session을 FAILED로 마감한 뒤
+    다음 정수 경계에서 새 Session을 시작합니다. 서비스 시작·재시작
+    시점에 이미 여러 과거 Window가 지나있는 경우는 start_new_session의 Session Gap
+    기록으로 처리되며, 여기서는 Window별 가짜 Segment를 소급 생성하지 않습니다.
 
     max_windows가 주어지면 그만큼만 캡처하고 반환합니다 (수동 테스트/`--windows` 옵션용).
-    max_windows 카운트에는 만료로 건너뛴 Window는 포함하지 않습니다.
+    max_windows 카운트에는 LATE_CAPTURE로 건너뛴 Window는 포함하지 않습니다.
 
     Returns:
-        실제로 캡처를 시도한 Window 개수.
+        실제로 캡처를 시도한(READY 또는 PARTIAL_CAPTURE) Window 개수.
     """
     window_start = first_window_start
     windows_captured = 0
@@ -264,12 +272,38 @@ def run_capture_loop(
         repo.close_session(db, session_pk, now, status)
         db.commit()
 
-    def _transition_to_new_session(now: datetime) -> None:
+    def _record_late_capture_and_transition(
+        now: datetime,
+        *,
+        missed_window_end: datetime,
+        start_delay_seconds: float | None,
+        error_message: str,
+    ) -> None:
+        """허용 지연 초과 Window 한 건을 감사용 Segment로 남기고 새 Session으로 전환한다."""
         nonlocal session_pk, session_id, window_start
-        missed_window_start = window_start  # 전환 전, 놓친 Window의 시작 시각을 보존
-        _close_current_session(now, "COMPLETED")
+        missed_window_start = window_start
+        repo.insert_late_capture_segment(
+            db,
+            capture_session_pk=session_pk,
+            capture_interface=config.capture_interface,
+            window_start=missed_window_start,
+            window_end=missed_window_end,
+            error_message=error_message,
+            start_delay_seconds=start_delay_seconds,
+        )
+        db.commit()
+        logger.warning(
+            "LATE_CAPTURE segment 생성: window=%s~%s start_delay_seconds=%s; "
+            "Session을 FAILED로 마감하고 다음 경계에서 새 Session으로 전환",
+            format_utc_iso(missed_window_start), format_utc_iso(missed_window_end),
+            start_delay_seconds,
+        )
+        # 허용 지연을 초과한 Window는 ... 부모 packet_capture_sessions.status=FAILED로
+        # 마감한다. (COMPLETED가 아니라 FAILED로 마감해야 Phase 4 Cutover/모니터링에서
+        # 지연으로 인한 전환과 정상 종료를 구분할 수 있다.)
+        _close_current_session(now, "FAILED")
         session_pk, session_id, window_start = start_new_session(
-            db, config, now, fallback_gap_start=missed_window_start
+            db, config, now, fallback_gap_start=missed_window_end
         )
 
     try:
@@ -277,40 +311,19 @@ def run_capture_loop(
             now = clock()
             window_end = window_start + timedelta(seconds=config.window_seconds)
 
-            if window_end <= now:
-                # 이 Window는 대기를 시작하기도 전에 이미 만료된 상태로 발견됐다.
-                logger.warning(
-                    "Window %s~%s는 대기 중 만료되어 건너뜀 (현재 시각=%s); "
-                    "Session을 종료하고 다음 경계에서 새 Session을 시작",
-                    format_utc_iso(window_start), format_utc_iso(window_end), format_utc_iso(now),
-                )
-                _transition_to_new_session(now)
-                continue
-
-            _sleep_until(window_start, clock=clock, sleep=sleep)
-
-            if shutdown.requested:
-                # 대기 중 종료 신호를 받았다면 새 캡처를 시작하지 않고 즉시 빠져나간다
-                break
+            if window_end > now:
+                _sleep_until(window_start, clock=clock, sleep=sleep)
+                if shutdown.requested:
+                    # 대기 중 종료 신호를 받았다면 새 캡처를 시작하지 않고 즉시 빠져나간다
+                    break
 
             capture_started_at = clock()
 
-            if capture_started_at >= window_end:
-                logger.warning(
-                    "Window %s~%s는 캡처 시작 전에 만료됨 (capture_started_at=%s); "
-                    "Session을 종료하고 다음 경계에서 새 Session을 시작",
-                    format_utc_iso(window_start), format_utc_iso(window_end),
-                    format_utc_iso(capture_started_at),
-                )
-                _transition_to_new_session(capture_started_at)
-                continue
-
             drift_seconds = (capture_started_at - window_start).total_seconds()
-            if drift_seconds > 0:
-                # 이 지연 자체는 문제가 아니다 -- execute_capture_window가 window_end까지
-                # 남은 시간만큼만 캡처하도록 자체 보정하므로 다음 Window로 누적되지 않는다.
-                # 다만 지속적으로 지연이 관측되면 DB/디스크 성능 저하의 신호일 수 있어
-                # 로그로 남긴다.
+            if 0 < drift_seconds <= config.capture_policy.max_start_delay_seconds:
+                # 허용 범위 안의 지연이다 -- execute_capture_window가 window_end까지
+                # 남은 시간만큼만 캡처하도록 자체 보정하므로 다음 Window로 누적되지
+                # 않는다. 다만 지속 관측되면 DB/디스크 성능 저하의 신호일 수 있어 로그로 남긴다.
                 logger.info(
                     "Window %s 캡처가 %.3fs 지연되어 시작됨 (자동 보정됨)",
                     format_utc_iso(window_start), drift_seconds,
@@ -323,7 +336,18 @@ def run_capture_loop(
                 window_start=window_start,
                 window_end=window_end,
                 capture_started_at=capture_started_at,
+                policy=config.capture_policy,
+                clock=clock,
             )
+
+            if result.error_code == LATE_CAPTURE:
+                _record_late_capture_and_transition(
+                    capture_started_at,
+                    missed_window_end=window_end,
+                    start_delay_seconds=result.start_delay_seconds,
+                    error_message=result.error_message or "",
+                )
+                continue
 
             if result.success:
                 repo.insert_ready_segment(
@@ -333,6 +357,11 @@ def run_capture_loop(
                     capture_interface=config.capture_interface,
                     window_start=window_start,
                     window_end=window_end,
+                    actual_capture_started_at=result.actual_capture_started_at,
+                    capture_stop_requested_at=result.capture_stop_requested_at,
+                    capture_process_exited_at=result.capture_process_exited_at,
+                    start_delay_seconds=result.start_delay_seconds,
+                    captured_duration_seconds=result.captured_duration_seconds,
                 )
                 logger.info("READY segment 생성: %s", result.file_name)
             else:
@@ -345,6 +374,11 @@ def run_capture_loop(
                     window_end=window_end,
                     error_code=result.error_code or repo.PARTIAL_CAPTURE,
                     error_message=result.error_message or "",
+                    actual_capture_started_at=result.actual_capture_started_at,
+                    capture_stop_requested_at=result.capture_stop_requested_at,
+                    capture_process_exited_at=result.capture_process_exited_at,
+                    start_delay_seconds=result.start_delay_seconds,
+                    captured_duration_seconds=result.captured_duration_seconds,
                 )
                 logger.warning("FAILED segment 생성: %s (%s)", result.file_name, result.error_code)
 
