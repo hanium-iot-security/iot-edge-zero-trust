@@ -38,6 +38,11 @@ logs/
 ai/models/*.pkl
 ai/models/*.joblib
 ai/models/*.onnx
+ai/models/**/*.pkl
+ai/models/**/*.joblib
+ai/models/**/*.onnx
+ai/models/packet_if/**
+!ai/models/packet_if/.gitkeep
 models/*.pkl
 models/*.joblib
 models/*.onnx
