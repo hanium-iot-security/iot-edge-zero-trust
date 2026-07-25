@@ -303,7 +303,7 @@ def insert_ready_segment(
             "window_start": format_utc_iso(window_start),
             "window_end": format_utc_iso(window_end),
             "actual_capture_started_at": _optional_utc_iso_precise(actual_capture_started_at),
-            "capture_stop_requested_at": _optional_utc_iso(capture_stop_requested_at),
+            "capture_stop_requested_at": _optional_utc_iso_precise(capture_stop_requested_at),
             "capture_process_exited_at": _optional_utc_iso_precise(capture_process_exited_at),
             "start_delay_seconds": start_delay_seconds,
             "captured_duration_seconds": captured_duration_seconds,
@@ -364,7 +364,7 @@ def insert_failed_segment(
             "error_code": error_code,
             "error_message": error_message,
             "actual_capture_started_at": _optional_utc_iso_precise(actual_capture_started_at),
-            "capture_stop_requested_at": _optional_utc_iso(capture_stop_requested_at),
+            "capture_stop_requested_at": _optional_utc_iso_precise(capture_stop_requested_at),
             "capture_process_exited_at": _optional_utc_iso_precise(capture_process_exited_at),
             "start_delay_seconds": start_delay_seconds,
             "captured_duration_seconds": captured_duration_seconds,
@@ -385,15 +385,14 @@ def insert_late_capture_segment(
 ) -> int:
     """허용 지연을 초과해 Capture Process를 아예 실행하지 못한 Window를 기록합니다.
 
-    "예정된 Window를 대기한 뒤 허용 지연을 초과한 경우에는 FAILED/LATE_CAPTURE Segment 한 건을 남기고 Session을 마감한다."
+    예정된 Window를 대기한 뒤 허용 지연을 초과한 경우에는 FAILED/LATE_CAPTURE Segment 한 건을 남기고 Session을 마감한다."
 
     file_name/actual_capture_started_at/capture_stop_requested_at/
     capture_process_exited_at은 DB CHECK 제약에 따라 항상 NULL이고
     captured_duration_seconds는 항상 0으로 고정된다. start_delay_seconds만
     감사용으로 실제 관측된 지연을 남긴다 (CHECK 제약이 이 컬럼은 제한하지 않음).
 
-    호출자는 이 Segment 저장 직후 부모 Session을 FAILED로 마감해야 한다
-    (해당 Segment는 정상 Packet Feature·Packet IF 학습·추론·Trust 입력에서 제외하고 다음 정수 경계에서 새 Session으로 전환한다").
+    호출자는 이 Segment 저장 직후 부모 Session을 FAILED로 마감해야 한다.
     """
     return insert_failed_segment(
         db,
@@ -412,14 +411,10 @@ def insert_late_capture_segment(
     )
 
 
-def _optional_utc_iso(value: datetime | None) -> str | None:
-    """capture_stop_requested_at처럼 항상 정수 초 Window 경계인 필드용."""
-    return format_utc_iso(value) if value is not None else None
-
-
 def _optional_utc_iso_precise(value: datetime | None) -> str | None:
-    """actual_capture_started_at/capture_process_exited_at처럼 실제 wall-clock 관측값인
-    필드용. window_start/window_end와 달리 밀리초 이하 정밀도를 보존한다."""
+    """actual_capture_started_at/capture_stop_requested_at/capture_process_exited_at처럼
+    실제 wall-clock 관측값인 필드용. window_start/window_end와 달리 밀리초 이하
+    정밀도를 보존한다."""
     return format_utc_iso_precise(value) if value is not None else None
 
 

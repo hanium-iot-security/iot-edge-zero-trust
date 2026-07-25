@@ -298,7 +298,9 @@ class TestSegments:
             window_start=_utc(2026, 7, 15, 10, 0, 0),
             window_end=_utc(2026, 7, 15, 10, 0, 10),
             actual_capture_started_at=_utc(2026, 7, 15, 10, 0, 0).replace(microsecond=300_000),
-            capture_stop_requested_at=_utc(2026, 7, 15, 10, 0, 10),
+            # 실제 SIGTERM이 명목 window_end(10:00:10)보다 0.4초 늦게 나간 상황을 흉내낸다
+            # (OS 스케줄링 지연). 이 필드도 실제 관측값이므로 window_end와 다를 수 있다.
+            capture_stop_requested_at=_utc(2026, 7, 15, 10, 0, 10).replace(microsecond=400_000),
             capture_process_exited_at=_utc(2026, 7, 15, 10, 0, 10).replace(microsecond=50_000),
             start_delay_seconds=0.3,
             captured_duration_seconds=9.7,
@@ -315,14 +317,16 @@ class TestSegments:
         ).mappings().first()
         assert row["start_delay_seconds"] == pytest.approx(0.3)
         assert row["captured_duration_seconds"] == pytest.approx(9.7)
-        # capture_stop_requested_at은 항상 정수 초 Window 경계이므로 microsecond=0이다.
-        assert row["capture_stop_requested_at"] == "2026-07-15T10:00:10Z"
-        # actual_capture_started_at/capture_process_exited_at은 실제 wall-clock 관측값
-        # 이므로 format_utc_iso()(정수 초로 truncate)가 아니라 microsecond를 보존하는
-        # format_utc_iso_precise()로 저장돼야 한다. 여기서 0.3초·0.05초 지연이 그대로
-        # 남아있는지 확인한다 (회귀 시 "2026-07-15T10:00:00Z"처럼 소수점이 사라진다).
+        # actual_capture_started_at/capture_stop_requested_at/capture_process_exited_at은
+        # 전부 실제 wall-clock 관측값이므로 format_utc_iso()(정수 초로 truncate)가 아니라
+        # microsecond를 보존하는 format_utc_iso_precise()로 저장돼야 한다. capture_stop_
+        # requested_at은 window_end와 항상 같은 값이 아니라 실제 SIGTERM 호출 시각이라는
+        # 점이 이 필드가 별도 컬럼으로 존재하는 이유이므로, 소수점이 사라지면(예:
+        # "2026-07-15T10:00:10Z") 회귀다.
         assert row["actual_capture_started_at"] == "2026-07-15T10:00:00.300000Z"
+        assert row["capture_stop_requested_at"] == "2026-07-15T10:00:10.400000Z"
         assert row["capture_process_exited_at"] == "2026-07-15T10:00:10.050000Z"
+
 
     def test_insert_ready_segment_without_timing_metadata_defaults_to_null(self, db_session) -> None:
         """Crash Recovery 경로처럼 Timing Metadata를 모르는 호출부는 생략할 수 있다."""
@@ -351,7 +355,7 @@ class TestSegments:
 
 
 class TestInsertLateCaptureSegment:
-    """허용 지연 초과 Window의 감사용 FAILED/LATE_CAPTURE Segment."""
+    """Phase 4 세부계획 2.1 절: 허용 지연 초과 Window의 감사용 FAILED/LATE_CAPTURE Segment."""
 
     def test_stores_failed_late_capture_with_null_file_name(self, db_session) -> None:
         session_pk = repo.create_session(
@@ -833,7 +837,7 @@ class TestRunCaptureLoop:
 
 
 class TestRunCaptureLoopLateCaptureWithinWindow:
-    """정상 실행 중이며 window_start < actual_start < window_end, 지연 1초 초과 -> Capture Process를 실행하지 않고 FAILED/LATE_CAPTURE로 처리."""
+    """정상 실행 중이며 window_start < actual_start < window_end, 지연 1초 초과" -> Capture Process를 실행하지 않고 FAILED/LATE_CAPTURE로 처리."""
 
     def test_delay_beyond_policy_skips_capture_and_fails_session(self, db_session, tmp_path) -> None:
         config = _make_config(tmp_path)
