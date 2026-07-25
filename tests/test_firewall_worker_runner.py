@@ -17,7 +17,15 @@ from sqlalchemy.orm import sessionmaker
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
 from edge.runtime_lock import RuntimeLockError, single_instance_lock
 from edge.trust import firewall_repository
-from edge.trust.firewall_worker import CHECK, INSERT, CommandResult, FirewallPolicy
+from edge.trust.firewall_worker import (
+    CHECK,
+    INSERT,
+    LIST_RULES,
+    CommandResult,
+    FirewallPolicy,
+    FirewallRuleSpec,
+    build_rule_args,
+)
 from edge.trust.run_firewall_worker import (
     GracefulShutdown,
     firewall_lock_path,
@@ -36,11 +44,12 @@ class RecordingRunner:
         self.installed: list[str] = []
         self.calls: list[list[str]] = []
 
-    def run(self, args: Sequence[str]) -> CommandResult:
-        args = list(args)
+    def run_operation(
+        self, operation: str, spec: FirewallRuleSpec | None = None
+    ) -> CommandResult:
+        args = [operation, "INPUT"] if spec is None else build_rule_args(spec, operation=operation)
         self.calls.append(args)
-        operation = args[0]
-        if operation == "-S":
+        if operation == LIST_RULES:
             return CommandResult(returncode=0, stdout="\n".join(self.installed))
         key = " ".join(args[3:] if operation == INSERT else args[2:])
         if operation == CHECK:
@@ -119,7 +128,7 @@ def test_loop_applies_pending_rule_and_reconciles_once(SessionLocal, policy, tmp
 
     assert completed == 2
     # Reconciliation(`-S`)은 첫 Cycle에서 한 번만 수행한다.
-    assert runner.operations().count("-S") == 1
+    assert runner.operations().count(LIST_RULES) == 1
     with SessionLocal() as db:
         assert _status(db, rule_id) == "APPLIED"
 
@@ -170,7 +179,7 @@ def test_reconcile_runs_on_first_executed_cycle_not_first_attempt(
             lock_path=lock_path,
             lock_wait_seconds=0.05,
         )
-    assert runner.operations().count("-S") == 0
+    assert runner.operations().count(LIST_RULES) == 0
 
     run_worker_loop(
         runner=runner,
@@ -182,7 +191,7 @@ def test_reconcile_runs_on_first_executed_cycle_not_first_attempt(
         clock=lambda: NOW,
         lock_path=lock_path,
     )
-    assert runner.operations().count("-S") == 1
+    assert runner.operations().count(LIST_RULES) == 1
 
 
 def test_worker_cycle_reports_reconcile_and_pending_results(SessionLocal, policy):
@@ -207,7 +216,7 @@ def test_cycle_without_reconcile_skips_rule_listing(SessionLocal, policy):
         _create_pending(db)
         run_worker_cycle(db, runner=runner, policy=policy, now=NOW, with_reconcile=False)
 
-    assert "-S" not in runner.operations()
+    assert LIST_RULES not in runner.operations()
 
 
 def test_lock_path_defaults_next_to_database_file():

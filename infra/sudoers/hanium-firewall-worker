@@ -1,26 +1,27 @@
 # IoT Edge Zero Trust - Firewall Worker sudoers
 #
 # 설치:
+#   sudo install -o root -g root -m 0755 \
+#     infra/scripts/hanium-firewall-rule /usr/local/sbin/hanium-firewall-rule
 #   sudo cp infra/sudoers/hanium-firewall-worker /etc/sudoers.d/hanium-firewall-worker
 #   sudo chmod 0440 /etc/sudoers.d/hanium-firewall-worker
 #   sudo visudo -c -f /etc/sudoers.d/hanium-firewall-worker
 #
-# Worker는 INPUT Chain의 TCP 1883 DROP Rule만 다룬다. 아래 4개 명령 외의 iptables
-# 사용은 허용하지 않는다. Worker가 항상 -p tcp --dport 1883 -j DROP 형태의 동일한
-# Match Specification을 사용하므로, 명령 형태를 Prefix로 고정해 오용 범위를 줄인다.
+# 허용 대상은 root 소유 Wrapper 하나뿐이다. iptables를 직접 허용하지 않는다.
 #
-# 주의: sudoers 와일드카드(*)는 인자 전체를 느슨하게 매칭한다. 아래 항목은 Chain을
-# INPUT으로 고정하지만 그 뒤 인자까지 강제하지는 못한다. 실제 인자 검증은 Worker의
-# validate_rule_row()와 build_rule_args()가 담당한다.
+# sudoers 와일드카드는 인자를 강제할 수 없다. `iptables -A INPUT *`를 허용하면 pi
+# 계정이 Worker를 거치지 않고 임의의 INPUT Rule을 root 권한으로 추가할 수 있다
+# (예: SSH 차단, 통제를 무력화하는 ACCEPT). Python의 validate_rule_row()는 직접 실행한
+# sudo 명령을 막지 못한다.
+#
+# Wrapper는 Operation·Source IP·Rule ID만 받고 Chain·Port·Target·Comment를 스스로
+# 조립하므로, 호출자가 Rule 규격을 바꿀 수 없다.
+#
+# 전제: /usr/local/sbin/hanium-firewall-rule 이 root 소유이고 pi가 수정할 수 없어야
+# 한다. pi가 그 파일을 고칠 수 있으면 아래 제한은 무의미해진다.
 
-Cmnd_Alias HANIUM_FW_CHECK  = /usr/sbin/iptables -C INPUT *
-Cmnd_Alias HANIUM_FW_APPEND = /usr/sbin/iptables -A INPUT *
-Cmnd_Alias HANIUM_FW_DELETE = /usr/sbin/iptables -D INPUT *
-Cmnd_Alias HANIUM_FW_LIST   = /usr/sbin/iptables -S INPUT
+Cmnd_Alias HANIUM_FIREWALL_RULE = /usr/local/sbin/hanium-firewall-rule
 
-pi ALL=(root) NOPASSWD: HANIUM_FW_CHECK, HANIUM_FW_APPEND, HANIUM_FW_DELETE, HANIUM_FW_LIST
+pi ALL=(root) NOPASSWD: HANIUM_FIREWALL_RULE
 
-Defaults!HANIUM_FW_CHECK  !requiretty
-Defaults!HANIUM_FW_APPEND !requiretty
-Defaults!HANIUM_FW_DELETE !requiretty
-Defaults!HANIUM_FW_LIST   !requiretty
+Defaults!HANIUM_FIREWALL_RULE !requiretty

@@ -28,7 +28,7 @@ ping -c 1 192.168.0.5
 
 - [ ] `.env`의 `FIREWALL_PROTECTED_IPS`에 Broker·관리자 노트북 IP 등록
       (Pi #1 = `CAPTURE_INTERFACE_IP`는 자동 포함되지만 명시해도 무방)
-- [ ] `iptables` 설치 경로 확인 (`which iptables` → 기본값 `/usr/sbin/iptables`)
+- [ ] `iptables` 설치 확인 (`which iptables` → Wrapper 기본값 `/usr/sbin/iptables`)
 
 > **Protected IP를 반드시 확인할 것.** 관리자 노트북 IP가 빠진 상태에서 그 IP로 Rule이
 > 생성되면 SSH·Dashboard 접근이 끊길 수 있다. Worker는 Protected IP Rule을 즉시
@@ -36,16 +36,50 @@ ping -c 1 192.168.0.5
 
 ## 3. 설치
 
-### sudoers
+### Rule Wrapper + sudoers
+
+방화벽 명령은 root 소유 Wrapper 하나만 거친다. `iptables`를 sudoers로 직접 허용하지
+않는다.
 
 ```bash
+# 1) Wrapper 설치 (root 소유, pi가 수정할 수 없어야 함)
+sudo install -o root -g root -m 0755 \
+  infra/scripts/hanium-firewall-rule /usr/local/sbin/hanium-firewall-rule
+
+# 2) sudoers 설치
 sudo cp infra/sudoers/hanium-firewall-worker /etc/sudoers.d/hanium-firewall-worker
 sudo chmod 0440 /etc/sudoers.d/hanium-firewall-worker
 sudo visudo -c -f /etc/sudoers.d/hanium-firewall-worker   # 반드시 문법 검사
-sudo -n /usr/sbin/iptables -S INPUT                        # 비밀번호 없이 동작 확인
+
+# 3) 동작 확인 (비밀번호 없이 실행되어야 함)
+sudo -n /usr/local/sbin/hanium-firewall-rule list
+
+# 4) 조립되는 Rule 규격 확인 (실행하지 않음)
+sudo -n HANIUM_FW_DRY_RUN=1 /usr/local/sbin/hanium-firewall-rule insert 192.168.0.5 1
+#   또는 로컬에서: HANIUM_FW_DRY_RUN=1 bash infra/scripts/hanium-firewall-rule insert 192.168.0.5 1
+
+# 5) 권한 확인 — root 소유이고 pi 쓰기 권한이 없어야 함
+ls -l /usr/local/sbin/hanium-firewall-rule
 ```
 
-허용 명령은 `iptables -C/-A/-D INPUT ...`과 `iptables -S INPUT` 4개뿐이다.
+**왜 Wrapper인가**: sudoers 와일드카드는 인자를 강제할 수 없다. `iptables -A INPUT *`를
+허용하면 pi 계정이 Worker를 거치지 않고 임의의 INPUT Rule을 root 권한으로 추가할 수
+있다(예: SSH 차단, 통제를 무력화하는 ACCEPT). Python의 `validate_rule_row()`는 직접
+실행한 sudo 명령을 막지 못한다. Wrapper는 Operation·Source IP·Rule ID만 받고
+Chain·Port·Target·Comment를 스스로 조립하므로 호출자가 규격을 바꿀 수 없다.
+
+Wrapper가 허용하는 것은 4개뿐이다: `check`, `insert`, `delete`, `list`.
+사설 IPv4가 아닌 Source IP나 숫자가 아닌 Rule ID는 Wrapper에서 거부된다(종료 코드 65).
+
+> **Wrapper 파일 권한이 이 통제의 전제다.** pi가 Wrapper를 수정할 수 있으면 sudoers
+> 제한이 무의미해진다. 반드시 root 소유이고 다른 사용자에게 쓰기 권한이 없어야 한다.
+
+> **계정 권한도 함께 확인할 것.** Raspberry Pi OS 기본 설정에서 `pi` 계정은
+> `/etc/sudoers.d/010_pi-nopasswd` 등으로 모든 명령에 sudo 권한을 갖는 경우가 많다.
+> 그 상태라면 Wrapper 제한은 "Worker가 실수로 잘못된 Rule을 넣는 것"만 막고, 계정
+> 탈취에 대한 방어는 되지 않는다. 가능하면 서비스 전용 계정(예: `hanium`)을 만들고
+> blanket sudo 없이 Wrapper만 허용한 뒤 systemd Unit의 `User=`를 바꾼다.
+> (Phase 4에서는 폐쇄형 테스트베드 기준으로 `pi` 계정을 사용한다.)
 
 ### systemd
 
@@ -87,8 +121,8 @@ python -m edge.trust.run_firewall_worker --dry-run
 # 2) 한 Cycle 실행 (Reconciliation 포함)
 python -m edge.trust.run_firewall_worker --once
 
-# 3) 실제 Rule 확인
-sudo iptables -S INPUT | grep hanium-firewall
+# 3) 실제 Rule 확인 (Wrapper 경유 — Worker와 같은 권한 경로)
+sudo -n /usr/local/sbin/hanium-firewall-rule list | grep hanium-firewall
 
 # 4) DB 상태 확인
 sqlite3 backend/data/iot_security.db \
@@ -205,16 +239,19 @@ Lock이 없으면 다음 경합이 발생합니다:
 
 | 증상 | 확인 |
 |---|---|
-| `sudo: a password is required` | sudoers 미설치 또는 사용자 불일치. `sudo -n /usr/sbin/iptables -S INPUT` |
+| `sudo: a password is required` | sudoers 미설치 또는 사용자 불일치. `sudo -n /usr/local/sbin/hanium-firewall-rule list` |
 | 모든 Rule이 즉시 FAILED | `last_error` 확인. Protected IP·비사설 IP·Port 불일치 여부 |
 | `PENDING`인데 처리 안 됨 | `next_retry_at`이 미래인지, `retry_count`가 3인지 확인 |
 | APPLIED인데 차단 안 됨 | `sudo iptables -S INPUT`에 Rule이 있는지, Device 실제 IP가 `source_ip`와 같은지 |
 | Rule은 있는데 DB가 PENDING | 정상. 다음 Cycle의 `-C`가 기존 Rule을 찾아 APPLIED로 수렴한다 |
-| iptables 명령 없음 | `FIREWALL_IPTABLES_PATH` 확인 |
+| Wrapper 없음 | `FIREWALL_WRAPPER_PATH`와 `/usr/local/sbin/hanium-firewall-rule` 설치 확인 |
+| Wrapper가 종료 코드 65 | Source IP가 사설 IPv4가 아니거나 Rule ID가 숫자가 아니다 |
 
 ## 11. 안전 규칙
 
 - 허용 범위는 **등록된 사설 IPv4 / TCP / 목적지 Port 1883 / INPUT DROP**뿐이다
+- sudoers는 root 소유 Wrapper 하나만 허용한다. `iptables`를 직접 허용하지 않는다
+- Wrapper는 root 소유 0755여야 한다. pi가 수정 가능하면 통제가 무너진다
 - `shell=True`를 사용하지 않는다. 항상 인자 배열로 실행한다
 - Pi #1·Broker·관리자 IP는 Protected IP로 차단하지 않는다
 - DB에 없는 `hanium-firewall:` Rule을 자동 삭제하지 않는다

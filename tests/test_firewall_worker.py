@@ -23,6 +23,7 @@ from edge.trust.firewall_worker import (
     DELETE,
     INSERT,
     INSERT_POSITION,
+    LIST_RULES,
     CommandResult,
     FirewallPolicy,
     FirewallRuleSpec,
@@ -64,10 +65,13 @@ class FakeIptablesRunner:
         self.fail_returncode = fail_returncode
         self.calls: list[list[str]] = []
 
-    def run(self, args: Sequence[str]) -> CommandResult:
-        args = list(args)
+    def run_operation(
+        self, operation: str, spec: FirewallRuleSpec | None = None
+    ) -> CommandResult:
+        # 실제 Rule 규격은 운영 Wrapper가 조립하지만, 테스트는 Python 쪽 단일
+        # Specification(build_rule_args)을 그대로 사용해 규격·삽입 위치까지 검증한다.
+        args = [operation, CHAIN] if spec is None else build_rule_args(spec, operation=operation)
         self.calls.append(args)
-        operation = args[0]
 
         remaining = self.fail_operations.get(operation, 0)
         if remaining > 0:
@@ -77,7 +81,7 @@ class FakeIptablesRunner:
                 stderr="iptables: Resource temporarily unavailable.",
             )
 
-        if operation == "-S":
+        if operation == LIST_RULES:
             return CommandResult(returncode=0, stdout="\n".join(self.installed))
 
         key = _rule_key(args)
@@ -522,7 +526,7 @@ def test_list_managed_rule_ids_parses_comment(policy):
 
 
 def test_list_managed_rule_ids_raises_transient_on_command_failure():
-    runner = FakeIptablesRunner(fail_operations={"-S": 1})
+    runner = FakeIptablesRunner(fail_operations={LIST_RULES: 1})
     with pytest.raises(FirewallTransientError):
         list_managed_rule_ids(runner)
 
@@ -538,7 +542,9 @@ def test_plan_pending_rules_does_not_change_state(SessionLocal, policy):
         planned = plan_pending_rules(db, policy=policy, now=NOW)
 
         assert planned[0][0] == rule_id
-        assert planned[0][1][:3] == [INSERT, CHAIN, INSERT_POSITION]
+        spec, iptables_args = planned[0][1]
+        assert spec.rule_id == rule_id
+        assert iptables_args[:3] == [INSERT, CHAIN, INSERT_POSITION]
         assert _rule_row(db, rule_id)["status"] == "PENDING"
 
 

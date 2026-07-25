@@ -1,0 +1,118 @@
+#!/bin/bash
+# IoT Edge Zero Trust - Firewall Rule Wrapper
+#
+# root 소유로 설치되어 sudo로 실행되는 유일한 방화벽 진입점이다.
+#
+# sudoers에 `iptables -A INPUT *`를 직접 허용하면, Worker를 거치지 않고도 pi 계정이
+# 임의의 INPUT Rule을 root 권한으로 추가할 수 있다(예: SSH 차단, 통제 무력화 ACCEPT).
+# Python의 validate_rule_row()는 직접 실행한 sudo 명령을 막지 못한다.
+#
+# 그래서 이 Wrapper가 Operation·Source IP·Rule ID만 받고, 실제 Rule 규격
+# (INPUT / TCP / 목적지 Port 1883 / hanium-firewall:{id} Comment / DROP)은
+# 여기서 조립한다. 호출자는 Chain·Port·Target·Comment를 바꿀 수 없다.
+#
+# 설치:
+#   sudo install -o root -g root -m 0755 \
+#     infra/scripts/hanium-firewall-rule /usr/local/sbin/hanium-firewall-rule
+#
+# 중요: 이 파일이 pi 계정으로 수정 가능하면 sudoers 제한이 무의미해진다.
+# 반드시 root 소유이고 다른 사용자에게 쓰기 권한이 없어야 한다.
+#
+# 사용법:
+#   hanium-firewall-rule check  <source_ip> <rule_id>
+#   hanium-firewall-rule insert <source_ip> <rule_id>
+#   hanium-firewall-rule delete <source_ip> <rule_id>
+#   hanium-firewall-rule list
+#
+# 종료 코드는 iptables의 것을 그대로 전달한다(check에서 1 = Rule 없음).
+# HANIUM_FW_DRY_RUN=1이면 조립된 iptables 인자만 출력하고 실행하지 않는다.
+
+set -euo pipefail
+
+IPTABLES="${HANIUM_FW_IPTABLES:-/usr/sbin/iptables}"
+CHAIN="INPUT"
+PROTOCOL="tcp"
+DEST_PORT="1883"
+ACTION="DROP"
+COMMENT_PREFIX="hanium-firewall:"
+INSERT_POSITION="1"
+
+usage() {
+    echo "usage: $(basename "$0") check|insert|delete <source_ip> <rule_id>" >&2
+    echo "       $(basename "$0") list" >&2
+    exit 64
+}
+
+# 등록 기기가 쓰는 사설 IPv4만 허용한다. 공인 IP나 잘못된 문자열은 여기서 끊는다.
+validate_private_ipv4() {
+    local ip="$1"
+    if [[ ! "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        echo "invalid IPv4 address: $ip" >&2
+        exit 65
+    fi
+    local o1="${BASH_REMATCH[1]}" o2="${BASH_REMATCH[2]}"
+    local o3="${BASH_REMATCH[3]}" o4="${BASH_REMATCH[4]}"
+    for octet in "$o1" "$o2" "$o3" "$o4"; do
+        if (( octet > 255 )); then
+            echo "invalid IPv4 address: $ip" >&2
+            exit 65
+        fi
+    done
+    if (( o1 == 10 )); then return 0; fi
+    if (( o1 == 172 )) && (( o2 >= 16 )) && (( o2 <= 31 )); then return 0; fi
+    if (( o1 == 192 )) && (( o2 == 168 )); then return 0; fi
+    echo "source IP must be a private IPv4 address: $ip" >&2
+    exit 65
+}
+
+validate_rule_id() {
+    local rule_id="$1"
+    if [[ ! "$rule_id" =~ ^[0-9]+$ ]]; then
+        echo "invalid rule id: $rule_id" >&2
+        exit 65
+    fi
+}
+
+build_match_args() {
+    local ip="$1" rule_id="$2"
+    MATCH_ARGS=(
+        -p "$PROTOCOL"
+        -s "$ip"
+        --dport "$DEST_PORT"
+        -m comment --comment "${COMMENT_PREFIX}${rule_id}"
+        -j "$ACTION"
+    )
+}
+
+[[ $# -ge 1 ]] || usage
+operation="$1"
+
+case "$operation" in
+    check|insert|delete)
+        [[ $# -eq 3 ]] || usage
+        source_ip="$2"
+        rule_id="$3"
+        validate_private_ipv4 "$source_ip"
+        validate_rule_id "$rule_id"
+        build_match_args "$source_ip" "$rule_id"
+        case "$operation" in
+            check)  IPTABLES_ARGS=(-C "$CHAIN" "${MATCH_ARGS[@]}") ;;
+            insert) IPTABLES_ARGS=(-I "$CHAIN" "$INSERT_POSITION" "${MATCH_ARGS[@]}") ;;
+            delete) IPTABLES_ARGS=(-D "$CHAIN" "${MATCH_ARGS[@]}") ;;
+        esac
+        ;;
+    list)
+        [[ $# -eq 1 ]] || usage
+        IPTABLES_ARGS=(-S "$CHAIN")
+        ;;
+    *)
+        usage
+        ;;
+esac
+
+if [[ "${HANIUM_FW_DRY_RUN:-0}" == "1" ]]; then
+    printf '%s\n' "${IPTABLES_ARGS[@]}"
+    exit 0
+fi
+
+exec "$IPTABLES" "${IPTABLES_ARGS[@]}"

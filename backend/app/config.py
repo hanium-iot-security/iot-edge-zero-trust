@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     firewall_worker_batch_size: int = 20
     firewall_retry_delay_seconds: int = 30
     firewall_protected_ips: str = ""
-    firewall_iptables_path: str = "/usr/sbin/iptables"
+    firewall_wrapper_path: str = "/usr/local/sbin/hanium-firewall-rule"
     firewall_sudo_path: str = "/usr/bin/sudo"
     firewall_command_timeout_seconds: float = 10.0
     firewall_lock_path: str = ""

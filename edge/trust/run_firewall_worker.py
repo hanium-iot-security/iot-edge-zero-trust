@@ -27,7 +27,7 @@ from edge.trust.firewall_worker import (
     IptablesRunner,
     PendingCycleResult,
     ReconcileResult,
-    SudoIptablesRunner,
+    WrapperIptablesRunner,
     plan_pending_rules,
     process_pending_rules,
     reconcile,
@@ -83,7 +83,7 @@ def load_firewall_policy(app_settings: Settings = settings) -> FirewallPolicy:
 
     return FirewallPolicy(
         protected_ips=frozenset(protected),
-        iptables_path=app_settings.firewall_iptables_path,
+        wrapper_path=app_settings.firewall_wrapper_path,
         sudo_path=app_settings.firewall_sudo_path,
         command_timeout_seconds=app_settings.firewall_command_timeout_seconds,
         retry_delay_seconds=app_settings.firewall_retry_delay_seconds,
@@ -194,9 +194,8 @@ def run_worker_loop(
     return completed
 
 
-def _print_dry_run(
-    db: Session, *, policy: FirewallPolicy, now: datetime, sudo_path: str, iptables_path: str
-) -> None:
+def _print_dry_run(db: Session, *, policy: FirewallPolicy, now: datetime) -> None:
+    """실행 예정 Wrapper 명령과 그 결과로 만들어질 iptables Rule을 함께 보여줍니다."""
     planned = plan_pending_rules(db, policy=policy, now=now)
     if not planned:
         print("실행 대기 중인 PENDING Rule이 없습니다.")
@@ -205,8 +204,12 @@ def _print_dry_run(
         if isinstance(plan, str):
             print(f"[rule_id={rule_id}] {plan}")
             continue
-        command = " ".join([sudo_path, "-n", iptables_path, *plan])
-        print(f"[rule_id={rule_id}] {command}")
+        spec, iptables_args = plan
+        wrapper_command = " ".join(
+            [policy.sudo_path, "-n", policy.wrapper_path, "insert", spec.source_ip, str(rule_id)]
+        )
+        print(f"[rule_id={rule_id}] {wrapper_command}")
+        print(f"[rule_id={rule_id}]   -> iptables {' '.join(iptables_args)}")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -281,17 +284,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
-    runner = SudoIptablesRunner(policy)
+    runner = WrapperIptablesRunner(policy)
 
     if args.dry_run:
         with SessionLocal() as db:
-            _print_dry_run(
-                db,
-                policy=policy,
-                now=_now(),
-                sudo_path=policy.sudo_path,
-                iptables_path=policy.iptables_path,
-            )
+            _print_dry_run(db, policy=policy, now=_now())
         return 0
 
     if args.release is not None:

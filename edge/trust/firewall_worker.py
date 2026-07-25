@@ -92,7 +92,7 @@ class FirewallPolicy:
     """Worker 실행 정책입니다. Protected IP는 어떤 경우에도 차단하지 않습니다."""
 
     protected_ips: frozenset[str] = frozenset()
-    iptables_path: str = "/usr/sbin/iptables"
+    wrapper_path: str = "/usr/local/sbin/hanium-firewall-rule"
     sudo_path: str = "/usr/bin/sudo"
     command_timeout_seconds: float = 10.0
     retry_delay_seconds: int = 30
@@ -134,29 +134,52 @@ class ReconcileResult:
 
 
 class IptablesRunner(Protocol):
-    """iptables 실행 경계입니다. 테스트는 Fake Runner로 대체합니다."""
+    """방화벽 명령 실행 경계입니다. 테스트는 Fake Runner로 대체합니다.
 
-    def run(self, args: Sequence[str]) -> CommandResult: ...
+    Operation과 Rule 식별 정보만 전달합니다. 실제 Rule 규격은 운영 환경에서는 root
+    소유 Wrapper가 조립하므로, 호출자가 Chain·Port·Target을 바꿀 수 없습니다.
+    """
+
+    def run_operation(
+        self, operation: str, spec: FirewallRuleSpec | None = None
+    ) -> CommandResult: ...
 
 
-class SudoIptablesRunner:
-    """제한된 sudo 명령으로 실제 iptables를 실행합니다.
+WRAPPER_OPERATION_NAMES = {
+    CHECK: "check",
+    INSERT: "insert",
+    DELETE: "delete",
+    LIST_RULES: "list",
+}
 
-    인자 배열만 사용하고 `shell=True`는 절대 사용하지 않습니다. Comment에 들어가는
-    문자열은 우리가 만든 `hanium-firewall:{id}`뿐이지만, Shell을 거치지 않는 것이
-    Injection에 대한 근본 방어입니다.
+
+class WrapperIptablesRunner:
+    """root 소유 Wrapper를 sudo로 호출합니다.
+
+    sudoers에 `iptables -A INPUT *`를 직접 허용하면 Worker를 거치지 않고도 pi 계정이
+    임의의 INPUT Rule을 root 권한으로 추가할 수 있습니다. `validate_rule_row()`는 직접
+    실행한 sudo 명령을 막을 수 없으므로, 권한 자체를 Wrapper 하나로 좁힙니다.
+
+    인자 배열만 사용하고 `shell=True`는 사용하지 않습니다.
     """
 
     def __init__(self, policy: FirewallPolicy) -> None:
         self._policy = policy
 
-    def run(self, args: Sequence[str]) -> CommandResult:
-        command = [
-            self._policy.sudo_path,
-            "-n",
-            self._policy.iptables_path,
-            *args,
-        ]
+    def run_operation(
+        self, operation: str, spec: FirewallRuleSpec | None = None
+    ) -> CommandResult:
+        try:
+            operation_name = WRAPPER_OPERATION_NAMES[operation]
+        except KeyError as exc:
+            raise ValueError(f"unsupported firewall operation: {operation!r}") from exc
+
+        command = [self._policy.sudo_path, "-n", self._policy.wrapper_path, operation_name]
+        if operation != LIST_RULES:
+            if spec is None:
+                raise ValueError(f"{operation_name} requires a rule spec")
+            command += [spec.source_ip, str(spec.rule_id)]
+
         try:
             completed = subprocess.run(  # noqa: S603 - 인자 배열만 사용하며 shell을 쓰지 않는다
                 command,
@@ -167,12 +190,12 @@ class SudoIptablesRunner:
             )
         except subprocess.TimeoutExpired as exc:
             raise FirewallTransientError(
-                f"iptables command timed out after {self._policy.command_timeout_seconds}s"
+                f"firewall command timed out after {self._policy.command_timeout_seconds}s"
             ) from exc
         except FileNotFoundError as exc:
-            raise FirewallTransientError(f"iptables command not found: {exc}") from exc
+            raise FirewallTransientError(f"firewall wrapper not found: {exc}") from exc
         except OSError as exc:
-            raise FirewallTransientError(f"failed to execute iptables: {exc}") from exc
+            raise FirewallTransientError(f"failed to execute firewall wrapper: {exc}") from exc
 
         return CommandResult(
             returncode=completed.returncode,
@@ -243,7 +266,7 @@ def validate_rule_row(row: dict[str, Any], policy: FirewallPolicy) -> FirewallRu
 
 def rule_exists(runner: IptablesRunner, spec: FirewallRuleSpec) -> bool:
     """동일 Specification의 실제 Rule이 있는지 확인합니다."""
-    result = runner.run(build_rule_args(spec, operation=CHECK))
+    result = runner.run_operation(CHECK, spec)
     if result.returncode == 0:
         return True
     if result.returncode == _RULE_ABSENT_RETURNCODE:
@@ -255,7 +278,7 @@ def rule_exists(runner: IptablesRunner, spec: FirewallRuleSpec) -> bool:
 
 def insert_rule(runner: IptablesRunner, spec: FirewallRuleSpec) -> None:
     """INPUT Chain 맨 앞에 DROP Rule을 넣습니다."""
-    result = runner.run(build_rule_args(spec, operation=INSERT))
+    result = runner.run_operation(INSERT, spec)
     if result.returncode != 0:
         raise FirewallTransientError(
             f"iptables insert failed (rc={result.returncode}): {_summarize(result.stderr)}"
@@ -263,7 +286,7 @@ def insert_rule(runner: IptablesRunner, spec: FirewallRuleSpec) -> None:
 
 
 def delete_rule(runner: IptablesRunner, spec: FirewallRuleSpec) -> None:
-    result = runner.run(build_rule_args(spec, operation=DELETE))
+    result = runner.run_operation(DELETE, spec)
     if result.returncode != 0:
         raise FirewallTransientError(
             f"iptables delete failed (rc={result.returncode}): {_summarize(result.stderr)}"
@@ -272,7 +295,7 @@ def delete_rule(runner: IptablesRunner, spec: FirewallRuleSpec) -> None:
 
 def list_managed_rule_ids(runner: IptablesRunner) -> dict[int, str]:
     """실제 iptables에 남아 있는 `hanium-firewall:` Rule을 Rule ID별로 반환합니다."""
-    result = runner.run([LIST_RULES, CHAIN])
+    result = runner.run_operation(LIST_RULES)
     if result.returncode != 0:
         raise FirewallTransientError(
             f"iptables list failed (rc={result.returncode}): {_summarize(result.stderr)}"
@@ -502,13 +525,13 @@ def plan_pending_rules(
     policy: FirewallPolicy,
     now: datetime,
     limit: int | None = None,
-) -> list[tuple[int, list[str] | str]]:
-    """Dry Run용으로 실행 예정 명령을 만들되 OS·DB를 건드리지 않습니다."""
+) -> list[tuple[int, tuple[FirewallRuleSpec, list[str]] | str]]:
+    """Dry Run용으로 실행 예정 내용을 만들되 OS·DB를 건드리지 않습니다."""
     now_utc = require_utc_whole_second(now, "now")
     batch_size = limit if limit is not None else policy.batch_size
     rows = firewall_repository.list_pending_rules(db, now=now_utc, limit=batch_size)
 
-    planned: list[tuple[int, list[str] | str]] = []
+    planned: list[tuple[int, tuple[FirewallRuleSpec, list[str]] | str]] = []
     for row in rows:
         rule_id = int(row["id"])
         try:
@@ -516,7 +539,7 @@ def plan_pending_rules(
         except FirewallValidationError as exc:
             planned.append((rule_id, f"VALIDATION_FAILURE: {exc}"))
             continue
-        planned.append((rule_id, build_rule_args(spec, operation=INSERT)))
+        planned.append((rule_id, (spec, build_rule_args(spec, operation=INSERT))))
     return planned
 
 
