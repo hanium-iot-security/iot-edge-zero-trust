@@ -303,7 +303,7 @@ Extractor 쪽 연결은 추후 정종민 님과 협의해서 결정합니다.
 
 ---
 
-## 6. Capture 입력 적격 Policy·LATE_CAPTURE (P4-1-01)
+## Capture 입력 적격 Policy·LATE_CAPTURE (P4-1-01)
 
 담당: 정선우
 
@@ -364,7 +364,7 @@ Inference), Dataset Export는 모두 이 함수를 그대로 호출해야 하며
 3. `capture_gap_start`가 직전 마지막 Segment(있다면 LATE_CAPTURE 감사 Segment
    포함)의 `window_end` 기준으로 계산됐는지 확인한다.
 
-**(5) Capture 시작 후 중간 종료 (`PARTIAL_CAPTURE`, 기존 Phase 3-B 동작 유지)**
+**(5) Capture 시작 후 중간 종료 (`PARTIAL_CAPTURE`, 기존 동작 유지)**
 1. 캡처 도중 `pkill -TERM tcpdump`로 강제 종료한다.
 2. `status=FAILED`, `error_code=PARTIAL_CAPTURE`로 기록되고, 파일이 실제
    생성됐다면 `file_name`에 남는지 확인한다. 지연 초과가 아니므로 Session은
@@ -373,4 +373,4 @@ Inference), Dataset Export는 모두 이 함수를 그대로 호출해야 하며
 
 ### 6.3 pcap 자동 삭제
 
-pcap 자동 Cleanup은 구현하지 않는다 ("원본 pcap은 Feature 오류·오탐·미탐을 재현하는 근거다. 백업과 보관 기간이 합의되기 전에는 자동 삭제하지 않는다").
+pcap 자동 Cleanup은 구현하지 않는다 (원본 pcap은 Feature 오류·오탐·미탐을 재현하는 근거다. 백업과 보관 기간이 합의되기 전에는 자동 삭제하지 않는다).

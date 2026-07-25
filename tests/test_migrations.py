@@ -43,6 +43,19 @@ def _write_project_migrations(migrations_dir: Path) -> None:
         )
 
 
+def _write_project_migrations_subset(
+    migrations_dir: Path,
+    migration_names: tuple[str, ...],
+) -> None:
+    migrations_dir.mkdir()
+    for migration_name in migration_names:
+        source_path = MIGRATIONS_DIR / migration_name
+        (migrations_dir / migration_name).write_text(
+            source_path.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+
 def _migration_versions(connection: sqlite3.Connection) -> list[int]:
     rows = connection.execute(
         """
@@ -228,9 +241,9 @@ def test_runner_applies_new_database_in_order(tmp_path: Path) -> None:
     result = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [1, 2]
+        assert result.applied_versions == [1, 2, 3]
         assert result.baselined_versions == []
-        assert _migration_versions(connection) == [1, 2]
+        assert _migration_versions(connection) == [1, 2, 3]
         assert _table_exists(connection, "packet_capture_sessions")
         assert _table_exists(connection, "trust_score_history")
 
@@ -542,7 +555,7 @@ def test_legacy_db_missing_feature_unique_is_not_baselined(tmp_path: Path) -> No
         assert not _table_exists(connection, "packet_capture_sessions")
 
 
-def test_runner_applies_only_002_to_existing_001_db_and_preserves_rows(
+def test_runner_applies_002_and_003_to_existing_001_db_and_preserves_rows(
     tmp_path: Path,
 ) -> None:
     db_path = _legacy_001_db(tmp_path)
@@ -602,8 +615,8 @@ def test_runner_applies_only_002_to_existing_001_db_and_preserves_rows(
 
     with connect_database(db_path) as connection:
         assert result.baselined_versions == [1]
-        assert result.applied_versions == [2]
-        assert _migration_versions(connection) == [1, 2]
+        assert result.applied_versions == [2, 3]
+        assert _migration_versions(connection) == [1, 2, 3]
         device = connection.execute(
             "SELECT device_id, status, trust_score FROM devices"
         ).fetchone()
@@ -644,10 +657,10 @@ def test_runner_skips_already_applied_migrations(tmp_path: Path) -> None:
     second = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert first.applied_versions == [1, 2]
+        assert first.applied_versions == [1, 2, 3]
         assert second.applied_versions == []
-        assert second.skipped_versions == [1, 2]
-        assert _migration_versions(connection) == [1, 2]
+        assert second.skipped_versions == [1, 2, 3]
+        assert _migration_versions(connection) == [1, 2, 3]
 
 
 def test_runner_sorts_migration_files_by_version(tmp_path: Path) -> None:
@@ -782,8 +795,8 @@ def test_failed_002_migration_can_be_retried_after_fix(tmp_path: Path) -> None:
     result = apply_migrations(db_path, migrations_dir)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [2]
-        assert _migration_versions(connection) == [1, 2]
+        assert result.applied_versions == [2, 3]
+        assert _migration_versions(connection) == [1, 2, 3]
         assert not _table_exists(connection, "retry_marker")
         assert _table_exists(connection, "packet_capture_sessions")
         assert "failed_retry_column" not in _column_names(
@@ -1753,6 +1766,392 @@ def test_firewall_rules_status_and_active_unique_contract(tmp_path: Path) -> Non
             VALUES ('192.168.0.36', 'tcp', 1883, 'PENDING')
             """
         )
+
+
+def test_phase4_migration_applies_003_to_existing_002_and_preserves_segments(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "phase4-existing-002.db"
+    migrations_002_dir = tmp_path / "migrations-002"
+    _write_project_migrations_subset(
+        migrations_002_dir,
+        ("001_init.sql", "002_packet_gateway.sql"),
+    )
+    apply_migrations(db_path, migrations_002_dir)
+
+    with connect_database(db_path) as connection:
+        session_id = _insert_packet_capture_session(connection)
+        segment_id = _insert_packet_capture_segment(
+            connection,
+            capture_session_id=session_id,
+            file_name="phase4-preserve.pcap",
+        )
+        feature_id = _insert_packet_feature_log(
+            connection,
+            capture_segment_id=segment_id,
+        )
+
+    result = apply_migrations(db_path, MIGRATIONS_DIR)
+
+    with connect_database(db_path) as connection:
+        assert result.applied_versions == [3]
+        assert _migration_versions(connection) == [1, 2, 3]
+        assert {
+            "actual_capture_started_at",
+            "capture_stop_requested_at",
+            "capture_process_exited_at",
+            "start_delay_seconds",
+            "captured_duration_seconds",
+        } <= _column_names(connection, "packet_capture_segments")
+        assert {"dedupe_key", "policy_version"} <= _column_names(
+            connection,
+            "detection_events",
+        )
+        segment = connection.execute(
+            """
+            SELECT id, file_name, actual_capture_started_at,
+                   captured_duration_seconds
+            FROM packet_capture_segments
+            WHERE id = ?
+            """,
+            (segment_id,),
+        ).fetchone()
+        feature = connection.execute(
+            """
+            SELECT id, capture_segment_id
+            FROM packet_feature_logs
+            WHERE id = ?
+            """,
+            (feature_id,),
+        ).fetchone()
+        assert segment["id"] == segment_id
+        assert segment["file_name"] == "phase4-preserve.pcap"
+        assert segment["actual_capture_started_at"] is None
+        assert segment["captured_duration_seconds"] is None
+        assert feature["capture_segment_id"] == segment_id
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+        new_segment_id = _insert_packet_capture_segment(
+            connection,
+            capture_session_id=session_id,
+            file_name="phase4-next.pcap",
+            window_start="2026-07-16T10:00:10Z",
+            window_end="2026-07-16T10:00:20Z",
+        )
+        assert new_segment_id > segment_id
+
+
+def test_phase4_segment_timing_and_file_name_constraints(tmp_path: Path) -> None:
+    db_path = tmp_path / "phase4-segment-constraints.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+
+    with connect_database(db_path) as connection:
+        session_id = _insert_packet_capture_session(connection)
+
+        for status, file_name, start_second in (
+            ("READY", None, 0),
+            ("PROCESSED", None, 10),
+            ("EMPTY", None, 20),
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO packet_capture_segments (
+                        capture_session_id, file_name, capture_interface,
+                        window_start, window_end, status
+                    )
+                    VALUES (?, ?, 'wlan0', ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        file_name,
+                        f"2026-07-16T10:00:{start_second:02d}Z",
+                        f"2026-07-16T10:00:{start_second + 10:02d}Z",
+                        status,
+                    ),
+                )
+
+        connection.execute(
+            """
+            INSERT INTO packet_capture_segments (
+                capture_session_id, file_name, capture_interface,
+                window_start, window_end, status, error_code,
+                captured_duration_seconds
+            )
+            VALUES (?, NULL, 'wlan0', '2026-07-16T10:01:00Z',
+                    '2026-07-16T10:01:10Z', 'FAILED',
+                    'LATE_CAPTURE', 0)
+            """,
+            (session_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO packet_capture_segments (
+                capture_session_id, file_name, capture_interface,
+                window_start, window_end, status,
+                captured_duration_seconds
+            )
+            VALUES (?, NULL, 'wlan0', '2026-07-16T10:01:10Z',
+                    '2026-07-16T10:01:20Z', 'FAILED', 9)
+            """,
+            (session_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO packet_capture_segments (
+                capture_session_id, file_name, capture_interface,
+                window_start, window_end, status,
+                captured_duration_seconds
+            )
+            VALUES (?, NULL, 'wlan0', '2026-07-16T10:01:20Z',
+                    '2026-07-16T10:01:30Z', 'FAILED', 10)
+            """,
+            (session_id,),
+        )
+
+        invalid_values = [
+            {
+                "window_start": "2026-07-16T10:02:00Z",
+                "window_end": "2026-07-16T10:02:10Z",
+                "status": "FAILED",
+                "file_name": "late-file.pcap",
+                "error_code": "LATE_CAPTURE",
+                "actual_capture_started_at": None,
+                "captured_duration_seconds": 0,
+            },
+            {
+                "window_start": "2026-07-16T10:02:10Z",
+                "window_end": "2026-07-16T10:02:20Z",
+                "status": "FAILED",
+                "file_name": None,
+                "error_code": "LATE_CAPTURE",
+                "actual_capture_started_at": "2026-07-16T10:02:10Z",
+                "captured_duration_seconds": 0,
+            },
+            {
+                "window_start": "2026-07-16T10:02:20Z",
+                "window_end": "2026-07-16T10:02:30Z",
+                "status": "FAILED",
+                "file_name": None,
+                "error_code": "LATE_CAPTURE",
+                "actual_capture_started_at": None,
+                "captured_duration_seconds": 1,
+            },
+            {
+                "window_start": "2026-07-16T10:02:30Z",
+                "window_end": "2026-07-16T10:02:40Z",
+                "status": "FAILED",
+                "file_name": None,
+                "error_code": "PARTIAL_CAPTURE",
+                "actual_capture_started_at": None,
+                "captured_duration_seconds": -1,
+            },
+            {
+                "window_start": "2026-07-16T10:02:40Z",
+                "window_end": "2026-07-16T10:02:50Z",
+                "status": "FAILED",
+                "file_name": None,
+                "error_code": "PARTIAL_CAPTURE",
+                "actual_capture_started_at": None,
+                "captured_duration_seconds": 10.1,
+            },
+        ]
+        for values in invalid_values:
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO packet_capture_segments (
+                        capture_session_id, file_name, capture_interface,
+                        window_start, window_end, status, error_code,
+                        actual_capture_started_at, captured_duration_seconds
+                    )
+                    VALUES (
+                        :capture_session_id, :file_name, 'wlan0',
+                        :window_start, :window_end, :status, :error_code,
+                        :actual_capture_started_at, :captured_duration_seconds
+                    )
+                    """,
+                    {"capture_session_id": session_id, **values},
+                )
+
+
+def test_phase4_detection_isolation_firewall_constraints(tmp_path: Path) -> None:
+    db_path = tmp_path / "phase4-constraints.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+
+    with connect_database(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO devices (device_id, status, trust_score)
+            VALUES ('esp32_01', 'normal', 100)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO detection_events (
+                device_id, detector_type, event_type, score_delta,
+                applied_to_score, dedupe_key, policy_version
+            )
+            VALUES ('esp32_01', 'RULE', 'ABNORMAL_TOPIC', -20, 0,
+                    NULL, NULL)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO detection_events (
+                device_id, detector_type, event_type, score_delta,
+                applied_to_score, dedupe_key, policy_version
+            )
+            VALUES ('esp32_01', 'RULE', 'ABNORMAL_TOPIC', -20, 0,
+                    NULL, NULL)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO detection_events (
+                device_id, detector_type, event_type, score_delta,
+                applied_to_score, dedupe_key, policy_version
+            )
+            VALUES ('esp32_01', 'RULE', 'ABNORMAL_TOPIC', -20, 0,
+                    'rule:feature:1:ABNORMAL_TOPIC:v1', 'v1')
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO detection_events (
+                    device_id, detector_type, event_type, score_delta,
+                    applied_to_score, dedupe_key, policy_version
+                )
+                VALUES ('esp32_01', 'RULE', 'ABNORMAL_TOPIC', -20, 0,
+                        'rule:feature:1:ABNORMAL_TOPIC:v1', 'v1')
+                """
+            )
+
+        connection.execute(
+            """
+            INSERT INTO trust_score_history (
+                device_id, analysis_window_start, analysis_window_end,
+                previous_score, calculated_delta, capped_delta,
+                actual_delta, new_score, representative_event_ids_json,
+                policy_version
+            )
+            VALUES ('esp32_01', '2026-07-16T10:00:00Z',
+                    '2026-07-16T10:00:10Z', 100, -20, -20,
+                    -20, 80, '[1]', 'v2')
+            """
+        )
+        trust_score_history_id = connection.execute(
+            "SELECT id FROM trust_score_history"
+        ).fetchone()["id"]
+        connection.execute(
+            """
+            INSERT INTO isolation_history (
+                device_id, action, trust_score, trust_score_history_id
+            )
+            VALUES ('esp32_01', 'ISOLATED', 25, ?)
+            """,
+            (trust_score_history_id,),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO isolation_history (
+                    device_id, action, trust_score, trust_score_history_id
+                )
+                VALUES ('esp32_01', 'ISOLATED', 25, ?)
+                """,
+                (trust_score_history_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO isolation_history (
+                    device_id, action, trust_score, trust_score_history_id
+                )
+                VALUES ('esp32_01', 'ISOLATED', 25, 999)
+                """
+            )
+
+        connection.execute(
+            """
+            INSERT INTO firewall_rules (source_ip, status)
+            VALUES ('192.168.0.90', 'FAILED')
+            """
+        )
+        retry_count = connection.execute(
+            """
+            SELECT retry_count
+            FROM firewall_rules
+            WHERE source_ip = '192.168.0.90'
+            """
+        ).fetchone()["retry_count"]
+        assert retry_count == 0
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO firewall_rules (source_ip, status, retry_count)
+                VALUES ('192.168.0.91', 'FAILED', -1)
+                """
+            )
+
+
+def test_phase4_migration_failure_rolls_back_rebuild_and_restores_schema(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "phase4-rollback.db"
+    migrations_002_dir = tmp_path / "migrations-002"
+    _write_project_migrations_subset(
+        migrations_002_dir,
+        ("001_init.sql", "002_packet_gateway.sql"),
+    )
+    apply_migrations(db_path, migrations_002_dir)
+    with connect_database(db_path) as connection:
+        session_id = _insert_packet_capture_session(connection)
+        segment_id = _insert_packet_capture_segment(
+            connection,
+            capture_session_id=session_id,
+        )
+        _insert_packet_feature_log(connection, capture_segment_id=segment_id)
+
+    broken_migrations_dir = tmp_path / "broken-migrations"
+    _write_project_migrations_subset(
+        broken_migrations_dir,
+        ("001_init.sql", "002_packet_gateway.sql", "003_phase4_detection.sql"),
+    )
+    migration_003 = broken_migrations_dir / "003_phase4_detection.sql"
+    migration_003.write_text(
+        migration_003.read_text(encoding="utf-8")
+        + "\nINSERT INTO missing_phase4_table (id) VALUES (1);\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MigrationError):
+        apply_migrations(db_path, broken_migrations_dir)
+
+    with connect_database(db_path) as connection:
+        assert _migration_versions(connection) == [1, 2]
+        assert "dedupe_key" not in _column_names(connection, "detection_events")
+        assert "captured_duration_seconds" not in _column_names(
+            connection,
+            "packet_capture_segments",
+        )
+        file_name_info = {
+            row["name"]: row
+            for row in connection.execute("PRAGMA table_info(packet_capture_segments)")
+        }["file_name"]
+        assert file_name_info["notnull"] == 1
+        assert connection.execute(
+            """
+            SELECT capture_segment_id
+            FROM packet_feature_logs
+            WHERE capture_segment_id = ?
+            """,
+            (segment_id,),
+        ).fetchone()["capture_segment_id"] == segment_id
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_existing_trust_score_history_api_still_uses_detection_events(

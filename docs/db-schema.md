@@ -93,10 +93,14 @@ PRAGMA busy_timeout = 5000;
 | evidence_schema_version | INTEGER | evidence schema version |
 | processed_at | DATETIME | 후속 처리 완료 시각 |
 | processing_reason | TEXT | 후속 처리 사유 |
+| dedupe_key | TEXT | Phase 4 detector 중복 이벤트 방지 key |
+| policy_version | TEXT | 이벤트 생성 정책 version |
 | description | TEXT | 사람이 읽을 설명 |
 | detected_at | DATETIME | 탐지 시각, 기본 current timestamp |
 
-기존 `detection_events` row는 002 migration 적용 시 backfill하지 않습니다. `incident_family`, `processed_at`, `processing_reason`, `applied_to_score` 값은 기존 의미를 유지합니다.
+`dedupe_key`는 NULL을 허용합니다. NULL이 아닌 값은 `idx_detection_events_dedupe_key` partial unique index로 중복 저장을 방지합니다.
+
+기존 `detection_events` row는 002·003 migration 적용 시 backfill하지 않습니다. `incident_family`, `processed_at`, `processing_reason`, `applied_to_score`, `dedupe_key`, `policy_version` 값은 기존 의미를 유지합니다.
 
 ## isolation_history
 
@@ -108,10 +112,12 @@ PRAGMA busy_timeout = 5000;
 | reason | TEXT | 격리 이유 |
 | trust_score | INTEGER | action 당시 점수 |
 | trigger_event_id | INTEGER | action을 유발한 이벤트 |
+| trust_score_history_id | INTEGER | Phase 4 격리 결정을 만든 `trust_score_history.id` |
 | created_at | DATETIME | 생성 시각, 기본 current timestamp |
 
 `devices.status`는 현재 기기 상태를 나타내므로 `isolated`를 사용합니다.
 `isolation_history.action`은 격리 이력에 저장되는 action 코드이므로 `ISOLATED`를 사용합니다.
+`trust_score_history_id`는 NULL을 허용해 기존 이력을 보존합니다. NULL이 아닌 값은 `idx_isolation_history_trust_score_history_id` partial unique index로 한 Trust History가 중복 Isolation History를 만들지 못하게 합니다.
 
 TODO: 향후 격리 해제 기능을 추가하면 `RELEASED`를 action 값으로 사용할 수 있습니다.
 
@@ -141,7 +147,7 @@ pcap segment 파일 단위입니다. Window는 `[window_start, window_end)` 반�
 | --- | --- | --- |
 | id | INTEGER | primary key autoincrement |
 | capture_session_id | INTEGER | `packet_capture_sessions.id` 참조 |
-| file_name | TEXT | segment 파일명, unique |
+| file_name | TEXT | segment 파일명, unique. `READY`, `PROCESSED`, `EMPTY`는 필수이며 파일 미생성 `FAILED`는 NULL 허용 |
 | capture_interface | TEXT | capture interface |
 | window_start | DATETIME | window 시작 |
 | window_end | DATETIME | window 종료 |
@@ -150,11 +156,17 @@ pcap segment 파일 단위입니다. Window는 `[window_start, window_end)` 반�
 | processed_at | DATETIME | 처리 완료 시각 |
 | error_code | TEXT | 오류 코드 |
 | error_message | TEXT | 오류 메시지 |
+| actual_capture_started_at | DATETIME | 실제 capture process 시작 시각 |
+| capture_stop_requested_at | DATETIME | capture stop 요청 시각 |
+| capture_process_exited_at | DATETIME | capture process 종료 시각 |
+| start_delay_seconds | REAL | window 시작 대비 capture 시작 지연. NULL 또는 0 이상 |
+| captured_duration_seconds | REAL | 실제 capture duration. NULL 또는 0 이상 10 이하 |
 | created_at | DATETIME | 생성 시각 |
 | updated_at | DATETIME | 수정 시각 |
 
-`file_name`과 `(capture_interface, window_start, window_end)`는 중복될 수 없습니다.
+`file_name`은 NULL이 아닌 경우 중복될 수 없습니다. `(capture_interface, window_start, window_end)`는 중복될 수 없습니다.
 `window_start`, `window_end`는 정수 초 UTC 경계의 `YYYY-MM-DDTHH:MM:SSZ` 형식이어야 하며, `window_end`는 `window_start`로부터 정확히 10초 후여야 합니다. 소수점 이하 초가 포함된 시각은 저장하지 않습니다.
+`error_code='LATE_CAPTURE'`인 row는 `status='FAILED'`, `file_name IS NULL`, capture timing 시각 NULL, `captured_duration_seconds=0`이어야 합니다. 003 migration은 기존 segment id, feature FK, unique/check/index 계약을 보존하기 위해 `packet_capture_segments`를 재구성합니다.
 
 ## packet_feature_logs
 
@@ -208,7 +220,7 @@ PR #14 Gateway Metrics Collector의 `GatewayMetricsSample`은 `collected_at`, `s
 
 ## detector_checkpoints
 
-Detector별 처리 지점을 저장하기 위한 Phase 4용 테이블입니다. 이번 단계에서는 갱신 로직을 구현하지 않습니다.
+Detector별 처리 지점을 저장하기 위한 Phase 4용 테이블입니다. 003 이후 `edge.detection.checkpoint_repository`와 `initialize_phase4_cutover()`가 이 테이블을 사용합니다.
 
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |
@@ -219,6 +231,20 @@ Detector별 처리 지점을 저장하기 위한 Phase 4용 테이블입니다. 
 | updated_at | DATETIME | 수정 시각 |
 
 `(detector_name, source_table)`은 primary key입니다. Checkpoint 대상 이름은 향후 확장을 막지 않도록 DB CHECK로 고정하지 않습니다.
+
+Phase 4 cutover initializer가 생성하는 공통 checkpoint key는 다음 7개입니다.
+
+```text
+mqtt_feature_builder+mqtt_logs
+mqtt_feature_rule+feature_logs
+mqtt_message_rule+mqtt_logs
+mqtt_if+feature_logs
+packet_rule+packet_feature_logs
+packet_if+packet_feature_logs
+trust_score_v2+detection_events
+```
+
+Source row가 없거나 검증된 완료 watermark가 없으면 `last_processed_id`와 `last_completed_window_end`는 NULL로 유지합니다. `updated_at`은 UTC `Z` 형식으로 저장합니다. `initialize_phase4_cutover()`는 정수 초 UTC `phase4_cutover_at`만 허용하며, MQTT/Packet 완료 watermark가 cutover 시각을 초과하면 실패합니다.
 
 ## trust_score_history
 
@@ -259,6 +285,9 @@ Phase 4용 firewall 요청/상태 테이블입니다. 이번 단계에서는 row
 | applied_at | DATETIME | 적용 시각 |
 | released_at | DATETIME | 해제 시각 |
 | last_error | TEXT | 마지막 오류 메시지 |
+| retry_count | INTEGER | firewall 적용 재시도 횟수, 기본 0, 0 이상 |
+| last_attempted_at | DATETIME | 마지막 적용 시도 시각 |
+| next_retry_at | DATETIME | 다음 재시도 가능 시각 |
 | created_at | DATETIME | 요청 생성 시각 |
 | updated_at | DATETIME | 수정 시각 |
 
@@ -279,6 +308,8 @@ Phase 4용 firewall 요청/상태 테이블입니다. 이번 단계에서는 row
 | `idx_detection_events_packet_feature_log_id` | packet feature 기반 detection event 조회 |
 | `idx_detection_events_incident_family_detected_at` | incident family별 event 조회 |
 | `idx_detection_events_subject_ip_detected_at` | subject IP별 event 조회 |
+| `idx_detection_events_dedupe_key` | Phase 4 detection event dedupe |
+| `idx_isolation_history_trust_score_history_id` | Trust History 기반 isolation exactly-once |
 | `idx_trust_score_history_window` | window 기반 Trust Score history 조회 |
 | `idx_firewall_rules_status` | firewall status 조회 |
 | `idx_firewall_rules_source_ip` | source IP별 firewall rule 조회 |
