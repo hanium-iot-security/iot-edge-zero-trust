@@ -308,13 +308,21 @@ class TestSegments:
         row = db_session.execute(
             text(
                 "SELECT start_delay_seconds, captured_duration_seconds, "
-                "capture_stop_requested_at FROM packet_capture_segments "
+                "capture_stop_requested_at, actual_capture_started_at, "
+                "capture_process_exited_at FROM packet_capture_segments "
                 "WHERE file_name = 'capture_timed.pcap'"
             )
         ).mappings().first()
         assert row["start_delay_seconds"] == pytest.approx(0.3)
         assert row["captured_duration_seconds"] == pytest.approx(9.7)
+        # capture_stop_requested_at은 항상 정수 초 Window 경계이므로 microsecond=0이다.
         assert row["capture_stop_requested_at"] == "2026-07-15T10:00:10Z"
+        # actual_capture_started_at/capture_process_exited_at은 실제 wall-clock 관측값
+        # 이므로 format_utc_iso()(정수 초로 truncate)가 아니라 microsecond를 보존하는
+        # format_utc_iso_precise()로 저장돼야 한다. 여기서 0.3초·0.05초 지연이 그대로
+        # 남아있는지 확인한다 (회귀 시 "2026-07-15T10:00:00Z"처럼 소수점이 사라진다).
+        assert row["actual_capture_started_at"] == "2026-07-15T10:00:00.300000Z"
+        assert row["capture_process_exited_at"] == "2026-07-15T10:00:10.050000Z"
 
     def test_insert_ready_segment_without_timing_metadata_defaults_to_null(self, db_session) -> None:
         """Crash Recovery 경로처럼 Timing Metadata를 모르는 호출부는 생략할 수 있다."""
@@ -825,6 +833,7 @@ class TestRunCaptureLoop:
 
 
 class TestRunCaptureLoopLateCaptureWithinWindow:
+    """정상 실행 중이며 window_start < actual_start < window_end, 지연 1초 초과 -> Capture Process를 실행하지 않고 FAILED/LATE_CAPTURE로 처리."""
 
     def test_delay_beyond_policy_skips_capture_and_fails_session(self, db_session, tmp_path) -> None:
         config = _make_config(tmp_path)

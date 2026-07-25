@@ -9,9 +9,8 @@
 
 Packet Rule Detector, Packet Behavior Isolation Forest(Train/Validation/Test/
 Inference), Dataset Export는 전부 이 모듈의 `is_capture_eligible()`을 통해서만
-적격 여부를 판정하며, 각자 별도의 판정식을 만들지 않는다 (Packet
-Rule·Packet IF·Dataset Export는 동일 공통 함수를 사용하고 API는 별도 판정식을
-만들지 않고 동일 결과와 제외 이유를 노출한다).
+적격 여부를 판정하며, 각자 별도의 판정식을 만들지 않는다 (Packet Rule·Packet IF·Dataset Export는 
+동일 공통 함수를 사용하고 API는 별도 판정식을 만들지 않고 동일 결과와 제외 이유를 노출한다).
 
 적격 판정은 반올림된 coverage_ratio가 아니라 원본 Timing Metadata를 기준으로
 한다. coverage_ratio는 표시·Evidence용 파생값으로만 사용한다.
@@ -23,6 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from math import isfinite
 
 NOMINAL_WINDOW_SECONDS = 10.0
 
@@ -31,15 +31,15 @@ DEFAULT_CAPTURE_TIME_EPSILON_SECONDS = 0.01
 DEFAULT_CAPTURE_POLICY_VERSION = "packet-capture-policy-v1"
 
 # is_capture_eligible의 status 조건에 해당하는 값들.
-# READY는 아직 Feature 추출 전 상태이므로 여기 포함하지 않는다 (Detector는
-# PROCESSED/EMPTY의 연속 완료만 입력 준비 상태로 사용한다).
+# READY는 아직 Feature 추출 전 상태이므로 여기 포함하지 않는다 (Detector는 PROCESSED/EMPTY의 연속 완료만 입력 준비 상태로 사용한다.
 ELIGIBLE_SEGMENT_STATUSES = frozenset({"PROCESSED", "EMPTY"})
 
 
 def derive_minimum_duration_seconds(max_start_delay_seconds: float) -> float:
     """PACKET_MIN_CAPTURE_DURATION_SECONDS = 10.0 - PCAP_MAX_START_DELAY_SECONDS.
 
-    PACKET_MIN_CAPTURE_DURATION_SECONDS는 기본적으로 10.0 - PCAP_MAX_START_DELAY_SECONDS에서 유도하며 Phase 4 기본값은 9.0초다.
+    Phase 4 세부계획 2.1 절: "PACKET_MIN_CAPTURE_DURATION_SECONDS는 기본적으로
+    10.0 - PCAP_MAX_START_DELAY_SECONDS에서 유도하며 Phase 4 기본값은 9.0초다."
     """
     return NOMINAL_WINDOW_SECONDS - max_start_delay_seconds
 
@@ -61,12 +61,25 @@ class CapturePolicy:
     version: str = DEFAULT_CAPTURE_POLICY_VERSION
 
     def __post_init__(self) -> None:
-        if self.max_start_delay_seconds < 0:
-            raise ValueError("max_start_delay_seconds must be >= 0")
-        if self.minimum_duration_seconds < 0:
-            raise ValueError("minimum_duration_seconds must be >= 0")
-        if self.epsilon_seconds < 0:
-            raise ValueError("epsilon_seconds must be >= 0")
+        # NaN/Infinity는 <, >=, > 비교에서 항상 False를 반환하므로, 아래 min/max
+        # 경계 체크만으로는 걸러지지 않는다. isfinite()로 먼저 명시적으로 걷어낸다.
+        for field_name in ("max_start_delay_seconds", "minimum_duration_seconds", "epsilon_seconds"):
+            value = getattr(self, field_name)
+            if not isfinite(value):
+                raise ValueError(f"{field_name} must be a finite number, got {value!r}")
+
+        if not (0 <= self.max_start_delay_seconds < NOMINAL_WINDOW_SECONDS):
+            raise ValueError(
+                f"max_start_delay_seconds must be in [0, {NOMINAL_WINDOW_SECONDS}), "
+                f"got {self.max_start_delay_seconds}"
+            )
+        if not (0 <= self.minimum_duration_seconds <= NOMINAL_WINDOW_SECONDS):
+            raise ValueError(
+                f"minimum_duration_seconds must be in [0, {NOMINAL_WINDOW_SECONDS}], "
+                f"got {self.minimum_duration_seconds}"
+            )
+        if not (0 <= self.epsilon_seconds < 1.0):
+            raise ValueError(f"epsilon_seconds must be in [0, 1.0), got {self.epsilon_seconds}")
         if not self.version:
             raise ValueError("version must be a non-empty Capture Policy Version string")
 
@@ -121,7 +134,7 @@ def is_capture_eligible(
     segment: CaptureEligibilitySegment,
     policy: CapturePolicy = DEFAULT_CAPTURE_POLICY,
 ) -> CaptureEligibilityResult:
-    """ 공통 적격 함수.
+    """공통 적격 함수.
 
     판정 순서는 Evidence의 exclusion_reason이 항상 "가장 먼저 걸린 조건"을
     가리키도록 계약서의 and 절 순서를 그대로 따른다.
@@ -149,6 +162,30 @@ def is_capture_eligible(
         return CaptureEligibilityResult(
             eligible=False,
             exclusion_reason="missing_timing_metadata",
+            coverage_ratio=coverage_ratio,
+        )
+
+    # NaN/Infinity는 <, >=, > 비교에서 항상 False를 반환하므로 아래의 policy 경계
+    # 비교만으로는 걸러지지 않는다 (예: NaN > threshold는 False이므로 "지연 초과 아님"
+    # 으로 잘못 통과함). 여기서 명시적으로 걷어낸다.
+    if not isfinite(segment.start_delay_seconds) or not isfinite(segment.captured_duration_seconds):
+        return CaptureEligibilityResult(
+            eligible=False,
+            exclusion_reason="non_finite_timing_metadata",
+            coverage_ratio=coverage_ratio,
+        )
+
+    if segment.start_delay_seconds < 0:
+        return CaptureEligibilityResult(
+            eligible=False,
+            exclusion_reason="negative_start_delay_seconds",
+            coverage_ratio=coverage_ratio,
+        )
+
+    if not (0 <= segment.captured_duration_seconds <= NOMINAL_WINDOW_SECONDS):
+        return CaptureEligibilityResult(
+            eligible=False,
+            exclusion_reason="captured_duration_out_of_range",
             coverage_ratio=coverage_ratio,
         )
 
@@ -197,10 +234,8 @@ def compute_effective_capture_window(
 def normalize_to_ten_second_rate(value: float, captured_duration_seconds: float) -> float:
     """실제 captured_duration_seconds 기준 값을 10초 명목 Window 기준으로 환산.
 
-    Packet Rule의 packets_per_second/bytes_per_second,
-    Packet IF의 packet_count/total_bytes 입력 모두 `value * 10.0 /
-    captured_duration_seconds`로 10초 기준 환산하며 Train·Validation·Test·
-    Inference에 동일한 변환을 적용한다.
+    Packet Rule의 packets_per_second/bytes_per_second, Packet IF의 packet_count/total_bytes 입력 모두 `value * 10.0 /
+    captured_duration_seconds`로 10초 기준 환산하며 Train·Validation·Test·Inference에 동일한 변환을 적용한다.
 
     captured_duration_seconds가 0이면 정의되지 않으므로 이 함수를 호출하기 전에
     반드시 is_capture_eligible로 걸러야 한다 (정상 적격 Segment는

@@ -47,6 +47,7 @@ class CaptureOutcome:
     # False: SIGTERM에 응답하지 않아 SIGKILL까지 실행함 (pcap 파일이 깨졌을 수 있어 신뢰 불가)
     terminated_cleanly: bool = True
 
+    stop_requested_at: datetime | None = None
 
 class CaptureProcess(Protocol):
     def capture_window(
@@ -102,16 +103,27 @@ class TcpdumpCaptureProcess:
 
         # 정상 경로: window가 끝났으므로 Wrapper가 캡처를 종료시킨다.
         # SIGTERM으로 정상 종료시켜야 tcpdump가 pcap 파일을 안전하게 flush하고 닫는다.
+        stop_requested_at = datetime.now(timezone.utc)
         process.terminate()
         try:
             exit_code = process.wait(timeout=self._terminate_grace_seconds)
-            return CaptureOutcome(completed_full_window=True, exit_code=exit_code, terminated_cleanly=True)
+            return CaptureOutcome(
+                completed_full_window=True,
+                exit_code=exit_code,
+                terminated_cleanly=True,
+                stop_requested_at=stop_requested_at,
+            )
         except subprocess.TimeoutExpired:
             # SIGTERM에 응답하지 않아 SIGKILL까지 실행함 -- pcap 파일이 깨졌을 수 있으므로
             # window_seconds를 다 채웠더라도 성공으로 취급하지 않는다.
             process.kill()
             exit_code = process.wait(timeout=self._terminate_grace_seconds)
-            return CaptureOutcome(completed_full_window=True, exit_code=exit_code, terminated_cleanly=False)
+            return CaptureOutcome(
+                completed_full_window=True,
+                exit_code=exit_code,
+                terminated_cleanly=False,
+                stop_requested_at=stop_requested_at,
+            )
 
 
 @dataclass(frozen=True)
@@ -123,6 +135,7 @@ class CaptureRuntimeConfig:
     failed_dir: Path
     tcpdump_path: str = "tcpdump"
     capture_filter: str | None = None
+    # 지연 판정에 쓰는 Versioned Capture Policy.
     capture_policy: CapturePolicy = field(default_factory=CapturePolicy)
 
     def __post_init__(self) -> None:
@@ -166,6 +179,7 @@ class CaptureWindowResult:
     exit_code: int | None
     error_code: str | None = None
     error_message: str | None = None
+    # --- Phase 4 Timing Metadata ---
     # LATE_CAPTURE에서는 전부 None/0.0으로 고정된다 (DB CHECK와 동일한 계약).
     actual_capture_started_at: datetime | None = None
     capture_stop_requested_at: datetime | None = None
@@ -187,6 +201,7 @@ def execute_capture_window(
 ) -> CaptureWindowResult:
     """한 Window(10초)를 캡처하고 결과를 파일 이동 + Timing Metadata로 반환합니다.
 
+    capture_started_at이 주어지면 Capture 경계 상태표에 따라 지연을 판정합니다:
       - capture_started_at이 이미 window_end 이후이거나
       - 허용 지연(policy.max_start_delay_seconds + epsilon)을 초과했다면
       tcpdump 프로세스를 아예 실행하지 않고 LATE_CAPTURE로 확정합니다.
@@ -263,17 +278,25 @@ def execute_capture_window(
     )
     capture_process_exited_at = process_exited_at_fallback()
 
-    # Capture 종료 요청은 항상 명목 window_end에 수행한다. OS Scheduling·pcap flush로 프로세스
-    # 종료가 늦어져도(capture_process_exited_at) 실제 Coverage 분모로는 쓰지 않는다.
-    capture_stop_requested_at = window_end
-    _effective_start, _effective_end, captured_duration_seconds = compute_effective_capture_window(
-        window_start=window_start,
-        window_end=window_end,
-        actual_capture_started_at=effective_started_at,
-        capture_stop_requested_at=capture_stop_requested_at,
-    )
+    if outcome.stop_requested_at is not None:
+        # 실제 관측값 (TcpdumpCaptureProcess가 process.terminate() 직전에 기록).
+        capture_stop_requested_at = outcome.stop_requested_at
+    elif outcome.completed_full_window:
+        # Wrapper가 이 Window를 끝내기로 판단한 경우인데 관측값이 없다
+        # (FakeCaptureProcess 같은 테스트 더블). window_end를 최선의 근사치로 쓴다.
+        capture_stop_requested_at = window_end
+    else:
+        # 프로세스가 스스로 먼저 종료돼 Wrapper가 종료를 요청한 적이 없다. 실제
+        # 관측된 종료 시각(capture_process_exited_at)을 대신 사용한다.
+        capture_stop_requested_at = capture_process_exited_at
 
     if outcome.completed_full_window and outcome.terminated_cleanly:
+        _effective_start, _effective_end, captured_duration_seconds = compute_effective_capture_window(
+            window_start=window_start,
+            window_end=window_end,
+            actual_capture_started_at=effective_started_at,
+            capture_stop_requested_at=capture_stop_requested_at,
+        )
         final_path = _atomic_rename_same_filesystem(tmp_path, config.ready_dir / ready_filename)
         return CaptureWindowResult(
             success=True,
@@ -287,8 +310,27 @@ def execute_capture_window(
             captured_duration_seconds=captured_duration_seconds,
         )
 
+    # PARTIAL_CAPTURE(파일은 있으나 조기 종료)와 PCAP_FILE_MISSING(파일이 아예
+    # 생성되지 않음)을 구분한다. move 전에 확인해야 한다 -- 성공 시
+    # _move_to_failed가 tmp_path를 옮겨버려서 이후엔 존재 여부를 알 수 없다.
     file_was_created = tmp_path.exists()
     final_path = _move_to_failed(tmp_path, config.failed_dir / ready_filename)
+
+    if not file_was_created:
+        # 파일이 아예 생성되지 않았으므로 실제로 캡처된 데이터는 없다 (0초).
+        captured_duration_seconds = 0.0
+    else:
+        # 프로세스가 명목 window_end까지 살아남지 못했다면 (자력 조기 종료)
+        # capture_stop_requested_at은 위에서 이미 capture_process_exited_at으로
+        # fallback돼 있다. window_end를 그대로 쓰면 2초 만에 죽은 캡처도
+        # captured_duration_seconds가 9~10초로 나와 실제 캡처량을 과대평가하게 된다.
+
+        _effective_start, _effective_end, captured_duration_seconds = compute_effective_capture_window(
+            window_start=window_start,
+            window_end=window_end,
+            actual_capture_started_at=effective_started_at,
+            capture_stop_requested_at=capture_stop_requested_at,
+        )
 
     if not outcome.completed_full_window:
         error_message = (

@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from edge.packet.pcap_naming import format_utc_iso, parse_utc_iso
+from edge.packet.pcap_naming import format_utc_iso, format_utc_iso_precise, parse_utc_iso
 
 PARTIAL_CAPTURE = "PARTIAL_CAPTURE"
 PCAP_FILE_MISSING = "PCAP_FILE_MISSING"
@@ -269,7 +269,14 @@ def insert_ready_segment(
     start_delay_seconds: float | None = None,
     captured_duration_seconds: float | None = None,
 ) -> int:
-    
+    """캡처가 정상 종료된 pcap에 대해 READY 상태 Segment row를 생성합니다.
+
+    Timing Metadata 인자들은 전부 선택 사항이다 (기본값 None). Crash Recovery
+    경로(reconcile_orphan_ready_files 등)처럼 실제 tcpdump 실행 시각을 알 수 없는
+    호출부는 이 값들을 생략해도 되며, 이 경우 명목 Window와 실제 Coverage를
+    구분하는 Phase 4 Packet Feature API는 해당 Segment를 "Timing Metadata 없음"으로
+    간주해 학습·추론·Trust 입력에서 제외한다 (공통 적격 함수, capture_policy.py 참고).
+    """
     result = db.execute(
         text(
             """
@@ -295,9 +302,9 @@ def insert_ready_segment(
             "capture_interface": capture_interface,
             "window_start": format_utc_iso(window_start),
             "window_end": format_utc_iso(window_end),
-            "actual_capture_started_at": _optional_utc_iso(actual_capture_started_at),
+            "actual_capture_started_at": _optional_utc_iso_precise(actual_capture_started_at),
             "capture_stop_requested_at": _optional_utc_iso(capture_stop_requested_at),
-            "capture_process_exited_at": _optional_utc_iso(capture_process_exited_at),
+            "capture_process_exited_at": _optional_utc_iso_precise(capture_process_exited_at),
             "start_delay_seconds": start_delay_seconds,
             "captured_duration_seconds": captured_duration_seconds,
         },
@@ -356,9 +363,9 @@ def insert_failed_segment(
             "window_end": format_utc_iso(window_end),
             "error_code": error_code,
             "error_message": error_message,
-            "actual_capture_started_at": _optional_utc_iso(actual_capture_started_at),
+            "actual_capture_started_at": _optional_utc_iso_precise(actual_capture_started_at),
             "capture_stop_requested_at": _optional_utc_iso(capture_stop_requested_at),
-            "capture_process_exited_at": _optional_utc_iso(capture_process_exited_at),
+            "capture_process_exited_at": _optional_utc_iso_precise(capture_process_exited_at),
             "start_delay_seconds": start_delay_seconds,
             "captured_duration_seconds": captured_duration_seconds,
         },
@@ -378,14 +385,15 @@ def insert_late_capture_segment(
 ) -> int:
     """허용 지연을 초과해 Capture Process를 아예 실행하지 못한 Window를 기록합니다.
 
-    예정된 Window를 대기한 뒤 허용 지연을 초과한 경우에는 FAILED/LATE_CAPTURE Segment 한 건을 남기고 Session을 마감한다.
+    "예정된 Window를 대기한 뒤 허용 지연을 초과한 경우에는 FAILED/LATE_CAPTURE Segment 한 건을 남기고 Session을 마감한다."
 
     file_name/actual_capture_started_at/capture_stop_requested_at/
     capture_process_exited_at은 DB CHECK 제약에 따라 항상 NULL이고
     captured_duration_seconds는 항상 0으로 고정된다. start_delay_seconds만
     감사용으로 실제 관측된 지연을 남긴다 (CHECK 제약이 이 컬럼은 제한하지 않음).
 
-    호출자는 이 Segment 저장 직후 부모 Session을 FAILED로 마감해야 한다.
+    호출자는 이 Segment 저장 직후 부모 Session을 FAILED로 마감해야 한다
+    (해당 Segment는 정상 Packet Feature·Packet IF 학습·추론·Trust 입력에서 제외하고 다음 정수 경계에서 새 Session으로 전환한다").
     """
     return insert_failed_segment(
         db,
@@ -405,7 +413,14 @@ def insert_late_capture_segment(
 
 
 def _optional_utc_iso(value: datetime | None) -> str | None:
+    """capture_stop_requested_at처럼 항상 정수 초 Window 경계인 필드용."""
     return format_utc_iso(value) if value is not None else None
+
+
+def _optional_utc_iso_precise(value: datetime | None) -> str | None:
+    """actual_capture_started_at/capture_process_exited_at처럼 실제 wall-clock 관측값인
+    필드용. window_start/window_end와 달리 밀리초 이하 정밀도를 보존한다."""
+    return format_utc_iso_precise(value) if value is not None else None
 
 
 def _parse_db_utc(value: str | datetime) -> datetime:

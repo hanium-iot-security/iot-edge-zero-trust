@@ -68,6 +68,25 @@ class TestCapturePolicyDefaults:
         with pytest.raises(ValueError):
             CapturePolicy(version="")
 
+    @pytest.mark.parametrize("field", ["max_start_delay_seconds", "minimum_duration_seconds", "epsilon_seconds"])
+    def test_rejects_nan_and_infinity(self, field: str) -> None:
+        """NaN/Infinity는 `< 0` 비교에서 항상 False를 반환하므로, 단순 부호 체크만으로는
+        걸러지지 않는다. isfinite()로 명시적으로 검증해야 한다."""
+        for bad_value in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValueError):
+                CapturePolicy(**{field: bad_value})
+
+    def test_rejects_max_start_delay_at_or_above_nominal_window(self) -> None:
+        """지연 허용치가 Window 자체 길이(10초)와 같거나 크면 정책 자체가 무의미하다."""
+        with pytest.raises(ValueError):
+            CapturePolicy(max_start_delay_seconds=10.0)
+        with pytest.raises(ValueError):
+            CapturePolicy(max_start_delay_seconds=15.0)
+
+    def test_rejects_minimum_duration_above_nominal_window(self) -> None:
+        with pytest.raises(ValueError):
+            CapturePolicy(minimum_duration_seconds=10.1)
+
 
 class TestComputeCoverageRatio:
     def test_full_window(self) -> None:
@@ -81,7 +100,8 @@ class TestComputeCoverageRatio:
 
     def test_is_a_display_value_not_used_for_eligibility(self) -> None:
         """coverage_ratio가 0.9 이상이어도, 원본 값이 policy 경계 미만이면 부적격이어야 한다.
-        적격 판정은 반올림된 coverage_ratio가 아니라 원본 Timing Metadata를 기준으로 한다.
+
+        적격 판정은 반올림된 coverage_ratio가 아니라 원본 Timing Metadata를 기준으로 한다."
         """
         # captured_duration_seconds=8.995 -> coverage_ratio는 반올림하면 0.9로
         # 보일 수 있지만 minimum_duration_seconds(9.0) - epsilon(0.01) = 8.99보다
@@ -132,6 +152,48 @@ class TestIsCaptureEligibleMissingTimingMetadata:
         assert result.eligible is False
         assert result.exclusion_reason == "missing_timing_metadata"
         assert result.coverage_ratio is None
+
+
+class TestIsCaptureEligibleNonFiniteTimingMetadata:
+    """NaN/Infinity는 <, >=, > 비교에서 항상 False를 반환하므로, policy 경계
+    비교만으로는 걸러지지 않고 잘못 eligible=True가 될 수 있다. 회귀 방지용."""
+
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_start_delay_is_excluded(self, bad_value: float) -> None:
+        result = is_capture_eligible(
+            _segment(start_delay_seconds=bad_value), DEFAULT_POLICY
+        )
+        assert result.eligible is False
+        assert result.exclusion_reason == "non_finite_timing_metadata"
+
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_captured_duration_is_excluded(self, bad_value: float) -> None:
+        result = is_capture_eligible(
+            _segment(captured_duration_seconds=bad_value), DEFAULT_POLICY
+        )
+        assert result.eligible is False
+        assert result.exclusion_reason == "non_finite_timing_metadata"
+
+    def test_negative_start_delay_is_excluded(self) -> None:
+        result = is_capture_eligible(
+            _segment(start_delay_seconds=-0.5), DEFAULT_POLICY
+        )
+        assert result.eligible is False
+        assert result.exclusion_reason == "negative_start_delay_seconds"
+
+    def test_negative_captured_duration_is_excluded(self) -> None:
+        result = is_capture_eligible(
+            _segment(captured_duration_seconds=-1.0), DEFAULT_POLICY
+        )
+        assert result.eligible is False
+        assert result.exclusion_reason == "captured_duration_out_of_range"
+
+    def test_captured_duration_above_nominal_window_is_excluded(self) -> None:
+        result = is_capture_eligible(
+            _segment(captured_duration_seconds=15.0), DEFAULT_POLICY
+        )
+        assert result.eligible is False
+        assert result.exclusion_reason == "captured_duration_out_of_range"
 
 
 class TestIsCaptureEligibleStartDelayBoundary:
