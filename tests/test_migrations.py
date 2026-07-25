@@ -2154,7 +2154,7 @@ def test_phase4_migration_failure_rolls_back_rebuild_and_restores_schema(
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
-def test_existing_trust_score_history_api_still_uses_detection_events(
+def test_trust_score_history_api_uses_trust_score_history_table(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "api.db"
@@ -2168,17 +2168,32 @@ def test_existing_trust_score_history_api_still_uses_detection_events(
         )
         connection.execute(
             """
-            INSERT INTO detection_events (
+            INSERT INTO trust_score_history (
                 device_id,
-                detector_type,
-                event_type,
-                severity,
-                score_delta,
-                applied_to_score,
-                detected_at
+                analysis_window_start,
+                analysis_window_end,
+                previous_score,
+                calculated_delta,
+                capped_delta,
+                actual_delta,
+                new_score,
+                representative_event_ids_json,
+                policy_version,
+                created_at
             )
-            VALUES ('esp32_01', 'RULE', 'ABNORMAL_PUBLISH_RATE',
-                    'high', -20, 1, '2026-07-16T10:00:10Z')
+            VALUES (
+                'esp32_01',
+                '2026-07-16T10:00:00Z',
+                '2026-07-16T10:00:10Z',
+                100,
+                -20,
+                -20,
+                -20,
+                80,
+                '[1]',
+                'trust-score-v2',
+                '2026-07-16T10:00:10Z'
+            )
             """
         )
 
@@ -2205,13 +2220,13 @@ def test_existing_trust_score_history_api_still_uses_detection_events(
     with connect_database(db_path) as connection:
         assert connection.execute(
             "SELECT COUNT(*) AS count FROM trust_score_history"
-        ).fetchone()["count"] == 0
+        ).fetchone()["count"] == 1
 
     assert response.status_code == 200
     body = response.json()
     assert body["current_score"] == 80
     assert body["current_status"] == "normal"
     assert body["total"] == 1
-    assert body["items"][0]["event_type"] == "ABNORMAL_PUBLISH_RATE"
-    assert body["items"][0]["score_before"] == 100
-    assert body["items"][0]["score_after"] == 80
+    assert body["items"][0]["previous_score"] == 100
+    assert body["items"][0]["new_score"] == 80
+    assert body["items"][0]["representative_event_ids"] == [1]

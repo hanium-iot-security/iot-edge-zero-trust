@@ -215,7 +215,8 @@ def list_packet_feature_logs(
                 pfl.mqtt_related_packet_count,
                 pfl.non_mqtt_tcp_udp_packet_count,
                 pfl.capture_scope,
-                pfl.created_at
+                pfl.created_at,
+                pcsg.captured_duration_seconds
             FROM packet_feature_logs pfl
             JOIN packet_capture_segments pcsg
                 ON pfl.capture_segment_id = pcsg.id

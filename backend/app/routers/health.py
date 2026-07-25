@@ -1,25 +1,31 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter
 from sqlalchemy import text
 
 from backend.app.database import SessionLocal
+from edge.packet.pcap_naming import format_utc_iso
 
 router = APIRouter(tags=["health"])
 
 
 @router.get("/health")
-def health_check() -> dict[str, str | bool]:
-    db_connected = False
+def health_check() -> dict[str, object]:
+    server_time = format_utc_iso(datetime.now(timezone.utc))
     try:
         with SessionLocal() as db:
             db.execute(text("SELECT 1"))
-        db_connected = True
     except Exception:
-        db_connected = False
+        return {
+            "status": "degraded",
+            "database": "error",
+            "db_connected": False,
+            "server_time": server_time,
+        }
 
     return {
         "status": "ok",
-        "db_connected": db_connected,
-        "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "database": "ok",
+        "db_connected": True,
+        "server_time": server_time,
     }

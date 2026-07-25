@@ -8,16 +8,13 @@ from sqlalchemy.orm import sessionmaker
 
 from backend.app.database import get_db
 from backend.app.main import app
-
-
-SCHEMA_PATH = Path("db/migrations/001_init.sql")
+from db.migration_runner import MIGRATIONS_DIR, apply_migrations
 
 
 @pytest.fixture
 def api_client(tmp_path: Path):
     db_path = tmp_path / "api_test.db"
-    with sqlite3.connect(db_path) as connection:
-        connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    apply_migrations(db_path, MIGRATIONS_DIR)
 
     engine = create_engine(
         f"sqlite:///{db_path}",
@@ -152,6 +149,37 @@ def seed_api_rows(db_path: Path) -> None:
                 "2026-05-11 10:00:11",
             ),
         )
+        history_cursor = connection.execute(
+            """
+            INSERT INTO trust_score_history (
+                device_id,
+                analysis_window_start,
+                analysis_window_end,
+                previous_score,
+                calculated_delta,
+                capped_delta,
+                actual_delta,
+                new_score,
+                representative_event_ids_json,
+                policy_version,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "esp32_01",
+                "2026-05-11T10:00:00Z",
+                "2026-05-11T10:00:10Z",
+                100,
+                -20,
+                -20,
+                -20,
+                80,
+                "[1]",
+                "trust-score-v2",
+                "2026-05-11T10:00:10Z",
+            ),
+        )
         connection.execute(
             """
             INSERT INTO isolation_history (
@@ -160,9 +188,10 @@ def seed_api_rows(db_path: Path) -> None:
                 reason,
                 trust_score,
                 trigger_event_id,
+                trust_score_history_id,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "esp32_02",
@@ -170,6 +199,7 @@ def seed_api_rows(db_path: Path) -> None:
                 "Trust Score below threshold",
                 20,
                 1,
+                history_cursor.lastrowid,
                 "2026-05-11 10:01:00",
             ),
         )
@@ -317,7 +347,7 @@ def test_trust_score_summary_returns_current_device_scores(api_client) -> None:
     assert body["items"][1]["trust_score"] == 80
 
 
-def test_trust_score_history_returns_only_applied_events(api_client) -> None:
+def test_trust_score_history_reads_history_table(api_client) -> None:
     client, db_path = api_client
     seed_api_rows(db_path)
 
@@ -329,10 +359,9 @@ def test_trust_score_history_returns_only_applied_events(api_client) -> None:
     assert body["current_score"] == 80
     assert body["current_status"] == "normal"
     assert body["total"] == 1
-    assert body["items"][0]["event_type"] == "ABNORMAL_PUBLISH_RATE"
-    assert body["items"][0]["score_before"] == 100
-    assert body["items"][0]["score_after"] == 80
-    assert body["items"][0]["applied_to_score"] == 1
+    assert body["items"][0]["previous_score"] == 100
+    assert body["items"][0]["new_score"] == 80
+    assert body["items"][0]["representative_event_ids"] == [1]
 
 
 def test_trust_score_history_calculates_before_pagination(api_client) -> None:
@@ -341,27 +370,33 @@ def test_trust_score_history_calculates_before_pagination(api_client) -> None:
     with sqlite3.connect(db_path) as connection:
         connection.execute(
             """
-            INSERT INTO detection_events (
+            INSERT INTO trust_score_history (
                 device_id,
-                detector_type,
-                event_type,
-                severity,
-                score_delta,
-                applied_to_score,
-                description,
-                detected_at
+                analysis_window_start,
+                analysis_window_end,
+                previous_score,
+                calculated_delta,
+                capped_delta,
+                actual_delta,
+                new_score,
+                representative_event_ids_json,
+                policy_version,
+                created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "esp32_01",
-                "AI",
-                "AI_ANOMALY",
-                "medium",
+                "2026-05-11T10:00:10Z",
+                "2026-05-11T10:00:20Z",
+                80,
                 -15,
-                1,
-                "applied ai anomaly",
-                "2026-05-11 10:00:12",
+                -15,
+                -15,
+                65,
+                "[2]",
+                "trust-score-v2",
+                "2026-05-11T10:00:20Z",
             ),
         )
         connection.execute(
@@ -389,13 +424,11 @@ def test_trust_score_history_calculates_before_pagination(api_client) -> None:
     assert latest_body["current_status"] == "warning"
     assert latest_body["total"] == 2
     assert len(latest_body["items"]) == 1
-    assert latest_body["items"][0]["event_type"] == "AI_ANOMALY"
-    assert latest_body["items"][0]["score_before"] == 80
-    assert latest_body["items"][0]["score_after"] == 65
+    assert latest_body["items"][0]["previous_score"] == 80
+    assert latest_body["items"][0]["new_score"] == 65
     assert older_body["total"] == 2
-    assert older_body["items"][0]["event_type"] == "ABNORMAL_PUBLISH_RATE"
-    assert older_body["items"][0]["score_before"] == 100
-    assert older_body["items"][0]["score_after"] == 80
+    assert older_body["items"][0]["previous_score"] == 100
+    assert older_body["items"][0]["new_score"] == 80
 
 
 def test_trust_score_history_unknown_device_returns_empty(api_client) -> None:
@@ -427,6 +460,7 @@ def test_isolation_history_returns_rows(api_client) -> None:
     assert body["items"][0]["device_id"] == "esp32_02"
     assert body["items"][0]["action"] == "ISOLATED"
     assert body["items"][0]["trust_score"] == 20
+    assert body["items"][0]["trust_score_history_id"] is not None
 
 
 def test_limit_and_offset_work_on_devices_endpoint(api_client) -> None:
