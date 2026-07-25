@@ -255,9 +255,8 @@ def run_capture_loop(
 
     허용 지연을 초과해 LATE_CAPTURE로 판정되면(Window 대기 중 만료 포함) 감사용
     FAILED/LATE_CAPTURE Segment 한 건만 남기고 현재 Session을 FAILED로 마감한 뒤
-    다음 정수 경계에서 새 Session을 시작합니다. 서비스 시작·재시작
-    시점에 이미 여러 과거 Window가 지나있는 경우는 start_new_session의 Session Gap
-    기록으로 처리되며, 여기서는 Window별 가짜 Segment를 소급 생성하지 않습니다.
+    다음 정수 경계에서 새 Session을 시작합니다. 서비스 시작·재시작 시점에 이미 여러 과거 Window가 지나있는 경우는 
+    start_new_session의 Session Gap 기록으로 처리되며, 여기서는 Window별 가짜 Segment를 소급 생성하지 않습니다.
 
     max_windows가 주어지면 그만큼만 캡처하고 반환합니다 (수동 테스트/`--windows` 옵션용).
     max_windows 카운트에는 LATE_CAPTURE로 건너뛴 Window는 포함하지 않습니다.
@@ -320,7 +319,8 @@ def run_capture_loop(
             capture_started_at = clock()
 
             drift_seconds = (capture_started_at - window_start).total_seconds()
-            if 0 < drift_seconds <= config.capture_policy.max_start_delay_seconds:
+            allowed_delay = config.capture_policy.max_start_delay_seconds + config.capture_policy.epsilon_seconds
+            if 0 < drift_seconds <= allowed_delay:
                 # 허용 범위 안의 지연이다 -- execute_capture_window가 window_end까지
                 # 남은 시간만큼만 캡처하도록 자체 보정하므로 다음 Window로 누적되지
                 # 않는다. 다만 지속 관측되면 DB/디스크 성능 저하의 신호일 수 있어 로그로 남긴다.

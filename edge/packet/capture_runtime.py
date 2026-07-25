@@ -25,8 +25,11 @@ TERMINATE_GRACE_SECONDS = 5.0
 
 PARTIAL_CAPTURE = "PARTIAL_CAPTURE"
 
+# 프로세스는 시작됐지만 pcap 파일이 아예 생성되지 않은 채로 종료된 경우.
+PCAP_FILE_MISSING = "PCAP_FILE_MISSING"
+
 # 허용 지연(PCAP_MAX_START_DELAY_SECONDS)을 초과했거나 Window가 이미 끝나버려
-# tcpdump 프로세스를 아예 실행하지 못한 경우 (Capture 경계 상태표).
+# tcpdump 프로세스를 아예 실행하지 못한 경우.
 LATE_CAPTURE = "LATE_CAPTURE"
 
 
@@ -120,7 +123,6 @@ class CaptureRuntimeConfig:
     failed_dir: Path
     tcpdump_path: str = "tcpdump"
     capture_filter: str | None = None
-    # 지연 판정에 쓰는 Versioned Capture Policy
     capture_policy: CapturePolicy = field(default_factory=CapturePolicy)
 
     def __post_init__(self) -> None:
@@ -164,7 +166,6 @@ class CaptureWindowResult:
     exit_code: int | None
     error_code: str | None = None
     error_message: str | None = None
-    # --- Timing Metadata ---
     # LATE_CAPTURE에서는 전부 None/0.0으로 고정된다 (DB CHECK와 동일한 계약).
     actual_capture_started_at: datetime | None = None
     capture_stop_requested_at: datetime | None = None
@@ -186,7 +187,6 @@ def execute_capture_window(
 ) -> CaptureWindowResult:
     """한 Window(10초)를 캡처하고 결과를 파일 이동 + Timing Metadata로 반환합니다.
 
-    capture_started_at이 주어지면 Capture 경계 상태표에 따라 지연을 판정합니다:
       - capture_started_at이 이미 window_end 이후이거나
       - 허용 지연(policy.max_start_delay_seconds + epsilon)을 초과했다면
       tcpdump 프로세스를 아예 실행하지 않고 LATE_CAPTURE로 확정합니다.
@@ -214,7 +214,6 @@ def execute_capture_window(
         start_delay_seconds: float | None = None
         window_seconds = (window_end - window_start).total_seconds()
     else:
-        effective_started_at = capture_started_at
         start_delay_seconds = max(0.0, (capture_started_at - window_start).total_seconds())
 
         already_expired = capture_started_at >= window_end
@@ -252,7 +251,8 @@ def execute_capture_window(
                 captured_duration_seconds=0.0,
             )
 
-        window_seconds = max(0.0, (window_end - capture_started_at).total_seconds())
+        effective_started_at = max(capture_started_at, window_start)
+        window_seconds = max(0.0, (window_end - effective_started_at).total_seconds())
 
     process_exited_at_fallback = clock  # 아래에서 실제 종료 직후 시각을 기록하는 데 사용
 
@@ -263,8 +263,8 @@ def execute_capture_window(
     )
     capture_process_exited_at = process_exited_at_fallback()
 
-    # Capture 종료 요청은 항상 명목 window_end에 수행한다. OS Scheduling·pcap flush로 프로세스 종료가 늦어져도(capture_process_exited_at) 
-    # 실제 Coverage 분모로는 쓰지 않는다.
+    # Capture 종료 요청은 항상 명목 window_end에 수행한다. OS Scheduling·pcap flush로 프로세스
+    # 종료가 늦어져도(capture_process_exited_at) 실제 Coverage 분모로는 쓰지 않는다.
     capture_stop_requested_at = window_end
     _effective_start, _effective_end, captured_duration_seconds = compute_effective_capture_window(
         window_start=window_start,
@@ -287,7 +287,9 @@ def execute_capture_window(
             captured_duration_seconds=captured_duration_seconds,
         )
 
+    file_was_created = tmp_path.exists()
     final_path = _move_to_failed(tmp_path, config.failed_dir / ready_filename)
+
     if not outcome.completed_full_window:
         error_message = (
             f"tcpdump exited before the {window_seconds:.0f}s window completed "
@@ -298,6 +300,22 @@ def execute_capture_window(
             f"tcpdump did not respond to SIGTERM within the grace period and had to be "
             f"SIGKILLed; pcap file may be corrupted (exit_code={outcome.exit_code})"
         )
+
+    if not file_was_created:
+        return CaptureWindowResult(
+            success=False,
+            file_name=None,
+            final_path=None,
+            exit_code=outcome.exit_code,
+            error_code=PCAP_FILE_MISSING,
+            error_message=error_message,
+            actual_capture_started_at=effective_started_at,
+            capture_stop_requested_at=capture_stop_requested_at,
+            capture_process_exited_at=capture_process_exited_at,
+            start_delay_seconds=start_delay_seconds if start_delay_seconds is not None else 0.0,
+            captured_duration_seconds=captured_duration_seconds,
+        )
+
     return CaptureWindowResult(
         success=False,
         file_name=ready_filename,

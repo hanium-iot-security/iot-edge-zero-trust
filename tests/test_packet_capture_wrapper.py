@@ -277,7 +277,9 @@ class TestExecuteCaptureWindowDriftCorrection:
         assert process.last_call["window_seconds"] == 10.0
 
     def test_capture_started_at_past_window_end_does_not_invoke_process(self, tmp_path: Path) -> None:
-        
+        """window_end을 이미 지난 채로 발견되면 tcpdump조차 실행하지 않고
+        즉시 LATE_CAPTURE로 처리해야 한다 (Capture 경계 상태표: "Runtime이 현재 Window를 대기하다가 actual_start >= window_end가 됨" -> FAILED/LATE_CAPTURE).
+        file_name은 DB CHECK 제약상 NULL이어야 하므로 실제 파일이 어디에도 생성되지 않는다."""
         config = _make_config(tmp_path)
         config.ensure_directories()
         window_start = _utc(2026, 7, 15, 10, 0, 10)
@@ -347,6 +349,36 @@ class TestExecuteCaptureWindowDriftCorrection:
         assert result.start_delay_seconds == pytest.approx(0.3)
         assert result.captured_duration_seconds == pytest.approx(9.7, abs=1e-6)
 
+    def test_capture_started_at_before_window_start_is_clamped(self, tmp_path: Path) -> None:
+        """NTP 보정 등으로 clock()이 window_start 이전 시각을 반환하는 방어적 케이스.
+
+        정상 흐름에서는 Runtime이 항상 window_start까지 대기한 뒤 capture_started_at을
+        읽으므로 이 상황이 발생할 수 없지만, 두 clock() 호출 사이에 시계가 뒤로
+        조정될 가능성을 배제할 수 없다. 이 경우에도 tcpdump에 명목 10초를 넘는
+        캡처를 요청해서는 안 되고, start_delay_seconds는 0으로 clamp돼야 한다.
+        """
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        window_start = _utc(2026, 7, 15, 10, 0, 10)
+        window_end = _utc(2026, 7, 15, 10, 0, 20)
+        capture_started_at = _utc(2026, 7, 15, 10, 0, 8)  # window_start보다 2초 이름
+        process = FakeCaptureProcess(outcome=CaptureOutcome(completed_full_window=True, exit_code=-15))
+
+        result = execute_capture_window(
+            process, config, session_id=SESSION_ID,
+            window_start=window_start, window_end=window_end,
+            capture_started_at=capture_started_at,
+        )
+
+        assert result.success is True
+        # tcpdump에는 명목 10초까지만 요청해야 한다 (12초를 요청하면 안 됨).
+        assert process.last_call["window_seconds"] == pytest.approx(10.0)
+        assert result.start_delay_seconds == 0.0
+        assert result.captured_duration_seconds == pytest.approx(10.0)
+        # actual_capture_started_at도 window_start로 clamp되어야 한다
+        # (raw capture_started_at을 그대로 저장하면 Window보다 이른 시각이 Evidence에 남는다).
+        assert result.actual_capture_started_at == window_start
+
 
 class TestExecuteCaptureWindowSuccess:
     def test_moves_file_to_ready_and_strips_tmp_suffix(self, tmp_path: Path) -> None:
@@ -410,6 +442,8 @@ class TestExecuteCaptureWindowFailure:
         assert not (config.ready_dir / result.file_name).exists()
 
     def test_process_that_never_wrote_a_file_does_not_crash(self, tmp_path: Path) -> None:
+        """파일이 아예 생성되지 않은 경우, 존재하지 않는 파일명을 합성하지 않고
+        file_name/final_path를 NULL로 반환해야 한다."""
         config = _make_config(tmp_path)
         config.ensure_directories()
         window_start = _utc(2026, 7, 15, 10, 0, 10)
@@ -425,7 +459,29 @@ class TestExecuteCaptureWindowFailure:
         )
 
         assert result.success is False
-        assert not result.final_path.exists()
+        assert result.error_code == "PCAP_FILE_MISSING"
+        assert result.file_name is None
+        assert result.final_path is None
+
+    def test_partial_capture_with_existing_file_keeps_file_name(self, tmp_path: Path) -> None:
+        """파일이 실제로 생성됐다면 (write_file=True, 기본값) 여전히 PARTIAL_CAPTURE로
+        분류되고 file_name이 채워져야 한다 -- PCAP_FILE_MISSING과의 회귀 방지용 대조 테스트."""
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        window_start = _utc(2026, 7, 15, 10, 0, 10)
+        window_end = _utc(2026, 7, 15, 10, 0, 20)
+        process = FakeCaptureProcess(outcome=CaptureOutcome(completed_full_window=False, exit_code=1))
+
+        result = execute_capture_window(
+            process, config, session_id=SESSION_ID,
+            window_start=window_start, window_end=window_end,
+        )
+
+        assert result.success is False
+        assert result.error_code == "PARTIAL_CAPTURE"
+        assert result.file_name is not None
+        assert result.final_path is not None
+        assert result.final_path.exists()
 
     def test_sigkill_escalation_is_not_treated_as_success(self, tmp_path: Path) -> None:
         """SIGTERM에 응답하지 않아 SIGKILL까지 실행된 경우, window_seconds를 다 채웠어도
