@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     failed_pcap_retention_hours: int = 24
     failed_pcap_max_storage_mb: int = 256
     failed_pcap_max_files: int = 20
+    pcap_max_start_delay_seconds: float = 1.0
+    packet_min_capture_duration_seconds: float = 9.0
+    capture_time_epsilon_seconds: float = 0.01
+    capture_policy_version: str = "packet-capture-policy-v1"
 
     # Firewall Worker
     firewall_worker_interval_seconds: float = 5.0

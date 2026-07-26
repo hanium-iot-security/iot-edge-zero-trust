@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from edge.packet.capture_policy import CapturePolicy
 from edge.packet.capture_runtime import (
     CaptureOutcome,
     CaptureRuntimeConfig,
@@ -276,9 +277,10 @@ class TestExecuteCaptureWindowDriftCorrection:
         assert process.last_call["window_seconds"] == 10.0
 
     def test_capture_started_at_past_window_end_does_not_invoke_process(self, tmp_path: Path) -> None:
-        """window_seconds<=0이면 tcpdump조차 실행하지 않고
-        즉시 실패로 처리해야 한다. 남은 시간이 없는 캡처가 정상 READY Segment로
-        저장되는 일을 막기 위한 방어 코드다."""
+        """window_end을 이미 지난 채로 발견되면 tcpdump조차 실행하지 않고
+        즉시 LATE_CAPTURE로 처리해야 한다 (Capture 경계 상태표: "Runtime이 현재 Window를 대기하다가
+        actual_start >= window_end가 됨" -> FAILED/LATE_CAPTURE). file_name은 DB CHECK 제약상 NULL이어야 하므로
+        실제 파일이 어디에도 생성되지 않는다."""
         config = _make_config(tmp_path)
         config.ensure_directories()
         window_start = _utc(2026, 7, 15, 10, 0, 10)
@@ -293,9 +295,90 @@ class TestExecuteCaptureWindowDriftCorrection:
 
         assert process.last_call is None  # capture_window()가 호출되지 않음
         assert result.success is False
-        assert result.error_code == "PARTIAL_CAPTURE"
-        assert not (config.ready_dir / result.file_name).exists()
-        assert not (config.failed_dir / result.file_name).exists()  # 파일 자체가 생성되지 않음
+        assert result.error_code == "LATE_CAPTURE"
+        assert result.file_name is None
+        assert result.final_path is None
+        assert result.captured_duration_seconds == 0.0
+        assert result.actual_capture_started_at is None
+        # incoming/ready/failed 어디에도 파일이 생성되지 않아야 한다.
+        expected_ready_name = build_pcap_filename(
+            session_id=SESSION_ID, interface="eth0",
+            window_start=window_start, window_end=window_end, tmp=False,
+        )
+        assert not (config.ready_dir / expected_ready_name).exists()
+        assert not (config.failed_dir / expected_ready_name).exists()
+
+    def test_start_delay_beyond_policy_but_before_window_end_is_late_capture(self, tmp_path: Path) -> None:
+        """window은 아직 안 끝났어도, 허용 지연(기본 1.0초+epsilon)을 넘겼다면
+        tcpdump를 실행하지 않고 LATE_CAPTURE여야 한다."""
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        window_start = _utc(2026, 7, 15, 10, 0, 10)
+        window_end = _utc(2026, 7, 15, 10, 0, 20)
+        capture_started_at = window_start.replace(microsecond=500_000)  # 0.5초 지연: 허용 초과
+        process = FakeCaptureProcess(outcome=CaptureOutcome(completed_full_window=True, exit_code=-15))
+        policy = CapturePolicy(max_start_delay_seconds=0.3, minimum_duration_seconds=9.5)
+
+        result = execute_capture_window(
+            process, config, session_id=SESSION_ID,
+            window_start=window_start, window_end=window_end,
+            capture_started_at=capture_started_at,
+            policy=policy,
+        )
+
+        assert process.last_call is None
+        assert result.error_code == "LATE_CAPTURE"
+        assert result.start_delay_seconds == pytest.approx(0.5)
+
+    def test_start_delay_within_policy_before_window_end_still_captures(self, tmp_path: Path) -> None:
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        window_start = _utc(2026, 7, 15, 10, 0, 10)
+        window_end = _utc(2026, 7, 15, 10, 0, 20)
+        capture_started_at = window_start.replace(microsecond=300_000)  # 0.3초 지연: 기본 정책 허용 범위
+        process = FakeCaptureProcess(outcome=CaptureOutcome(completed_full_window=True, exit_code=-15))
+
+        result = execute_capture_window(
+            process, config, session_id=SESSION_ID,
+            window_start=window_start, window_end=window_end,
+            capture_started_at=capture_started_at,
+        )
+
+        assert process.last_call is not None
+        assert result.success is True
+        assert result.error_code is None
+        assert result.start_delay_seconds == pytest.approx(0.3)
+        assert result.captured_duration_seconds == pytest.approx(9.7, abs=1e-6)
+
+    def test_capture_started_at_before_window_start_is_clamped(self, tmp_path: Path) -> None:
+        """NTP 보정 등으로 clock()이 window_start 이전 시각을 반환하는 방어적 케이스.
+
+        정상 흐름에서는 Runtime이 항상 window_start까지 대기한 뒤 capture_started_at을
+        읽으므로 이 상황이 발생할 수 없지만, 두 clock() 호출 사이에 시계가 뒤로
+        조정될 가능성을 배제할 수 없다. 이 경우에도 tcpdump에 명목 10초를 넘는
+        캡처를 요청해서는 안 되고, start_delay_seconds는 0으로 clamp돼야 한다.
+        """
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        window_start = _utc(2026, 7, 15, 10, 0, 10)
+        window_end = _utc(2026, 7, 15, 10, 0, 20)
+        capture_started_at = _utc(2026, 7, 15, 10, 0, 8)  # window_start보다 2초 이름
+        process = FakeCaptureProcess(outcome=CaptureOutcome(completed_full_window=True, exit_code=-15))
+
+        result = execute_capture_window(
+            process, config, session_id=SESSION_ID,
+            window_start=window_start, window_end=window_end,
+            capture_started_at=capture_started_at,
+        )
+
+        assert result.success is True
+        # tcpdump에는 명목 10초까지만 요청해야 한다 (12초를 요청하면 안 됨).
+        assert process.last_call["window_seconds"] == pytest.approx(10.0)
+        assert result.start_delay_seconds == 0.0
+        assert result.captured_duration_seconds == pytest.approx(10.0)
+        # actual_capture_started_at도 window_start로 clamp되어야 한다
+        # (raw capture_started_at을 그대로 저장하면 Window보다 이른 시각이 Evidence에 남는다).
+        assert result.actual_capture_started_at == window_start
 
 
 class TestExecuteCaptureWindowSuccess:
@@ -360,6 +443,8 @@ class TestExecuteCaptureWindowFailure:
         assert not (config.ready_dir / result.file_name).exists()
 
     def test_process_that_never_wrote_a_file_does_not_crash(self, tmp_path: Path) -> None:
+        """파일이 아예 생성되지 않은 경우, 존재하지 않는 파일명을 합성하지 않고
+        file_name/final_path를 NULL로 반환해야 한다 (존재하지 않는 예정 파일명을 합성하지 않는다)."""
         config = _make_config(tmp_path)
         config.ensure_directories()
         window_start = _utc(2026, 7, 15, 10, 0, 10)
@@ -375,7 +460,114 @@ class TestExecuteCaptureWindowFailure:
         )
 
         assert result.success is False
-        assert not result.final_path.exists()
+        assert result.error_code == "PCAP_FILE_MISSING"
+        assert result.file_name is None
+        assert result.final_path is None
+
+    def test_partial_capture_with_existing_file_keeps_file_name(self, tmp_path: Path) -> None:
+        """파일이 실제로 생성됐다면 (write_file=True, 기본값) 여전히 PARTIAL_CAPTURE로
+        분류되고 file_name이 채워져야 한다 -- PCAP_FILE_MISSING과의 회귀 방지용 대조 테스트."""
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        window_start = _utc(2026, 7, 15, 10, 0, 10)
+        window_end = _utc(2026, 7, 15, 10, 0, 20)
+        process = FakeCaptureProcess(outcome=CaptureOutcome(completed_full_window=False, exit_code=1))
+
+        result = execute_capture_window(
+            process, config, session_id=SESSION_ID,
+            window_start=window_start, window_end=window_end,
+        )
+
+        assert result.success is False
+        assert result.error_code == "PARTIAL_CAPTURE"
+        assert result.file_name is not None
+        assert result.final_path is not None
+        assert result.final_path.exists()
+
+    def test_partial_capture_duration_reflects_actual_exit_time_not_nominal_window_end(
+        self, tmp_path: Path
+    ) -> None:
+        """조기 종료된 PARTIAL_CAPTURE는 captured_duration_seconds가 실제 종료 시각
+        기준으로 계산돼야 한다. 명목 window_end 기준으로 계산하면 프로세스가 시작
+        2초 만에 죽어도 captured_duration_seconds가 9~10초로 나와 실제 캡처량을
+        과대평가하게 된다."""
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        window_start = _utc(2026, 7, 15, 10, 0, 10)
+        window_end = _utc(2026, 7, 15, 10, 0, 20)
+        actual_exit_at = _utc(2026, 7, 15, 10, 0, 12)  # window_start로부터 2초 만에 죽음
+        process = FakeCaptureProcess(outcome=CaptureOutcome(completed_full_window=False, exit_code=1))
+
+        result = execute_capture_window(
+            process, config, session_id=SESSION_ID,
+            window_start=window_start, window_end=window_end,
+            capture_started_at=window_start,
+            clock=lambda: actual_exit_at,
+        )
+
+        assert result.success is False
+        assert result.error_code == "PARTIAL_CAPTURE"
+        assert result.captured_duration_seconds == pytest.approx(2.0)
+        assert result.capture_process_exited_at == actual_exit_at
+        # 이 케이스는 프로세스가 스스로 먼저 종료돼 Wrapper가 종료를 "요청"한 적이
+        # 없으므로, capture_stop_requested_at도 실제 관측된 종료 시각을 대신 쓴다
+        # (window_end라는 허수를 넣지 않는다).
+        assert result.capture_stop_requested_at == actual_exit_at
+
+    def test_stop_requested_at_from_outcome_is_used_and_clamped_to_window_end(self, tmp_path: Path) -> None:
+        """CaptureOutcome.stop_requested_at(TcpdumpCaptureProcess가 실제 SIGTERM을 보낸
+        시각)이 있으면 그 값을 그대로 capture_stop_requested_at으로 사용해야 하고,
+        window_end보다 늦게 들어온 경우(OS 스케줄링 지연)에는 captured_duration_seconds
+        계산에서 window_end로 clamp돼야 한다. window_end를 무조건 대입하면 이 필드가
+        이미 있는 window_end 컬럼의 복사본일 뿐이라 스케줄링 지연을 감사할 수 없다."""
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        window_start = _utc(2026, 7, 15, 10, 0, 10)
+        window_end = _utc(2026, 7, 15, 10, 0, 20)
+        # OS 스케줄링 지연으로 SIGTERM이 명목 window_end보다 0.4초 늦게 나간 상황.
+        late_stop_requested_at = window_end.replace(microsecond=400_000)
+        process = FakeCaptureProcess(
+            outcome=CaptureOutcome(
+                completed_full_window=True,
+                exit_code=-15,
+                stop_requested_at=late_stop_requested_at,
+            )
+        )
+
+        result = execute_capture_window(
+            process, config, session_id=SESSION_ID,
+            window_start=window_start, window_end=window_end,
+            capture_started_at=window_start,
+        )
+
+        assert result.success is True
+        # 실제 관측값이 그대로 저장돼야 한다 (window_end로 뭉개지 않는다).
+        assert result.capture_stop_requested_at == late_stop_requested_at
+        # 하지만 captured_duration_seconds는 여전히 10초를 넘지 않도록 clamp된다.
+        assert result.captured_duration_seconds == pytest.approx(10.0)
+
+
+    def test_pcap_file_missing_reports_zero_captured_duration(self, tmp_path: Path) -> None:
+        """파일이 아예 생성되지 않았다면, 프로세스가 얼마나 오래 떠 있었든 실제로
+        캡처된 데이터는 없으므로 captured_duration_seconds는 0이어야 한다."""
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        window_start = _utc(2026, 7, 15, 10, 0, 10)
+        window_end = _utc(2026, 7, 15, 10, 0, 20)
+        process = FakeCaptureProcess(
+            outcome=CaptureOutcome(completed_full_window=False, exit_code=127),
+            write_file=False,
+        )
+
+        result = execute_capture_window(
+            process, config, session_id=SESSION_ID,
+            window_start=window_start, window_end=window_end,
+            capture_started_at=window_start,
+            clock=lambda: _utc(2026, 7, 15, 10, 0, 18),  # 8초 동안 떠 있었지만 파일은 없음
+        )
+
+        assert result.error_code == "PCAP_FILE_MISSING"
+        assert result.captured_duration_seconds == 0.0
 
     def test_sigkill_escalation_is_not_treated_as_success(self, tmp_path: Path) -> None:
         """SIGTERM에 응답하지 않아 SIGKILL까지 실행된 경우, window_seconds를 다 채웠어도
