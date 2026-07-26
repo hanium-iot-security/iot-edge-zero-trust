@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import ipaddress
 import json
+from math import isclose, isfinite
 from numbers import Integral
+from numbers import Real
 from pathlib import Path
 import re
 from typing import Any
@@ -15,7 +18,16 @@ from uuid import UUID
 
 import pandas as pd
 
-from ai.packet_if_contract import PACKET_IF_RAW_FEATURES, packet_feature_matrix
+from ai.packet_if_contract import (
+    PACKET_IF_NOMINAL_WINDOW_SECONDS,
+    PACKET_IF_RAW_FEATURES,
+    packet_feature_matrix,
+)
+from edge.packet.capture_policy import (
+    CaptureEligibilitySegment,
+    CapturePolicy,
+    is_capture_eligible,
+)
 
 _UTC_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
@@ -39,8 +51,21 @@ DATASET_REQUIRED_COLUMNS = (
     "window_start",
     "window_end",
     "peer_ip",
+    "segment_window_start",
+    "segment_window_end",
+    "segment_status",
+    "segment_error_code",
+    "start_delay_seconds",
+    "registered_device_id",
+    "registered_ip_address",
     *PACKET_IF_RAW_FEATURES,
 )
+
+
+@dataclass(frozen=True)
+class PacketIFSessionDevice:
+    device_id: str
+    peer_ip: str
 
 
 @dataclass(frozen=True)
@@ -50,14 +75,29 @@ class PacketIFSessionSpec:
     traffic_label: str
     scenario: str
     target_device_id: str | None = None
+    status: str = "COMPLETED"
+    capture_interface: str = ""
+    capture_filter: str = ""
+    source_commit_sha: str = ""
+    started_at: datetime | None = None
+    first_window_start: datetime | None = None
+    ended_at: datetime | None = None
+    capture_gap_start: datetime | None = None
+    capture_gap_end: datetime | None = None
+    devices: tuple[PacketIFSessionDevice, ...] = ()
+    data_sha256: str = ""
 
 
 @dataclass(frozen=True)
 class PacketIFDatasetManifest:
     dataset_version: str
-    capture_policy_version: str
+    capture_policy: CapturePolicy
     dataset_sha256: str
     sessions: tuple[PacketIFSessionSpec, ...]
+
+    @property
+    def capture_policy_version(self) -> str:
+        return self.capture_policy.version
 
 
 @dataclass(frozen=True)
@@ -90,9 +130,14 @@ def load_packet_if_dataset(
             f"expected={manifest.dataset_sha256}, actual={actual_sha256}"
         )
 
+    session_sha256s = session_data_sha256s(dataset_path)
     frame = pd.read_csv(dataset_path)
     _validate_dataset_columns(frame)
-    _validate_dataset_rows(frame, manifest)
+    _validate_dataset_rows(
+        frame,
+        manifest,
+        session_sha256s=session_sha256s,
+    )
 
     session_map = {spec.session_id: spec for spec in manifest.sessions}
     enriched = frame.copy(deep=True)
@@ -136,10 +181,7 @@ def load_packet_if_manifest(path: Path) -> PacketIFDatasetManifest:
             f"expected={PACKET_IF_DATASET_VERSION!r}, actual={dataset_version!r}"
         )
 
-    capture_policy_version = _required_non_empty_string(
-        payload,
-        "capture_policy_version",
-    )
+    capture_policy = _parse_capture_policy(payload)
     dataset_sha256 = _validate_sha256(
         _required_non_empty_string(payload, "dataset_sha256"),
         "dataset_sha256",
@@ -153,7 +195,7 @@ def load_packet_if_manifest(path: Path) -> PacketIFDatasetManifest:
     _validate_manifest_sessions(sessions)
     return PacketIFDatasetManifest(
         dataset_version=dataset_version,
-        capture_policy_version=capture_policy_version,
+        capture_policy=capture_policy,
         dataset_sha256=dataset_sha256,
         sessions=sessions,
     )
@@ -168,6 +210,124 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def session_data_sha256s(path: Path) -> dict[str, str]:
+    """Hash each Session's canonical CSV rows without pandas type coercion."""
+    if not path.is_file():
+        raise FileNotFoundError(f"packet dataset not found: {path}")
+
+    digests: dict[str, Any] = {}
+    with path.open(newline="", encoding="utf-8") as csv_file:
+        reader = csv.DictReader(csv_file)
+        fieldnames = tuple(reader.fieldnames or ())
+        missing = [
+            column
+            for column in DATASET_REQUIRED_COLUMNS
+            if column not in fieldnames
+        ]
+        if missing:
+            raise ValueError(
+                f"packet dataset is missing required columns: {missing}"
+            )
+        for row in reader:
+            session_id = str(row.get("session_id", "")).strip()
+            if not session_id:
+                raise ValueError("packet dataset session_id must not be empty")
+            digest = digests.setdefault(session_id, hashlib.sha256())
+            canonical_row = {
+                column: row.get(column, "")
+                for column in DATASET_REQUIRED_COLUMNS
+            }
+            digest.update(
+                (
+                    json.dumps(
+                        canonical_row,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+    return {
+        session_id: digest.hexdigest()
+        for session_id, digest in digests.items()
+    }
+
+
+def _parse_capture_policy(payload: dict[str, Any]) -> CapturePolicy:
+    policy_version = _required_non_empty_string(
+        payload,
+        "capture_policy_version",
+    )
+    raw_policy = payload.get("capture_policy")
+    if not isinstance(raw_policy, dict):
+        raise ValueError("packet dataset capture_policy must be an object")
+    nested_version = _required_non_empty_string(raw_policy, "version")
+    if nested_version != policy_version:
+        raise ValueError(
+            "packet dataset Capture Policy version mismatch: "
+            f"expected={policy_version!r}, actual={nested_version!r}"
+        )
+
+    nominal_window_seconds = _required_finite_real(
+        raw_policy,
+        "nominal_window_seconds",
+    )
+    if not isclose(
+        nominal_window_seconds,
+        PACKET_IF_NOMINAL_WINDOW_SECONDS,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(
+            "packet dataset nominal_window_seconds must match "
+            f"{PACKET_IF_NOMINAL_WINDOW_SECONDS}"
+        )
+
+    policy = CapturePolicy(
+        max_start_delay_seconds=_required_finite_real(
+            raw_policy,
+            "max_start_delay_seconds",
+        ),
+        minimum_duration_seconds=_required_finite_real(
+            raw_policy,
+            "minimum_duration_seconds",
+        ),
+        epsilon_seconds=_required_finite_real(
+            raw_policy,
+            "epsilon_seconds",
+        ),
+        version=nested_version,
+    )
+    coverage_ratio = _required_finite_real(
+        raw_policy,
+        "minimum_coverage_ratio",
+    )
+    expected_coverage_ratio = (
+        policy.minimum_duration_seconds / PACKET_IF_NOMINAL_WINDOW_SECONDS
+    )
+    if not isclose(
+        coverage_ratio,
+        expected_coverage_ratio,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(
+            "packet dataset minimum_coverage_ratio does not match "
+            "minimum_duration_seconds"
+        )
+    return policy
+
+
+def _parse_session_device(payload: Any) -> PacketIFSessionDevice:
+    if not isinstance(payload, dict):
+        raise ValueError("each session device must be a JSON object")
+    device_id = _required_non_empty_string(payload, "device_id")
+    peer_ip = _required_non_empty_string(payload, "peer_ip")
+    _validate_ipv4(peer_ip)
+    return PacketIFSessionDevice(device_id=device_id, peer_ip=peer_ip)
 
 
 def _parse_session_spec(payload: Any) -> PacketIFSessionSpec:
@@ -202,12 +362,78 @@ def _parse_session_spec(payload: Any) -> PacketIFSessionSpec:
             f"target_device_id must be a non-empty string or omitted: {raw_target!r}"
         )
 
+    status = _required_non_empty_string(payload, "status")
+    if status != "COMPLETED":
+        raise ValueError(
+            f"packet dataset session must be COMPLETED: {session_id}"
+        )
+    capture_interface = _required_non_empty_string(
+        payload,
+        "capture_interface",
+    )
+    capture_filter = payload.get("capture_filter")
+    if not isinstance(capture_filter, str):
+        raise ValueError("capture_filter must be a string")
+    source_commit_sha = _validate_sha1(
+        _required_non_empty_string(payload, "source_commit_sha"),
+        "source_commit_sha",
+    )
+    started_at = _required_utc_timestamp(payload, "started_at")
+    first_window_start = _required_canonical_utc_timestamp(
+        payload,
+        "first_window_start",
+    )
+    ended_at = _required_utc_timestamp(payload, "ended_at")
+    if not started_at <= first_window_start < ended_at:
+        raise ValueError(
+            "packet dataset session timestamps must satisfy "
+            "started_at <= first_window_start < ended_at"
+        )
+
+    capture_gap_start = _optional_canonical_utc_timestamp(
+        payload,
+        "capture_gap_start",
+    )
+    capture_gap_end = _optional_canonical_utc_timestamp(
+        payload,
+        "capture_gap_end",
+    )
+    if (capture_gap_start is None) != (capture_gap_end is None):
+        raise ValueError(
+            "capture_gap_start and capture_gap_end must both be set or null"
+        )
+    if capture_gap_start is not None and capture_gap_end is not None:
+        if not capture_gap_start < capture_gap_end <= first_window_start:
+            raise ValueError(
+                "Capture Gap must end no later than first_window_start"
+            )
+
+    raw_devices = payload.get("devices")
+    if not isinstance(raw_devices, list) or not raw_devices:
+        raise ValueError("packet dataset session devices must be a non-empty list")
+    devices = tuple(_parse_session_device(item) for item in raw_devices)
+    data_sha256 = _validate_sha256(
+        _required_non_empty_string(payload, "data_sha256"),
+        "data_sha256",
+    )
+
     return PacketIFSessionSpec(
         session_id=session_id,
         split=split,
         traffic_label=traffic_label,
         scenario=scenario,
         target_device_id=target_device_id,
+        status=status,
+        capture_interface=capture_interface,
+        capture_filter=capture_filter,
+        source_commit_sha=source_commit_sha,
+        started_at=started_at,
+        first_window_start=first_window_start,
+        ended_at=ended_at,
+        capture_gap_start=capture_gap_start,
+        capture_gap_end=capture_gap_end,
+        devices=devices,
+        data_sha256=data_sha256,
     )
 
 
@@ -231,6 +457,11 @@ def _validate_manifest_sessions(
                 raise ValueError(
                     f"{spec.split} session must be normal: {spec.session_id}"
                 )
+            if spec.scenario == "normal_management_traffic":
+                raise ValueError(
+                    "normal_management_traffic is reserved for Rule allowlist "
+                    f"and false-positive evaluation: {spec.session_id}"
+                )
 
     test_labels = {
         spec.traffic_label
@@ -253,6 +484,24 @@ def _validate_manifest_sessions(
             raise ValueError(
                 f"normal session must not have target_device_id: {spec.session_id}"
             )
+        device_ids = [device.device_id for device in spec.devices]
+        peer_ips = [device.peer_ip for device in spec.devices]
+        if len(set(device_ids)) != len(device_ids):
+            raise ValueError(
+                f"packet dataset session has duplicate device_id: {spec.session_id}"
+            )
+        if len(set(peer_ips)) != len(peer_ips):
+            raise ValueError(
+                f"packet dataset session has duplicate peer_ip: {spec.session_id}"
+            )
+        if (
+            spec.target_device_id is not None
+            and spec.target_device_id not in device_ids
+        ):
+            raise ValueError(
+                "attack target_device_id is missing from session devices: "
+                f"{spec.session_id}"
+            )
 
 
 def _validate_dataset_columns(frame: pd.DataFrame) -> None:
@@ -270,6 +519,8 @@ def _validate_dataset_columns(frame: pd.DataFrame) -> None:
 def _validate_dataset_rows(
     frame: pd.DataFrame,
     manifest: PacketIFDatasetManifest,
+    *,
+    session_sha256s: dict[str, str],
 ) -> None:
     ids = frame["packet_feature_log_id"]
     if ids.isna().any():
@@ -300,6 +551,14 @@ def _validate_dataset_rows(
         raise ValueError(
             f"packet dataset has no rows for manifest sessions: {sorted(missing_sessions)}"
         )
+    for spec in manifest.sessions:
+        actual_session_sha256 = session_sha256s.get(spec.session_id)
+        if actual_session_sha256 != spec.data_sha256:
+            raise ValueError(
+                "packet dataset Session SHA256 mismatch: "
+                f"session_id={spec.session_id}, "
+                f"expected={spec.data_sha256}, actual={actual_session_sha256}"
+            )
 
     if frame["device_id"].isna().any() or frame["device_id"].astype(str).str.strip().eq("").any():
         raise ValueError("packet dataset requires mapped device_id values")
@@ -319,11 +578,55 @@ def _validate_dataset_rows(
         _validate_ipv4(raw_ip)
 
     _validate_window_timestamps(frame["window_start"], frame["window_end"])
+    _validate_window_timestamps(
+        frame["segment_window_start"],
+        frame["segment_window_end"],
+    )
 
     session_map = {spec.session_id: spec for spec in manifest.sessions}
     for session_id, group in frame.groupby("session_id"):
         spec = session_map.get(str(session_id))
-        if spec is not None and spec.target_device_id is not None:
+        if spec is None:
+            continue
+
+        expected_devices = {
+            (device.device_id, device.peer_ip)
+            for device in spec.devices
+        }
+        for row in group.to_dict(orient="records"):
+            _validate_dataset_source_row(
+                row,
+                capture_policy=manifest.capture_policy,
+            )
+            device_mapping = (
+                str(row["device_id"]),
+                str(row["peer_ip"]),
+            )
+            if device_mapping not in expected_devices:
+                raise ValueError(
+                    "packet dataset row is missing from Session device provenance: "
+                    f"session_id={session_id}, device={device_mapping!r}"
+                )
+            window_start = _parse_canonical_utc(
+                row["window_start"],
+                "window_start",
+            )
+            window_end = _parse_canonical_utc(
+                row["window_end"],
+                "window_end",
+            )
+            if (
+                spec.first_window_start is None
+                or spec.ended_at is None
+                or window_start < spec.first_window_start
+                or window_end > spec.ended_at
+            ):
+                raise ValueError(
+                    "packet dataset row falls outside Session timing provenance: "
+                    f"session_id={session_id}"
+                )
+
+        if spec.target_device_id is not None:
             mismatched = group[
                 group["device_id"].astype(str) != spec.target_device_id
             ]
@@ -334,6 +637,68 @@ def _validate_dataset_rows(
                 )
 
     packet_feature_matrix(frame.to_dict(orient="records"))
+
+
+def _validate_dataset_source_row(
+    row: dict[str, Any],
+    *,
+    capture_policy: CapturePolicy,
+) -> None:
+    feature_start = _parse_canonical_utc(row["window_start"], "window_start")
+    feature_end = _parse_canonical_utc(row["window_end"], "window_end")
+    segment_start = _parse_canonical_utc(
+        row["segment_window_start"],
+        "segment_window_start",
+    )
+    segment_end = _parse_canonical_utc(
+        row["segment_window_end"],
+        "segment_window_end",
+    )
+    if feature_start != segment_start or feature_end != segment_end:
+        raise ValueError(
+            "Packet Feature window must match its Capture Segment window"
+        )
+
+    registered_device_id = _required_dataframe_string(
+        row,
+        "registered_device_id",
+    )
+    registered_ip_address = _required_dataframe_string(
+        row,
+        "registered_ip_address",
+    )
+    _validate_ipv4(registered_ip_address)
+    if registered_device_id != str(row["device_id"]):
+        raise ValueError(
+            "packet dataset device_id does not match registered_device_id"
+        )
+    if registered_ip_address != str(row["peer_ip"]):
+        raise ValueError(
+            "packet dataset peer_ip does not match registered_ip_address"
+        )
+
+    eligibility = is_capture_eligible(
+        CaptureEligibilitySegment(
+            status=_required_dataframe_string(row, "segment_status"),
+            error_code=_optional_dataframe_string(
+                row.get("segment_error_code"),
+            ),
+            start_delay_seconds=_optional_dataframe_float(
+                row.get("start_delay_seconds"),
+                "start_delay_seconds",
+            ),
+            captured_duration_seconds=_optional_dataframe_float(
+                row.get("captured_duration_seconds"),
+                "captured_duration_seconds",
+            ),
+        ),
+        capture_policy,
+    )
+    if not eligibility.eligible:
+        raise ValueError(
+            "packet dataset row is not Capture Policy eligible: "
+            f"{eligibility.exclusion_reason}"
+        )
 
 
 def _split_frame(frame: pd.DataFrame, split: str) -> pd.DataFrame:
@@ -381,11 +746,90 @@ def _validate_ipv4(ip_str: str) -> None:
         ) from exc
 
 
+def _required_dataframe_string(
+    row: dict[str, Any],
+    field_name: str,
+) -> str:
+    value = row.get(field_name)
+    if pd.isna(value) or not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value.strip()
+
+
+def _optional_dataframe_string(value: Any) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    if not isinstance(value, str):
+        raise ValueError("segment_error_code must be a string or null")
+    return value or None
+
+
+def _optional_dataframe_float(
+    value: Any,
+    field_name: str,
+) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{field_name} must be a real number or null")
+    result = float(value)
+    if not isfinite(result):
+        raise ValueError(f"{field_name} must be finite")
+    return result
+
+
 def _required_non_empty_string(payload: dict[str, Any], field_name: str) -> str:
     value = payload.get(field_name)
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
     return value.strip()
+
+
+def _required_finite_real(payload: dict[str, Any], field_name: str) -> float:
+    value = payload.get(field_name)
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{field_name} must be a real number")
+    result = float(value)
+    if not isfinite(result):
+        raise ValueError(f"{field_name} must be finite")
+    return result
+
+
+def _required_utc_timestamp(
+    payload: dict[str, Any],
+    field_name: str,
+) -> datetime:
+    value = payload.get(field_name)
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise ValueError(f"{field_name} must be an ISO-8601 UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name} must be an ISO-8601 UTC timestamp"
+        ) from exc
+    if parsed.utcoffset() != timedelta(0):
+        raise ValueError(f"{field_name} must use UTC")
+    return parsed
+
+
+def _required_canonical_utc_timestamp(
+    payload: dict[str, Any],
+    field_name: str,
+) -> datetime:
+    if field_name not in payload:
+        raise ValueError(f"{field_name} is required")
+    return _parse_canonical_utc(payload[field_name], field_name)
+
+
+def _optional_canonical_utc_timestamp(
+    payload: dict[str, Any],
+    field_name: str,
+) -> datetime | None:
+    value = payload.get(field_name)
+    if value is None:
+        return None
+    return _parse_canonical_utc(value, field_name)
 
 
 def _validate_sha256(value: str, field_name: str) -> str:
@@ -396,3 +840,12 @@ def _validate_sha256(value: str, field_name: str) -> str:
     ):
         raise ValueError(f"{field_name} must be a 64-character SHA256 hex digest")
     return normalized
+
+
+def _validate_sha1(value: str, field_name: str) -> str:
+    if len(value) != 40 or any(
+        character not in "0123456789abcdef"
+        for character in value
+    ):
+        raise ValueError(f"{field_name} must be a lowercase 40-character SHA1")
+    return value

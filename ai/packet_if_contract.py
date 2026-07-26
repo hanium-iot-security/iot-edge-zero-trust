@@ -13,12 +13,18 @@ import numpy as np
 PACKET_IF_FEATURE_VERSION = "packet-if-features-v1"
 PACKET_IF_TRANSFORM_VERSION = "packet-10s-normalization-v1"
 PACKET_IF_NOMINAL_WINDOW_SECONDS = 10.0
-PACKET_IF_ARTIFACT_SCHEMA_VERSION = 1
+PACKET_IF_ARTIFACT_SCHEMA_VERSION = 2
 PACKET_IF_MODEL_FILENAME = "model.joblib"
 PACKET_IF_METADATA_FILENAME = "metadata.json"
 PACKET_IF_TRAINING_REPORT_FILENAME = "training_report.json"
 PACKET_IF_SCORE_DIRECTION = "higher_is_more_anomalous"
 PACKET_IF_THRESHOLD_OPERATOR = ">"
+PACKET_IF_PACKET_COUNT_FORMULA = (
+    "packet_count * nominal_window_seconds / captured_duration_seconds"
+)
+PACKET_IF_TOTAL_BYTES_FORMULA = (
+    "total_bytes * nominal_window_seconds / captured_duration_seconds"
+)
 
 PACKET_IF_RAW_FEATURES = (
     "packet_count",
