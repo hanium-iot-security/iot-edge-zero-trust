@@ -300,3 +300,77 @@ Extractor 쪽 연결은 추후 정종민 님과 협의해서 결정합니다.
 - [`db-schema.md`](./db-schema.md) — `packet_capture_sessions`/`packet_capture_segments`/`packet_feature_logs` 스키마
 - [`raspberry-pi-setup.md`](./raspberry-pi-setup.md) — Pi 네트워크·계정 정보
 - [`db-backup-restore.md`](./db-backup-restore.md) — DB 백업/복구 절차 (Migration 관련)
+
+---
+
+## Capture 입력 적격 Policy·LATE_CAPTURE (P4-1-01)
+
+담당: 정선우
+
+### 6.1 새 환경값
+
+Pi Pilot 측정 근거 없이 임의로 바꾸지 않는다. 바꿀 경우 `CAPTURE_POLICY_VERSION`도
+함께 올려서 Evidence에 어떤 정책 버전으로 판정됐는지 남긴다.
+
+| 환경변수 | 기본값 | 의미 |
+|---|---|---|
+| `PCAP_MAX_START_DELAY_SECONDS` | `1.0` | 이 값을 넘는 지연으로 캡처가 시작되면 tcpdump를 아예 실행하지 않고 `LATE_CAPTURE`로 처리한다 |
+| `PACKET_MIN_CAPTURE_DURATION_SECONDS` | `9.0` | `10.0 - PCAP_MAX_START_DELAY_SECONDS`로 유도된 값. 두 값을 따로 바꾸면 어긋나므로 항상 함께 조정한다 |
+| `CAPTURE_TIME_EPSILON_SECONDS` | `0.01` | 부동소수점 경계 오차 허용치 |
+| `CAPTURE_POLICY_VERSION` | `packet-capture-policy-v1` | Evidence·Model Metadata에 기록되는 Policy 식별자 |
+
+공통 판정 로직은 `edge/packet/capture_policy.py`의 `is_capture_eligible()`이다.
+Packet Rule Detector, Packet Behavior Isolation Forest(Train/Validation/Test/
+Inference), Dataset Export는 모두 이 함수를 그대로 호출해야 하며, 별도의 적격
+판정식을 새로 작성하지 않는다.
+
+### 6.2 Capture 경계 상태표 실기기 재현 절차
+
+세부계획 2.1 절 표와 동일하게, 아래 다섯 가지 상황을 실기기에서 재현하고 결과를
+`Phase 4 실기기 테스트 및 검증 결과` 문서에 기록한다.
+
+**(1) 정상 실행 (`start_delay_seconds <= 1.0`)**
+1. `packet-capture.service`를 정상 기동한다.
+2. 몇 개 Window가 지난 뒤 `packet_capture_segments`를 조회해 `status=READY`,
+   `start_delay_seconds`가 1.0 이하, `captured_duration_seconds`가 9~10초
+   범위인지 확인한다.
+3. `coverage_ratio = captured_duration_seconds / 10.0`이 표시값으로만 쓰이고
+   판정에는 원본 값이 쓰였는지 확인한다 (반올림된 coverage_ratio 기준으로
+   적격 판정하지 않는다).
+
+**(2) 지연 1초 초과, Window는 아직 안 끝남 (Capture Process 미실행, `LATE_CAPTURE`)**
+1. Pi에서 인위적 부하(`stress-ng` 등)를 걸어 캡처 루프가 예정 시각보다 1초
+   넘게 늦게 깨어나도록 유도하거나, 테스트 환경에서 `run_capture_loop`를
+   직접 호출해 재현한다.
+2. 해당 Window가 `status=FAILED`, `error_code=LATE_CAPTURE`, `file_name=NULL`,
+   `actual_capture_started_at=NULL`, `capture_stop_requested_at=NULL`,
+   `capture_process_exited_at=NULL`, `captured_duration_seconds=0`으로
+   기록됐는지 확인한다. `start_delay_seconds`만 감사용으로 실제 관측된 지연
+   값이 남는다.
+3. 부모 `packet_capture_sessions`가 `FAILED`로 마감되고, 다음 정수 10초
+   경계에서 새 Session이 시작됐는지(`session_id`가 바뀜) 확인한다.
+
+**(3) Window 대기 중 완전히 만료 (`actual_start >= window_end`)**
+1. Pi를 `SIGSTOP`으로 멈췄다가 수십 초 뒤 `SIGCONT`로 재개해, 캡처 루프가
+   현재 대기 중이던 Window의 window_end까지 지나버린 상태로 깨어나게 한다.
+2. 이 경우도 (2)와 동일하게 **딱 하나의** `FAILED/LATE_CAPTURE` Segment만
+   남아야 한다 (실행 중 놓친 현재 Window 한 건은 감사용으로 남긴다).
+
+**(4) 서비스 재시작 시 여러 과거 Window 만료 (Session Gap, 소급 Segment 없음)**
+1. `packet-capture.service`를 1분 이상 멈췄다가 재시작한다.
+2. `packet_capture_sessions.capture_gap_start`/`capture_gap_end`에 정지~재시작
+   구간이 **하나의 범위**로만 기록되고, 그 사이 개별 Window에 대한 가짜
+   Segment가 전혀 생성되지 않는지 확인한다.
+3. `capture_gap_start`가 직전 마지막 Segment(있다면 LATE_CAPTURE 감사 Segment
+   포함)의 `window_end` 기준으로 계산됐는지 확인한다.
+
+**(5) Capture 시작 후 중간 종료 (`PARTIAL_CAPTURE`, 기존 동작 유지)**
+1. 캡처 도중 `pkill -TERM tcpdump`로 강제 종료한다.
+2. `status=FAILED`, `error_code=PARTIAL_CAPTURE`로 기록되고, 파일이 실제
+   생성됐다면 `file_name`에 남는지 확인한다. 지연 초과가 아니므로 Session은
+   FAILED로 전환되지 않고 같은 Session에서 다음 Window로 계속 진행되는지
+   확인한다.
+
+### 6.3 pcap 자동 삭제
+
+pcap 자동 Cleanup은 구현하지 않는다 (원본 pcap은 Feature 오류·오탐·미탐을 재현하는 근거다. 백업과 보관 기간이 합의되기 전에는 자동 삭제하지 않는다).

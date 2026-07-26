@@ -59,10 +59,33 @@ def sanitize_interface_name(interface: str) -> str:
 
 
 def format_utc_iso(value: datetime) -> str:
-    """DB/API 계약에 맞는 UTC ISO 8601 문자열로 변환합니다 (예: 2026-07-15T00:00:10Z)."""
+    """DB/API 계약에 맞는 UTC ISO 8601 문자열로 변환합니다 (예: 2026-07-15T00:00:10Z).
+
+    Window 경계(window_start/window_end)는 정의상 항상 정수 초 UTC 경계이므로 이
+    포맷으로 충분하다. 실제 wall-clock 관측값(Timing Metadata)에는
+    format_utc_iso_precise()를 사용한다 -- 이 함수로 그대로 저장하면 밀리초 이하
+    지연·조기 종료 정보가 소실된다.
+    """
     if value.tzinfo is None:
         raise ValueError("value must be timezone-aware")
     return value.astimezone(timezone.utc).replace(microsecond=0).strftime(_ISO_UTC_FORMAT)
+
+
+def format_utc_iso_precise(value: datetime) -> str:
+    """마이크로초까지 보존하는 UTC ISO 8601 문자열 (예: 2026-07-15T00:00:10.300000Z).
+
+    Phase 4 세부계획 2.1 절의 Timing Metadata(actual_capture_started_at,
+    capture_stop_requested_at, capture_process_exited_at)처럼 정수 초 경계가 아닌
+    실제 관측 시각을 기록할 때 사용한다. Window 경계용 format_utc_iso()와 달리
+    microsecond를 자르지 않는다.
+
+    datetime.isoformat()은 microsecond가 정확히 0이면 소수점 이하를 아예 생략해서
+    같은 컬럼 안에서도 값에 따라 포맷 길이가 달라지는 문제가 있어, strftime으로
+    항상 6자리 마이크로초를 명시적으로 포함시킨다.
+    """
+    if value.tzinfo is None:
+        raise ValueError("value must be timezone-aware")
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def parse_utc_iso(value: str) -> datetime:
