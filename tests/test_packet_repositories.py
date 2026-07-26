@@ -205,6 +205,69 @@ def test_get_packet_capture_ready_through_ignores_other_sessions_and_before_firs
     assert readiness.packet_capture_ready_through.tzinfo is timezone.utc
 
 
+def test_get_packet_feature_ready_through_requires_extractor_terminal_prefix(
+    db_session: Session,
+) -> None:
+    session_pk = _create_session(db_session)
+    first_segment = _insert_segment(
+        db_session,
+        session_pk=session_pk,
+        file_name="feature-ready.pcap",
+        start=_utc(10, 0, 0),
+    )
+    _insert_segment(
+        db_session,
+        session_pk=session_pk,
+        file_name="still-ready.pcap",
+        start=_utc(10, 0, 10),
+    )
+    feature_repo.insert_packet_feature_rows(
+        db_session,
+        capture_segment_id=first_segment,
+        feature_rows=[_feature_row()],
+        ip_device_map={},
+        capture_scope="scope-a",
+    )
+    feature_repo.update_capture_segment_status(
+        db_session,
+        segment_id=first_segment,
+        status="PROCESSED",
+        packet_count=2,
+    )
+    db_session.commit()
+
+    readiness = capture_repo.get_packet_feature_ready_through(
+        db_session,
+        session_id=SESSION_A,
+    )
+
+    assert readiness is not None
+    assert readiness.first_window_start == _utc(10, 0, 0)
+    assert readiness.packet_feature_ready_through == _utc(10, 0, 10)
+
+
+def test_get_packet_feature_ready_through_rejects_inconsistent_terminal_rows(
+    db_session: Session,
+) -> None:
+    session_pk = _create_session(db_session)
+    _insert_segment(
+        db_session,
+        session_pk=session_pk,
+        file_name="processed-without-feature.pcap",
+        start=_utc(10, 0, 0),
+        status="PROCESSED",
+    )
+    db_session.commit()
+
+    readiness = capture_repo.get_packet_feature_ready_through(
+        db_session,
+        session_id=SESSION_A,
+    )
+
+    assert readiness is not None
+    assert readiness.packet_feature_ready_through is None
+
+
 def test_packet_feature_repository_write_contracts(db_session: Session) -> None:
     db_session.execute(
         text(
