@@ -38,7 +38,7 @@ pytestmark = pytest.mark.skipif(
 def _run_wrapper(*args: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ, HANIUM_FW_DRY_RUN="1")
     return subprocess.run(
-        ["bash", str(WRAPPER), *args],
+        ["bash", WRAPPER.as_posix(), *args],
         capture_output=True,
         text=True,
         env=env,
@@ -73,7 +73,15 @@ def test_wrapper_list_only_reads_input_chain():
 
 @pytest.mark.parametrize(
     "source_ip",
-    ["8.8.8.8", "1.1.1.1", "256.1.1.1", "192.168.0", "not-an-ip", "192.168.0.5; rm -rf /"],
+    [
+        "8.8.8.8",
+        "1.1.1.1",
+        "169.254.10.20",
+        "256.1.1.1",
+        "192.168.0",
+        "not-an-ip",
+        "192.168.0.5; rm -rf /",
+    ],
 )
 def test_wrapper_rejects_non_private_or_malformed_ip(source_ip):
     result = _run_wrapper("insert", source_ip, str(RULE_ID))

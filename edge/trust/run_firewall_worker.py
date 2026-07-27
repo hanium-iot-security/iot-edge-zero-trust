@@ -170,7 +170,7 @@ def run_worker_loop(
         try:
             with single_instance_lock(path, wait_seconds=lock_wait_seconds):
                 with session_factory() as db:
-                    run_worker_cycle(
+                    _, reconcile_result = run_worker_cycle(
                         db,
                         runner=runner,
                         policy=policy,
@@ -179,7 +179,14 @@ def run_worker_loop(
                     )
                 # Lock 경쟁으로 건너뛴 Cycle은 Reconciliation을 수행하지 않았으므로
                 # 실제로 실행된 Cycle에서만 완료로 표시한다.
-                reconciled = True
+                if reconcile_result is None or not reconcile_result.restore_failed:
+                    reconciled = True
+                else:
+                    logger.warning(
+                        "Firewall reconciliation will retry next cycle "
+                        "(restore_failed=%s)",
+                        reconcile_result.restore_failed,
+                    )
         except RuntimeLockError:
             logger.info(
                 "Cycle skipped: another firewall command holds the lock (%s)", path

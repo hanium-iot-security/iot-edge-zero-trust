@@ -38,6 +38,11 @@ PROTOCOL = "tcp"
 DEST_PORT = 1883
 ACTION = "DROP"
 COMMENT_PREFIX = "hanium-firewall:"
+RFC1918_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
 
 CHECK = "-C"
 INSERT = "-I"
@@ -613,10 +618,10 @@ def _require_private_ipv4(source_ip: str) -> ipaddress.IPv4Address:
 
     if not isinstance(address, ipaddress.IPv4Address):
         raise FirewallValidationError(f"source_ip must be IPv4: {source_ip!r}")
-    if not address.is_private:
-        raise FirewallValidationError(f"source_ip must be a private address: {source_ip!r}")
-    if address.is_loopback:
-        raise FirewallValidationError(f"source_ip must not be loopback: {source_ip!r}")
+    if not any(address in network for network in RFC1918_NETWORKS):
+        raise FirewallValidationError(
+            f"source_ip must be an RFC1918 private address: {source_ip!r}"
+        )
     return address
 
 

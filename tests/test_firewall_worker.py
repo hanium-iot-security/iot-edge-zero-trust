@@ -228,6 +228,7 @@ def test_validate_rule_row_accepts_registered_private_ipv4(policy):
     "row",
     [
         {"id": 1, "source_ip": "8.8.8.8", "protocol": "tcp", "dest_port": 1883, "action": "DROP"},
+        {"id": 1, "source_ip": "169.254.10.20", "protocol": "tcp", "dest_port": 1883, "action": "DROP"},
         {"id": 1, "source_ip": "127.0.0.1", "protocol": "tcp", "dest_port": 1883, "action": "DROP"},
         {"id": 1, "source_ip": "not-an-ip", "protocol": "tcp", "dest_port": 1883, "action": "DROP"},
         {"id": 1, "source_ip": "fd00::1", "protocol": "tcp", "dest_port": 1883, "action": "DROP"},

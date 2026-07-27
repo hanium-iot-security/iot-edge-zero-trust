@@ -40,9 +40,10 @@ DEVICE_IP = "192.168.0.5"
 
 
 class RecordingRunner:
-    def __init__(self) -> None:
+    def __init__(self, *, insert_failures: int = 0) -> None:
         self.installed: list[str] = []
         self.calls: list[list[str]] = []
+        self.insert_failures = insert_failures
 
     def run_operation(
         self, operation: str, spec: FirewallRuleSpec | None = None
@@ -55,6 +56,12 @@ class RecordingRunner:
         if operation == CHECK:
             return CommandResult(returncode=0 if key in self.installed else 1)
         if operation == INSERT:
+            if self.insert_failures > 0:
+                self.insert_failures -= 1
+                return CommandResult(
+                    returncode=2,
+                    stderr="iptables: Resource temporarily unavailable.",
+                )
             self.installed.insert(int(args[2]) - 1, key)
             return CommandResult(returncode=0)
         self.installed.remove(key)
@@ -192,6 +199,39 @@ def test_reconcile_runs_on_first_executed_cycle_not_first_attempt(
         lock_path=lock_path,
     )
     assert runner.operations().count(LIST_RULES) == 1
+
+
+def test_reconcile_retries_on_next_cycle_after_restore_failure(
+    SessionLocal, policy, tmp_path: Path
+):
+    with SessionLocal() as db:
+        rule_id = _create_pending(db)
+        initial_runner = RecordingRunner()
+        run_worker_cycle(
+            db,
+            runner=initial_runner,
+            policy=policy,
+            now=NOW,
+            with_reconcile=False,
+        )
+        assert _status(db, rule_id) == "APPLIED"
+
+    runner = RecordingRunner(insert_failures=1)
+    completed = run_worker_loop(
+        runner=runner,
+        policy=policy,
+        shutdown=GracefulShutdown(),
+        interval_seconds=0.01,
+        session_factory=SessionLocal,
+        max_cycles=2,
+        clock=lambda: NOW,
+        lock_path=tmp_path / "fw.lock",
+    )
+
+    assert completed == 2
+    assert runner.operations().count(LIST_RULES) == 2
+    assert runner.operations().count(INSERT) == 2
+    assert len(runner.installed) == 1
 
 
 def test_worker_cycle_reports_reconcile_and_pending_results(SessionLocal, policy):
