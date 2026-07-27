@@ -136,8 +136,22 @@ def test_initialize_phase4_cutover_empty_db_returns_exact_seven_keys(
         checkpoint_repository.checkpoint_summary_key(detector_name, source_table)
         for detector_name, source_table in checkpoint_repository.PHASE4_CHECKPOINT_KEYS
     }
-    for checkpoint in summary["checkpoints"].values():
-        assert checkpoint == {
+    for checkpoint_key in (
+        "mqtt_feature_builder+mqtt_logs",
+        "mqtt_feature_rule+feature_logs",
+        "mqtt_message_rule+mqtt_logs",
+        "mqtt_if+feature_logs",
+    ):
+        assert summary["checkpoints"][checkpoint_key] == {
+            "last_processed_id": None,
+            "last_completed_window_end": "2026-07-21T04:30:00Z",
+        }
+    for checkpoint_key in (
+        "packet_rule+packet_feature_logs",
+        "packet_if+packet_feature_logs",
+        "trust_score_v2+detection_events",
+    ):
+        assert summary["checkpoints"][checkpoint_key] == {
             "last_processed_id": None,
             "last_completed_window_end": None,
         }

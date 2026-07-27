@@ -105,8 +105,10 @@ Runner는 반환 요약과 DB Row의 Key·`last_processed_id`·UTC 완료 Window
 - 실제 Rollback은 `--execute --confirm PHASE4-ROLLBACK`이 모두 있어야 한다.
 - Pi의 실제 Cutover·Rollback은 root 권한으로 실행한다.
 - CLI는 전달받은 systemd Unit만 제어한다. Crontab은 자동 수정하지 않는다.
-- `--writer-service`에는 Capture, Packet Feature, Gateway Metrics, MQTT Producer 등 운영 DB에
+- `--writer-service`에는 Capture, Packet Feature, Gateway Metrics 등 Cutover 전부터 운영 DB에
   쓰는 모든 Unit을 전달한다. Cutover 동안 중지하고 성공·실패 후 작업 전 상태로 복구한다.
+- 최초 Cutover에서 새로 활성화되는 `mqtt-feature-builder.service`는 기존 Writer가 아니라
+  `--new-service`로 전달한다.
 - 기존·신규·Writer Unit의 작업 전 active/inactive 상태를 JSON에 기록한다. 실패 시에는
   작업 전 active였던 Unit만 다시 활성화하고 원래 inactive였던 Unit은 시작하지 않는다.
 - SIGINT·SIGTERM을 포함한 중단은 실패로 처리하고, Migration·Checkpoint·서비스 전환 중
@@ -164,9 +166,9 @@ python -m edge.scripts.run_phase4_cutover \
   --legacy-service trust-score.service \
   --new-service detection-orchestrator.service \
   --new-service firewall-worker.service \
+  --new-service mqtt-feature-builder.service \
   --writer-service packet-capture.service \
   --writer-service gateway-metrics.service \
-  --writer-service mqtt-feature-builder.service \
   --dry-run
 ```
 
@@ -188,7 +190,6 @@ python -m edge.scripts.run_phase4_cutover \
   --git-sha "$(git rev-parse HEAD)" \
   --writer-service packet-capture.service \
   --writer-service gateway-metrics.service \
-  --writer-service mqtt-feature-builder.service \
   --smoke-test
 ```
 
@@ -246,9 +247,9 @@ sudo /home/pi/iot-edge-zero-trust/venv/bin/python \
   --legacy-service trust-score.service \
   --new-service detection-orchestrator.service \
   --new-service firewall-worker.service \
+  --new-service mqtt-feature-builder.service \
   --writer-service packet-capture.service \
   --writer-service gateway-metrics.service \
-  --writer-service mqtt-feature-builder.service \
   --execute \
   --confirm PHASE4-CUTOVER
 ```
@@ -289,11 +290,11 @@ python -m edge.scripts.rollback_phase4_cutover \
   --git-sha "$(git rev-parse HEAD)" \
   --new-service detection-orchestrator.service \
   --new-service firewall-worker.service \
+  --new-service mqtt-feature-builder.service \
   --legacy-service mqtt-feature-rule.service \
   --legacy-service trust-score.service \
   --writer-service packet-capture.service \
   --writer-service gateway-metrics.service \
-  --writer-service mqtt-feature-builder.service \
   --dry-run
 ```
 
@@ -310,11 +311,11 @@ sudo /home/pi/iot-edge-zero-trust/venv/bin/python \
   --git-sha "$(git rev-parse HEAD)" \
   --new-service detection-orchestrator.service \
   --new-service firewall-worker.service \
+  --new-service mqtt-feature-builder.service \
   --legacy-service mqtt-feature-rule.service \
   --legacy-service trust-score.service \
   --writer-service packet-capture.service \
   --writer-service gateway-metrics.service \
-  --writer-service mqtt-feature-builder.service \
   --execute \
   --confirm PHASE4-ROLLBACK
 ```

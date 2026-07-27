@@ -18,6 +18,7 @@ from sqlalchemy.orm import sessionmaker
 
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
 from edge.detection import runtime_checkpoint_repository as checkpoints
+from edge.detection.phase4_cutover_repository import initialize_phase4_cutover
 from edge.detection.phase4_time import format_db_utc
 from edge.features import collect_feature_logs
 from edge.features.collect_feature_logs import (
@@ -225,6 +226,28 @@ def test_runtime_works_after_bootstrap(SessionLocal):
     assert result.created_feature_count == 1
 
 
+def test_legacy_cutover_starts_producer_from_next_window(SessionLocal):
+    database_path = Path(str(SessionLocal.kw["bind"].url.database))
+
+    summary = initialize_phase4_cutover(database_path, WINDOW_0_START)
+
+    assert summary["checkpoints"]["mqtt_feature_builder+mqtt_logs"] == {
+        "last_processed_id": None,
+        "last_completed_window_end": "2026-07-25T12:00:00Z",
+    }
+
+    with SessionLocal() as db:
+        _insert_mqtt_log(
+            db,
+            received_at=datetime(2026, 7, 25, 12, 0, 3, tzinfo=timezone.utc),
+        )
+
+    result = run_producer_cycle(session_factory=SessionLocal, now=NOW)
+
+    assert result is not None
+    assert result.created_feature_count == 1
+
+
 # --- 중복 실행 방지 --------------------------------------------------------
 
 
@@ -273,6 +296,39 @@ def test_legacy_cli_still_runs_before_cutover(SessionLocal, monkeypatch):
 
     # Checkpoint가 없으면 MVP 호환 경로는 그대로 동작한다.
     collect_feature_logs.main()
+
+
+def test_running_legacy_cli_stops_when_cutover_appears(SessionLocal, monkeypatch):
+    collection_count = 0
+
+    def fake_checkpoint_exists(_db) -> bool:
+        return collection_count > 0
+
+    def fake_collect_feature_windows(_db) -> int:
+        nonlocal collection_count
+        collection_count += 1
+        if collection_count > 1:
+            raise AssertionError("legacy collector continued after cutover")
+        return 0
+
+    monkeypatch.setattr(collect_feature_logs, "SessionLocal", SessionLocal)
+    monkeypatch.setattr(
+        collect_feature_logs,
+        "phase4_producer_checkpoint_exists",
+        fake_checkpoint_exists,
+    )
+    monkeypatch.setattr(
+        collect_feature_logs,
+        "collect_feature_windows",
+        fake_collect_feature_windows,
+    )
+    monkeypatch.setattr(collect_feature_logs.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr("sys.argv", ["collect_feature_logs", "--loop"])
+
+    with pytest.raises(SystemExit, match="run_mqtt_feature_builder"):
+        collect_feature_logs.main()
+
+    assert collection_count == 1
 
 
 def test_producer_loop_requires_checkpoint(SessionLocal):
