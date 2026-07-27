@@ -470,6 +470,16 @@ def test_train_succeeds_in_new_version_directory(tmp_path: Path) -> None:
     assert second.model_sha256 == file_sha256(second.model_path)
 
 
+def test_fsync_file_is_cross_platform_and_preserves_contents(tmp_path: Path) -> None:
+    artifact = tmp_path / "artifact.bin"
+    expected = b"packet-if-artifact"
+    artifact.write_bytes(expected)
+
+    trainer._fsync_file(artifact)
+
+    assert artifact.read_bytes() == expected
+
+
 def test_training_failure_does_not_publish_partial_bundle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

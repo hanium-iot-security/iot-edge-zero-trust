@@ -436,7 +436,8 @@ def _write_json(destination: Path, payload: dict[str, Any]) -> None:
 
 
 def _fsync_file(path: Path) -> None:
-    with path.open("rb") as handle:
+    # Windows의 os.fsync()는 쓰기 가능한 CRT descriptor가 필요합니다.
+    with path.open("r+b") as handle:
         os.fsync(handle.fileno())
 
 
