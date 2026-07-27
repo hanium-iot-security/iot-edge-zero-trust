@@ -333,7 +333,7 @@ export default function Events() {
             "applied"
           ) {
             params.applied_to_score =
-              true;
+              1;
           }
 
           if (
@@ -341,7 +341,7 @@ export default function Events() {
             "unapplied"
           ) {
             params.applied_to_score =
-              false;
+              0;
           }
 
           const data =
