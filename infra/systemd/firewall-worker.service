@@ -1,0 +1,31 @@
+[Unit]
+Description=IoT Edge Zero Trust - Firewall Worker
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/iot-edge-zero-trust
+EnvironmentFile=/home/pi/iot-edge-zero-trust/.env
+ExecStart=/home/pi/iot-edge-zero-trust/venv/bin/python -m edge.trust.run_firewall_worker --loop
+
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# sudo는 setuid 바이너리이므로 NoNewPrivileges=true이면 iptables 실행이 전부 실패한다.
+# 대신 sudoers를 필요한 iptables 명령만 허용하도록 제한한다.
+# (infra/sudoers/hanium-firewall-worker 참고)
+NoNewPrivileges=false
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=firewall-worker
+
+[Install]
+WantedBy=multi-user.target

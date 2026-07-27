@@ -119,8 +119,13 @@ python -m edge.mqtt.subscriber
 ```bash
 cd ~/iot-edge-zero-trust
 source venv/bin/activate
-python -m edge.features.collect_feature_logs --loop --interval 5
+python -m edge.features.run_mqtt_feature_builder \
+  --bootstrap --confirm BOOTSTRAP-MQTT-FEATURE-CHECKPOINT
+python -m edge.features.run_mqtt_feature_builder --loop
 ```
+
+신규 DB에서는 Bootstrap을 최초 1회 실행합니다. 기존 데이터가 있는 운영 DB에서는
+이 명령을 사용하지 않고 Phase 4 Cutover로 Checkpoint를 초기화합니다.
 
 ### 터미널 3: 공격 및 탐지 실행
 

@@ -77,6 +77,10 @@ def _calculate_cutover_checkpoints(
     )
     if mqtt_ready_through is not None and mqtt_ready_through > cutover_at:
         raise ValueError("mqtt producer watermark exceeds phase4_cutover_at")
+    if mqtt_ready_through is None:
+        # Legacy DBs have no producer watermark. The explicit cutover snapshot
+        # is the boundary after which the Phase 4 producer owns new windows.
+        mqtt_ready_through = cutover_at
 
     packet_processed_id, packet_ready_through = _packet_feature_checkpoint(
         connection,

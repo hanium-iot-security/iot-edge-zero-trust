@@ -244,7 +244,13 @@ packet_if+packet_feature_logs
 trust_score_v2+detection_events
 ```
 
-Source row가 없거나 검증된 완료 watermark가 없으면 `last_processed_id`와 `last_completed_window_end`는 NULL로 유지합니다. `updated_at`은 UTC `Z` 형식으로 저장합니다. `initialize_phase4_cutover()`는 정수 초 UTC `phase4_cutover_at`만 허용하며, MQTT/Packet 완료 watermark가 cutover 시각을 초과하면 실패합니다.
+Source row가 없으면 `last_processed_id`는 NULL로 유지합니다. Legacy DB에 MQTT
+Producer 완료 watermark가 없으면 `phase4_cutover_at`을 MQTT Producer와 MQTT
+Detector의 시작 경계로 저장합니다. Packet 완료 watermark가 없으면 Packet 관련
+`last_completed_window_end`는 NULL을 유지합니다. `updated_at`은 UTC `Z` 형식으로
+저장합니다. `initialize_phase4_cutover()`는 정수 초 UTC
+`phase4_cutover_at`만 허용하며, 기존 MQTT/Packet 완료 watermark가 cutover 시각을
+초과하면 실패합니다.
 
 ## trust_score_history
 

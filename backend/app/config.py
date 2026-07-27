@@ -21,6 +21,16 @@ class Settings(BaseSettings):
     api_allowed_origins: str = DEFAULT_API_ALLOWED_ORIGINS
     api_allow_credentials: bool = True
 
+    # MQTT Feature Producer
+    mqtt_feature_builder_interval_seconds: float = 5.0
+    mqtt_feature_builder_lock_path: str = ""
+
+    # Detection Orchestrator
+    orchestrator_interval_seconds: float = 5.0
+    orchestrator_enabled_stages: str = "mqtt_feature_rule,mqtt_message_rule"
+    orchestrator_required_stages: str = "mqtt_feature_rule,mqtt_message_rule"
+    orchestrator_lock_path: str = ""
+
     # Gateway Metrics
     gateway_metrics_interval_seconds: float = 10.0
     internal_lan_interface: str = "eth0"
@@ -49,6 +59,17 @@ class Settings(BaseSettings):
     packet_if_artifact_dir: str = ""
     packet_if_expected_model_version: str = ""
     packet_if_expected_bundle_sha256: str = ""
+
+    # Firewall Worker
+    firewall_worker_interval_seconds: float = 5.0
+    firewall_worker_batch_size: int = 20
+    firewall_retry_delay_seconds: int = 30
+    firewall_protected_ips: str = ""
+    firewall_wrapper_path: str = "/usr/local/sbin/hanium-firewall-rule"
+    firewall_sudo_path: str = "/usr/bin/sudo"
+    firewall_command_timeout_seconds: float = 10.0
+    firewall_lock_path: str = ""
+    firewall_lock_wait_seconds: float = 15.0
 
     model_config = SettingsConfigDict(env_file=(".env", "../.env"), env_file_encoding="utf-8")
 

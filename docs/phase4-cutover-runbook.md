@@ -16,6 +16,31 @@
 - Phase 3-B 통합 기준 Commit과 운영 DB Backup이 기록됨
 - 기존 Detector·Trust Cron 중지 방법과 신규 systemd Unit 이름 확정
 
+### MQTT Feature Producer 전환 확인 (P4-0-04)
+
+기존 `edge.features.collect_feature_logs` 경로는 Producer Checkpoint를 갱신하지 않는다.
+신규 `mqtt-feature-builder.service`와 동시에 실행되면 Feature는 늘어나는데 Checkpoint는
+그대로여서, 같은 Window가 다시 처리되거나 Orchestrator가 잘못된 완료 상태를 본다.
+
+```bash
+# 1) 기존 Feature Collector 실행 경로가 남아 있지 않은지 확인
+crontab -l | grep -i feature || echo "cron 항목 없음"
+systemctl list-units --all | grep -i feature
+pgrep -af "collect_feature_logs" || echo "실행 중 프로세스 없음"
+
+# 2) 남아 있으면 중지·제거
+crontab -e            # 기존 feature collector 항목 삭제
+sudo systemctl disable --now <구 Unit 이름>
+
+# 3) Cutover 후 Producer Checkpoint 확인
+python -m edge.features.run_mqtt_feature_builder --status
+```
+
+Cutover가 `mqtt_feature_builder + mqtt_logs` Checkpoint를 초기화하면, 기존 CLI는
+실행 시 스스로 거부한다. Checkpoint가 없는 상태에서 신규 Runtime을 실행하면 과거
+`mqtt_logs` 전체가 재처리되므로 Runtime도 실행을 거부한다. 완전히 빈 신규 DB만
+`--bootstrap`으로 시작 시점을 기록한다.
+
 ## 2. 역할 경계
 
 원우민 담당 도구는 다음 순서를 제어한다.
@@ -80,8 +105,10 @@ Runner는 반환 요약과 DB Row의 Key·`last_processed_id`·UTC 완료 Window
 - 실제 Rollback은 `--execute --confirm PHASE4-ROLLBACK`이 모두 있어야 한다.
 - Pi의 실제 Cutover·Rollback은 root 권한으로 실행한다.
 - CLI는 전달받은 systemd Unit만 제어한다. Crontab은 자동 수정하지 않는다.
-- `--writer-service`에는 Capture, Packet Feature, Gateway Metrics, MQTT Producer 등 운영 DB에
+- `--writer-service`에는 Capture, Packet Feature, Gateway Metrics 등 Cutover 전부터 운영 DB에
   쓰는 모든 Unit을 전달한다. Cutover 동안 중지하고 성공·실패 후 작업 전 상태로 복구한다.
+- 최초 Cutover에서 새로 활성화되는 `mqtt-feature-builder.service`는 기존 Writer가 아니라
+  `--new-service`로 전달한다.
 - 기존·신규·Writer Unit의 작업 전 active/inactive 상태를 JSON에 기록한다. 실패 시에는
   작업 전 active였던 Unit만 다시 활성화하고 원래 inactive였던 Unit은 시작하지 않는다.
 - SIGINT·SIGTERM을 포함한 중단은 실패로 처리하고, Migration·Checkpoint·서비스 전환 중
@@ -139,6 +166,7 @@ python -m edge.scripts.run_phase4_cutover \
   --legacy-service trust-score.service \
   --new-service detection-orchestrator.service \
   --new-service firewall-worker.service \
+  --new-service mqtt-feature-builder.service \
   --writer-service packet-capture.service \
   --writer-service gateway-metrics.service \
   --dry-run
@@ -219,6 +247,7 @@ sudo /home/pi/iot-edge-zero-trust/venv/bin/python \
   --legacy-service trust-score.service \
   --new-service detection-orchestrator.service \
   --new-service firewall-worker.service \
+  --new-service mqtt-feature-builder.service \
   --writer-service packet-capture.service \
   --writer-service gateway-metrics.service \
   --execute \
@@ -261,6 +290,7 @@ python -m edge.scripts.rollback_phase4_cutover \
   --git-sha "$(git rev-parse HEAD)" \
   --new-service detection-orchestrator.service \
   --new-service firewall-worker.service \
+  --new-service mqtt-feature-builder.service \
   --legacy-service mqtt-feature-rule.service \
   --legacy-service trust-score.service \
   --writer-service packet-capture.service \
@@ -281,6 +311,7 @@ sudo /home/pi/iot-edge-zero-trust/venv/bin/python \
   --git-sha "$(git rev-parse HEAD)" \
   --new-service detection-orchestrator.service \
   --new-service firewall-worker.service \
+  --new-service mqtt-feature-builder.service \
   --legacy-service mqtt-feature-rule.service \
   --legacy-service trust-score.service \
   --writer-service packet-capture.service \
