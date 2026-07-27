@@ -6,6 +6,8 @@
 
 ## 명령어
 
+### 로컬 개발
+
 ```bash
 sudo systemctl start mosquitto
 python db/create_tables.py
@@ -14,6 +16,20 @@ python edge/mqtt/subscriber.py
 python edge/features/collect_feature_logs.py
 uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+### Pi 운영
+
+Pi에서는 개발용 `--reload` 대신 설치된 Backend 서비스를 사용합니다.
+
+```bash
+sudo systemctl start mosquitto
+sudo systemctl start iot-edge-api.service
+systemctl is-active iot-edge-api.service
+curl --fail http://127.0.0.1:8000/api/health
+```
+
+최초 설치와 CORS·재부팅 검증은 `docs/phase4-api-deployment-runbook.md`를
+따릅니다.
 
 탐지 및 Trust Score 실행:
 

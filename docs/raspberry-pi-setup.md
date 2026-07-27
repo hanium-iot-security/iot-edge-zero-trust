@@ -74,8 +74,27 @@ python db/create_tables.py
 python db/seed_devices.py
 ```
 
-## 백엔드
+## 백엔드 로컬 개발
 
 ```bash
 uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+`--reload`는 개발 과정에서만 사용합니다.
+
+## 백엔드 Pi 운영
+
+Pi 운영 환경에서는 MQTT·Packet·Gateway·Detection·Trust·Firewall API를
+`iot-edge-api.service` 하나로 실행합니다.
+
+```bash
+sudo install -m 0644 infra/systemd/iot-edge-api.service /etc/systemd/system/iot-edge-api.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now iot-edge-api.service
+
+systemctl is-active iot-edge-api.service
+curl --fail http://127.0.0.1:8000/api/health
+```
+
+실제 Dashboard Origin을 포함한 CORS 설정과 재부팅·Rollback 검증은
+`docs/phase4-api-deployment-runbook.md`를 따릅니다.

@@ -99,11 +99,23 @@ python -m edge.detection.run_ai_detector
 python -m edge.trust.run_trust_score_update
 ```
 
-FastAPI 실행:
+FastAPI 로컬 개발 실행:
 
 ```bash
 uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+`--reload`는 로컬 개발용입니다. Raspberry Pi 운영 환경에서는 전체 Backend
+API를 `iot-edge-api.service` 하나로 실행합니다.
+
+```bash
+sudo systemctl enable --now iot-edge-api.service
+systemctl is-active iot-edge-api.service
+curl --fail http://127.0.0.1:8000/api/health
+```
+
+설치, CORS, 재시작·재부팅 및 Rollback 절차는
+`docs/phase4-api-deployment-runbook.md`를 따릅니다.
 
 프론트엔드 실행:
 
