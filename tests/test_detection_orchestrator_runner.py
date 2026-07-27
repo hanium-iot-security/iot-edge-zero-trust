@@ -17,8 +17,13 @@ from sqlalchemy.orm import sessionmaker
 
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
 from edge.detection import runtime_checkpoint_repository as checkpoints
+from edge.detection.detection_event_writer import write_detection_event
 from edge.detection.detector_contract import DetectorRunResult
 from edge.detection.phase4_time import format_db_utc
+from edge.detection.rule_detector import (
+    ABNORMAL_PUBLISH_RATE,
+    DETECTOR_RULE,
+)
 from edge.features.collect_feature_logs import MQTT_FEATURE_BUILDER, MQTT_LOGS_SOURCE
 from edge.features.run_mqtt_feature_builder import (
     bootstrap_producer_checkpoint,
@@ -31,6 +36,7 @@ from edge.orchestration.run_detection_orchestrator import (
     GracefulShutdown,
     resolve_cycle_cutoff,
     resolve_cycle_range_start,
+    print_checkpoint_status,
     run_orchestration_cycle,
     run_orchestrator_loop,
 )
@@ -251,6 +257,70 @@ class StallingStage:
         )
 
 
+@dataclass
+class FailingOptionalStage:
+    detector_name: str = "mqtt_if"
+    source_table: str = "feature_logs"
+
+    def run_until(self, db, *, cycle_range_start, cycle_cutoff) -> DetectorRunResult:
+        raise RuntimeError("optional stage failed")
+
+
+@dataclass
+class LateEventStage:
+    detector_name: str = "mqtt_if"
+    source_table: str = "feature_logs"
+
+    def run_until(self, db, *, cycle_range_start, cycle_cutoff) -> DetectorRunResult:
+        feature = db.execute(
+            text(
+                """
+                SELECT id, device_id, window_start, window_end
+                FROM feature_logs
+                ORDER BY id
+                LIMIT 1
+                """
+            )
+        ).mappings().one()
+        write_detection_event(
+            db,
+            device_id=feature["device_id"],
+            detector_name=self.detector_name,
+            source_table=self.source_table,
+            source_id=int(feature["id"]),
+            detector_type=DETECTOR_RULE,
+            event_type=ABNORMAL_PUBLISH_RATE,
+            severity="high",
+            description="late optional evidence",
+            policy_version="late-optional-test-v1",
+            detected_at=cycle_cutoff,
+            analysis_window_start=BASE,
+            analysis_window_end=BASE + timedelta(seconds=10),
+            subject_ip=DEVICE_IP,
+            feature_log_id=int(feature["id"]),
+        )
+        checkpoints.upsert_detector_checkpoint(
+            db,
+            detector_name=self.detector_name,
+            source_table=self.source_table,
+            last_processed_id=int(feature["id"]),
+            last_completed_window_end=cycle_cutoff,
+            updated_at=cycle_cutoff,
+        )
+        return DetectorRunResult(
+            detector_name=self.detector_name,
+            source_table=self.source_table,
+            range_start=cycle_range_start,
+            cutoff=cycle_cutoff,
+            selected_count=1,
+            created_event_count=1,
+            last_processed_id_before=None,
+            last_processed_id_after=int(feature["id"]),
+            completed_window_end_before=None,
+            completed_window_end_after=cycle_cutoff,
+        )
+
+
 def test_trust_is_not_called_when_required_stage_has_not_reached_cutoff(SessionLocal):
     from edge.orchestration.stage_registry import ConfiguredStage, StageRegistry
 
@@ -289,6 +359,106 @@ def test_optional_stage_that_stalls_does_not_block_trust(SessionLocal):
     assert outcome.status == CYCLE_COMPLETED
     with SessionLocal() as db:
         assert _completed(db, TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE) == outcome.cutoff
+
+
+def test_optional_stage_exception_does_not_block_trust_or_rewind_next_cycle(
+    SessionLocal,
+    caplog,
+):
+    from edge.orchestration.stage_registry import ConfiguredStage, StageRegistry
+
+    built = build_stage_registry(
+        enabled=[MQTT_FEATURE_RULE, MQTT_MESSAGE_RULE],
+        required=[MQTT_FEATURE_RULE, MQTT_MESSAGE_RULE],
+    )
+    mixed = StageRegistry(
+        stages=built.stages
+        + (
+            ConfiguredStage(
+                name="mqtt_if",
+                stage=FailingOptionalStage(),
+                required=False,
+            ),
+        )
+    )
+    with SessionLocal() as db:
+        _flood_window(db, window_index=0)
+    run_producer_cycle(session_factory=SessionLocal, now=BASE + timedelta(seconds=11))
+
+    with caplog.at_level("ERROR"):
+        outcome = run_orchestration_cycle(session_factory=SessionLocal, registry=mixed)
+
+    assert outcome.status == CYCLE_COMPLETED
+    assert [result.detector_name for result in outcome.stage_results] == [
+        MQTT_FEATURE_RULE,
+        MQTT_MESSAGE_RULE,
+    ]
+    assert "event=STAGE_FAILED" in caplog.text
+    assert "detector_name=mqtt_if" in caplog.text
+    assert "source_table=feature_logs" in caplog.text
+    assert "cycle_range_start=2026-07-25T12:00:00Z" in caplog.text
+    assert "cycle_cutoff=2026-07-25T12:00:10Z" in caplog.text
+
+    with SessionLocal() as db:
+        assert (
+            resolve_cycle_range_start(
+                db,
+                registry=mixed,
+                cutoff=BASE + timedelta(seconds=20),
+            )
+            == BASE + timedelta(seconds=10)
+        )
+
+
+def test_late_optional_event_after_completed_trust_is_not_scored_twice(SessionLocal):
+    from edge.orchestration.stage_registry import ConfiguredStage, StageRegistry
+
+    required = build_stage_registry(
+        enabled=[MQTT_FEATURE_RULE, MQTT_MESSAGE_RULE],
+        required=[MQTT_FEATURE_RULE, MQTT_MESSAGE_RULE],
+    )
+    with SessionLocal() as db:
+        _flood_window(db, window_index=0)
+    run_producer_cycle(session_factory=SessionLocal, now=BASE + timedelta(seconds=11))
+    first = run_orchestration_cycle(session_factory=SessionLocal, registry=required)
+    assert first.status == CYCLE_COMPLETED
+
+    with SessionLocal() as db:
+        _insert_mqtt_log(db, received_at=BASE + timedelta(seconds=11))
+        db.commit()
+    run_producer_cycle(session_factory=SessionLocal, now=BASE + timedelta(seconds=21))
+
+    with_late_optional = StageRegistry(
+        stages=required.stages
+        + (
+            ConfiguredStage(
+                name="mqtt_if",
+                stage=LateEventStage(),
+                required=False,
+            ),
+        )
+    )
+    second = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=with_late_optional,
+    )
+    assert second.status == CYCLE_COMPLETED
+
+    with SessionLocal() as db:
+        assert _scalar(db, "SELECT COUNT(*) FROM trust_score_history") == 1
+        assert (
+            _scalar(
+                db,
+                """
+                SELECT COUNT(*)
+                FROM detection_events
+                WHERE description = 'late optional evidence'
+                  AND processing_reason = 'LATE_EVENT'
+                  AND applied_to_score = 0
+                """,
+            )
+            == 1
+        )
 
 
 def test_all_stages_receive_the_same_cycle_window(SessionLocal, registry):
@@ -374,6 +544,26 @@ def test_loop_rejects_invalid_max_cycles(SessionLocal, registry, invalid):
             session_factory=SessionLocal,
             max_cycles=invalid,
         )
+
+
+def test_status_prints_all_checkpoint_keys_and_real_updated_at(
+    SessionLocal,
+    capsys,
+):
+    print_checkpoint_status(SessionLocal)
+
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 7
+    assert any(
+        line.startswith("mqtt_feature_builder+mqtt_logs: status=PRESENT")
+        and "updated_at=2026-07-25T12:00:00Z" in line
+        for line in lines
+    )
+    assert any(
+        line.startswith("mqtt_if+feature_logs: status=MISSING")
+        and "updated_at=None" in line
+        for line in lines
+    )
 
 
 # --- 전체 흐름 -------------------------------------------------------------

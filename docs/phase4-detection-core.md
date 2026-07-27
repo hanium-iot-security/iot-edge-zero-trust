@@ -106,3 +106,19 @@ This PR intentionally implements only the stage transaction foundation. The full
 - structured runtime logging
 
 Producer runner, environment wiring beyond API CORS settings, systemd integration, Raspberry Pi watermark validation, Packet Rule implementation, Packet IF implementation, and Firewall Worker execution are outside this PR.
+
+## Detection Orchestrator Runtime
+
+The runtime fixes one `cycle_range_start` and `cycle_cutoff` per cycle and gives
+the same range to every enabled stage. Required stages form the completion
+barrier. Optional-stage checkpoints do not rewind a later cycle, and an
+optional-stage exception is recorded as a structured `STAGE_FAILED` log without
+blocking required-stage Trust processing. A required-stage exception still
+fails the cycle and prevents Trust invocation.
+
+Events produced late for an already completed window are retained as evidence
+with `processing_reason=LATE_EVENT` and are not scored again.
+
+`python -m edge.orchestration.run_detection_orchestrator --status` always
+prints all seven Phase 4 checkpoint keys. Missing rows are shown as `MISSING`;
+existing rows show their persisted `updated_at` value.

@@ -39,6 +39,10 @@ from sqlalchemy.orm import Session
 from backend.app.config import Settings, settings
 from backend.app.database import SessionLocal
 from edge.detection import runtime_checkpoint_repository as checkpoints
+from edge.detection.checkpoint_repository import (
+    PHASE4_CHECKPOINT_KEYS,
+    checkpoint_summary_key,
+)
 from edge.detection.detector_contract import DetectorRunResult
 from edge.detection.orchestrator import ensure_checkpoint_completed, run_detection_cycle
 from edge.detection.phase4_time import floor_window_start, format_db_utc, parse_db_utc
@@ -137,7 +141,7 @@ def resolve_cycle_range_start(
     않은 최초 실행에서는 가장 오래된 Source Window부터 시작합니다.
     """
     completed: list[datetime | None] = []
-    for configured in registry.stages:
+    for configured in registry.required_stages:
         completed.append(
             checkpoints.get_completed_window_end(
                 db,
@@ -223,22 +227,40 @@ def run_orchestration_cycle(
         ",".join(registry.required_names),
     )
 
-    detection = run_detection_cycle(
-        session_factory=session_factory,
-        stages=registry.detector_stages,
-        cycle_range_start=range_start,
-        cycle_cutoff=cutoff,
-    )
-    for stage_result in detection.stage_results:
-        logger.info(
-            "event=STAGE_DONE detector=%s source=%s selected=%d created_events=%d "
-            "completed_window_end=%s",
-            stage_result.detector_name,
-            stage_result.source_table,
-            stage_result.selected_count,
-            stage_result.created_event_count,
-            format_db_utc(stage_result.completed_window_end_after),
-        )
+    stage_results: list[DetectorRunResult] = []
+    for configured in registry.stages:
+        try:
+            detection = run_detection_cycle(
+                session_factory=session_factory,
+                stages=(configured.stage,),
+                cycle_range_start=range_start,
+                cycle_cutoff=cutoff,
+            )
+        except Exception:
+            logger.exception(
+                "event=STAGE_FAILED detector_name=%s source_table=%s required=%s "
+                "cycle_range_start=%s cycle_cutoff=%s",
+                configured.stage.detector_name,
+                configured.stage.source_table,
+                configured.required,
+                format_db_utc(range_start),
+                format_db_utc(cutoff),
+            )
+            if configured.required:
+                raise
+            continue
+
+        stage_results.extend(detection.stage_results)
+        for stage_result in detection.stage_results:
+            logger.info(
+                "event=STAGE_DONE detector=%s source=%s selected=%d created_events=%d "
+                "completed_window_end=%s",
+                stage_result.detector_name,
+                stage_result.source_table,
+                stage_result.selected_count,
+                stage_result.created_event_count,
+                format_db_utc(stage_result.completed_window_end_after),
+            )
 
     with session_factory() as db:
         for configured in registry.required_stages:
@@ -273,7 +295,7 @@ def run_orchestration_cycle(
         "trust_history=%d isolations=%d firewall_pending=%d",
         format_db_utc(range_start),
         format_db_utc(cutoff),
-        len(detection.stage_results),
+        len(stage_results),
         trust_result.processed_event_count,
         trust_result.created_history_count,
         trust_result.created_isolation_count,
@@ -283,7 +305,7 @@ def run_orchestration_cycle(
         status=CYCLE_COMPLETED,
         range_start=range_start,
         cutoff=cutoff,
-        stage_results=list(detection.stage_results),
+        stage_results=stage_results,
         trust_result=trust_result,
     )
 
@@ -317,11 +339,23 @@ def run_orchestrator_loop(
 def print_checkpoint_status(session_factory: SessionFactory = SessionLocal) -> None:
     """Phase 4 Checkpoint 7개의 현재 상태를 출력합니다."""
     with session_factory() as db:
-        summary = checkpoints.list_phase4_checkpoint_summary(db)
-    for key in sorted(summary):
-        row = summary[key]
+        rows = [
+            (
+                checkpoint_summary_key(detector_name, source_table),
+                checkpoints.get_detector_checkpoint(
+                    db,
+                    detector_name=detector_name,
+                    source_table=source_table,
+                ),
+            )
+            for detector_name, source_table in PHASE4_CHECKPOINT_KEYS
+        ]
+    for key, row in rows:
+        status = "PRESENT" if row is not None else "MISSING"
+        row = row or {}
         print(
-            f"{key}: last_processed_id={row.get('last_processed_id')} "
+            f"{key}: status={status} "
+            f"last_processed_id={row.get('last_processed_id')} "
             f"last_completed_window_end={row.get('last_completed_window_end')} "
             f"updated_at={row.get('updated_at')}"
         )
