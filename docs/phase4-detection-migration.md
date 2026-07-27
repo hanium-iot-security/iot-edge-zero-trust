@@ -113,7 +113,13 @@ On failure it rolls back the whole transaction. Partial checkpoint rows and part
 
 ## Watermark Policy
 
-MQTT detector checkpoints are initialized only from an existing verified `mqtt_feature_builder+mqtt_logs` completion watermark. If there is no completed producer watermark, the MQTT-related detector checkpoints remain `NULL`. If the existing MQTT producer watermark is later than `phase4_cutover_at`, initialization fails because the DB snapshot is newer than the declared cutover boundary.
+MQTT detector checkpoints use an existing verified
+`mqtt_feature_builder+mqtt_logs` completion watermark when present. A legacy DB
+without that watermark uses `phase4_cutover_at` as the explicit ownership
+boundary, so the new producer starts from the next closed Window instead of
+replaying legacy `mqtt_logs`. If the existing producer watermark is later than
+`phase4_cutover_at`, initialization fails because the DB snapshot is newer than
+the declared cutover boundary.
 
 Packet detector checkpoints are calculated from each capture session's contiguous completed prefix:
 
