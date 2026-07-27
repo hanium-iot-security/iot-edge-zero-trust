@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     capture_time_epsilon_seconds: float = 0.01
     capture_policy_version: str = "packet-capture-policy-v1"
 
+    # Packet Isolation Forest
+    packet_if_artifact_dir: str = ""
+    packet_if_expected_model_version: str = ""
+    packet_if_expected_bundle_sha256: str = ""
+
     # Firewall Worker
     firewall_worker_interval_seconds: float = 5.0
     firewall_worker_batch_size: int = 20

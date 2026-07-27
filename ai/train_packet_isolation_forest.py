@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import version as package_version
@@ -13,9 +14,10 @@ from numbers import Real
 import os
 from pathlib import Path
 import platform
+import shutil
 import subprocess
-from typing import Any
-from uuid import uuid4
+import tempfile
+from typing import Any, Iterator
 
 import joblib
 import numpy as np
@@ -27,18 +29,26 @@ from ai.packet_if_contract import (
     PACKET_IF_FEATURES,
     PACKET_IF_METADATA_FILENAME,
     PACKET_IF_MODEL_FILENAME,
+    PACKET_IF_NOMINAL_WINDOW_SECONDS,
+    PACKET_IF_PACKET_COUNT_FORMULA,
     PACKET_IF_SCORE_DIRECTION,
     PACKET_IF_THRESHOLD_OPERATOR,
+    PACKET_IF_TOTAL_BYTES_FORMULA,
     PACKET_IF_TRAINING_REPORT_FILENAME,
     PACKET_IF_TRANSFORM_VERSION,
     packet_feature_matrix,
 )
+from ai.packet_if_artifact import packet_if_bundle_sha256
 from ai.packet_if_dataset import (
     ATTACK_LABEL,
     NORMAL_LABEL,
     PacketIFDataset,
     file_sha256,
     load_packet_if_dataset,
+)
+from edge.packet.capture_policy import (
+    DEFAULT_CAPTURE_POLICY,
+    CapturePolicy,
 )
 
 
@@ -59,6 +69,9 @@ class PacketIFTrainingArtifacts:
     training_report_path: Path
     threshold: float
     model_sha256: str
+    metadata_sha256: str
+    training_report_sha256: str
+    bundle_sha256: str
 
 
 def train_packet_isolation_forest(
@@ -71,6 +84,7 @@ def train_packet_isolation_forest(
     random_state: int = DEFAULT_RANDOM_STATE,
     git_commit_sha: str,
     manifest_sha256: str,
+    capture_policy: CapturePolicy = DEFAULT_CAPTURE_POLICY,
 ) -> PacketIFTrainingArtifacts:
     """Train으로 학습하고 Validation으로 Threshold를 정한 뒤 Test를 평가합니다."""
     _validate_training_options(
@@ -81,8 +95,11 @@ def train_packet_isolation_forest(
         git_commit_sha=git_commit_sha,
         manifest_sha256=manifest_sha256,
     )
-    paths = _artifact_paths(artifact_dir)
-    _prepare_artifact_directory(paths)
+    _validate_dataset_capture_policy(dataset, capture_policy)
+    _validate_artifact_destination(
+        artifact_dir=artifact_dir,
+        model_version=model_version,
+    )
 
     train_matrix = packet_feature_matrix(dataset.train.to_dict(orient="records"))
     validation_matrix = packet_feature_matrix(
@@ -92,87 +109,106 @@ def train_packet_isolation_forest(
     if train_matrix.shape[0] == 0 or validation_matrix.shape[0] == 0:
         raise ValueError("train and validation datasets must contain rows")
 
-    model = IsolationForest(
-        n_estimators=n_estimators,
-        contamination=CONTAMINATION,
-        random_state=random_state,
-        n_jobs=1,
-    )
-    model.fit(train_matrix)
+    with _artifact_staging_directory(artifact_dir) as staging_dir:
+        staging_paths = _artifact_paths(staging_dir)
+        model = IsolationForest(
+            n_estimators=n_estimators,
+            contamination=CONTAMINATION,
+            random_state=random_state,
+            n_jobs=1,
+        )
+        model.fit(train_matrix)
 
-    train_scores = anomaly_scores(model, train_matrix)
-    validation_scores = anomaly_scores(model, validation_matrix)
-    test_scores = anomaly_scores(model, test_matrix)
-    threshold = float(np.percentile(validation_scores, threshold_percentile))
+        train_scores = anomaly_scores(model, train_matrix)
+        validation_scores = anomaly_scores(model, validation_matrix)
+        test_scores = anomaly_scores(model, test_matrix)
+        threshold = float(
+            np.percentile(validation_scores, threshold_percentile)
+        )
 
-    _atomic_joblib_dump(model, paths["model"])
-    model_sha256 = file_sha256(paths["model"])
-    created_at = _utc_now_string()
+        _write_joblib(staging_paths["model"], model)
+        model_sha256 = file_sha256(staging_paths["model"])
+        created_at = _utc_now_string()
 
-    report = _build_training_report(
-        dataset=dataset,
-        train_scores=train_scores,
-        validation_scores=validation_scores,
-        test_scores=test_scores,
-        threshold=threshold,
-        threshold_percentile=threshold_percentile,
-    )
-    _atomic_write_json(paths["report"], report)
+        report = _build_training_report(
+            dataset=dataset,
+            train_scores=train_scores,
+            validation_scores=validation_scores,
+            test_scores=test_scores,
+            threshold=threshold,
+            threshold_percentile=threshold_percentile,
+        )
+        _write_json(staging_paths["report"], report)
+        training_report_sha256 = file_sha256(staging_paths["report"])
 
-    metadata = {
-        "artifact_schema_version": PACKET_IF_ARTIFACT_SCHEMA_VERSION,
-        "model_type": "IsolationForest",
-        "model_version": model_version,
-        "model_filename": PACKET_IF_MODEL_FILENAME,
-        "model_sha256": model_sha256,
-        "scaler_type": SCALER_TYPE,
-        "feature_version": PACKET_IF_FEATURE_VERSION,
-        "feature_order": list(PACKET_IF_FEATURES),
-        "transform_version": PACKET_IF_TRANSFORM_VERSION,
-        "score_direction": PACKET_IF_SCORE_DIRECTION,
-        "threshold": threshold,
-        "threshold_percentile": float(threshold_percentile),
-        "threshold_operator": PACKET_IF_THRESHOLD_OPERATOR,
-        "threshold_source": "normal_validation",
-        "training_parameters": {
-            "n_estimators": n_estimators,
-            "contamination": CONTAMINATION,
-            "random_state": random_state,
-            "n_jobs": 1,
-        },
-        "capture_policy_version": dataset.manifest.capture_policy_version,
-        "dataset_version": dataset.manifest.dataset_version,
-        "dataset_sha256": dataset.manifest.dataset_sha256,
-        "manifest_sha256": manifest_sha256,
-        "sessions": {
-            "train": list(dataset.session_ids("train")),
-            "validation": list(dataset.session_ids("validation")),
-            "test": list(dataset.session_ids("test")),
-        },
-        "row_counts": {
-            "train": int(len(dataset.train)),
-            "validation": int(len(dataset.validation)),
-            "test": int(len(dataset.test)),
-        },
-        "library_versions": {
-            "python": platform.python_version(),
-            "numpy": package_version("numpy"),
-            "pandas": package_version("pandas"),
-            "scikit_learn": package_version("scikit-learn"),
-            "joblib": package_version("joblib"),
-        },
-        "git_commit_sha": git_commit_sha,
-        "created_at": created_at,
-    }
-    # Metadata를 Bundle 완료 표식으로 사용하기 위해 마지막에 기록합니다.
-    _atomic_write_json(paths["metadata"], metadata)
+        metadata = {
+            "artifact_schema_version": PACKET_IF_ARTIFACT_SCHEMA_VERSION,
+            "model_type": "IsolationForest",
+            "model_version": model_version,
+            "model_filename": PACKET_IF_MODEL_FILENAME,
+            "model_sha256": model_sha256,
+            "training_report_filename": PACKET_IF_TRAINING_REPORT_FILENAME,
+            "training_report_sha256": training_report_sha256,
+            "scaler_type": SCALER_TYPE,
+            "feature_version": PACKET_IF_FEATURE_VERSION,
+            "feature_order": list(PACKET_IF_FEATURES),
+            "transform_version": PACKET_IF_TRANSFORM_VERSION,
+            "score_direction": PACKET_IF_SCORE_DIRECTION,
+            "threshold": threshold,
+            "threshold_percentile": float(threshold_percentile),
+            "threshold_operator": PACKET_IF_THRESHOLD_OPERATOR,
+            "threshold_source": "normal_validation",
+            "training_parameters": {
+                "n_estimators": n_estimators,
+                "contamination": CONTAMINATION,
+                "random_state": random_state,
+                "n_jobs": 1,
+            },
+            "capture_policy_version": capture_policy.version,
+            "capture_policy": _capture_policy_metadata(capture_policy),
+            "normalization": {
+                "version": PACKET_IF_TRANSFORM_VERSION,
+                "nominal_window_seconds": PACKET_IF_NOMINAL_WINDOW_SECONDS,
+                "packet_count_formula": PACKET_IF_PACKET_COUNT_FORMULA,
+                "total_bytes_formula": PACKET_IF_TOTAL_BYTES_FORMULA,
+            },
+            "dataset_version": dataset.manifest.dataset_version,
+            "dataset_sha256": dataset.manifest.dataset_sha256,
+            "manifest_sha256": manifest_sha256,
+            "sessions": {
+                "train": list(dataset.session_ids("train")),
+                "validation": list(dataset.session_ids("validation")),
+                "test": list(dataset.session_ids("test")),
+            },
+            "row_counts": {
+                "train": int(len(dataset.train)),
+                "validation": int(len(dataset.validation)),
+                "test": int(len(dataset.test)),
+            },
+            "library_versions": {
+                "python": platform.python_version(),
+                "numpy": package_version("numpy"),
+                "pandas": package_version("pandas"),
+                "scikit_learn": package_version("scikit-learn"),
+                "joblib": package_version("joblib"),
+            },
+            "git_commit_sha": git_commit_sha,
+            "created_at": created_at,
+        }
+        _write_json(staging_paths["metadata"], metadata)
+        metadata_sha256 = file_sha256(staging_paths["metadata"])
+        bundle_sha256 = packet_if_bundle_sha256(staging_dir)
 
+    paths = _artifact_paths(artifact_dir)
     return PacketIFTrainingArtifacts(
         model_path=paths["model"],
         metadata_path=paths["metadata"],
         training_report_path=paths["report"],
         threshold=threshold,
         model_sha256=model_sha256,
+        metadata_sha256=metadata_sha256,
+        training_report_sha256=training_report_sha256,
+        bundle_sha256=bundle_sha256,
     )
 
 
@@ -192,9 +228,11 @@ def train_from_files(
     n_estimators: int = DEFAULT_N_ESTIMATORS,
     random_state: int = DEFAULT_RANDOM_STATE,
     git_commit_sha: str | None = None,
+    capture_policy: CapturePolicy | None = None,
 ) -> PacketIFTrainingArtifacts:
     dataset = load_packet_if_dataset(dataset_path, manifest_path)
     commit_sha = git_commit_sha or current_git_commit_sha()
+    resolved_capture_policy = capture_policy or CapturePolicy.from_env()
     return train_packet_isolation_forest(
         dataset,
         artifact_dir=artifact_dir,
@@ -204,6 +242,7 @@ def train_from_files(
         random_state=random_state,
         git_commit_sha=commit_sha,
         manifest_sha256=file_sha256(manifest_path),
+        capture_policy=resolved_capture_policy,
     )
 
 
@@ -263,6 +302,51 @@ def _score_summary(scores: np.ndarray, threshold: float) -> dict[str, float | in
     }
 
 
+def _validate_dataset_capture_policy(
+    dataset: PacketIFDataset,
+    capture_policy: CapturePolicy,
+) -> None:
+    if dataset.manifest.capture_policy != capture_policy:
+        raise ValueError(
+            "Packet IF dataset Capture Policy mismatch: "
+            f"expected={capture_policy!r}, "
+            f"actual={dataset.manifest.capture_policy!r}"
+        )
+
+    minimum_eligible_duration = max(
+        0.0,
+        capture_policy.minimum_duration_seconds - capture_policy.epsilon_seconds,
+    )
+    for split_name, frame in (
+        ("train", dataset.train),
+        ("validation", dataset.validation),
+        ("test", dataset.test),
+    ):
+        for row in frame.to_dict(orient="records"):
+            duration = float(row["captured_duration_seconds"])
+            if duration < minimum_eligible_duration:
+                raise ValueError(
+                    "Packet IF dataset row is below the Capture Policy minimum "
+                    f"duration: split={split_name}, "
+                    f"packet_feature_log_id={row['packet_feature_log_id']}, "
+                    f"duration={duration}, minimum={minimum_eligible_duration}"
+                )
+
+
+def _capture_policy_metadata(capture_policy: CapturePolicy) -> dict[str, Any]:
+    return {
+        "version": capture_policy.version,
+        "nominal_window_seconds": PACKET_IF_NOMINAL_WINDOW_SECONDS,
+        "max_start_delay_seconds": capture_policy.max_start_delay_seconds,
+        "minimum_duration_seconds": capture_policy.minimum_duration_seconds,
+        "epsilon_seconds": capture_policy.epsilon_seconds,
+        "minimum_coverage_ratio": (
+            capture_policy.minimum_duration_seconds
+            / PACKET_IF_NOMINAL_WINDOW_SECONDS
+        ),
+    }
+
+
 def _artifact_paths(artifact_dir: Path) -> dict[str, Path]:
     return {
         "model": artifact_dir / PACKET_IF_MODEL_FILENAME,
@@ -271,36 +355,100 @@ def _artifact_paths(artifact_dir: Path) -> dict[str, Path]:
     }
 
 
-def _prepare_artifact_directory(paths: dict[str, Path]) -> None:
-    artifact_dir = paths["model"].parent
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    existing = [path for path in paths.values() if path.exists()]
-    if existing:
+def _validate_artifact_destination(
+    *,
+    artifact_dir: Path,
+    model_version: str,
+) -> None:
+    if artifact_dir.name != model_version:
+        raise ValueError(
+            "Packet IF artifact directory name must match model_version: "
+            f"directory={artifact_dir.name!r}, model_version={model_version!r}"
+        )
+    if artifact_dir.exists():
         raise FileExistsError(
-            "Packet IF artifact already exists; use a new version directory to retrain: "
-            + ", ".join(str(path) for path in existing)
+            "Packet IF artifact already exists; use a new version directory "
+            f"to retrain: {artifact_dir}"
         )
 
 
-def _atomic_joblib_dump(model: IsolationForest, destination: Path) -> None:
-    temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+@contextmanager
+def _artifact_staging_directory(
+    artifact_dir: Path,
+) -> Iterator[Path]:
+    parent = artifact_dir.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    lock_path = parent / f".{artifact_dir.name}.build.lock"
     try:
-        joblib.dump(model, temporary)
-        os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _atomic_write_json(destination: Path, payload: dict[str, Any]) -> None:
-    temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
-    try:
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+        lock_descriptor = os.open(
+            lock_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
         )
-        os.replace(temporary, destination)
+    except FileExistsError as exc:
+        raise RuntimeError(
+            f"another Packet IF build holds the lock: {lock_path}"
+        ) from exc
+
+    staging_dir: Path | None = None
+    try:
+        try:
+            os.write(
+                lock_descriptor,
+                f"pid={os.getpid()}\n".encode("ascii"),
+            )
+        finally:
+            os.close(lock_descriptor)
+        staging_dir = Path(
+            tempfile.mkdtemp(
+                prefix=f".{artifact_dir.name}.",
+                suffix=".tmp",
+                dir=parent,
+            )
+        )
+        yield staging_dir
+        _fsync_directory(staging_dir)
+        if artifact_dir.exists():
+            raise FileExistsError(
+                "Packet IF artifact appeared during build; refusing to replace "
+                f"it: {artifact_dir}"
+            )
+        os.rename(staging_dir, artifact_dir)
+        staging_dir = None
+        _fsync_directory(parent)
     finally:
-        temporary.unlink(missing_ok=True)
+        if staging_dir is not None:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        lock_path.unlink(missing_ok=True)
+
+
+def _write_joblib(destination: Path, model: IsolationForest) -> None:
+    joblib.dump(model, destination)
+    _fsync_file(destination)
+
+
+def _write_json(destination: Path, payload: dict[str, Any]) -> None:
+    destination.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    _fsync_file(destination)
+
+
+def _fsync_file(path: Path) -> None:
+    # Windows의 os.fsync()는 쓰기 가능한 CRT descriptor가 필요합니다.
+    with path.open("r+b") as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name != "posix":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _validate_training_options(
@@ -394,6 +542,7 @@ def main() -> None:
     logger.info("Packet IF model: %s", artifacts.model_path)
     logger.info("Packet IF metadata: %s", artifacts.metadata_path)
     logger.info("Packet IF threshold: %.8f", artifacts.threshold)
+    logger.info("Packet IF bundle SHA256: %s", artifacts.bundle_sha256)
 
 
 if __name__ == "__main__":

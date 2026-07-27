@@ -16,6 +16,7 @@ from ai.packet_if_dataset import (
     file_sha256,
     load_packet_if_dataset,
     load_packet_if_manifest,
+    session_data_sha256s,
 )
 
 
@@ -39,6 +40,13 @@ def _dataset_rows() -> list[dict[str, object]]:
                 "window_start": f"2026-07-23T00:00:{(index - 1) * 10:02d}Z",
                 "window_end": f"2026-07-23T00:00:{index * 10:02d}Z",
                 "peer_ip": "192.168.1.100",
+                "segment_window_start": f"2026-07-23T00:00:{(index - 1) * 10:02d}Z",
+                "segment_window_end": f"2026-07-23T00:00:{index * 10:02d}Z",
+                "segment_status": "PROCESSED",
+                "segment_error_code": None,
+                "start_delay_seconds": 0.0,
+                "registered_device_id": "esp32_01",
+                "registered_ip_address": "192.168.1.100",
                 "packet_count": 10 + index,
                 "total_bytes": 1_000 + index,
                 "avg_packet_size": 100.0,
@@ -51,7 +59,7 @@ def _dataset_rows() -> list[dict[str, object]]:
     return rows
 
 
-def _manifest_sessions() -> list[dict[str, str]]:
+def _manifest_sessions() -> list[dict[str, object]]:
     return [
         {
             "session_id": SESSION_IDS["train"],
@@ -85,7 +93,7 @@ def _write_dataset_bundle(
     tmp_path: Path,
     *,
     rows: list[dict[str, object]] | None = None,
-    sessions: list[dict[str, str]] | None = None,
+    sessions: list[dict[str, object]] | None = None,
     manifest_overrides: dict[str, object] | None = None,
 ) -> tuple[Path, Path]:
     dataset_path = tmp_path / "packet_if.csv"
@@ -93,11 +101,46 @@ def _write_dataset_bundle(
         dataset_path,
         index=False,
     )
+    session_payloads = (
+        sessions if sessions is not None else _manifest_sessions()
+    )
+    try:
+        per_session_sha256 = session_data_sha256s(dataset_path)
+    except ValueError:
+        per_session_sha256 = {}
+    for session in session_payloads:
+        session_id = str(session["session_id"])
+        session.setdefault("status", "COMPLETED")
+        session.setdefault("capture_interface", "eth0")
+        session.setdefault("capture_filter", "tcp or udp")
+        session.setdefault("source_commit_sha", "a" * 40)
+        session.setdefault("started_at", "2026-07-23T00:00:00Z")
+        session.setdefault("first_window_start", "2026-07-23T00:00:00Z")
+        session.setdefault("ended_at", "2026-07-23T00:01:00Z")
+        session.setdefault("capture_gap_start", None)
+        session.setdefault("capture_gap_end", None)
+        session.setdefault(
+            "devices",
+            [{"device_id": "esp32_01", "peer_ip": "192.168.1.100"}],
+        )
+        session.setdefault(
+            "data_sha256",
+            per_session_sha256.get(session_id, "0" * 64),
+        )
+
     manifest: dict[str, object] = {
         "dataset_version": PACKET_IF_DATASET_VERSION,
         "capture_policy_version": "packet-capture-policy-v1",
+        "capture_policy": {
+            "version": "packet-capture-policy-v1",
+            "nominal_window_seconds": 10.0,
+            "max_start_delay_seconds": 1.0,
+            "minimum_duration_seconds": 9.0,
+            "epsilon_seconds": 0.01,
+            "minimum_coverage_ratio": 0.9,
+        },
         "dataset_sha256": file_sha256(dataset_path),
-        "sessions": sessions if sessions is not None else _manifest_sessions(),
+        "sessions": session_payloads,
     }
     if manifest_overrides:
         manifest.update(manifest_overrides)
@@ -145,6 +188,26 @@ def test_load_dataset_rejects_sha256_mismatch(tmp_path: Path) -> None:
         load_packet_if_dataset(dataset_path, manifest_path)
 
 
+def test_load_dataset_rejects_session_sha256_mismatch(tmp_path: Path) -> None:
+    dataset_path, manifest_path = _write_dataset_bundle(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sessions"][0]["data_sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Session SHA256 mismatch"):
+        load_packet_if_dataset(dataset_path, manifest_path)
+
+
+def test_manifest_requires_full_capture_policy_values(tmp_path: Path) -> None:
+    _, manifest_path = _write_dataset_bundle(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["capture_policy"]["epsilon_seconds"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="epsilon_seconds"):
+        load_packet_if_manifest(manifest_path)
+
+
 def test_manifest_rejects_duplicate_session_id(tmp_path: Path) -> None:
     sessions = _manifest_sessions()
     sessions.append(dict(sessions[0]))
@@ -172,6 +235,17 @@ def test_manifest_requires_every_split(tmp_path: Path) -> None:
     _, manifest_path = _write_dataset_bundle(tmp_path, sessions=sessions)
 
     with pytest.raises(ValueError, match="missing splits"):
+        load_packet_if_manifest(manifest_path)
+
+
+def test_manifest_rejects_management_traffic_from_training(
+    tmp_path: Path,
+) -> None:
+    sessions = _manifest_sessions()
+    sessions[0]["scenario"] = "normal_management_traffic"
+    _, manifest_path = _write_dataset_bundle(tmp_path, sessions=sessions)
+
+    with pytest.raises(ValueError, match="normal_management_traffic"):
         load_packet_if_manifest(manifest_path)
 
 
@@ -245,6 +319,49 @@ def test_load_dataset_rejects_outbound_row(tmp_path: Path) -> None:
         load_packet_if_dataset(dataset_path, manifest_path)
 
 
+@pytest.mark.parametrize(
+    ("field_name", "bad_value", "message"),
+    [
+        ("segment_status", "FAILED", "status_not_eligible"),
+        ("segment_error_code", "LATE_CAPTURE", "error_code_present"),
+        ("start_delay_seconds", 2.0, "start_delay_exceeds_policy"),
+    ],
+)
+def test_load_dataset_rejects_capture_policy_ineligible_source_rows(
+    tmp_path: Path,
+    field_name: str,
+    bad_value: object,
+    message: str,
+) -> None:
+    rows = _dataset_rows()
+    rows[0][field_name] = bad_value
+    dataset_path, manifest_path = _write_dataset_bundle(tmp_path, rows=rows)
+
+    with pytest.raises(ValueError, match=message):
+        load_packet_if_dataset(dataset_path, manifest_path)
+
+
+def test_load_dataset_rejects_segment_window_mismatch(tmp_path: Path) -> None:
+    rows = _dataset_rows()
+    rows[0]["segment_window_start"] = "2026-07-23T00:00:10Z"
+    rows[0]["segment_window_end"] = "2026-07-23T00:00:20Z"
+    dataset_path, manifest_path = _write_dataset_bundle(tmp_path, rows=rows)
+
+    with pytest.raises(ValueError, match="must match"):
+        load_packet_if_dataset(dataset_path, manifest_path)
+
+
+def test_load_dataset_rejects_stale_registered_device_mapping(
+    tmp_path: Path,
+) -> None:
+    rows = _dataset_rows()
+    rows[0]["registered_ip_address"] = "192.168.1.200"
+    dataset_path, manifest_path = _write_dataset_bundle(tmp_path, rows=rows)
+
+    with pytest.raises(ValueError, match="registered_ip_address"):
+        load_packet_if_dataset(dataset_path, manifest_path)
+
+
 def test_load_dataset_rejects_duplicate_feature_id(tmp_path: Path) -> None:
     rows = _dataset_rows()
     rows[1]["packet_feature_log_id"] = rows[0]["packet_feature_log_id"]
@@ -286,7 +403,7 @@ def test_load_dataset_applies_packet_feature_validation(tmp_path: Path) -> None:
 
     with pytest.raises(
         ValueError,
-        match="captured_duration_seconds must be greater than zero",
+        match="captured_duration_below_policy",
     ):
         load_packet_if_dataset(dataset_path, manifest_path)
 
@@ -405,7 +522,25 @@ def test_load_dataset_rejects_attack_row_with_wrong_device_id(tmp_path: Path) ->
     for row in rows:
         if row["session_id"] == SESSION_IDS["test_attack"]:
             row["device_id"] = "esp32_02"
-    dataset_path, manifest_path = _write_dataset_bundle(tmp_path, rows=rows)
+            row["registered_device_id"] = "esp32_02"
+    sessions = _manifest_sessions()
+    for session in sessions:
+        if session["session_id"] == SESSION_IDS["test_attack"]:
+            session["devices"] = [
+                {
+                    "device_id": "esp32_01",
+                    "peer_ip": "192.168.1.101",
+                },
+                {
+                    "device_id": "esp32_02",
+                    "peer_ip": "192.168.1.100",
+                }
+            ]
+    dataset_path, manifest_path = _write_dataset_bundle(
+        tmp_path,
+        rows=rows,
+        sessions=sessions,
+    )
 
     with pytest.raises(ValueError, match="not matching target_device_id"):
         load_packet_if_dataset(dataset_path, manifest_path)

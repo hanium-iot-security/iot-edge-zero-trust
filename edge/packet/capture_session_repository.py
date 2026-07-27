@@ -33,6 +33,13 @@ class PacketCaptureReadiness:
     packet_capture_ready_through: datetime | None
 
 
+@dataclass(frozen=True)
+class PacketFeatureReadiness:
+    session_id: str
+    first_window_start: datetime | None
+    packet_feature_ready_through: datetime | None
+
+
 def create_session(
     db: Session,
     *,
@@ -252,6 +259,89 @@ def get_packet_capture_ready_through(
     return PacketCaptureReadiness(
         session_id=session_id,
         packet_capture_ready_through=ready_through,
+    )
+
+
+def get_packet_feature_ready_through(
+    db: Session,
+    *,
+    session_id: str,
+) -> PacketFeatureReadiness | None:
+    """Return the contiguous prefix already converted to Packet Features.
+
+    PROCESSED and EMPTY are terminal extractor states. READY is intentionally
+    excluded because the pcap has not been converted yet. A malformed segment
+    state or a missing window stops the prefix instead of skipping ahead.
+    """
+    session = get_capture_session_by_session_id(db, session_id=session_id)
+    if session is None:
+        return None
+
+    raw_first_window_start = session.get("first_window_start")
+    if raw_first_window_start is None:
+        return PacketFeatureReadiness(
+            session_id=session_id,
+            first_window_start=None,
+            packet_feature_ready_through=None,
+        )
+
+    first_window_start = _parse_db_utc(raw_first_window_start)
+    expected_window_start = first_window_start
+    ready_through: datetime | None = None
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                pcsg.window_start,
+                pcsg.window_end,
+                pcsg.status,
+                pcsg.error_code,
+                COUNT(pfl.id) AS feature_count
+            FROM packet_capture_segments pcsg
+            LEFT JOIN packet_feature_logs pfl
+                ON pfl.capture_segment_id = pcsg.id
+            JOIN packet_capture_sessions pcs
+                ON pcs.id = pcsg.capture_session_id
+            WHERE pcs.session_id = :session_id
+            GROUP BY
+                pcsg.id,
+                pcsg.window_start,
+                pcsg.window_end,
+                pcsg.status,
+                pcsg.error_code
+            ORDER BY pcsg.window_start ASC, pcsg.id ASC
+            """
+        ),
+        {"session_id": session_id},
+    ).mappings()
+
+    for segment in rows:
+        window_start = _parse_db_utc(segment["window_start"])
+        if window_start < expected_window_start:
+            continue
+        if window_start > expected_window_start:
+            break
+
+        status = str(segment["status"])
+        feature_count = int(segment["feature_count"])
+        if status not in {"PROCESSED", "EMPTY"} or segment["error_code"] is not None:
+            break
+        if status == "PROCESSED" and feature_count == 0:
+            break
+        if status == "EMPTY" and feature_count != 0:
+            break
+
+        window_end = _parse_db_utc(segment["window_end"])
+        if window_end != window_start + timedelta(seconds=10):
+            break
+
+        ready_through = window_end
+        expected_window_start = window_end
+
+    return PacketFeatureReadiness(
+        session_id=session_id,
+        first_window_start=first_window_start,
+        packet_feature_ready_through=ready_through,
     )
 
 

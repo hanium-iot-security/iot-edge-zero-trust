@@ -316,4 +316,4 @@ type: 작업 내용 요약
 
 - [MVP E2E 테스트 가이드](docs/mvp-e2e-test-guide.md)
 - [MVP E2E 테스트 결과 - 2026-07-02](docs/mvp-e2e-test-results-2026-07-02.md)
-- [Packet Isolation Forest Core 가이드](docs/packet-if-runbook.md)
+- [Packet Isolation Forest 가이드](docs/packet-if-runbook.md)
