@@ -1,0 +1,27 @@
+# IoT Edge Zero Trust - Firewall Worker sudoers
+#
+# 설치:
+#   sudo install -o root -g root -m 0755 \
+#     infra/scripts/hanium-firewall-rule /usr/local/sbin/hanium-firewall-rule
+#   sudo cp infra/sudoers/hanium-firewall-worker /etc/sudoers.d/hanium-firewall-worker
+#   sudo chmod 0440 /etc/sudoers.d/hanium-firewall-worker
+#   sudo visudo -c -f /etc/sudoers.d/hanium-firewall-worker
+#
+# 허용 대상은 root 소유 Wrapper 하나뿐이다. iptables를 직접 허용하지 않는다.
+#
+# sudoers 와일드카드는 인자를 강제할 수 없다. `iptables -A INPUT *`를 허용하면 pi
+# 계정이 Worker를 거치지 않고 임의의 INPUT Rule을 root 권한으로 추가할 수 있다
+# (예: SSH 차단, 통제를 무력화하는 ACCEPT). Python의 validate_rule_row()는 직접 실행한
+# sudo 명령을 막지 못한다.
+#
+# Wrapper는 Operation·Source IP·Rule ID만 받고 Chain·Port·Target·Comment를 스스로
+# 조립하므로, 호출자가 Rule 규격을 바꿀 수 없다.
+#
+# 전제: /usr/local/sbin/hanium-firewall-rule 이 root 소유이고 pi가 수정할 수 없어야
+# 한다. pi가 그 파일을 고칠 수 있으면 아래 제한은 무의미해진다.
+
+Cmnd_Alias HANIUM_FIREWALL_RULE = /usr/local/sbin/hanium-firewall-rule
+
+pi ALL=(root) NOPASSWD: HANIUM_FIREWALL_RULE
+
+Defaults!HANIUM_FIREWALL_RULE !requiretty
