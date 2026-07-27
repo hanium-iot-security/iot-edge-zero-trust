@@ -39,6 +39,12 @@ sudo -u pi test -r /home/pi/iot-edge-zero-trust/.env
 venv/bin/python -m uvicorn --version
 sqlite3 backend/data/iot_security.db \
   "PRAGMA integrity_check; PRAGMA foreign_key_check;"
+
+sqlite3 -separator '|' backend/data/iot_security.db \
+  "SELECT version, name
+   FROM schema_migrations
+   WHERE version IN (1, 2, 3)
+   ORDER BY version;"
 ```
 
 기대 결과:
@@ -46,6 +52,16 @@ sqlite3 backend/data/iot_security.db \
 - Worktree에 의도하지 않은 변경이 없다.
 - 가상환경 Python과 Uvicorn을 실행할 수 있다.
 - `integrity_check`가 `ok`이고 `foreign_key_check` 결과가 비어 있다.
+- `schema_migrations`에 다음 세 Migration이 모두 표시된다.
+
+```text
+1|init
+2|packet_gateway
+3|phase4_detection
+```
+
+Version 1·2·3 중 하나라도 없으면 API를 기동하지 말고 Migration 적용 상태를
+먼저 점검한다.
 
 ## 3. `.env` 설정
 
@@ -121,7 +137,24 @@ curl --fail --silent --show-error http://127.0.0.1:8000/api/health
 `status=degraded`, `database=error` 또는 `db_connected=false`이면 API
 프로세스가 실행 중이어도 배포 성공으로 판정하지 않는다.
 
-### 5.2 같은 LAN의 Windows 노트북
+### 5.2 대표 API Smoke Test
+
+Migration 003 Schema와 Phase 4 Router가 실제 운영 DB에서 조회 가능한지
+대표 Endpoint를 확인한다.
+
+```bash
+curl --fail --silent --show-error \
+  'http://127.0.0.1:8000/api/packet-feature-logs?limit=1&offset=0'
+
+curl --fail --silent --show-error \
+  'http://127.0.0.1:8000/api/firewall-rules?limit=1&offset=0'
+```
+
+두 요청 모두 HTTP 200을 반환하고 응답이 `items`와 `total`을 포함해야 한다.
+빈 데이터는 정상일 수 있지만 HTTP 4xx·5xx, Timestamp 변환 오류 또는 DB Column
+오류가 발생하면 배포 성공으로 판정하지 않는다.
+
+### 5.3 같은 LAN의 Windows 노트북
 
 ```powershell
 Invoke-RestMethod http://192.168.0.20:8000/api/health
@@ -255,4 +288,3 @@ PR 본문과 Notion 검증 페이지에 다음을 실제 실행 결과로 기록
 - 미실행 항목과 사유
 
 실제 Pi에서 실행하지 않은 검증은 완료로 표시하지 않는다.
-

@@ -1,0 +1,27 @@
+[Unit]
+Description=IoT Edge Zero Trust - Detection Orchestrator
+After=network-online.target mqtt-feature-builder.service
+Wants=network-online.target mqtt-feature-builder.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/iot-edge-zero-trust
+EnvironmentFile=/home/pi/iot-edge-zero-trust/.env
+ExecStart=/home/pi/iot-edge-zero-trust/venv/bin/python -m edge.orchestration.run_detection_orchestrator --loop
+
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+NoNewPrivileges=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=detection-orchestrator
+
+[Install]
+WantedBy=multi-user.target

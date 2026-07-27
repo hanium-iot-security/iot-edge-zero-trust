@@ -86,6 +86,18 @@ def test_api_deployment_runbook_verifies_health_and_exact_cors_origin() -> None:
     assert "Wildcard" in runbook
 
 
+def test_api_deployment_runbook_verifies_phase4_schema_and_representative_apis() -> None:
+    runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+
+    assert "SELECT version, name" in runbook
+    assert "FROM schema_migrations" in runbook
+    assert "1|init" in runbook
+    assert "2|packet_gateway" in runbook
+    assert "3|phase4_detection" in runbook
+    assert "/api/packet-feature-logs?limit=1&offset=0" in runbook
+    assert "/api/firewall-rules?limit=1&offset=0" in runbook
+
+
 def test_api_deployment_runbook_covers_restart_reboot_and_safe_rollback() -> None:
     runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
 
@@ -116,6 +128,8 @@ def test_api_deployment_docs_distinguish_local_reload_from_pi_service() -> None:
     assert "로컬 개발" in demo_guide
     assert "Pi 운영" in demo_guide
     assert "sudo systemctl start iot-edge-api.service" in demo_guide
+    assert "BOOTSTRAP-MQTT-FEATURE-CHECKPOINT" in demo_guide
+    assert "기존 운영 DB는 Phase 4" in demo_guide
 
 
 def test_env_example_explains_exact_dashboard_origin_for_cors() -> None:
