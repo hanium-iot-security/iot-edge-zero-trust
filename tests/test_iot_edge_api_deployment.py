@@ -55,6 +55,12 @@ def test_iot_edge_api_service_waits_for_network_and_starts_on_normal_boot() -> N
     assert unit["Install"]["WantedBy"] == "multi-user.target"
 
 
+def test_iot_edge_api_service_uses_linux_line_endings() -> None:
+    assert b"\r\n" not in UNIT_PATH.read_bytes()
+    attributes = Path(".gitattributes").read_text(encoding="utf-8")
+    assert "*.service text eol=lf" in attributes
+
+
 def test_api_deployment_runbook_installs_and_observes_the_service() -> None:
     runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
 
