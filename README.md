@@ -88,8 +88,13 @@ Edge 진입점 실행:
 
 ```bash
 python edge/mqtt/subscriber.py
+python -m edge.features.run_mqtt_feature_builder \
+  --bootstrap --confirm BOOTSTRAP-MQTT-FEATURE-CHECKPOINT
 python -m edge.features.run_mqtt_feature_builder --loop
 ```
+
+위 Bootstrap은 신규 DB에서 최초 1회만 실행합니다. 기존 운영 DB는 임의로
+Bootstrap하지 않고 Phase 4 Cutover 도구로 Checkpoint를 초기화합니다.
 
 탐지 및 Trust Score 실행:
 

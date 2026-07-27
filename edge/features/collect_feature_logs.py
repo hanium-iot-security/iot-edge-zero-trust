@@ -386,6 +386,15 @@ def phase4_producer_checkpoint_exists(db: Session) -> bool:
     )
 
 
+def _stop_if_phase4_producer_is_active(db: Session) -> None:
+    if phase4_producer_checkpoint_exists(db):
+        raise SystemExit(
+            "이 DB는 Phase 4 MQTT Feature Producer가 관리합니다. "
+            "python -m edge.features.run_mqtt_feature_builder --loop 를 사용하세요. "
+            "(기존 Cron·스크립트는 중지해야 합니다)"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="mqtt_logs를 10초 feature window로 집계합니다.")
     parser.add_argument("--loop", action="store_true", help="반복 실행합니다.")
@@ -396,16 +405,11 @@ def main() -> None:
     # 끝난 DB에서 함께 실행되면 Feature는 늘어나는데 Checkpoint는 그대로여서, 같은
     # Window를 Phase 4 Producer가 다시 처리하거나 Orchestrator가 잘못된 완료 상태를
     # 보게 된다. 전환 후에는 edge.features.run_mqtt_feature_builder만 사용한다.
-    with SessionLocal() as db:
-        if phase4_producer_checkpoint_exists(db):
-            raise SystemExit(
-                "이 DB는 Phase 4 MQTT Feature Producer가 관리합니다. "
-                "python -m edge.features.run_mqtt_feature_builder --loop 를 사용하세요. "
-                "(기존 Cron·스크립트는 중지해야 합니다)"
-            )
-
     while True:
         with SessionLocal() as db:
+            # Cutover can happen while this legacy loop is already running.
+            # Re-check every cycle to prevent concurrent writes.
+            _stop_if_phase4_producer_is_active(db)
             inserted_count = collect_feature_windows(db)
         print(f"feature_logs 생성: {inserted_count} rows")
         if not args.loop:
