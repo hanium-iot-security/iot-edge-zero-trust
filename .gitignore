@@ -54,3 +54,6 @@ ai/notebooks/.ipynb_checkpoints/
 Thumbs.db
 .idea/
 .vscode/
+
+# Local Git worktrees
+.worktrees/
