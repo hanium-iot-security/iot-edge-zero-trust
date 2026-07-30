@@ -26,7 +26,7 @@ from ai.predict_packet_isolation_forest import (
     load_packet_if_artifact,
     predict_packet_feature_rows,
 )
-from backend.app.config import settings
+from backend.app.config import Settings, settings
 from edge.detection import runtime_checkpoint_repository as checkpoints
 from edge.detection.detection_event_writer import write_detection_event
 from edge.detection.detector_contract import DetectorRunResult, validate_cycle_window
@@ -93,22 +93,24 @@ class PacketIsolationForestStage:
     def from_settings(
         cls,
         *,
+        app_settings: Settings | None = None,
         artifact_dir: Path | None = None,
         expected_model_version: str | None = None,
         expected_bundle_sha256: str | None = None,
         capture_policy: CapturePolicy | None = None,
     ) -> "PacketIsolationForestStage":
+        configured_settings = app_settings or settings
         configured_path = (
             str(artifact_dir)
             if artifact_dir is not None
-            else settings.packet_if_artifact_dir.strip()
+            else configured_settings.packet_if_artifact_dir.strip()
         )
         if not configured_path:
             raise ValueError("PACKET_IF_ARTIFACT_DIR must be configured")
         expected_version = (
             expected_model_version
             if expected_model_version is not None
-            else settings.packet_if_expected_model_version
+            else configured_settings.packet_if_expected_model_version
         )
         expected_version = expected_version.strip()
         if not expected_version:
@@ -118,7 +120,7 @@ class PacketIsolationForestStage:
         expected_bundle = (
             expected_bundle_sha256
             if expected_bundle_sha256 is not None
-            else settings.packet_if_expected_bundle_sha256
+            else configured_settings.packet_if_expected_bundle_sha256
         )
         expected_bundle = expected_bundle.strip()
         if not expected_bundle:
@@ -132,7 +134,17 @@ class PacketIsolationForestStage:
                 expected_model_version=expected_version,
             ),
             expected_model_version=expected_version,
-            capture_policy=capture_policy or CapturePolicy.from_env(),
+            capture_policy=capture_policy
+            or CapturePolicy(
+                max_start_delay_seconds=(
+                    configured_settings.pcap_max_start_delay_seconds
+                ),
+                minimum_duration_seconds=(
+                    configured_settings.packet_min_capture_duration_seconds
+                ),
+                epsilon_seconds=configured_settings.capture_time_epsilon_seconds,
+                version=configured_settings.capture_policy_version,
+            ),
         )
 
     def run_until(

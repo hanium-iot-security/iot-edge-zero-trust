@@ -15,7 +15,10 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from backend.app.config import Settings
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
+from edge.detection.packet_ai_detector import PacketIsolationForestStage
+from edge.detection.packet_rule_detector import PacketRuleDetectorStage
 from edge.detection import runtime_checkpoint_repository as checkpoints
 from edge.detection.detection_event_writer import write_detection_event
 from edge.detection.detector_contract import DetectorRunResult
@@ -40,16 +43,22 @@ from edge.orchestration.run_detection_orchestrator import (
     run_orchestration_cycle,
     run_orchestrator_loop,
 )
+from edge.orchestration.packet_stage_readiness import (
+    PacketFeatureRangeNotReadyError,
+    PacketFeatureReadyStage,
+)
 from edge.runtime_lock import RuntimeLockError, single_instance_lock as _lock
 from edge.orchestration.stage_registry import (
     MQTT_FEATURE_RULE,
     MQTT_MESSAGE_RULE,
+    PACKET_IF,
     PACKET_RULE,
     StageConfigurationError,
     build_stage_registry,
     parse_stage_names,
 )
 from edge.trust.trust_score_v2 import TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE
+from edge.packet import capture_session_repository as capture_sessions
 
 
 DEVICE_ID = "esp32_02"
@@ -159,9 +168,101 @@ def test_required_stage_must_be_enabled():
         build_stage_registry(enabled=[MQTT_FEATURE_RULE], required=[MQTT_MESSAGE_RULE])
 
 
-def test_packet_stage_is_rejected_until_implemented():
-    with pytest.raises(StageConfigurationError, match="not implemented"):
-        build_stage_registry(enabled=[MQTT_FEATURE_RULE, PACKET_RULE], required=[])
+def test_packet_rule_stage_can_be_enabled_and_required():
+    app_settings = Settings(
+        _env_file=None,
+        packet_rule_packet_rate_threshold=321.0,
+        packet_rule_policy_version="packet-rule-registry-test",
+        pcap_max_start_delay_seconds=0.5,
+        packet_min_capture_duration_seconds=9.5,
+    )
+
+    built = build_stage_registry(
+        enabled=[MQTT_FEATURE_RULE, PACKET_RULE],
+        required=[PACKET_RULE],
+        app_settings=app_settings,
+    )
+
+    assert built.enabled_names == (MQTT_FEATURE_RULE, PACKET_RULE)
+    assert built.required_names == (PACKET_RULE,)
+    assert isinstance(built.stages[1].stage, PacketFeatureReadyStage)
+    packet_rule = built.stages[1].stage.delegate
+    assert isinstance(packet_rule, PacketRuleDetectorStage)
+    assert packet_rule.rule_policy.packet_rate_threshold == 321.0
+    assert (
+        packet_rule.rule_policy.version
+        == "packet-rule-registry-test"
+    )
+    assert packet_rule.capture_policy.max_start_delay_seconds == 0.5
+    assert built.packet_layer_enabled is True
+    assert built.packet_layer_required is True
+
+
+def test_disabled_packet_if_does_not_require_artifact_configuration():
+    app_settings = Settings(
+        _env_file=None,
+        packet_if_artifact_dir="",
+        packet_if_expected_model_version="",
+        packet_if_expected_bundle_sha256="",
+    )
+
+    built = build_stage_registry(
+        enabled=[MQTT_FEATURE_RULE, PACKET_RULE],
+        required=[MQTT_FEATURE_RULE],
+        app_settings=app_settings,
+    )
+
+    assert PACKET_IF not in built.enabled_names
+
+
+def test_enabled_packet_if_requires_artifact_configuration():
+    app_settings = Settings(
+        _env_file=None,
+        packet_if_artifact_dir="",
+        packet_if_expected_model_version="",
+        packet_if_expected_bundle_sha256="",
+    )
+
+    with pytest.raises(
+        StageConfigurationError,
+        match=r"packet_if.*PACKET_IF_ARTIFACT_DIR",
+    ):
+        build_stage_registry(
+            enabled=[PACKET_IF],
+            required=[PACKET_IF],
+            app_settings=app_settings,
+        )
+
+
+def test_packet_if_builder_uses_explicit_settings(monkeypatch):
+    app_settings = Settings(
+        _env_file=None,
+        packet_if_artifact_dir="ai/models/packet_if/test-model",
+        packet_if_expected_model_version="packet-if-test",
+        packet_if_expected_bundle_sha256="a" * 64,
+    )
+    stage = object()
+    captured = {}
+
+    def fake_from_settings(cls, **kwargs):
+        captured.update(kwargs)
+        return stage
+
+    monkeypatch.setattr(
+        PacketIsolationForestStage,
+        "from_settings",
+        classmethod(fake_from_settings),
+    )
+
+    built = build_stage_registry(
+        enabled=[PACKET_IF],
+        required=[],
+        app_settings=app_settings,
+    )
+
+    assert isinstance(built.stages[0].stage, PacketFeatureReadyStage)
+    assert built.stages[0].stage.delegate is stage
+    assert captured["app_settings"] is app_settings
 
 
 def test_empty_stage_list_is_rejected():
@@ -230,6 +331,144 @@ def test_second_cycle_without_new_window_is_skipped(SessionLocal, registry):
 
     second = run_orchestration_cycle(session_factory=SessionLocal, registry=registry)
     assert second.status == CYCLE_SKIPPED_NO_NEW_WINDOW
+
+
+def test_required_packet_stage_rejects_unready_feature_range(SessionLocal):
+    with SessionLocal() as db:
+        _flood_window(db, window_index=0)
+    run_producer_cycle(session_factory=SessionLocal, now=BASE + timedelta(seconds=11))
+    packet_registry = build_stage_registry(
+        enabled=[PACKET_RULE],
+        required=[PACKET_RULE],
+    )
+
+    with pytest.raises(
+        PacketFeatureRangeNotReadyError,
+        match="no Capture Session covers",
+    ):
+        run_orchestration_cycle(
+            session_factory=SessionLocal,
+            registry=packet_registry,
+        )
+
+    with SessionLocal() as db:
+        assert _completed(db, "packet_rule", "packet_feature_logs") is None
+        assert _completed(db, TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE) is None
+
+
+def test_required_packet_stage_accepts_contiguous_empty_prefix(SessionLocal):
+    session_id = "12345678-1234-4234-8234-1234567890ab"
+    with SessionLocal() as db:
+        _flood_window(db, window_index=0)
+        session_pk = capture_sessions.create_session(
+            db,
+            session_id=session_id,
+            capture_interface="eth0",
+            started_at=BASE,
+        )
+        capture_sessions.set_first_window_start(db, session_pk, BASE)
+        segment_id = capture_sessions.insert_ready_segment(
+            db,
+            capture_session_pk=session_pk,
+            file_name=f"capture_{session_id}_eth0_empty.pcap",
+            capture_interface="eth0",
+            window_start=BASE,
+            window_end=BASE + timedelta(seconds=10),
+        )
+        db.execute(
+            text(
+                """
+                UPDATE packet_capture_segments
+                SET status = 'EMPTY', packet_count = 0, processed_at = :processed_at
+                WHERE id = :segment_id
+                """
+            ),
+            {
+                "segment_id": segment_id,
+                "processed_at": format_db_utc(BASE + timedelta(seconds=10)),
+            },
+        )
+        db.commit()
+
+    run_producer_cycle(session_factory=SessionLocal, now=BASE + timedelta(seconds=11))
+    packet_registry = build_stage_registry(
+        enabled=[PACKET_RULE],
+        required=[PACKET_RULE],
+    )
+
+    outcome = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=packet_registry,
+    )
+
+    assert outcome.status == CYCLE_COMPLETED
+    with SessionLocal() as db:
+        assert _completed(
+            db,
+            "packet_rule",
+            "packet_feature_logs",
+        ) == BASE + timedelta(seconds=10)
+
+
+def test_required_packet_stage_limits_cutoff_to_ready_prefix(SessionLocal):
+    session_id = "12345678-1234-4234-8234-1234567890ac"
+    with SessionLocal() as db:
+        _flood_window(db, window_index=0)
+        _flood_window(db, window_index=1)
+        session_pk = capture_sessions.create_session(
+            db,
+            session_id=session_id,
+            capture_interface="eth0",
+            started_at=BASE,
+        )
+        capture_sessions.set_first_window_start(db, session_pk, BASE)
+        segment_id = capture_sessions.insert_ready_segment(
+            db,
+            capture_session_pk=session_pk,
+            file_name=f"capture_{session_id}_eth0_empty.pcap",
+            capture_interface="eth0",
+            window_start=BASE,
+            window_end=BASE + timedelta(seconds=10),
+        )
+        db.execute(
+            text(
+                """
+                UPDATE packet_capture_segments
+                SET status = 'EMPTY', packet_count = 0, processed_at = :processed_at
+                WHERE id = :segment_id
+                """
+            ),
+            {
+                "segment_id": segment_id,
+                "processed_at": format_db_utc(BASE + timedelta(seconds=10)),
+            },
+        )
+        db.commit()
+
+    run_producer_cycle(session_factory=SessionLocal, now=BASE + timedelta(seconds=21))
+    packet_registry = build_stage_registry(
+        enabled=[PACKET_RULE],
+        required=[PACKET_RULE],
+    )
+
+    outcome = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=packet_registry,
+    )
+
+    assert outcome.status == CYCLE_COMPLETED
+    assert outcome.cutoff == BASE + timedelta(seconds=10)
+    with SessionLocal() as db:
+        assert _completed(
+            db,
+            "packet_rule",
+            "packet_feature_logs",
+        ) == BASE + timedelta(seconds=10)
+        assert _completed(
+            db,
+            TRUST_DETECTOR_NAME,
+            TRUST_SOURCE_TABLE,
+        ) == BASE + timedelta(seconds=10)
 
 
 # --- Barrier ---------------------------------------------------------------

@@ -15,10 +15,14 @@ Cycle 순서(세부계획 2.4):
 한 Cycle의 모든 Stage는 **같은** `cycle_range_start`·`cycle_cutoff`를 받습니다. Stage마다
 현재 시각을 다시 계산하면 서로 다른 Window의 Event가 한 Trust 계산에 섞입니다.
 
-현재 Packet 계층(Packet Rule·Packet IF)은 `develop`에 없어 MQTT 단독 Cycle로 동작합니다.
-세부계획 2.4의 "Packet 계층이 비활성화됐거나 required=false이면 Packet Watermark를
-Barrier에서 제외하고 MQTT 단독 Trust Cycle을 정상 수행한다"에 해당합니다. Packet Session
-Gap Drain은 Packet Stage와 Core의 Ready Range가 들어온 뒤 연결합니다.
+Packet Rule·Packet IF는 Stage Registry 설정으로 활성화합니다. Packet Stage 앞의 Ready
+Range Gate는 Cycle 범위 전체가 한 Capture Session의 연속 `PROCESSED`·`EMPTY` Prefix인지
+확인합니다. `READY`·`FAILED`·누락 Window 또는 Session Gap이 있으면 Packet Checkpoint와
+Trust를 전진시키지 않습니다. Packet 계층이 Required이면 MQTT Producer Watermark와
+Packet Feature Ready Through 중 이른 시각을 공통 cutoff로 사용합니다. Packet 계층이
+비활성화됐거나 `required=false`이면 MQTT 단독 Trust Cycle은 기존 계약대로 동작합니다.
+Gap을 정상 데이터로 연결하지 않으며, 운영자가 Gap을 확인하고 새 연속 구간으로 재개하는
+절차는 별도 운영 단계에서 수행합니다.
 """
 
 from __future__ import annotations
@@ -47,6 +51,10 @@ from edge.detection.detector_contract import DetectorRunResult
 from edge.detection.orchestrator import ensure_checkpoint_completed, run_detection_cycle
 from edge.detection.phase4_time import floor_window_start, format_db_utc, parse_db_utc
 from edge.features.collect_feature_logs import MQTT_FEATURE_BUILDER, MQTT_LOGS_SOURCE
+from edge.orchestration.packet_stage_readiness import (
+    PacketFeatureRangeNotReadyError,
+    get_packet_feature_readiness_for_range_start,
+)
 from edge.orchestration.stage_registry import StageRegistry, load_stage_registry
 from edge.runtime_lock import RuntimeLockError, single_instance_lock
 from edge.runtime_lock import resolve_lock_path as _resolve_lock_path
@@ -206,6 +214,28 @@ def run_orchestration_cycle(
             )
             return CycleOutcome(status=CYCLE_SKIPPED_NO_WATERMARK)
         range_start = resolve_cycle_range_start(db, registry=registry, cutoff=cutoff)
+        if registry.packet_layer_required:
+            packet_readiness = get_packet_feature_readiness_for_range_start(
+                db,
+                range_start=range_start,
+            )
+            if (
+                packet_readiness is None
+                or packet_readiness.first_window_start is None
+            ):
+                raise PacketFeatureRangeNotReadyError(
+                    "no Capture Session covers the Packet Detector range start: "
+                    f"range_start={format_db_utc(range_start)}"
+                )
+            packet_ready_through = packet_readiness.packet_feature_ready_through
+            if packet_ready_through is None:
+                raise PacketFeatureRangeNotReadyError(
+                    "Capture Session has no contiguous PROCESSED/EMPTY "
+                    "Packet Feature prefix: "
+                    f"session_id={packet_readiness.session_id}, "
+                    f"range_start={format_db_utc(range_start)}"
+                )
+            cutoff = min(cutoff, packet_ready_through)
 
     if range_start >= cutoff:
         logger.debug(
