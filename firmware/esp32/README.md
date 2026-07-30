@@ -107,3 +107,20 @@ mosquitto_sub -h localhost -p 1883 -t "iot/+/sensor"
 ```json
 {"device_id":"esp32_01","seq":3,"rssi":-50,"temp":24.1,"hum":45.3,"bat":98,"st":"ok"}
 ```
+
+## attack_sender
+
+`attack_sender/attack_sender.ino`는 Phase 4 공식 E2E에서 등록 테스트 Device
+`esp32_02`의 실제 Source IP로 제한된 MQTT Flood를 발생시키기 위한 별도
+Firmware입니다.
+
+- 기본값은 `ATTACK_TEST_ENABLED = false`입니다.
+- 사설 IPv4 Broker만 허용합니다.
+- 40개 메시지 Burst를 10초 간격으로 최대 4회만 실행합니다.
+- 부팅당 한 번, 최대 45초만 실행하고 MQTT 연결을 종료합니다.
+- 정상 데이터 수집이나 일반 운영 Firmware로 사용하지 않습니다.
+
+실행 전 DB IP 매핑·서비스 상태 확인, 실행 중 증적 수집, Firewall 해제와 정상
+Firmware 복구는
+[`docs/phase4-esp32-attack-test-runbook.md`](../../docs/phase4-esp32-attack-test-runbook.md)를
+따릅니다.
