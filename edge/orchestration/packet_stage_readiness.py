@@ -111,13 +111,24 @@ class PacketFeatureReadyStage:
         cycle_range_start: datetime,
         cycle_cutoff: datetime,
     ) -> DetectorRunResult:
-        require_packet_feature_ready_range(
+        readiness = require_packet_feature_ready_range(
             db,
             cycle_range_start=cycle_range_start,
             cycle_cutoff=cycle_cutoff,
         )
-        return self.delegate.run_until(
+        session_bound_runner = getattr(
+            self.delegate,
+            "run_until_for_capture_session",
+            None,
+        )
+        if session_bound_runner is None:
+            raise TypeError(
+                f"{self.detector_name} must implement "
+                "run_until_for_capture_session()"
+            )
+        return session_bound_runner(
             db,
             cycle_range_start=cycle_range_start,
             cycle_cutoff=cycle_cutoff,
+            expected_capture_session_id=readiness.session_id,
         )

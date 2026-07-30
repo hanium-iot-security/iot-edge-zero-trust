@@ -575,6 +575,67 @@ class TestPacketRuleDetectorStage:
                         db, cycle_range_start=RANGE_START, cycle_cutoff=CUTOFF
                     )
 
+    def test_expected_capture_session_is_recorded_in_result(self, SessionLocal) -> None:
+        with SessionLocal() as db:
+            _insert_device(db)
+            session_pk = _insert_capture_session(db)
+            _insert_packet_source(
+                db,
+                session_pk=session_pk,
+                feature_id=1,
+                segment_id=1,
+            )
+            db.commit()
+
+        with SessionLocal() as db:
+            with db.begin():
+                result = _stage().run_until_for_capture_session(
+                    db,
+                    cycle_range_start=RANGE_START,
+                    cycle_cutoff=CUTOFF,
+                    expected_capture_session_id=SESSION_ID,
+                )
+
+        assert result.capture_session_id == SESSION_ID
+        assert result.selected_count == 1
+
+    def test_feature_from_unexpected_capture_session_is_rejected(
+        self,
+        SessionLocal,
+    ) -> None:
+        expected_session_id = "33333333-3333-4333-8333-333333333333"
+        with SessionLocal() as db:
+            _insert_device(db)
+            _insert_capture_session(db, session_id=expected_session_id)
+            other_session_pk = _insert_capture_session(db, session_id=SESSION_ID)
+            _insert_packet_source(
+                db,
+                session_pk=other_session_pk,
+                feature_id=1,
+                segment_id=1,
+            )
+            db.commit()
+
+        with SessionLocal() as db:
+            with pytest.raises(RuntimeError, match="unexpected Capture Session"):
+                with db.begin():
+                    _stage().run_until_for_capture_session(
+                        db,
+                        cycle_range_start=RANGE_START,
+                        cycle_cutoff=CUTOFF,
+                        expected_capture_session_id=expected_session_id,
+                    )
+
+        with SessionLocal() as db:
+            assert db.execute(
+                text("SELECT COUNT(*) FROM detection_events")
+            ).scalar_one() == 0
+            assert get_detector_checkpoint(
+                db,
+                detector_name="packet_rule",
+                source_table="packet_feature_logs",
+            ) is None
+
     def test_feature_window_mismatched_with_segment_window_is_rejected(self, SessionLocal) -> None:
         """packet_feature_logs.window와 그 부모 packet_capture_segments.window가
         어긋나 있으면(데이터 정합성 오류) 조용히 넘어가지 않고 예외를 낸다."""

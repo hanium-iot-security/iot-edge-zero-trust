@@ -52,7 +52,6 @@ from edge.detection.orchestrator import ensure_checkpoint_completed, run_detecti
 from edge.detection.phase4_time import floor_window_start, format_db_utc, parse_db_utc
 from edge.features.collect_feature_logs import MQTT_FEATURE_BUILDER, MQTT_LOGS_SOURCE
 from edge.orchestration.packet_stage_readiness import (
-    PacketFeatureRangeNotReadyError,
     get_packet_feature_readiness_for_range_start,
 )
 from edge.orchestration.stage_registry import StageRegistry, load_stage_registry
@@ -72,6 +71,7 @@ SessionFactory = Callable[[], Session]
 CYCLE_COMPLETED = "COMPLETED"
 CYCLE_SKIPPED_NO_WATERMARK = "SKIPPED_NO_WATERMARK"
 CYCLE_SKIPPED_NO_NEW_WINDOW = "SKIPPED_NO_NEW_WINDOW"
+CYCLE_SKIPPED_PACKET_NOT_READY = "SKIPPED_PACKET_NOT_READY"
 
 
 @dataclass(frozen=True)
@@ -223,17 +223,31 @@ def run_orchestration_cycle(
                 packet_readiness is None
                 or packet_readiness.first_window_start is None
             ):
-                raise PacketFeatureRangeNotReadyError(
-                    "no Capture Session covers the Packet Detector range start: "
-                    f"range_start={format_db_utc(range_start)}"
+                logger.info(
+                    "event=CYCLE_SKIPPED reason=PACKET_NOT_READY "
+                    "detail=NO_CAPTURE_SESSION range_start=%s cutoff=%s",
+                    format_db_utc(range_start),
+                    format_db_utc(cutoff),
+                )
+                return CycleOutcome(
+                    status=CYCLE_SKIPPED_PACKET_NOT_READY,
+                    range_start=range_start,
+                    cutoff=cutoff,
                 )
             packet_ready_through = packet_readiness.packet_feature_ready_through
             if packet_ready_through is None:
-                raise PacketFeatureRangeNotReadyError(
-                    "Capture Session has no contiguous PROCESSED/EMPTY "
-                    "Packet Feature prefix: "
-                    f"session_id={packet_readiness.session_id}, "
-                    f"range_start={format_db_utc(range_start)}"
+                logger.info(
+                    "event=CYCLE_SKIPPED reason=PACKET_NOT_READY "
+                    "detail=NO_CONTIGUOUS_PREFIX session_id=%s "
+                    "range_start=%s cutoff=%s",
+                    packet_readiness.session_id,
+                    format_db_utc(range_start),
+                    format_db_utc(cutoff),
+                )
+                return CycleOutcome(
+                    status=CYCLE_SKIPPED_PACKET_NOT_READY,
+                    range_start=range_start,
+                    cutoff=cutoff,
                 )
             cutoff = min(cutoff, packet_ready_through)
 

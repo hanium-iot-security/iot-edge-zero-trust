@@ -111,6 +111,13 @@ and the Packet Feature ready-through boundary, so a continuously lagging Packet
 extractor does not starve every cycle. Packet IF additionally requires a verified
 model artifact path, version, and SHA256 at startup.
 
+If the Capture Session is not present yet or its first contiguous
+`PROCESSED`/`EMPTY` prefix is not ready, the runtime records
+`SKIPPED_PACKET_NOT_READY` and leaves detector and Trust checkpoints unchanged.
+This is a retryable startup or lag state: the process remains alive and retries
+on the next cycle. Window mismatch, mixed Capture Sessions, invalid timing
+metadata, and invalid model artifacts remain fail-fast integrity errors.
+
 Raspberry Pi deployment verification, final Packet IF model training, and
 operator-driven Session Gap recovery remain operational follow-up work.
 

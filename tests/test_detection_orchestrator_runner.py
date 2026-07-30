@@ -15,6 +15,7 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from ai.predict_packet_isolation_forest import PacketIFArtifact, PacketIFPrediction
 from backend.app.config import Settings
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
 from edge.detection.packet_ai_detector import PacketIsolationForestStage
@@ -35,6 +36,7 @@ from edge.features.run_mqtt_feature_builder import (
 from edge.orchestration.run_detection_orchestrator import (
     CYCLE_COMPLETED,
     CYCLE_SKIPPED_NO_NEW_WINDOW,
+    CYCLE_SKIPPED_PACKET_NOT_READY,
     CYCLE_SKIPPED_NO_WATERMARK,
     GracefulShutdown,
     resolve_cycle_cutoff,
@@ -43,16 +45,16 @@ from edge.orchestration.run_detection_orchestrator import (
     run_orchestration_cycle,
     run_orchestrator_loop,
 )
-from edge.orchestration.packet_stage_readiness import (
-    PacketFeatureRangeNotReadyError,
-    PacketFeatureReadyStage,
-)
+from edge.orchestration.packet_stage_readiness import PacketFeatureReadyStage
+from edge.packet.capture_policy import CapturePolicy
 from edge.runtime_lock import RuntimeLockError, single_instance_lock as _lock
 from edge.orchestration.stage_registry import (
+    ConfiguredStage,
     MQTT_FEATURE_RULE,
     MQTT_MESSAGE_RULE,
     PACKET_IF,
     PACKET_RULE,
+    StageRegistry,
     StageConfigurationError,
     build_stage_registry,
     parse_stage_names,
@@ -64,6 +66,7 @@ from edge.packet import capture_session_repository as capture_sessions
 DEVICE_ID = "esp32_02"
 DEVICE_IP = "192.168.0.5"
 BASE = datetime(2026, 7, 25, 12, 0, 0, tzinfo=timezone.utc)
+PACKET_SESSION_ID = "33333333-3333-4333-8333-333333333333"
 
 
 @pytest.fixture
@@ -146,6 +149,96 @@ def _completed(db, detector_name: str, source_table: str):
 
 def _scalar(db, sql: str):
     return db.execute(text(sql)).scalar()
+
+
+def _insert_processed_packet_window(
+    db,
+    *,
+    session_id: str = PACKET_SESSION_ID,
+    packet_count: int = 980,
+    total_bytes: int = 9800,
+) -> int:
+    session_result = db.execute(
+        text(
+            """
+            INSERT INTO packet_capture_sessions (
+                session_id, capture_interface, started_at,
+                first_window_start, ended_at, status
+            )
+            VALUES (
+                :session_id, 'eth0', :window_start,
+                :window_start, :window_end, 'COMPLETED'
+            )
+            """
+        ),
+        {
+            "session_id": session_id,
+            "window_start": format_db_utc(BASE),
+            "window_end": format_db_utc(BASE + timedelta(seconds=10)),
+        },
+    )
+    session_pk = int(session_result.lastrowid)
+    segment_result = db.execute(
+        text(
+            """
+            INSERT INTO packet_capture_segments (
+                capture_session_id, file_name, capture_interface,
+                window_start, window_end, status, packet_count, processed_at,
+                actual_capture_started_at, capture_stop_requested_at,
+                capture_process_exited_at, start_delay_seconds,
+                captured_duration_seconds
+            )
+            VALUES (
+                :session_pk, :file_name, 'eth0',
+                :window_start, :window_end, 'PROCESSED', :packet_count, :window_end,
+                :actual_start, :stop_requested_at,
+                :process_exited_at, 0.2, 9.8
+            )
+            """
+        ),
+        {
+            "session_pk": session_pk,
+            "file_name": f"capture_{session_id}_eth0_packet-stage-e2e.pcap",
+            "window_start": format_db_utc(BASE),
+            "window_end": format_db_utc(BASE + timedelta(seconds=10)),
+            "packet_count": packet_count,
+            "actual_start": "2026-07-25T12:00:00.200000Z",
+            "stop_requested_at": "2026-07-25T12:00:10.000000Z",
+            "process_exited_at": "2026-07-25T12:00:10.050000Z",
+        },
+    )
+    segment_id = int(segment_result.lastrowid)
+    feature_result = db.execute(
+        text(
+            """
+            INSERT INTO packet_feature_logs (
+                capture_segment_id, device_id, peer_ip, direction,
+                window_start, window_end, packet_count, total_bytes,
+                avg_packet_size, max_packet_size, mean_inter_arrival_time,
+                distinct_dest_port_count, tcp_syn_count,
+                mqtt_related_packet_count, non_mqtt_tcp_udp_packet_count,
+                capture_scope
+            )
+            VALUES (
+                :segment_id, :device_id, :peer_ip, 'INBOUND',
+                :window_start, :window_end, :packet_count, :total_bytes,
+                10.0, 20, 0.01,
+                1, 0, 10, 0,
+                'gateway'
+            )
+            """
+        ),
+        {
+            "segment_id": segment_id,
+            "device_id": DEVICE_ID,
+            "peer_ip": DEVICE_IP,
+            "window_start": format_db_utc(BASE),
+            "window_end": format_db_utc(BASE + timedelta(seconds=10)),
+            "packet_count": packet_count,
+            "total_bytes": total_bytes,
+        },
+    )
+    return int(feature_result.lastrowid)
 
 
 # --- Stage 구성 ------------------------------------------------------------
@@ -333,7 +426,7 @@ def test_second_cycle_without_new_window_is_skipped(SessionLocal, registry):
     assert second.status == CYCLE_SKIPPED_NO_NEW_WINDOW
 
 
-def test_required_packet_stage_rejects_unready_feature_range(SessionLocal):
+def test_required_packet_stage_skips_when_capture_session_is_not_ready(SessionLocal):
     with SessionLocal() as db:
         _flood_window(db, window_index=0)
     run_producer_cycle(session_factory=SessionLocal, now=BASE + timedelta(seconds=11))
@@ -342,18 +435,84 @@ def test_required_packet_stage_rejects_unready_feature_range(SessionLocal):
         required=[PACKET_RULE],
     )
 
-    with pytest.raises(
-        PacketFeatureRangeNotReadyError,
-        match="no Capture Session covers",
-    ):
-        run_orchestration_cycle(
-            session_factory=SessionLocal,
-            registry=packet_registry,
-        )
+    outcome = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=packet_registry,
+    )
 
+    assert outcome.status == CYCLE_SKIPPED_PACKET_NOT_READY
+    assert outcome.range_start == BASE
+    assert outcome.cutoff == BASE + timedelta(seconds=10)
     with SessionLocal() as db:
         assert _completed(db, "packet_rule", "packet_feature_logs") is None
         assert _completed(db, TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE) is None
+
+
+def test_required_packet_stage_retries_after_ready_prefix_is_completed(SessionLocal):
+    session_id = "12345678-1234-4234-8234-1234567890aa"
+    with SessionLocal() as db:
+        _flood_window(db, window_index=0)
+        session_pk = capture_sessions.create_session(
+            db,
+            session_id=session_id,
+            capture_interface="eth0",
+            started_at=BASE,
+        )
+        capture_sessions.set_first_window_start(db, session_pk, BASE)
+        segment_id = capture_sessions.insert_ready_segment(
+            db,
+            capture_session_pk=session_pk,
+            file_name=f"capture_{session_id}_eth0_ready.pcap",
+            capture_interface="eth0",
+            window_start=BASE,
+            window_end=BASE + timedelta(seconds=10),
+        )
+        db.commit()
+
+    run_producer_cycle(session_factory=SessionLocal, now=BASE + timedelta(seconds=11))
+    packet_registry = build_stage_registry(
+        enabled=[PACKET_RULE],
+        required=[PACKET_RULE],
+    )
+
+    waiting = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=packet_registry,
+    )
+    assert waiting.status == CYCLE_SKIPPED_PACKET_NOT_READY
+
+    with SessionLocal() as db:
+        db.execute(
+            text(
+                """
+                UPDATE packet_capture_segments
+                SET status = 'EMPTY', packet_count = 0, processed_at = :processed_at
+                WHERE id = :segment_id
+                """
+            ),
+            {
+                "segment_id": segment_id,
+                "processed_at": format_db_utc(BASE + timedelta(seconds=10)),
+            },
+        )
+        db.commit()
+
+    completed = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=packet_registry,
+    )
+    assert completed.status == CYCLE_COMPLETED
+    with SessionLocal() as db:
+        assert _completed(
+            db,
+            "packet_rule",
+            "packet_feature_logs",
+        ) == BASE + timedelta(seconds=10)
+        assert _completed(
+            db,
+            TRUST_DETECTOR_NAME,
+            TRUST_SOURCE_TABLE,
+        ) == BASE + timedelta(seconds=10)
 
 
 def test_required_packet_stage_accepts_contiguous_empty_prefix(SessionLocal):
@@ -864,6 +1023,147 @@ def test_repeated_cycles_do_not_duplicate_trust_history(SessionLocal, registry):
         assert _scalar(db, "SELECT COUNT(*) FROM trust_score_history") == 1
         assert _scalar(db, "SELECT COUNT(*) FROM firewall_rules") == 0
         assert _scalar(db, f"SELECT trust_score FROM devices WHERE device_id = '{DEVICE_ID}'") == 80
+
+
+def test_packet_rule_and_if_share_ready_session_and_reach_trust_once(
+    SessionLocal,
+    tmp_path: Path,
+):
+    capture_policy = CapturePolicy()
+    model_version = "packet-if-orchestrator-e2e-v1"
+    artifact = PacketIFArtifact(
+        model=object(),
+        model_path=tmp_path / "model.joblib",
+        metadata_path=tmp_path / "metadata.json",
+        training_report_path=tmp_path / "training-report.json",
+        model_version=model_version,
+        threshold=0.1,
+        bundle_sha256="d" * 64,
+        capture_policy=capture_policy,
+        metadata={},
+    )
+
+    def predict_anomaly(
+        _artifact: PacketIFArtifact,
+        rows: list[dict],
+    ) -> tuple[PacketIFPrediction, ...]:
+        return tuple(
+            PacketIFPrediction(
+                model_version=model_version,
+                raw_decision_score=-0.2,
+                anomaly_score=0.2,
+                threshold=0.1,
+                is_anomaly=True,
+                feature_values=(
+                    float(row["packet_count"]),
+                    float(row["total_bytes"]),
+                    float(row["avg_packet_size"]),
+                    float(row["max_packet_size"]),
+                    float(row["mean_inter_arrival_time"]),
+                    float(row["distinct_dest_port_count"]),
+                ),
+            )
+            for row in rows
+        )
+
+    rule_registry = build_stage_registry(
+        enabled=[PACKET_RULE],
+        required=[PACKET_RULE],
+        app_settings=Settings(_env_file=None),
+    )
+    packet_if_stage = PacketFeatureReadyStage(
+        PacketIsolationForestStage(
+            artifact=artifact,
+            expected_model_version=model_version,
+            capture_policy=capture_policy,
+            predict_rows=predict_anomaly,
+        )
+    )
+    packet_registry = StageRegistry(
+        stages=rule_registry.stages
+        + (
+            ConfiguredStage(
+                name=PACKET_IF,
+                stage=packet_if_stage,
+                required=True,
+            ),
+        )
+    )
+
+    with SessionLocal() as db:
+        _insert_mqtt_log(db, received_at=BASE + timedelta(seconds=1))
+        packet_feature_id = _insert_processed_packet_window(db)
+        db.commit()
+    run_producer_cycle(
+        session_factory=SessionLocal,
+        now=BASE + timedelta(seconds=11),
+    )
+
+    first = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=packet_registry,
+    )
+    second = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=packet_registry,
+    )
+
+    assert first.status == CYCLE_COMPLETED
+    assert second.status == CYCLE_SKIPPED_NO_NEW_WINDOW
+    assert {result.detector_name for result in first.stage_results} == {
+        PACKET_RULE,
+        PACKET_IF,
+    }
+    assert {
+        result.capture_session_id for result in first.stage_results
+    } == {PACKET_SESSION_ID}
+
+    with SessionLocal() as db:
+        events = db.execute(
+            text(
+                """
+                SELECT dedupe_key, event_type, packet_feature_log_id
+                FROM detection_events
+                WHERE dedupe_key LIKE 'packet_rule:%'
+                   OR dedupe_key LIKE 'packet_if:%'
+                ORDER BY dedupe_key
+                """
+            )
+        ).mappings().all()
+        assert len(events) == 2
+        packet_if_event, packet_rule_event = events
+        assert packet_if_event["dedupe_key"].startswith(
+            f"packet_if:packet_feature_logs:{packet_feature_id}:"
+            "AI_PACKET_ANOMALY:"
+        )
+        assert packet_if_event["event_type"] == "AI_PACKET_ANOMALY"
+        assert packet_if_event["packet_feature_log_id"] == packet_feature_id
+        assert packet_rule_event["dedupe_key"].startswith(
+            f"packet_rule:packet_feature_logs:{packet_feature_id}:"
+            "PACKET_RATE_ANOMALY:"
+        )
+        assert packet_rule_event["event_type"] == "PACKET_RATE_ANOMALY"
+        assert packet_rule_event["packet_feature_log_id"] == packet_feature_id
+        assert _completed(
+            db,
+            PACKET_RULE,
+            "packet_feature_logs",
+        ) == BASE + timedelta(seconds=10)
+        assert _completed(
+            db,
+            PACKET_IF,
+            "packet_feature_logs",
+        ) == BASE + timedelta(seconds=10)
+        assert _completed(
+            db,
+            TRUST_DETECTOR_NAME,
+            TRUST_SOURCE_TABLE,
+        ) == BASE + timedelta(seconds=10)
+        assert _scalar(db, "SELECT COUNT(*) FROM trust_score_history") == 1
+        assert _scalar(
+            db,
+            f"SELECT trust_score FROM devices WHERE device_id = '{DEVICE_ID}'",
+        ) == 80
 
 
 def test_producer_and_orchestrator_checkpoints_stay_consistent(SessionLocal, registry):
