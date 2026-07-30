@@ -15,14 +15,20 @@ const unsigned int MAX_BURSTS = 4;
 const unsigned long PUBLISH_INTERVAL_MS = 50;
 const unsigned long BURST_START_INTERVAL_MS = 10000;
 const unsigned long MAX_TEST_DURATION_MS = 45000;
+const unsigned long OBSERVATION_TIMEOUT_MS = 45000;
+const unsigned long OBSERVATION_PROBE_INTERVAL_MS = 5000;
+const unsigned int MAX_OBSERVATION_PROBES = 9;
+const unsigned int OBSERVATION_CONNECT_TIMEOUT_SECONDS = 5;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 const unsigned long MQTT_CONNECT_TIMEOUT_MS = 10000;
+const unsigned int MQTT_CONNECT_SOCKET_TIMEOUT_SECONDS = 3;
+const unsigned int MQTT_CONNECT_MAX_ATTEMPTS = 2;
 
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
 
 bool testExecuted = false;
-unsigned long sequenceNumber = 0;
+unsigned long runStartedAt = 0;
 
 bool isPrivateBrokerAddress() {
   IPAddress brokerAddress;
@@ -60,10 +66,14 @@ bool connectWiFiWithTimeout() {
 bool connectMqttWithTimeout() {
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
   mqttClient.setBufferSize(256);
+  mqttClient.setSocketTimeout(MQTT_CONNECT_SOCKET_TIMEOUT_SECONDS);
 
   const unsigned long startedAt = millis();
+  unsigned int mqttConnectAttempt = 0;
   while (!mqttClient.connected() &&
-         millis() - startedAt < MQTT_CONNECT_TIMEOUT_MS) {
+         millis() - startedAt < MQTT_CONNECT_TIMEOUT_MS &&
+         mqttConnectAttempt < MQTT_CONNECT_MAX_ATTEMPTS) {
+    mqttConnectAttempt++;
     mqttClient.connect("phase4_attack_esp32_02");
     if (!mqttClient.connected()) {
       delay(500);
@@ -80,17 +90,8 @@ bool connectMqttWithTimeout() {
   return true;
 }
 
-String buildAttackPayload(
-    unsigned int burstIndex,
-    unsigned long sequence) {
-  const float temperature = 25.0 + ((sequence % 10) * 0.1);
-  const float humidity = 50.0 + (sequence % 5);
-
-  return String("{\"device_id\":\"") + DEVICE_ID +
-         "\",\"temperature\":" + String(temperature, 1) +
-         ",\"humidity\":" + String(humidity, 1) +
-         ",\"sequence\":" + sequence +
-         ",\"burst\":" + (burstIndex + 1) + "}";
+String buildCanonicalPayload() {
+  return String("{\"device_id\":\"") + DEVICE_ID + "\"}";
 }
 
 bool waitForBurstStart(
@@ -110,10 +111,13 @@ bool waitForBurstStart(
 }
 
 void runBoundedFloodTest() {
-  const unsigned long testStartedAt = millis();
+  runStartedAt = millis();
+  const unsigned long testStartedAt = runStartedAt;
   unsigned int publishedCount = 0;
   unsigned int failedCount = 0;
 
+  Serial.print("[TEST] run_started_at_device_ms=");
+  Serial.println(runStartedAt);
   Serial.println("[TEST] Limited MQTT Flood test started");
 
   for (unsigned int burstIndex = 0;
@@ -142,9 +146,7 @@ void runBoundedFloodTest() {
         break;
       }
 
-      sequenceNumber++;
-      const String payload =
-          buildAttackPayload(burstIndex, sequenceNumber);
+      const String payload = buildCanonicalPayload();
       const bool published =
           mqttClient.publish(MQTT_TOPIC, payload.c_str());
 
@@ -166,15 +168,106 @@ void runBoundedFloodTest() {
     Serial.println(failedCount);
   }
 
-  mqttClient.disconnect();
-  WiFi.disconnect(false);
-
   Serial.print("[DONE] published=");
   Serial.print(publishedCount);
   Serial.print(", failed=");
   Serial.print(failedCount);
   Serial.print(", elapsed_ms=");
   Serial.println(millis() - testStartedAt);
+}
+
+void logFirstObservationFailure(
+    unsigned long observationStartedAt,
+    const char* failureKind,
+    const char* publishResult) {
+  Serial.print("[OBSERVE] first_failure_run_elapsed_ms=");
+  Serial.print(millis() - runStartedAt);
+  Serial.print(", observation_elapsed_ms=");
+  Serial.print(millis() - observationStartedAt);
+  Serial.print(", failure_kind=");
+  Serial.print(failureKind);
+  Serial.print(", mqtt_state=");
+  Serial.print(mqttClient.state());
+  Serial.print(", publish_result=");
+  Serial.println(publishResult);
+}
+
+void runBoundedIsolationObservation() {
+  const unsigned long observationStartedAt = millis();
+  unsigned long lastProbeAt = observationStartedAt;
+  unsigned int observationProbeCount = 0;
+  bool firstFailureRecorded = false;
+
+  Serial.println("[OBSERVE] bounded isolation observation started");
+
+  while (millis() - observationStartedAt < OBSERVATION_TIMEOUT_MS &&
+         observationProbeCount < MAX_OBSERVATION_PROBES) {
+    mqttClient.loop();
+
+    if (!mqttClient.connected()) {
+      logFirstObservationFailure(
+          observationStartedAt,
+          "connection_lost",
+          "not_attempted");
+      firstFailureRecorded = true;
+      break;
+    }
+
+    if (millis() - lastProbeAt >= OBSERVATION_PROBE_INTERVAL_MS) {
+      const String payload = buildCanonicalPayload();
+      const bool publishResult =
+          mqttClient.publish(MQTT_TOPIC, payload.c_str());
+      observationProbeCount++;
+      lastProbeAt = millis();
+
+      Serial.print("[OBSERVE] probe=");
+      Serial.print(observationProbeCount);
+      Serial.print(", elapsed_ms=");
+      Serial.print(millis() - observationStartedAt);
+      Serial.print(", mqtt_state=");
+      Serial.print(mqttClient.state());
+      Serial.print(", publish_result=");
+      Serial.println(publishResult ? "success" : "failed");
+
+      if (!publishResult) {
+        logFirstObservationFailure(
+            observationStartedAt,
+            "probe_publish_failed",
+            "failed");
+        firstFailureRecorded = true;
+        break;
+      }
+    }
+
+    delay(50);
+  }
+
+  if (!firstFailureRecorded) {
+    Serial.println("[OBSERVE] no failure before observation timeout");
+  }
+
+  if (mqttClient.connected()) {
+    mqttClient.disconnect();
+  }
+
+  mqttClient.setSocketTimeout(OBSERVATION_CONNECT_TIMEOUT_SECONDS);
+  const bool reconnectResult =
+      mqttClient.connect("phase4_observation_esp32_02");
+  Serial.print("[OBSERVE] reconnect_run_elapsed_ms=");
+  Serial.print(millis() - runStartedAt);
+  Serial.print(", observation_elapsed_ms=");
+  Serial.print(millis() - observationStartedAt);
+  Serial.print(", mqtt_state=");
+  Serial.print(mqttClient.state());
+  Serial.print(", reconnect_result=");
+  Serial.println(reconnectResult ? "success" : "failed");
+
+  if (reconnectResult) {
+    mqttClient.disconnect();
+  }
+  WiFi.disconnect(false);
+
+  Serial.println("[OBSERVE] bounded isolation observation finished");
   Serial.println("[DONE] Restore normal_sender.ino before normal operation");
 }
 
@@ -203,6 +296,7 @@ void setup() {
   }
 
   runBoundedFloodTest();
+  runBoundedIsolationObservation();
 }
 
 void loop() {

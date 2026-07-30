@@ -117,7 +117,12 @@ Firmware입니다.
 - 기본값은 `ATTACK_TEST_ENABLED = false`입니다.
 - 사설 IPv4 Broker만 허용합니다.
 - 40개 메시지 Burst를 10초 간격으로 최대 4회만 실행합니다.
-- 부팅당 한 번, 최대 45초만 실행하고 MQTT 연결을 종료합니다.
+- 공격 Payload는 정상 기본 모드와 같은 `device_id` 전용 Canonical Schema를
+  사용합니다.
+- 공격 종료 후 정상 간격 Probe를 최대 45초·9건으로 제한하고, 기존 연결 종료 후
+  신규 MQTT 연결을 1회만 시도합니다.
+- 공격 전 MQTT 연결은 3초 Socket Timeout·최대 2회로 제한합니다.
+- 부팅당 한 번만 실행하며 관측 종료 후 MQTT와 Wi-Fi 연결을 종료합니다.
 - 정상 데이터 수집이나 일반 운영 Firmware로 사용하지 않습니다.
 
 실행 전 DB IP 매핑·서비스 상태 확인, 실행 중 증적 수집, Firewall 해제와 정상

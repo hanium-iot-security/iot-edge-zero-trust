@@ -9,7 +9,7 @@
 
 **Goal:** 실제 `esp32_02` Source IP로 제한된 MQTT Flood를 재현하고 정상 펌웨어로 안전하게 복구할 수 있는 ESP32 Sketch와 실기기 Runbook을 제공한다.
 
-**Architecture:** 정상 송신기와 별도의 `attack_sender` Sketch를 추가하고, 상수 기반 안전 계약을 Python 테스트에서 정적으로 검증한다. 공격 Sketch는 사설 Broker·명시적 활성화·부팅당 1회·4개 Burst·45초 상한을 강제하며, Runbook은 DB IP 확인부터 공격·격리·정상 복구까지 기록 가능한 절차를 제공한다.
+**Architecture:** 정상 송신기와 별도의 `attack_sender` Sketch를 추가하고, 상수 기반 안전 계약을 Python 테스트에서 정적으로 검증한다. 공격 Sketch는 사설 Broker·명시적 활성화·부팅당 1회·4개 Burst·45초 공격 상한과 별도 45초 차단 관측 상한을 강제하며, Runbook은 DB IP 확인부터 공격·격리·정상 복구까지 기록 가능한 절차를 제공한다.
 
 **Tech Stack:** Arduino ESP32, WiFi, PubSubClient, pytest, Markdown
 
@@ -17,7 +17,8 @@
 
 - 실제 Source IP는 DB에 등록된 `esp32_02`의 `devices.ip_address`와 일치해야 한다.
 - MQTT Broker는 `192.168.0.20:1883`, Topic은 `iot/esp32_02/sensor`이다.
-- 40건 Burst를 10초 간격으로 최대 4회 수행하며 전체 실행은 45초를 넘기지 않는다.
+- 40건 Burst를 10초 간격으로 최대 4회 수행하며 공격 전송은 45초를 넘기지 않는다.
+- 공격 후 Canonical Payload Probe는 5초 간격·최대 9건·45초로 제한하고 신규 MQTT 연결은 1회만 시도한다.
 - 공격 기능은 기본 비활성화하고 RFC1918 사설 IPv4 Broker에서만 실행한다.
 - 공격은 부팅당 한 번만 실행하고 종료 후 자동 반복하지 않는다.
 - 정상 데이터 공식 수집과 Trust·Firewall 정책 변경은 범위에 포함하지 않는다.
@@ -114,8 +115,13 @@ const unsigned int MAX_BURSTS = 4;
 const unsigned long PUBLISH_INTERVAL_MS = 50;
 const unsigned long BURST_START_INTERVAL_MS = 10000;
 const unsigned long MAX_TEST_DURATION_MS = 45000;
+const unsigned long OBSERVATION_TIMEOUT_MS = 45000;
+const unsigned long OBSERVATION_PROBE_INTERVAL_MS = 5000;
+const unsigned int MAX_OBSERVATION_PROBES = 9;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 const unsigned long MQTT_CONNECT_TIMEOUT_MS = 10000;
+const unsigned int MQTT_CONNECT_SOCKET_TIMEOUT_SECONDS = 3;
+const unsigned int MQTT_CONNECT_MAX_ATTEMPTS = 2;
 
 bool testExecuted = false;
 ```
@@ -142,10 +148,16 @@ for (unsigned int burstIndex = 0; burstIndex < MAX_BURSTS; burstIndex++) {
   // 각 메시지 뒤 PUBLISH_INTERVAL_MS만큼 대기
   // 다음 Burst는 첫 Burst 시작 기준 10초 배수까지 bounded wait
 }
-mqttClient.disconnect();
+runBoundedIsolationObservation();
 ```
 
-Payload는 `device_id`, `temperature`, `humidity`, `sequence`, `burst`를 포함한다. Publish 성공·실패 수와 Burst 시작·종료를 Serial에 남긴다. `setup()`은 비활성·공인 IP·연결 실패 시 즉시 안전 종료하고, 성공 시 `testExecuted=true` 설정 후 한 번만 실행한다. `loop()`은 재연결이나 재실행 없이 짧은 `delay()`만 수행한다.
+Payload는 정상 Firmware 기본 모드와 같은 `device_id` 전용 Canonical Schema를
+사용한다. Publish 순번, Burst 번호와 실행 추적 정보는 Serial 로그와 Run
+Manifest에만 남긴다. 공격 종료 후 `runBoundedIsolationObservation()`은 기존
+연결의 정상 간격 Probe를 관측하고 신규 MQTT 연결을 정확히 1회 시도한다.
+`setup()`은 비활성·공인 IP·연결 실패 시 즉시 안전 종료하고, 성공 시
+`testExecuted=true` 설정 후 한 번만 실행한다. `loop()`은 재연결이나 재실행 없이
+짧은 `delay()`만 수행한다.
 
 - [ ] **Step 7: 공격 Sketch 테스트 통과 확인**
 
@@ -190,9 +202,11 @@ def test_runbook_covers_registered_ip_services_and_private_test_scope() -> None:
     assert "firewall-worker.service" in text
 
 
-def test_runbook_covers_four_windows_evidence_and_normal_recovery() -> None:
+def test_runbook_covers_window_evidence_and_normal_recovery() -> None:
     text = RUNBOOK.read_text(encoding="utf-8")
-    assert "4개 Window" in text
+    assert "analysis_window_start" in text
+    assert "analysis_window_end" in text
+    assert "4회 Burst가 정확히 4개 Window를 보장하지 않습니다" in text
     assert "ABNORMAL_PUBLISH_RATE" in text
     assert "PENDING" in text and "APPLIED" in text
     assert "normal_sender.ino" in text
@@ -217,14 +231,16 @@ Expected: FAIL because the Runbook does not exist and README lacks the attack se
 Runbook에 다음 순서를 명령과 판정 기준까지 포함한다.
 
 1. 정상 Sketch와 ESP32 설정 백업
-2. `devices.ip_address`와 ESP32 Serial 출력 IP 비교
-3. Broker·API·Capture·Feature Builder·Orchestrator·Firewall Worker 상태 확인
-4. Firewall에 기존 `esp32_02` 차단 Rule이 없는지 확인
-5. `ATTACK_TEST_ENABLED=true` 변경 후 업로드
-6. Burst 4회와 4개 Window Event·Trust History 확인
-7. `firewall_rules`의 `PENDING → APPLIED` 및 ESP32 Publish 실패 확인
-8. 정상 Sketch 재업로드와 Firewall 해제 후 정상 Publish 재개 확인
-9. Commit SHA, Firmware SHA256, DB Row, Serial 로그, 실행·복구 시각 기록
+2. `devices.ip_address`, `status=normal`, `trust_score=100` Baseline 확인
+3. MQTT Subscriber 실행과 정상 Publish Pipeline Preflight 확인
+4. Broker·API·Capture·Feature Builder·Orchestrator·Firewall Worker 상태 확인
+5. Firewall에 기존 `esp32_02` 차단 Rule이 없는지 확인
+6. `ATTACK_TEST_ENABLED=true` 변경 후 업로드
+7. 실제 `analysis_window_start/end`별 Event·Trust History 확인
+8. `firewall_rules`의 `PENDING → APPLIED`와 별도 관측 단계의 ESP32 Publish·신규 연결 실패 확인
+9. 정상 Sketch 재업로드와 Firewall 해제 후 정상 Publish 재개 확인
+10. Baseline Reset이 불가능하면 `HOLD`, 복구 실패면 `RESET_FAILED`로 기록
+11. Commit SHA, Firmware SHA256, DB Row, Serial 로그, 실행·복구 시각 기록
 
 미실행 또는 일부 성공은 성공으로 꾸미지 않고 `미검증`으로 기록하도록 명시한다.
 
@@ -288,6 +304,8 @@ Expected: all commands exit 0; only intended firmware, test, Runbook, README, de
 - 실제 `esp32_02` 식별자와 고정 Topic
 - 기본 비활성·사설 IP·연결 제한 시간
 - 40건 × 4회·10초 간격·45초 상한·부팅당 1회
+- Canonical Payload와 45초·9 Probe 관측 및 신규 연결 1회 상한
+- Subscriber·Preflight·Baseline·Reset Gate
 - 정상 펌웨어 백업·복구
 - 실기기 미실행 결과를 `미검증`으로 유지
 
