@@ -230,12 +230,54 @@ class PacketRuleDetectorStage:
         cycle_range_start: datetime,
         cycle_cutoff: datetime,
     ) -> DetectorRunResult:
+        return self._run_until(
+            db,
+            cycle_range_start=cycle_range_start,
+            cycle_cutoff=cycle_cutoff,
+            expected_capture_session_id=None,
+        )
+
+    def run_until_for_capture_session(
+        self,
+        db: Session,
+        *,
+        cycle_range_start: datetime,
+        cycle_cutoff: datetime,
+        expected_capture_session_id: str,
+    ) -> DetectorRunResult:
+        return self._run_until(
+            db,
+            cycle_range_start=cycle_range_start,
+            cycle_cutoff=cycle_cutoff,
+            expected_capture_session_id=expected_capture_session_id,
+        )
+
+    def _run_until(
+        self,
+        db: Session,
+        *,
+        cycle_range_start: datetime,
+        cycle_cutoff: datetime,
+        expected_capture_session_id: str | None,
+    ) -> DetectorRunResult:
         range_start, cutoff = validate_cycle_window(
             cycle_range_start=cycle_range_start,
             cycle_cutoff=cycle_cutoff,
         )
         before = _checkpoint_before(db)
-        rows = _select_packet_feature_rows(db, range_start=range_start, cutoff=cutoff)
+        if expected_capture_session_id is not None:
+            _validate_expected_capture_session(
+                db,
+                range_start=range_start,
+                cutoff=cutoff,
+                expected_capture_session_id=expected_capture_session_id,
+            )
+        rows = _select_packet_feature_rows(
+            db,
+            range_start=range_start,
+            cutoff=cutoff,
+            expected_capture_session_id=expected_capture_session_id,
+        )
         _validate_single_capture_session(rows)
 
         created_count = 0
@@ -315,6 +357,11 @@ class PacketRuleDetectorStage:
             last_processed_id_after=last_processed_after,
             completed_window_end_before=before["last_completed_window_end"],
             completed_window_end_after=cutoff,
+            capture_session_id=(
+                expected_capture_session_id
+                if expected_capture_session_id is not None
+                else _capture_session_id(rows)
+            ),
         )
 
 
@@ -341,6 +388,7 @@ def _select_packet_feature_rows(
     *,
     range_start: datetime,
     cutoff: datetime,
+    expected_capture_session_id: str | None = None,
 ) -> list[dict[str, Any]]:
     # Packet Rule은 등록 Device 여부와 무관하게 INBOUND 트래픽 전체를 대상으로
     # 한다 (미매핑 IP도 Event 저장 대상, Packet IF보다 넓은 범위). PORT_SCAN·
@@ -379,15 +427,58 @@ def _select_packet_feature_rows(
             WHERE pfl.direction = 'INBOUND'
               AND unixepoch(pfl.window_start) >= unixepoch(:range_start)
               AND unixepoch(pfl.window_end) <= unixepoch(:cutoff)
+              AND (
+                    :expected_capture_session_id IS NULL
+                    OR pcss.session_id = :expected_capture_session_id
+              )
             ORDER BY pfl.id ASC
             """
         ),
         {
             "range_start": format_db_utc(range_start),
             "cutoff": format_db_utc(cutoff),
+            "expected_capture_session_id": expected_capture_session_id,
         },
     ).mappings()
     return [dict(row) for row in rows]
+
+
+def _validate_expected_capture_session(
+    db: Session,
+    *,
+    range_start: datetime,
+    cutoff: datetime,
+    expected_capture_session_id: str,
+) -> None:
+    session_ids = {
+        str(value)
+        for value in db.execute(
+            text(
+                """
+                SELECT DISTINCT pcss.session_id
+                FROM packet_feature_logs pfl
+                JOIN packet_capture_segments pcs
+                    ON pcs.id = pfl.capture_segment_id
+                JOIN packet_capture_sessions pcss
+                    ON pcss.id = pcs.capture_session_id
+                WHERE pfl.direction = 'INBOUND'
+                  AND unixepoch(pfl.window_start) >= unixepoch(:range_start)
+                  AND unixepoch(pfl.window_end) <= unixepoch(:cutoff)
+                """
+            ),
+            {
+                "range_start": format_db_utc(range_start),
+                "cutoff": format_db_utc(cutoff),
+            },
+        ).scalars()
+    }
+    unexpected = session_ids - {expected_capture_session_id}
+    if unexpected:
+        raise RuntimeError(
+            "Packet Rule source rows include unexpected Capture Session(s): "
+            + ", ".join(sorted(unexpected))
+            + f"; expected={expected_capture_session_id}"
+        )
 
 
 def _validate_source_window(row: dict[str, Any]) -> None:
@@ -413,6 +504,12 @@ def _validate_single_capture_session(rows: list[dict[str, Any]]) -> None:
             "Packet Rule cycle must not mix Capture Sessions: "
             + ", ".join(sorted(session_ids))
         )
+
+
+def _capture_session_id(rows: list[dict[str, Any]]) -> str | None:
+    if not rows:
+        return None
+    return str(rows[0]["session_id"])
 
 
 def _capture_eligibility(

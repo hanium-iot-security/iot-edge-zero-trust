@@ -360,6 +360,72 @@ def test_packet_if_stage_rejects_mixed_capture_sessions_without_db_changes(
         ) is None
 
 
+def test_packet_if_expected_capture_session_is_recorded_in_result(
+    SessionLocal,
+) -> None:
+    with SessionLocal() as db:
+        _insert_device(db)
+        session_pk = _insert_capture_session(db)
+        _insert_packet_source(
+            db,
+            session_pk=session_pk,
+            feature_id=1,
+            segment_id=1,
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            result = _stage(raw_scores=[0.2]).run_until_for_capture_session(
+                db,
+                cycle_range_start=RANGE_START,
+                cycle_cutoff=CUTOFF,
+                expected_capture_session_id=SESSION_ID,
+            )
+
+    assert result.capture_session_id == SESSION_ID
+    assert result.selected_count == 1
+
+
+def test_packet_if_feature_from_unexpected_capture_session_is_rejected(
+    SessionLocal,
+) -> None:
+    with SessionLocal() as db:
+        _insert_device(db)
+        _insert_capture_session(db, session_id=SESSION_ID)
+        other_session_pk = _insert_capture_session(
+            db,
+            session_id=SECOND_SESSION_ID,
+        )
+        _insert_packet_source(
+            db,
+            session_pk=other_session_pk,
+            feature_id=1,
+            segment_id=1,
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        with pytest.raises(RuntimeError, match="unexpected Capture Session"):
+            with db.begin():
+                _stage(raw_scores=[0.2]).run_until_for_capture_session(
+                    db,
+                    cycle_range_start=RANGE_START,
+                    cycle_cutoff=CUTOFF,
+                    expected_capture_session_id=SESSION_ID,
+                )
+
+    with SessionLocal() as db:
+        assert db.execute(
+            text("SELECT COUNT(*) FROM detection_events")
+        ).scalar_one() == 0
+        assert get_detector_checkpoint(
+            db,
+            detector_name="packet_if",
+            source_table="packet_feature_logs",
+        ) is None
+
+
 def test_packet_if_stage_rolls_back_event_and_checkpoint_on_writer_failure(
     SessionLocal,
     monkeypatch: pytest.MonkeyPatch,

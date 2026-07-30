@@ -61,6 +61,8 @@ Implemented adapters:
 - `MqttFeatureRuleStage`
 - `MqttMessageRuleStage`
 - `MqttIsolationForestStage`
+- `PacketRuleDetectorStage`
+- `PacketIsolationForestStage`
 
 They keep the existing MQTT rule and Isolation Forest meaning. They add incremental source selection, Phase 4 event writing, deterministic evidence JSON, dedupe keys, and checkpoint updates.
 
@@ -96,16 +98,28 @@ Evidence JSON is deterministic and must not contain secrets, credentials, full p
 
 If a later stage fails, previously committed stage results are not rolled back. The failed stage transaction is rolled back and the exception is re-raised.
 
-This PR intentionally implements only the stage transaction foundation. The full P4-4-01 runtime orchestrator remains follow-up work:
+The runtime orchestrator now provides watermark-based cycle boundaries, required
+stage barriers, Trust Score invocation, a single-process lock, structured failure
+logs, and Packet Rule/Packet IF stage registration.
 
-- watermark calculation
-- packet ready range selection
-- required barrier handling
-- Trust Score invocation from the runtime loop
-- single-process lock
-- structured runtime logging
+Packet stages are wrapped by `PacketFeatureReadyStage`. Before a Packet detector
+runs, it verifies that the entire cycle range belongs to one Capture Session's
+contiguous `PROCESSED`/`EMPTY` prefix. `READY`, `FAILED`, missing windows, and
+Session Gaps do not advance Packet checkpoints or Trust. When the Packet layer is
+required, the common cycle cutoff is the earlier of the MQTT producer watermark
+and the Packet Feature ready-through boundary, so a continuously lagging Packet
+extractor does not starve every cycle. Packet IF additionally requires a verified
+model artifact path, version, and SHA256 at startup.
 
-Producer runner, environment wiring beyond API CORS settings, systemd integration, Raspberry Pi watermark validation, Packet Rule implementation, Packet IF implementation, and Firewall Worker execution are outside this PR.
+If the Capture Session is not present yet or its first contiguous
+`PROCESSED`/`EMPTY` prefix is not ready, the runtime records
+`SKIPPED_PACKET_NOT_READY` and leaves detector and Trust checkpoints unchanged.
+This is a retryable startup or lag state: the process remains alive and retries
+on the next cycle. Window mismatch, mixed Capture Sessions, invalid timing
+metadata, and invalid model artifacts remain fail-fast integrity errors.
+
+Raspberry Pi deployment verification, final Packet IF model training, and
+operator-driven Session Gap recovery remain operational follow-up work.
 
 ## Detection Orchestrator Runtime
 

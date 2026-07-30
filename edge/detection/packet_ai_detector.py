@@ -26,7 +26,7 @@ from ai.predict_packet_isolation_forest import (
     load_packet_if_artifact,
     predict_packet_feature_rows,
 )
-from backend.app.config import settings
+from backend.app.config import Settings, settings
 from edge.detection import runtime_checkpoint_repository as checkpoints
 from edge.detection.detection_event_writer import write_detection_event
 from edge.detection.detector_contract import DetectorRunResult, validate_cycle_window
@@ -93,22 +93,24 @@ class PacketIsolationForestStage:
     def from_settings(
         cls,
         *,
+        app_settings: Settings | None = None,
         artifact_dir: Path | None = None,
         expected_model_version: str | None = None,
         expected_bundle_sha256: str | None = None,
         capture_policy: CapturePolicy | None = None,
     ) -> "PacketIsolationForestStage":
+        configured_settings = app_settings or settings
         configured_path = (
             str(artifact_dir)
             if artifact_dir is not None
-            else settings.packet_if_artifact_dir.strip()
+            else configured_settings.packet_if_artifact_dir.strip()
         )
         if not configured_path:
             raise ValueError("PACKET_IF_ARTIFACT_DIR must be configured")
         expected_version = (
             expected_model_version
             if expected_model_version is not None
-            else settings.packet_if_expected_model_version
+            else configured_settings.packet_if_expected_model_version
         )
         expected_version = expected_version.strip()
         if not expected_version:
@@ -118,7 +120,7 @@ class PacketIsolationForestStage:
         expected_bundle = (
             expected_bundle_sha256
             if expected_bundle_sha256 is not None
-            else settings.packet_if_expected_bundle_sha256
+            else configured_settings.packet_if_expected_bundle_sha256
         )
         expected_bundle = expected_bundle.strip()
         if not expected_bundle:
@@ -132,7 +134,17 @@ class PacketIsolationForestStage:
                 expected_model_version=expected_version,
             ),
             expected_model_version=expected_version,
-            capture_policy=capture_policy or CapturePolicy.from_env(),
+            capture_policy=capture_policy
+            or CapturePolicy(
+                max_start_delay_seconds=(
+                    configured_settings.pcap_max_start_delay_seconds
+                ),
+                minimum_duration_seconds=(
+                    configured_settings.packet_min_capture_duration_seconds
+                ),
+                epsilon_seconds=configured_settings.capture_time_epsilon_seconds,
+                version=configured_settings.capture_policy_version,
+            ),
         )
 
     def run_until(
@@ -142,15 +154,53 @@ class PacketIsolationForestStage:
         cycle_range_start: datetime,
         cycle_cutoff: datetime,
     ) -> DetectorRunResult:
+        return self._run_until(
+            db,
+            cycle_range_start=cycle_range_start,
+            cycle_cutoff=cycle_cutoff,
+            expected_capture_session_id=None,
+        )
+
+    def run_until_for_capture_session(
+        self,
+        db: Session,
+        *,
+        cycle_range_start: datetime,
+        cycle_cutoff: datetime,
+        expected_capture_session_id: str,
+    ) -> DetectorRunResult:
+        return self._run_until(
+            db,
+            cycle_range_start=cycle_range_start,
+            cycle_cutoff=cycle_cutoff,
+            expected_capture_session_id=expected_capture_session_id,
+        )
+
+    def _run_until(
+        self,
+        db: Session,
+        *,
+        cycle_range_start: datetime,
+        cycle_cutoff: datetime,
+        expected_capture_session_id: str | None,
+    ) -> DetectorRunResult:
         range_start, cutoff = validate_cycle_window(
             cycle_range_start=cycle_range_start,
             cycle_cutoff=cycle_cutoff,
         )
         before = _checkpoint_before(db)
+        if expected_capture_session_id is not None:
+            _validate_expected_capture_session(
+                db,
+                range_start=range_start,
+                cutoff=cutoff,
+                expected_capture_session_id=expected_capture_session_id,
+            )
         rows = _select_packet_feature_rows(
             db,
             range_start=range_start,
             cutoff=cutoff,
+            expected_capture_session_id=expected_capture_session_id,
         )
         _validate_single_capture_session(rows)
 
@@ -251,6 +301,11 @@ class PacketIsolationForestStage:
             last_processed_id_after=last_processed_after,
             completed_window_end_before=before["last_completed_window_end"],
             completed_window_end_after=cutoff,
+            capture_session_id=(
+                expected_capture_session_id
+                if expected_capture_session_id is not None
+                else _capture_session_id(rows)
+            ),
         )
 
 
@@ -283,6 +338,7 @@ def _select_packet_feature_rows(
     *,
     range_start: datetime,
     cutoff: datetime,
+    expected_capture_session_id: str | None = None,
 ) -> list[dict[str, Any]]:
     rows = db.execute(
         text(
@@ -319,15 +375,57 @@ def _select_packet_feature_rows(
                 ON d.device_id = pfl.device_id
             WHERE unixepoch(pfl.window_start) >= unixepoch(:range_start)
               AND unixepoch(pfl.window_end) <= unixepoch(:cutoff)
+              AND (
+                    :expected_capture_session_id IS NULL
+                    OR pcss.session_id = :expected_capture_session_id
+              )
             ORDER BY pfl.id ASC
             """
         ),
         {
             "range_start": format_db_utc(range_start),
             "cutoff": format_db_utc(cutoff),
+            "expected_capture_session_id": expected_capture_session_id,
         },
     ).mappings()
     return [dict(row) for row in rows]
+
+
+def _validate_expected_capture_session(
+    db: Session,
+    *,
+    range_start: datetime,
+    cutoff: datetime,
+    expected_capture_session_id: str,
+) -> None:
+    session_ids = {
+        str(value)
+        for value in db.execute(
+            text(
+                """
+                SELECT DISTINCT pcss.session_id
+                FROM packet_feature_logs pfl
+                JOIN packet_capture_segments pcs
+                    ON pcs.id = pfl.capture_segment_id
+                JOIN packet_capture_sessions pcss
+                    ON pcss.id = pcs.capture_session_id
+                WHERE unixepoch(pfl.window_start) >= unixepoch(:range_start)
+                  AND unixepoch(pfl.window_end) <= unixepoch(:cutoff)
+                """
+            ),
+            {
+                "range_start": format_db_utc(range_start),
+                "cutoff": format_db_utc(cutoff),
+            },
+        ).scalars()
+    }
+    unexpected = session_ids - {expected_capture_session_id}
+    if unexpected:
+        raise RuntimeError(
+            "Packet IF source rows include unexpected Capture Session(s): "
+            + ", ".join(sorted(unexpected))
+            + f"; expected={expected_capture_session_id}"
+        )
 
 
 def _validate_source_window(row: dict[str, Any]) -> None:
@@ -354,6 +452,12 @@ def _validate_single_capture_session(rows: list[dict[str, Any]]) -> None:
             "Packet IF cycle must not mix Capture Sessions: "
             + ", ".join(sorted(session_ids))
         )
+
+
+def _capture_session_id(rows: list[dict[str, Any]]) -> str | None:
+    if not rows:
+        return None
+    return str(rows[0]["session_id"])
 
 
 def _runtime_eligibility(

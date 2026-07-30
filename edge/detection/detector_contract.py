@@ -23,6 +23,7 @@ class DetectorRunResult:
     last_processed_id_after: int | None
     completed_window_end_before: datetime | None
     completed_window_end_after: datetime
+    capture_session_id: str | None = None
 
 
 class DetectorStage(Protocol):
