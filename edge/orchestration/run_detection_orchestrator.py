@@ -54,7 +54,11 @@ from edge.features.collect_feature_logs import MQTT_FEATURE_BUILDER, MQTT_LOGS_S
 from edge.orchestration.packet_stage_readiness import (
     get_packet_feature_readiness_for_range_start,
 )
-from edge.orchestration.stage_registry import StageRegistry, load_stage_registry
+from edge.orchestration.stage_registry import (
+    PACKET_STAGE_NAMES,
+    StageRegistry,
+    load_stage_registry,
+)
 from edge.runtime_lock import RuntimeLockError, single_instance_lock
 from edge.runtime_lock import resolve_lock_path as _resolve_lock_path
 from edge.trust.trust_score_v2 import (
@@ -192,6 +196,59 @@ def earliest_source_window_start(db: Session) -> datetime | None:
     return min(candidates) if candidates else None
 
 
+def resolve_initial_packet_activation_boundary(
+    db: Session,
+    *,
+    registry: StageRegistry,
+    range_start: datetime,
+    cutoff: datetime,
+) -> datetime | None:
+    """Return the first Capture Session boundary for an uninitialized Packet layer.
+
+    This is intentionally limited to the initial state. Once any enabled Packet
+    stage has processed data or owns a completed-window boundary, later Capture
+    Session gaps must continue to block the orchestrator.
+    """
+    packet_stages = tuple(
+        configured
+        for configured in registry.stages
+        if configured.name in PACKET_STAGE_NAMES
+    )
+    if not packet_stages:
+        return None
+
+    for configured in packet_stages:
+        checkpoint = checkpoints.get_detector_checkpoint(
+            db,
+            detector_name=configured.stage.detector_name,
+            source_table=configured.stage.source_table,
+        )
+        if checkpoint is not None and (
+            checkpoint["last_processed_id"] is not None
+            or checkpoint["last_completed_window_end"] is not None
+        ):
+            return None
+
+    first_window_start = db.execute(
+        text(
+            """
+            SELECT MIN(first_window_start)
+            FROM packet_capture_sessions
+            WHERE first_window_start IS NOT NULL
+              AND unixepoch(first_window_start) > unixepoch(:range_start)
+              AND unixepoch(first_window_start) <= unixepoch(:cutoff)
+            """
+        ),
+        {
+            "range_start": format_db_utc(range_start),
+            "cutoff": format_db_utc(cutoff),
+        },
+    ).scalar()
+    if first_window_start is None:
+        return None
+    return parse_db_utc(first_window_start, "first_window_start")
+
+
 def run_orchestration_cycle(
     *,
     session_factory: SessionFactory = SessionLocal,
@@ -214,6 +271,7 @@ def run_orchestration_cycle(
             )
             return CycleOutcome(status=CYCLE_SKIPPED_NO_WATERMARK)
         range_start = resolve_cycle_range_start(db, registry=registry, cutoff=cutoff)
+        packet_activation_boundary: datetime | None = None
         if registry.packet_layer_required:
             packet_readiness = get_packet_feature_readiness_for_range_start(
                 db,
@@ -223,33 +281,50 @@ def run_orchestration_cycle(
                 packet_readiness is None
                 or packet_readiness.first_window_start is None
             ):
+                packet_activation_boundary = (
+                    resolve_initial_packet_activation_boundary(
+                        db,
+                        registry=registry,
+                        range_start=range_start,
+                        cutoff=cutoff,
+                    )
+                )
+                if packet_activation_boundary is None:
+                    logger.info(
+                        "event=CYCLE_SKIPPED reason=PACKET_NOT_READY "
+                        "detail=NO_CAPTURE_SESSION range_start=%s cutoff=%s",
+                        format_db_utc(range_start),
+                        format_db_utc(cutoff),
+                    )
+                    return CycleOutcome(
+                        status=CYCLE_SKIPPED_PACKET_NOT_READY,
+                        range_start=range_start,
+                        cutoff=cutoff,
+                    )
+                cutoff = packet_activation_boundary
                 logger.info(
-                    "event=CYCLE_SKIPPED reason=PACKET_NOT_READY "
-                    "detail=NO_CAPTURE_SESSION range_start=%s cutoff=%s",
+                    "event=PACKET_INITIAL_ACTIVATION range_start=%s "
+                    "activation_boundary=%s",
                     format_db_utc(range_start),
-                    format_db_utc(cutoff),
+                    format_db_utc(packet_activation_boundary),
                 )
-                return CycleOutcome(
-                    status=CYCLE_SKIPPED_PACKET_NOT_READY,
-                    range_start=range_start,
-                    cutoff=cutoff,
-                )
-            packet_ready_through = packet_readiness.packet_feature_ready_through
-            if packet_ready_through is None:
-                logger.info(
-                    "event=CYCLE_SKIPPED reason=PACKET_NOT_READY "
-                    "detail=NO_CONTIGUOUS_PREFIX session_id=%s "
-                    "range_start=%s cutoff=%s",
-                    packet_readiness.session_id,
-                    format_db_utc(range_start),
-                    format_db_utc(cutoff),
-                )
-                return CycleOutcome(
-                    status=CYCLE_SKIPPED_PACKET_NOT_READY,
-                    range_start=range_start,
-                    cutoff=cutoff,
-                )
-            cutoff = min(cutoff, packet_ready_through)
+            else:
+                packet_ready_through = packet_readiness.packet_feature_ready_through
+                if packet_ready_through is None:
+                    logger.info(
+                        "event=CYCLE_SKIPPED reason=PACKET_NOT_READY "
+                        "detail=NO_CONTIGUOUS_PREFIX session_id=%s "
+                        "range_start=%s cutoff=%s",
+                        packet_readiness.session_id,
+                        format_db_utc(range_start),
+                        format_db_utc(cutoff),
+                    )
+                    return CycleOutcome(
+                        status=CYCLE_SKIPPED_PACKET_NOT_READY,
+                        range_start=range_start,
+                        cutoff=cutoff,
+                    )
+                cutoff = min(cutoff, packet_ready_through)
 
     if range_start >= cutoff:
         logger.debug(
@@ -272,7 +347,25 @@ def run_orchestration_cycle(
     )
 
     stage_results: list[DetectorRunResult] = []
-    for configured in registry.stages:
+    stages = (
+        tuple(
+            configured
+            for configured in registry.stages
+            if configured.name not in PACKET_STAGE_NAMES
+        )
+        if packet_activation_boundary is not None
+        else registry.stages
+    )
+    for configured in stages:
+        if packet_activation_boundary is not None:
+            with session_factory() as db:
+                completed = checkpoints.get_completed_window_end(
+                    db,
+                    detector_name=configured.stage.detector_name,
+                    source_table=configured.stage.source_table,
+                )
+            if completed is not None and completed >= cutoff:
+                continue
         try:
             detection = run_detection_cycle(
                 session_factory=session_factory,
@@ -308,6 +401,11 @@ def run_orchestration_cycle(
 
     with session_factory() as db:
         for configured in registry.required_stages:
+            if (
+                packet_activation_boundary is not None
+                and configured.name in PACKET_STAGE_NAMES
+            ):
+                continue
             ensure_checkpoint_completed(
                 db,
                 detector_name=configured.stage.detector_name,
@@ -315,16 +413,25 @@ def run_orchestration_cycle(
                 cutoff=cutoff,
             )
 
-    db = session_factory()
-    try:
-        with db.begin():
-            trust_result = apply_trust_score_v2_until(
-                db,
-                cycle_range_start=range_start,
-                cycle_cutoff=cutoff,
-            )
-    finally:
-        db.close()
+    with session_factory() as db:
+        trust_completed = checkpoints.get_completed_window_end(
+            db,
+            detector_name=TRUST_DETECTOR_NAME,
+            source_table=TRUST_SOURCE_TABLE,
+        )
+
+    trust_result: TrustScoreV2RunResult | None = None
+    if trust_completed is None or trust_completed < cutoff:
+        db = session_factory()
+        try:
+            with db.begin():
+                trust_result = apply_trust_score_v2_until(
+                    db,
+                    cycle_range_start=range_start,
+                    cycle_cutoff=cutoff,
+                )
+        finally:
+            db.close()
 
     with session_factory() as db:
         ensure_checkpoint_completed(
@@ -334,16 +441,34 @@ def run_orchestration_cycle(
             cutoff=cutoff,
         )
 
+    if packet_activation_boundary is not None:
+        db = session_factory()
+        try:
+            with db.begin():
+                for configured in registry.stages:
+                    if configured.name not in PACKET_STAGE_NAMES:
+                        continue
+                    checkpoints.upsert_detector_checkpoint(
+                        db,
+                        detector_name=configured.stage.detector_name,
+                        source_table=configured.stage.source_table,
+                        last_processed_id=None,
+                        last_completed_window_end=packet_activation_boundary,
+                        updated_at=packet_activation_boundary,
+                    )
+        finally:
+            db.close()
+
     logger.info(
         "event=CYCLE_COMPLETED range_start=%s cutoff=%s stages=%d trust_events=%d "
         "trust_history=%d isolations=%d firewall_pending=%d",
         format_db_utc(range_start),
         format_db_utc(cutoff),
         len(stage_results),
-        trust_result.processed_event_count,
-        trust_result.created_history_count,
-        trust_result.created_isolation_count,
-        trust_result.created_firewall_rule_count,
+        trust_result.processed_event_count if trust_result is not None else 0,
+        trust_result.created_history_count if trust_result is not None else 0,
+        trust_result.created_isolation_count if trust_result is not None else 0,
+        trust_result.created_firewall_rule_count if trust_result is not None else 0,
     )
     return CycleOutcome(
         status=CYCLE_COMPLETED,

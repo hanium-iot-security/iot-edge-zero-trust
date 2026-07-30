@@ -515,6 +515,219 @@ def test_required_packet_stage_retries_after_ready_prefix_is_completed(SessionLo
         ) == BASE + timedelta(seconds=10)
 
 
+def test_initial_packet_activation_catches_up_mqtt_before_first_capture(SessionLocal):
+    session_id = "12345678-1234-4234-8234-1234567890ad"
+    first_capture_start = BASE + timedelta(seconds=10)
+    with SessionLocal() as db:
+        _flood_window(db, window_index=0)
+        _flood_window(db, window_index=1)
+        session_pk = capture_sessions.create_session(
+            db,
+            session_id=session_id,
+            capture_interface="eth0",
+            started_at=first_capture_start,
+        )
+        capture_sessions.set_first_window_start(db, session_pk, first_capture_start)
+        segment_id = capture_sessions.insert_ready_segment(
+            db,
+            capture_session_pk=session_pk,
+            file_name=f"capture_{session_id}_eth0_ready.pcap",
+            capture_interface="eth0",
+            window_start=first_capture_start,
+            window_end=first_capture_start + timedelta(seconds=10),
+        )
+        db.commit()
+
+    run_producer_cycle(session_factory=SessionLocal, now=BASE + timedelta(seconds=21))
+    packet_registry = build_stage_registry(
+        enabled=[MQTT_FEATURE_RULE, PACKET_RULE],
+        required=[MQTT_FEATURE_RULE, PACKET_RULE],
+    )
+
+    activation = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=packet_registry,
+    )
+
+    assert activation.status == CYCLE_COMPLETED
+    assert activation.range_start == BASE
+    assert activation.cutoff == first_capture_start
+    with SessionLocal() as db:
+        assert _completed(
+            db,
+            MQTT_FEATURE_RULE,
+            "feature_logs",
+        ) == first_capture_start
+        assert _completed(
+            db,
+            "packet_rule",
+            "packet_feature_logs",
+        ) == first_capture_start
+        assert _completed(
+            db,
+            TRUST_DETECTOR_NAME,
+            TRUST_SOURCE_TABLE,
+        ) == first_capture_start
+        assert _scalar(
+            db,
+            """
+            SELECT COUNT(*)
+            FROM detection_events
+            WHERE event_type = 'ABNORMAL_PUBLISH_RATE'
+              AND analysis_window_start = '2026-07-25T12:00:00Z'
+              AND processed_at IS NOT NULL
+            """,
+        ) == 1
+
+        db.execute(
+            text(
+                """
+                UPDATE packet_capture_segments
+                SET status = 'EMPTY', packet_count = 0, processed_at = :processed_at
+                WHERE id = :segment_id
+                """
+            ),
+            {
+                "segment_id": segment_id,
+                "processed_at": format_db_utc(
+                    first_capture_start + timedelta(seconds=10)
+                ),
+            },
+        )
+        db.commit()
+
+    resumed = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=packet_registry,
+    )
+
+    assert resumed.status == CYCLE_COMPLETED
+    assert resumed.range_start == first_capture_start
+    assert resumed.cutoff == first_capture_start + timedelta(seconds=10)
+    with SessionLocal() as db:
+        assert _completed(
+            db,
+            "packet_rule",
+            "packet_feature_logs",
+        ) == first_capture_start + timedelta(seconds=10)
+
+
+def test_packet_activation_does_not_bridge_a_later_capture_session_gap(SessionLocal):
+    first_session_id = "12345678-1234-4234-8234-1234567890ae"
+    second_session_id = "12345678-1234-4234-8234-1234567890af"
+    first_capture_start = BASE + timedelta(seconds=10)
+    with SessionLocal() as db:
+        for window_index in range(4):
+            _flood_window(db, window_index=window_index)
+        first_session_pk = capture_sessions.create_session(
+            db,
+            session_id=first_session_id,
+            capture_interface="eth0",
+            started_at=first_capture_start,
+        )
+        capture_sessions.set_first_window_start(
+            db,
+            first_session_pk,
+            first_capture_start,
+        )
+        first_segment_id = capture_sessions.insert_ready_segment(
+            db,
+            capture_session_pk=first_session_pk,
+            file_name=f"capture_{first_session_id}_eth0_empty.pcap",
+            capture_interface="eth0",
+            window_start=first_capture_start,
+            window_end=first_capture_start + timedelta(seconds=10),
+        )
+        db.execute(
+            text(
+                """
+                UPDATE packet_capture_segments
+                SET status = 'EMPTY', packet_count = 0, processed_at = :processed_at
+                WHERE id = :segment_id
+                """
+            ),
+            {
+                "segment_id": first_segment_id,
+                "processed_at": format_db_utc(
+                    first_capture_start + timedelta(seconds=10)
+                ),
+            },
+        )
+
+        second_capture_start = BASE + timedelta(seconds=30)
+        second_session_pk = capture_sessions.create_session(
+            db,
+            session_id=second_session_id,
+            capture_interface="eth0",
+            started_at=second_capture_start,
+        )
+        capture_sessions.set_first_window_start(
+            db,
+            second_session_pk,
+            second_capture_start,
+        )
+        second_segment_id = capture_sessions.insert_ready_segment(
+            db,
+            capture_session_pk=second_session_pk,
+            file_name=f"capture_{second_session_id}_eth0_empty.pcap",
+            capture_interface="eth0",
+            window_start=second_capture_start,
+            window_end=second_capture_start + timedelta(seconds=10),
+        )
+        db.execute(
+            text(
+                """
+                UPDATE packet_capture_segments
+                SET status = 'EMPTY', packet_count = 0, processed_at = :processed_at
+                WHERE id = :segment_id
+                """
+            ),
+            {
+                "segment_id": second_segment_id,
+                "processed_at": format_db_utc(
+                    second_capture_start + timedelta(seconds=10)
+                ),
+            },
+        )
+        db.commit()
+
+    run_producer_cycle(session_factory=SessionLocal, now=BASE + timedelta(seconds=41))
+    packet_registry = build_stage_registry(
+        enabled=[MQTT_FEATURE_RULE, PACKET_RULE],
+        required=[MQTT_FEATURE_RULE, PACKET_RULE],
+    )
+
+    activation = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=packet_registry,
+    )
+    first_packet_cycle = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=packet_registry,
+    )
+    blocked_at_gap = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=packet_registry,
+    )
+
+    assert activation.status == CYCLE_COMPLETED
+    assert activation.cutoff == first_capture_start
+    assert first_packet_cycle.status == CYCLE_COMPLETED
+    assert first_packet_cycle.cutoff == first_capture_start + timedelta(seconds=10)
+    assert blocked_at_gap.status == CYCLE_SKIPPED_NO_NEW_WINDOW
+    with SessionLocal() as db:
+        assert _completed(
+            db,
+            "packet_rule",
+            "packet_feature_logs",
+        ) == first_capture_start + timedelta(seconds=10)
+        assert _completed(
+            db,
+            TRUST_DETECTOR_NAME,
+            TRUST_SOURCE_TABLE,
+        ) == first_capture_start + timedelta(seconds=10)
+
+
 def test_required_packet_stage_accepts_contiguous_empty_prefix(SessionLocal):
     session_id = "12345678-1234-4234-8234-1234567890ab"
     with SessionLocal() as db:
