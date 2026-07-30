@@ -55,7 +55,8 @@ class PacketRulePolicy:
 
     Pilot 실측 P95/P99가 나오기 전까지의 잠정 임계값이다. 실제 정상 분포가
     확인되면 조정하되, 바꿀 때는 반드시 version도 함께 올려서 Evidence에 어떤
-    Policy Version으로 판정됐는지 남긴다 (Policy Version, Session, 표본 수, P95·P99, Commit을 기록한다).
+    Policy Version으로 판정됐는지 남긴다 (Policy Version, Session,
+    표본 수, P95·P99, Commit을 기록한다).
     """
 
     packet_rate_threshold: float
@@ -166,9 +167,10 @@ def detect_packet_rules(
 
     distinct_dest_port_count = int(row["distinct_dest_port_count"])
     tcp_syn_count = int(row["tcp_syn_count"])
+
     if (
         distinct_dest_port_count > policy.port_scan_distinct_port_threshold
-        or tcp_syn_count > policy.port_scan_syn_threshold
+        and tcp_syn_count > policy.port_scan_syn_threshold
     ):
         events.append(
             {

@@ -251,40 +251,67 @@ class TestDetectPacketRules:
         events = detect_packet_rules(row, TEST_POLICY)
         assert [e["event_type"] for e in events] == ["BYTE_RATE_ANOMALY"]
 
-    def test_port_scan_by_distinct_ports(self) -> None:
-        row = self._row(distinct_dest_port_count=20)
+    def test_port_scan_requires_both_distinct_ports_and_syn(self) -> None:
+        """다수 목적지 Port와 높은 SYN이 함께 존재하면 PORT_SCAN이 생성된다."""
+        row = self._row(distinct_dest_port_count=20, tcp_syn_count=20)
         events = detect_packet_rules(row, TEST_POLICY)
         assert [e["event_type"] for e in events] == ["PORT_SCAN"]
 
-    def test_port_scan_by_syn_count(self) -> None:
-        row = self._row(tcp_syn_count=20)
-        events = detect_packet_rules(row, TEST_POLICY)
-        assert [e["event_type"] for e in events] == ["PORT_SCAN"]
+    def test_single_port_high_syn_does_not_trigger_port_scan(self) -> None:
+        """단일 MQTT Port(1883)의 높은 SYN은 PORT_SCAN을 생성하지 않는다.
 
-    def test_broker_dos_suspected_can_fire_alongside_port_scan(self) -> None:
-        # tcp_syn_count가 두 Rule의 임계값(15, 30)을 모두 넘으면 SYN Flood 근거로
-        # PORT_SCAN·BROKER_DOS_SUSPECTED가 함께 잡히는 게 맞는 동작이다 (서로 다른
-        # 근거를 보는 별개 Rule이므로 상호 배타적이지 않다. 중복 감점 방지는 Trust
-        # Score v2의 Incident Family 단위 처리가 담당한다).
-        row = self._row(tcp_syn_count=40, mqtt_related_packet_count=150)
+        distinct_dest_port_count가 낮으면(목적지가 사실상 하나뿐이면) SYN이
+        아무리 높아도 그건 Port Scan이 아니라 단일 목적지 Flood(BROKER_DOS_SUSPECTED
+        영역)이므로 PORT_SCAN을 오탐하면 안 된다.
+        """
+        row = self._row(distinct_dest_port_count=1, tcp_syn_count=40)
+        events = detect_packet_rules(row, TEST_POLICY)
+        assert "PORT_SCAN" not in {e["event_type"] for e in events}
+
+    def test_high_distinct_ports_alone_does_not_trigger_port_scan(self) -> None:
+        """distinct_dest_port_count만 높고 SYN이 낮으면 PORT_SCAN이 아니다 (AND 조건)."""
+        row = self._row(distinct_dest_port_count=20, tcp_syn_count=1)
+        events = detect_packet_rules(row, TEST_POLICY)
+        assert "PORT_SCAN" not in {e["event_type"] for e in events}
+
+    def test_broker_dos_syn_alone_does_not_also_trigger_port_scan(self) -> None:
+        """Broker DoS가 SYN 수만으로 Scan Family까지 중복 감점되지 않는다.
+
+        목적지 Port가 사실상 하나(MQTT 1883)인 SYN Flood는 BROKER_DOS_SUSPECTED
+        (FLOODING, -25)만 발생해야 하고, PORT_SCAN(SCAN, -20)까지 함께 잡혀서
+        서로 다른 Incident Family로 이중 집계되면 안 된다.
+        """
+        row = self._row(distinct_dest_port_count=1, tcp_syn_count=40, mqtt_related_packet_count=150)
+        events = detect_packet_rules(row, TEST_POLICY)
+        event_types = {e["event_type"] for e in events}
+        assert event_types == {"BROKER_DOS_SUSPECTED"}
+
+    def test_port_scan_and_broker_dos_can_still_fire_together_when_both_genuinely_match(self) -> None:
+        """PORT_SCAN·BROKER_DOS_SUSPECTED는 서로 다른 근거를 보는 별개 Rule이라
+        상호 배타적이지 않다 -- 다만 이제는 PORT_SCAN도 distinct_dest_port_count
+        조건을 실제로 만족해야만 함께 발생한다 (예: 여러 Port를 스캔하면서
+        동시에 MQTT Broker에도 SYN Flood를 거는 복합 공격)."""
+        row = self._row(
+            distinct_dest_port_count=20, tcp_syn_count=40, mqtt_related_packet_count=150
+        )
         events = detect_packet_rules(row, TEST_POLICY)
         event_types = {e["event_type"] for e in events}
         assert event_types == {"PORT_SCAN", "BROKER_DOS_SUSPECTED"}
 
-    def test_broker_dos_not_triggered_by_syn_alone(self) -> None:
-        # SYN은 높지만 mqtt_related_packet_count가 낮으면 BROKER_DOS가 아니라 PORT_SCAN
-        # 경로로만 잡혀야 한다 (SYN 단독 과다는 Port Scan 근거).
-        row = self._row(tcp_syn_count=40, mqtt_related_packet_count=5)
+    def test_broker_dos_requires_both_syn_and_mqtt_volume(self) -> None:
+        """SYN은 높지만 mqtt_related_packet_count가 낮으면 BROKER_DOS_SUSPECTED가
+        아니어야 한다 (AND 조건). distinct_dest_port_count는 낮게 둬서 PORT_SCAN도
+        같이 섞이지 않게 한다."""
+        row = self._row(distinct_dest_port_count=1, tcp_syn_count=40, mqtt_related_packet_count=5)
         events = detect_packet_rules(row, TEST_POLICY)
-        event_types = {e["event_type"] for e in events}
-        assert "BROKER_DOS_SUSPECTED" not in event_types
-        assert "PORT_SCAN" in event_types
+        assert events == []
 
     def test_multiple_rules_can_fire_together(self) -> None:
         row = self._row(
             packet_count=1000,
             total_bytes=2_000_000,
             distinct_dest_port_count=20,
+            tcp_syn_count=20,
             captured_duration_seconds=10.0,
         )
         events = detect_packet_rules(row, TEST_POLICY)
@@ -307,7 +334,7 @@ class TestPacketRuleDetectorStage:
                 session_pk=session_pk,
                 feature_id=1,
                 segment_id=1,
-                distinct_dest_port_count=30,  # PORT_SCAN 유발
+                distinct_dest_port_count=30, tcp_syn_count=30,  # PORT_SCAN 유발 (AND 조건 만족)
             )
             db.commit()
 
@@ -367,6 +394,7 @@ class TestPacketRuleDetectorStage:
                 segment_id=1,
                 device_id=None,
                 peer_ip="192.168.0.99",
+                distinct_dest_port_count=20,
                 tcp_syn_count=20,
             )
             db.commit()
@@ -449,7 +477,7 @@ class TestPacketRuleDetectorStage:
             session_pk = _insert_capture_session(db)
             _insert_packet_source(
                 db, session_pk=session_pk, feature_id=1, segment_id=1,
-                distinct_dest_port_count=30,
+                distinct_dest_port_count=30, tcp_syn_count=30,
             )
             db.commit()
 
@@ -494,12 +522,12 @@ class TestPacketRuleDetectorStage:
             session_pk = _insert_capture_session(db)
             _insert_packet_source(
                 db, session_pk=session_pk, feature_id=1, segment_id=1,
-                distinct_dest_port_count=30,
+                distinct_dest_port_count=30, tcp_syn_count=30,
             )
             _insert_packet_source(
                 db, session_pk=session_pk, feature_id=2, segment_id=2,
                 window_start="2026-07-26T10:00:10Z", window_end="2026-07-26T10:00:20Z",
-                distinct_dest_port_count=30,
+                distinct_dest_port_count=30, tcp_syn_count=30,
             )
             db.commit()
 
