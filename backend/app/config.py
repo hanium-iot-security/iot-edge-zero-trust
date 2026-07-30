@@ -60,6 +60,15 @@ class Settings(BaseSettings):
     packet_if_expected_model_version: str = ""
     packet_if_expected_bundle_sha256: str = ""
 
+    # Packet Rule Detector
+    packet_rule_packet_rate_threshold: float = 50.0
+    packet_rule_byte_rate_threshold: float = 100_000.0
+    packet_rule_port_scan_distinct_port_threshold: int = 15
+    packet_rule_port_scan_syn_threshold: int = 15
+    packet_rule_broker_dos_tcp_syn_threshold: int = 30
+    packet_rule_broker_dos_mqtt_packet_threshold: int = 100
+    packet_rule_policy_version: str = "packet-rule-policy-v1"
+
     # Firewall Worker
     firewall_worker_interval_seconds: float = 5.0
     firewall_worker_batch_size: int = 20
