@@ -12,6 +12,7 @@ import signal
 import sqlite3
 from typing import Any, Callable, Iterator, Mapping
 
+from edge.detection.phase4_time import floor_window_start
 from edge.scripts.phase4_cutover_storage import (
     BackupArtifact,
     CutoverSafetyError,
@@ -218,7 +219,8 @@ def _utc_iso(value: datetime) -> str:
 def _whole_second_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise CutoverSafetyError("Cutover timestamps must be timezone-aware")
-    return value.astimezone(timezone.utc).replace(microsecond=0)
+    normalized = value.astimezone(timezone.utc).replace(microsecond=0)
+    return floor_window_start(normalized)
 
 
 def _summary(value: object) -> Mapping[str, object]:

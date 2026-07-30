@@ -33,6 +33,60 @@ from tests.phase4_cutover_test_support import (
 )
 
 
+@pytest.mark.parametrize(
+    ("wall_clock", "expected"),
+    [
+        (
+            datetime(
+                2026,
+                7,
+                30,
+                16,
+                17,
+                33,
+                123_456,
+                tzinfo=timezone.utc,
+            ),
+            datetime(
+                2026,
+                7,
+                30,
+                16,
+                17,
+                30,
+                tzinfo=timezone.utc,
+            ),
+        ),
+        (
+            datetime(
+                2026,
+                7,
+                30,
+                16,
+                17,
+                30,
+                123_456,
+                tzinfo=timezone.utc,
+            ),
+            datetime(
+                2026,
+                7,
+                30,
+                16,
+                17,
+                30,
+                tzinfo=timezone.utc,
+            ),
+        ),
+    ],
+)
+def test_cutover_timestamp_floors_to_completed_window_boundary(
+    wall_clock: datetime,
+    expected: datetime,
+) -> None:
+    assert cutover_runtime._whole_second_utc(wall_clock) == expected
+
+
 def test_termination_signal_guard_converts_sigterm_and_restores_handlers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
