@@ -1,7 +1,7 @@
 [Unit]
 Description=IoT Edge Zero Trust - Detection Orchestrator
-After=network-online.target mqtt-feature-builder.service
-Wants=network-online.target mqtt-feature-builder.service
+After=network-online.target systemd-time-wait-sync.service mqtt-feature-builder.service
+Wants=network-online.target systemd-time-wait-sync.service mqtt-feature-builder.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
