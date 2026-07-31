@@ -276,6 +276,7 @@ def produce_mqtt_features_until(
             else max(last_processed_after, source_id)
         )
         received_at = parse_db_utc(source["received_at"], "received_at")
+        source["received_at"] = received_at
         window_start = phase4_floor_window_start(received_at)
         window_end = window_start + timedelta(seconds=WINDOW_SECONDS)
 

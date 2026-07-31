@@ -41,7 +41,7 @@ def list_mqtt_logs(
                 error_message
             FROM mqtt_logs
             {where_clause}
-            ORDER BY received_at DESC, id DESC
+            ORDER BY id DESC
             LIMIT :limit OFFSET :offset
             """
         ),

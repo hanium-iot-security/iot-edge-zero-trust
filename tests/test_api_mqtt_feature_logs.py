@@ -8,6 +8,46 @@ from tests.conftest import cleanup_device
 def test_mqtt_logs_api_filters_and_paginates(db_session) -> None:
     device_id = "test_api_mqtt"
     cleanup_device(db_session, device_id)
+
+
+def test_mqtt_logs_api_orders_mixed_timestamps_by_ingestion_id(db_session) -> None:
+    device_id = "test_mqtt_order"
+    cleanup_device(db_session, device_id)
+    db_session.execute(
+        text(
+            """
+            INSERT INTO devices (device_id, ip_address, status, trust_score)
+            VALUES (:device_id, '192.168.0.98', 'normal', 100)
+            """
+        ),
+        {"device_id": device_id},
+    )
+    db_session.execute(
+        text(
+            """
+            INSERT INTO mqtt_logs (
+                device_id, topic, payload, payload_size,
+                received_at, is_json_valid, is_topic_valid
+            )
+            VALUES
+                (:device_id, 'iot/test_mqtt_order/sensor', '{}', 2,
+                 '2026-07-31T10:00:01Z', 1, 1),
+                (:device_id, 'iot/test_mqtt_order/sensor', '{}', 2,
+                 '2026-07-31 10:00:09', 1, 1)
+            """
+        ),
+        {"device_id": device_id},
+    )
+    db_session.commit()
+
+    response = TestClient(app).get(f"/api/mqtt-logs?device_id={device_id}")
+
+    assert response.status_code == 200
+    assert [row["received_at"] for row in response.json()["items"]] == [
+        "2026-07-31 10:00:09",
+        "2026-07-31T10:00:01Z",
+    ]
+    cleanup_device(db_session, device_id)
     db_session.execute(
         text(
             """

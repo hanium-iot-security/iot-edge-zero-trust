@@ -35,7 +35,7 @@ PRAGMA busy_timeout = 5000;
 | ip_address | TEXT | 기기 IP |
 | status | TEXT | `normal`, `warning`, `danger`, `isolated` |
 | trust_score | INTEGER | 기본값 `100` |
-| last_seen_at | DATETIME | 마지막 MQTT 수신 시각 |
+| last_seen_at | DATETIME | 마지막 MQTT 수신 시각. 신규 Subscriber는 UTC `YYYY-MM-DDTHH:MM:SSZ` 저장 |
 | created_at | DATETIME | 생성 시각, 기본 current timestamp |
 
 ## mqtt_logs
@@ -47,10 +47,19 @@ PRAGMA busy_timeout = 5000;
 | topic | TEXT | MQTT topic |
 | payload | TEXT | 원본 payload |
 | payload_size | INTEGER | payload byte 크기 |
-| received_at | DATETIME | 수신 시각, 기본 current timestamp |
+| received_at | DATETIME | 수신 시각. 신규 Subscriber는 UTC `YYYY-MM-DDTHH:MM:SSZ`, DB 기본값은 `CURRENT_TIMESTAMP` |
 | is_json_valid | INTEGER | `0` 또는 `1` |
 | is_topic_valid | INTEGER | `0` 또는 `1` |
 | error_message | TEXT | 검증 오류 상세 |
+
+신규 Subscriber는 한 메시지에서 생성한 UTC `Z` 문자열 하나를 `mqtt_logs.received_at`과
+`devices.last_seen_at`에 동일하게 저장합니다. 기존 DB의 공백 형식에는 서로 다른 의미가
+공존할 수 있습니다. Pi가 `Asia/Seoul`인 상태에서 기존 Subscriber가 생성한 값은 KST Local
+Naive Timestamp이고, SQLite `CURRENT_TIMESTAMP`가 생성한 값은 UTC입니다. 문자열 형식만으로
+둘을 구분할 수 없으므로 모든 공백값을 UTC 또는 KST로 일괄 변환하지 않습니다.
+
+Phase 4의 기존 `parse_db_utc()` Naive 호환 동작은 유지하지만 실제 Timestamp 출처를 증명하지는
+않습니다. 운영 DB 보정은 출처가 검증된 Row만 별도 승인·백업 절차로 수행합니다.
 
 ## feature_logs
 

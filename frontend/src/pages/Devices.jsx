@@ -21,35 +21,21 @@ import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
 import StatusBadge from "../components/StatusBadge";
 import SummaryCard from "../components/SummaryCard";
+import {
+  LEGACY_KST_OPTIONS,
+  elapsedSecondsFromMqttTimestamp,
+  formatMqttTimestampKST,
+} from "../utils/mqttTimestamp";
 
 const DEFAULT_LIMIT = 20;
 const POLLING_INTERVAL_MS = 10_000;
 const IS_DEV = import.meta.env.DEV;
 
 function formatKST(dateString) {
-  if (!dateString) {
-    return "-";
-  }
-
-  const date = new Date(dateString);
-
-  if (Number.isNaN(date.getTime())) {
-    return "-";
-  }
-
-  return new Intl.DateTimeFormat(
-    "ko-KR",
-    {
-      timeZone: "Asia/Seoul",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hour12: false,
-    }
-  ).format(date);
+  return formatMqttTimestampKST(
+    dateString,
+    LEGACY_KST_OPTIONS,
+  );
 }
 
 function formatNumber(
@@ -175,19 +161,19 @@ function getLastSeenStatus(lastSeenAt) {
     };
   }
 
-  const lastSeenTime =
-    new Date(lastSeenAt).getTime();
+  const elapsedSeconds =
+    elapsedSecondsFromMqttTimestamp(
+      lastSeenAt,
+      new Date(),
+      LEGACY_KST_OPTIONS,
+    );
 
-  if (Number.isNaN(lastSeenTime)) {
+  if (elapsedSeconds === null) {
     return {
       status: "unknown",
       label: "시간 확인 불가",
     };
   }
-
-  const elapsedSeconds =
-    (Date.now() - lastSeenTime) /
-    1000;
 
   if (elapsedSeconds <= 30) {
     return {
@@ -214,21 +200,16 @@ function formatElapsedTime(dateString) {
     return "-";
   }
 
-  const timestamp =
-    new Date(dateString).getTime();
+  const elapsedSeconds =
+    elapsedSecondsFromMqttTimestamp(
+      dateString,
+      new Date(),
+      LEGACY_KST_OPTIONS,
+    );
 
-  if (Number.isNaN(timestamp)) {
+  if (elapsedSeconds === null) {
     return "-";
   }
-
-  const elapsedSeconds =
-    Math.max(
-      0,
-      Math.floor(
-        (Date.now() - timestamp) /
-        1000
-      )
-    );
 
   if (elapsedSeconds < 60) {
     return `${elapsedSeconds}초 전`;
