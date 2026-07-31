@@ -1,0 +1,28 @@
+[Unit]
+Description=IoT Edge Zero Trust - MQTT Subscriber
+After=network-online.target systemd-time-wait-sync.service mosquitto.service
+Wants=network-online.target systemd-time-wait-sync.service
+Requires=mosquitto.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/iot-edge-zero-trust
+EnvironmentFile=/home/pi/iot-edge-zero-trust/.env
+ExecStart=/home/pi/iot-edge-zero-trust/venv/bin/python -m edge.mqtt.subscriber
+
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=15
+NoNewPrivileges=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mqtt-subscriber
+
+[Install]
+WantedBy=multi-user.target
