@@ -152,6 +152,30 @@ crontab -l
 - 신규 Orchestrator·Firewall Worker Unit 이름
 - 실행 시각과 작업자
 
+### MQTT Timestamp Preflight
+
+Cutover 시각을 UTC 10초 Window 경계로 확정한 뒤, 실제 Cutover 전에 다음 Query를 실행한다.
+`:cutover_at_plus_10_seconds`에는 Cutover 시각보다 정확히 10초 뒤인 UTC 값을 전달한다.
+
+```sql
+SELECT id, received_at
+FROM mqtt_logs
+WHERE unixepoch(received_at) IS NULL
+   OR unixepoch(received_at) >= unixepoch(:cutover_at_plus_10_seconds)
+ORDER BY id;
+```
+
+결과가 한 건이라도 있으면 실제 Cutover를 중단한다. `initialize_phase4_cutover()`도
+`BEGIN IMMEDIATE` 직후 같은 조건을 검사하며, 실패 시 Legacy Event 표시와
+`detector_checkpoints` UPSERT 전에 Rollback한다. 현재 열린 Window인
+`cutover_at <= received_at < cutover_at + 10초`는 허용하지만 Checkpoint에는 포함하지 않는다.
+
+기존 Subscriber가 `Asia/Seoul` Local Time을 공백 문자열로 저장한 Row와 SQLite
+`CURRENT_TIMESTAMP`가 UTC로 저장한 Row는 형식만으로 구분할 수 없다. Cutover 코드는 Legacy
+공백값을 자동으로 KST 또는 UTC로 변환하지 않는다. 알려진 문제 Row는 출처·대상 수·Device·Topic을
+검증한 뒤 별도 운영 DB 보정 절차에서만 처리한다. Preflight 통과만으로 모든 Legacy 공백값의
+실제 Timezone이 증명됐다고 간주하지 않는다.
+
 ## 5. Dry Run
 
 Dry Run은 파일·DB·서비스를 변경하지 않고 예정 작업만 JSON으로 출력한다.
