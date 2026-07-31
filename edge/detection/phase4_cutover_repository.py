@@ -30,6 +30,7 @@ def initialize_phase4_cutover(
     connection = connect_database(db_path)
     try:
         connection.execute("BEGIN IMMEDIATE;")
+        _validate_mqtt_timestamps(connection, cutover_at)
         checkpoint_values = _calculate_cutover_checkpoints(connection, cutover_at)
         legacy_migration_event_count = _mark_legacy_detection_events(
             connection,
@@ -64,6 +65,58 @@ def initialize_phase4_cutover(
         raise
     finally:
         connection.close()
+
+
+def _validate_mqtt_timestamps(
+    connection: sqlite3.Connection,
+    cutover_at: datetime,
+) -> None:
+    invalid = connection.execute(
+        """
+        SELECT id, received_at
+        FROM mqtt_logs
+        WHERE unixepoch(received_at) IS NULL
+        ORDER BY id ASC
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid is not None:
+        raise ValueError(
+            "mqtt_logs contains an unparseable received_at: "
+            f"id={invalid['id']} received_at={invalid['received_at']}"
+        )
+
+    allowed_before = cutover_at + timedelta(seconds=10)
+    params = {"allowed_before": format_utc_iso(allowed_before)}
+    future_count = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM mqtt_logs
+            WHERE unixepoch(received_at) >= unixepoch(:allowed_before)
+            """,
+            params,
+        ).fetchone()["count"]
+    )
+    if future_count == 0:
+        return
+
+    first = connection.execute(
+        """
+        SELECT id, received_at
+        FROM mqtt_logs
+        WHERE unixepoch(received_at) >= unixepoch(:allowed_before)
+        ORDER BY unixepoch(received_at) ASC, id ASC
+        LIMIT 1
+        """,
+        params,
+    ).fetchone()
+    raise ValueError(
+        "mqtt_logs contains timestamps beyond the allowed open window: "
+        f"count={future_count} id={first['id']} "
+        f"received_at={first['received_at']} "
+        f"allowed_before={format_utc_iso(allowed_before)}"
+    )
 
 
 def _calculate_cutover_checkpoints(
