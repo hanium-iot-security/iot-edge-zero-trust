@@ -1,7 +1,7 @@
 [Unit]
 Description=IoT Edge Zero Trust - Raspberry Pi #1 Packet Capture Runtime
-After=network-online.target
-Wants=network-online.target
+After=network-online.target systemd-time-wait-sync.service
+Wants=network-online.target systemd-time-wait-sync.service
 
 # 짧은 시간에 재시작이 5번을 넘으면 systemd가 더 이상 재시작을 시도하지 않는다.
 # (5.4 절: "systemd Start Limit으로 반복 재시작을 제한한다")

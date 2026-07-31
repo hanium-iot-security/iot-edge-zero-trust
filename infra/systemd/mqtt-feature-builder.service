@@ -1,7 +1,7 @@
 [Unit]
 Description=IoT Edge Zero Trust - MQTT Feature Producer
-After=network-online.target
-Wants=network-online.target
+After=network-online.target systemd-time-wait-sync.service
+Wants=network-online.target systemd-time-wait-sync.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
