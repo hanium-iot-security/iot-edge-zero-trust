@@ -1,6 +1,9 @@
 # Phase 4 ESP32 #2 제한형 MQTT Flood Test Mode Implementation Plan
 
-> **상태:** 코드·자동 계약 테스트·Runbook 구현 완료 / Arduino 컴파일·ESP32 #2 업로드·실기기 E2E는 미검증
+> **상태:** 코드·자동 계약 테스트·Runbook·Arduino 컴파일·ESP32 #2 업로드 및
+> MQTT Feature→MQTT Rule→Trust→Firewall 실기기 E2E·정상 Firmware 복구 확인 / 최종 Run `HOLD`
+> (승인된 Trust Score·Device status Baseline Reset 절차 미구현) /
+> Packet Rule·Packet IF·Packet 기반 격리는 미검증
 >
 > 아래 체크박스는 구현 전 TDD 실행 순서를 보존한 계획 기록이며, 실제 검증 결과는
 > 테스트 출력과 `docs/phase4-esp32-attack-test-runbook.md`의 실기기 기록을 기준으로 한다.

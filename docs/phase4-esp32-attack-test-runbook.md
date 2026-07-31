@@ -472,3 +472,56 @@ Firewall 해제 명령과 오류 복구는
 Firmware는 공격 메시지 최대 160건을 보냈다는 사실만으로 성공으로 판정하지 않습니다.
 실제 Event·Trust·Firewall·격리 실패·정상 복구 증적이 모두 있어야 공식 E2E
 성공으로 기록합니다.
+
+## 8. 실제 실행 결과: `esp32-attack-e2e-20260731T132407Z`
+
+### 8.1 실행·탐지·격리 결과
+
+| 항목 | 실제 결과 |
+| --- | --- |
+| Run ID | `esp32-attack-e2e-20260731T132407Z` |
+| ESP32 #2 실제 IP | `192.168.0.5` |
+| 제한형 MQTT Flood | 40건 × 4 Burst |
+| 공격 구간 `mqtt_logs` | 162건(관측 Probe 포함) |
+| 서로 다른 Feature Window | 4개: `publish_count` 40, 40, 40, 41 |
+| Detection Event | `ABNORMAL_PUBLISH_RATE` 4건 |
+| Trust Score | `100 → 80 → 60 → 40 → 20` |
+| Firewall | Rule ID `1`, `192.168.0.5` TCP `1883` DROP, `APPLIED` |
+| 격리 관측 | 기존 MQTT 연결 단절 및 신규 연결 실패 확인 |
+| 공식 release | Firewall Rule `REMOVED` 및 iptables Rule 제거 확인 |
+| 정상 복구 | 정상 Firmware 복구 후 `esp32_02` 정상 MQTT Publish 재개 확인 |
+| 최종 Run 상태 | `HOLD` |
+
+이 Run에서 MQTT Feature·MQTT Rule·Trust·Firewall 흐름과 정상 Firmware 복구를
+관측했습니다. Packet Rule, Packet IF 또는 Packet 기반 격리를 실행하거나 완료한
+결과가 아니며, 해당 항목은 계속 미검증으로 유지합니다.
+
+### 8.2 HOLD 판정
+
+Firewall Rule의 공식 release, iptables 제거와 `esp32_02`의 정상 Publish 재개는
+확인했습니다. 그러나 승인된 Trust Score·Device status Baseline Reset 절차가
+구현되어 있지 않으므로 다음 Run의 Baseline Gate를 충족할 수 없습니다. 자동 SQL로
+상태를 되돌리지 않고 최종 Run 상태를 `HOLD`로 기록합니다.
+
+### 8.3 복구 중 Firmware 식별자 설정 실수와 식별 오귀속 위험
+
+정상 Firmware 복구 과정에서 ESP32 #2에 `esp32_01` 설정을 잠시 잘못 업로드했고,
+같은 시기에 논리 Device `esp32_01`이 비의도적으로 탐지·감점·격리되었습니다.
+운영자의 Firmware 식별자 설정 실수가 직접적인 촉발 원인이었습니다.
+생성된 Firewall Rule ID `2`를 공식 release한 뒤
+`esp32_01`의 정상 Publish 복구를 확인했습니다.
+
+그러나 실제 Source IP와 MQTT Topic·Payload의 논리 `device_id`가 강하게
+바인딩되지 않아 이벤트가 다른 기기로 귀속되고, DB에 등록된 대상 기기의 IP가
+차단될 수 있는 Device identity 오귀속 위험도 확인됐습니다. 따라서 이를 제품 기능
+결함이 아니라고 단정하지 않습니다. Source IP·MQTT Client ID·Device ID 검증 강화는
+후속 보완으로 이월하며, 이번 PR에서는 관련 코드 기능을 추가하지 않습니다.
+
+재발 방지를 위해 Firmware 업로드 직전에 작업자가 아래 식별 정보를 서로 대조합니다.
+
+- Arduino IDE에서 선택한 COM Port와 물리 Device
+- Firmware의 `DEVICE_ID`
+- Firmware의 MQTT Topic
+- Serial Monitor의 실제 IP와 DB `devices.ip_address`
+
+네 항목 중 하나라도 대상 Device 계약과 다르면 업로드를 중단합니다.
