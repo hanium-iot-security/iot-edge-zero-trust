@@ -17,11 +17,11 @@
 - `run_until(db, cycle_range_start, cycle_cutoff)` Packet IF Detector Stage
 - `AI_PACKET_ANOMALY` Event와 `packet_if+packet_feature_logs` Checkpoint의
   동일 Transaction 처리
+- 운영 Orchestrator Stage Registry·Packet Ready Range·Required Barrier 연결
 - 수동 Smoke Test CLI
 
-후속 통합 범위:
+후속 운영 범위:
 
-- 운영 Orchestrator Stage Registry 등록과 Required Barrier 연결
 - 실제 정상 Packet Session 기반 최종 Model 학습·배포
 - Raspberry Pi Packet Capture부터 Trust Score까지 E2E 검증
 
@@ -236,9 +236,15 @@ Session 항목에 같은 Provenance 필드를 기록합니다.
 Repository Root에서 아래 명령을 실행합니다.
 
 ```bash
+test -z "$(git status --porcelain)" || {
+  echo "Packet IF 학습은 clean worktree에서만 실행할 수 있습니다."
+  exit 1
+}
+export SOURCE_COMMIT_SHA="$(git rev-parse HEAD)"
+
 python -m ai.train_packet_isolation_forest \
-  --dataset data/exports/packet_if_dataset.csv \
-  --manifest data/exports/packet_if_manifest.json \
+  --dataset data/exports/packet_if_dataset-v1.csv \
+  --manifest data/exports/packet_if_manifest-v1.json \
   --artifact-dir ai/models/packet_if/packet-if-v1 \
   --threshold-percentile 99.0 \
   --git-commit-sha "$SOURCE_COMMIT_SHA"
@@ -335,7 +341,51 @@ python -m ai.predict_packet_isolation_forest \
 ```
 
 명령 실행 결과로 Row 수, 저장된 Threshold, Anomaly Score 범위를 출력합니다.
-현재 Offline 추론은 Detection Event를 생성하거나 Checkpoint를 전진시키지 않습니다.
+현재 Offline 추론은 Train·Validation·Test 전체 Row의 배포 전 Smoke 용도이며,
+Detection Event를 생성하거나 Checkpoint를 전진시키지 않습니다. Phase 5 평가
+Core의 Local 검증은 Test Split만 사용하는 아래 평가 명령을 실행합니다.
+
+## Phase 5 Offline 평가
+
+현재 `packet-if-dataset-v1` 명령은 평가 Core와 Local Fixture를 검증하기 위한
+선행 경로입니다. 아래 조건이 모두 충족되기 전에는 출력 Bundle을 공식 Phase 5
+평가 결과로 사용하지 않습니다.
+
+- 공통 Phase 5 Run Manifest Schema가 병합되고 동결됨
+- Packet IF Dataset Manifest v2가 병합되고 동결됨
+- Dataset Exporter와 Loader가 v2 계약을 검증함
+- 공식 Session·Split과 Source Capture Group이 사전에 동결됨
+
+`packet-if-evaluation-v1`은 평가 출력의 Schema Version이며 공통 Run Manifest
+Schema Version과 별개입니다. 이 평가 Core는 `run_id` 등 공통 Run Manifest
+필드를 새로 정의하지 않습니다.
+
+```bash
+test -z "$(git status --porcelain)" || {
+  echo "Packet IF 평가는 clean worktree에서만 실행할 수 있습니다."
+  exit 1
+}
+export SOURCE_COMMIT_SHA="$(git rev-parse HEAD)"
+
+python -m ai.evaluate_packet_isolation_forest \
+  --dataset data/exports/packet_if_dataset-v1.csv \
+  --manifest data/exports/packet_if_manifest-v1.json \
+  --artifact-dir ai/models/packet_if/packet-if-v1 \
+  --expected-model-version packet-if-v1 \
+  --expected-bundle-sha256 "$PACKET_IF_EXPECTED_BUNDLE_SHA256" \
+  --output-dir data/evaluations/packet-if-eval-v1 \
+  --git-commit-sha "$SOURCE_COMMIT_SHA"
+```
+
+평가 모듈은 검증된 Dataset의 Test Split만 추론하고 Artifact Metadata의 Threshold를
+그대로 사용합니다. 입력 Dataset CSV·Manifest의 실제 SHA256과 Test Session
+목록이 Artifact 생성 시 Metadata에 고정된 전체 Dataset Bundle 계약과 정확히
+일치하지 않으면 평가를 시작하지 않습니다. 기존 평가 Directory를 덮어쓰지
+않으며 Row별 JSONL, 전체·Label·Session·Scenario별 JSON·CSV Summary와 파일
+SHA256 Manifest를 하나의 Version Directory로 게시합니다.
+
+평가 계약, 지표와 인계 절차는
+[Packet IF Phase 5 평가 가이드](packet-if-phase5-evaluation.md)를 따릅니다.
 
 ## Phase 4 Runtime
 
@@ -450,6 +500,7 @@ python -m pytest -q \
   tests/test_packet_if_dataset.py \
   tests/test_train_packet_isolation_forest.py \
   tests/test_predict_packet_isolation_forest.py \
+  tests/test_evaluate_packet_isolation_forest.py \
   tests/test_export_packet_if_dataset.py \
   tests/test_packet_ai_detector.py \
   tests/test_run_packet_ai_detector.py
@@ -458,6 +509,7 @@ python -m pytest -q
 python -m compileall -q ai edge backend tests
 python -m pip check
 python -m ai.export_packet_if_dataset --help
+python -m ai.evaluate_packet_isolation_forest --help
 python -m edge.detection.run_packet_ai_detector --help
 git diff --check
 git status --short
@@ -471,5 +523,5 @@ git status --short
 - 신규 정상 Packet Capture Session
 - 최종 Model·Threshold·Metadata 생성
 - Artifact Directory와 기대 Model Version 운영 환경 설정
-- Orchestrator Stage Registry 및 Required Barrier 연결
+- 운영 설정에서 Packet Rule·Packet IF Stage 활성화 및 Required Barrier 확인
 - Raspberry Pi E2E 및 전체 회귀 검증
