@@ -1,6 +1,6 @@
 # Phase 4 Wait for Time Sync Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> 이 문서는 단계별 구현과 검증을 위한 실행 계획이며, 체크박스로 진행 상태를 기록합니다.
 
 **Goal:** Raspberry Pi 부팅 시 최초 NTP 동기화가 끝난 뒤에만 시간 기반 수집·탐지 systemd 서비스가 시작되도록 한다.
 
