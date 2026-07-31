@@ -181,7 +181,8 @@ Frontend는 MQTT 전용 공통 Parser를 사용한다.
 
 - `Z` 또는 명시적 Offset이 있는 값은 그 Offset대로 파싱한다.
 - `devices.last_seen_at`의 Legacy 공백값은 Subscriber 저장 경로에 근거해 KST로 파싱한다.
-- `mqtt_logs.received_at`의 Legacy 공백값은 출처가 모호하므로 임의 변환하지 않고 시간대 미확인으로 표시한다.
+- `mqtt_logs.received_at`의 Legacy 공백값은 출처가 모호하므로 임의 변환하지 않고 원본을 보존해
+  `2026-07-31 19:00:01 (시간대 확인 불가)`처럼 표시한다.
 - 잘못된 문자열은 안전하게 거부한다.
 - 이 규칙을 다른 테이블 Timestamp에 전역 적용하지 않는다.
 

@@ -16,7 +16,10 @@ import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
 import StatusBadge from "../components/StatusBadge";
 import SummaryCard from "../components/SummaryCard";
-import { formatMqttTimestampKST } from "../utils/mqttTimestamp";
+import {
+  formatMqttLogTimestamp,
+  formatMqttTimestampKST,
+} from "../utils/mqttTimestamp";
 
 const DEFAULT_LIMIT = 20;
 const POLLING_INTERVAL_MS = 10_000;
@@ -612,7 +615,7 @@ export default function Logs() {
       header: "Received At",
       width: 190,
       render: (value) =>
-        formatKST(value),
+        formatMqttLogTimestamp(value),
     },
     {
       key: "detail",
@@ -1066,7 +1069,7 @@ export default function Logs() {
                 <span>Received At</span>
 
                 <strong>
-                  {formatKST(
+                  {formatMqttLogTimestamp(
                     selectedLog.received_at
                   )}
                 </strong>

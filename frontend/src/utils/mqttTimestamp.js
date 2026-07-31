@@ -54,6 +54,23 @@ export function formatMqttTimestampKST(
   return date ? KST_FORMATTER.format(date) : fallback;
 }
 
+export function formatMqttLogTimestamp(value) {
+  if (typeof value !== "string") {
+    return "시간 확인 불가";
+  }
+
+  const timestamp = value.trim();
+  if (!timestamp) {
+    return "시간 확인 불가";
+  }
+
+  if (LEGACY_NAIVE_PATTERN.test(timestamp)) {
+    return `${timestamp} (시간대 확인 불가)`;
+  }
+
+  return formatMqttTimestampKST(timestamp, undefined, "시간 확인 불가");
+}
+
 export function elapsedSecondsFromMqttTimestamp(
   value,
   now = new Date(),

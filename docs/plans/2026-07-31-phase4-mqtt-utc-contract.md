@@ -523,7 +523,8 @@ python -m pytest tests/test_api_mqtt_feature_logs.py -q
 
 - [ ] **5.2 두 화면에 필드별 정책 적용**
 
-- `Logs.jsx`: Offset 포함 값만 변환하고 Legacy 공백값은 시간대 미확인으로 표시한다.
+- `Logs.jsx`: Offset 포함 값만 변환하고 Legacy 공백값은 원본을 보존해
+  `2026-07-31 19:00:01 (시간대 확인 불가)`처럼 표시한다.
 - `Devices.jsx`: `last_seen_at`에 한해 Legacy 공백값을 KST로 해석한다.
 - 다른 화면과 Timestamp에는 이 Utility를 적용하지 않는다.
 
