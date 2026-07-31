@@ -171,6 +171,39 @@ def test_mqtt_feature_producer_creates_features_and_checkpoint_in_one_transactio
         assert checkpoint["last_completed_window_end"] == "2026-07-23T10:00:20Z"
 
 
+def test_mqtt_feature_producer_accepts_legacy_utc_and_canonical_z_rows(
+    SessionLocal,
+) -> None:
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01")
+        _insert_mqtt_log(db, "esp32_01", "2026-07-23 10:00:01", payload_size=100)
+        _insert_mqtt_log(db, "esp32_01", "2026-07-23T10:00:06Z", payload_size=200)
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            result = produce_mqtt_features_until(
+                db,
+                producer_cutoff=datetime(
+                    2026, 7, 23, 10, 0, 10, tzinfo=timezone.utc
+                ),
+            )
+
+        assert result.selected_count == 2
+        row = db.execute(
+            text(
+                """
+                SELECT publish_count, avg_message_interval, min_message_interval
+                FROM feature_logs
+                WHERE device_id = 'esp32_01'
+                """
+            )
+        ).mappings().one()
+        assert row["publish_count"] == 2
+        assert row["avg_message_interval"] == 5.0
+        assert row["min_message_interval"] == 5.0
+
+
 def test_mqtt_feature_producer_consumes_late_source_without_reopening_window(
     SessionLocal,
 ) -> None:

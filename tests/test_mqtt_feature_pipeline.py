@@ -1,9 +1,12 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from sqlalchemy import text
 
 from edge.features.collect_feature_logs import collect_feature_windows
-from edge.mqtt.subscriber import build_mqtt_log_row
+from edge.mqtt import subscriber
+from edge.mqtt.subscriber import build_mqtt_log_row, insert_mqtt_log
 from tests.conftest import cleanup_device
 
 
@@ -11,7 +14,7 @@ def test_build_mqtt_log_row_validates_topic_and_payload() -> None:
     row = build_mqtt_log_row(
         "iot/esp32_01/sensor",
         '{"device_id":"esp32_01"}',
-        received_at=datetime(2026, 5, 26, 14, 30, 1),
+        received_at=datetime(2026, 5, 26, 14, 30, 1, tzinfo=timezone.utc),
     )
 
     assert row["device_id"] == "esp32_01"
@@ -19,6 +22,94 @@ def test_build_mqtt_log_row_validates_topic_and_payload() -> None:
     assert row["is_json_valid"] == 1
     assert row["is_topic_valid"] == 1
     assert row["error_message"] is None
+
+
+def test_build_mqtt_log_row_uses_utc_clock_when_timestamp_is_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        subscriber,
+        "_utc_now",
+        lambda: datetime(2026, 7, 31, 10, 59, 47, tzinfo=timezone.utc),
+        raising=False,
+    )
+
+    row = build_mqtt_log_row(
+        "iot/esp32_01/sensor",
+        '{"device_id":"esp32_01"}',
+    )
+
+    assert row["received_at"] == "2026-07-31T10:59:47Z"
+
+
+def test_build_mqtt_log_row_formats_utc_aware_timestamp() -> None:
+    row = build_mqtt_log_row(
+        "iot/esp32_01/sensor",
+        '{"device_id":"esp32_01"}',
+        received_at=datetime(2026, 7, 31, 10, 59, 47, tzinfo=timezone.utc),
+    )
+
+    assert row["received_at"] == "2026-07-31T10:59:47Z"
+
+
+def test_build_mqtt_log_row_normalizes_seoul_timestamp_to_utc() -> None:
+    seoul = timezone(timedelta(hours=9))
+    row = build_mqtt_log_row(
+        "iot/esp32_01/sensor",
+        '{"device_id":"esp32_01"}',
+        received_at=datetime(2026, 7, 31, 19, 59, 47, tzinfo=seoul),
+    )
+
+    assert row["received_at"] == "2026-07-31T10:59:47Z"
+
+
+def test_build_mqtt_log_row_rejects_naive_timestamp() -> None:
+    with pytest.raises(ValueError, match="received_at must be timezone-aware"):
+        build_mqtt_log_row(
+            "iot/esp32_01/sensor",
+            '{"device_id":"esp32_01"}',
+            received_at=datetime(2026, 7, 31, 19, 59, 47),
+        )
+
+
+def test_insert_mqtt_log_keeps_last_seen_equal_to_received_at(db_session) -> None:
+    device_id = "test_mqtt_utc_device"
+    cleanup_device(db_session, device_id)
+    db_session.execute(
+        text(
+            """
+            INSERT INTO devices (device_id, ip_address, status, trust_score)
+            VALUES (:device_id, '192.168.0.99', 'normal', 100)
+            """
+        ),
+        {"device_id": device_id},
+    )
+    db_session.commit()
+
+    row = build_mqtt_log_row(
+        f"iot/{device_id}/sensor",
+        f'{{"device_id":"{device_id}"}}',
+        received_at=datetime(2026, 7, 31, 10, 59, 47, tzinfo=timezone.utc),
+    )
+    insert_mqtt_log(db_session, row)
+
+    stored = db_session.execute(
+        text(
+            """
+            SELECT m.received_at, d.last_seen_at
+            FROM mqtt_logs AS m
+            JOIN devices AS d ON d.device_id = m.device_id
+            WHERE m.device_id = :device_id
+            ORDER BY m.id DESC
+            LIMIT 1
+            """
+        ),
+        {"device_id": device_id},
+    ).mappings().one()
+
+    assert stored["received_at"] == "2026-07-31T10:59:47Z"
+    assert stored["last_seen_at"] == stored["received_at"]
+    cleanup_device(db_session, device_id)
 
 
 def test_build_mqtt_log_row_uses_payload_device_id_for_non_iot_topic() -> None:
