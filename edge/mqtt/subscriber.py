@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 from pathlib import Path
 import sys
@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.config import settings
 from backend.app.database import SessionLocal
+from edge.detection.phase4_time import format_db_utc
 from edge.features.feature_utils import extract_payload_device_id, payload_size
 from edge.mqtt.topic_utils import (
     extract_device_id_candidate_from_topic,
@@ -26,6 +27,17 @@ from edge.mqtt.topic_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _normalize_received_at(value: datetime | None) -> datetime:
+    timestamp = value if value is not None else _utc_now()
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("received_at must be timezone-aware")
+    return timestamp.astimezone(timezone.utc).replace(microsecond=0)
 
 
 def _decode_payload(payload: str | bytes) -> str:
@@ -60,7 +72,7 @@ def build_mqtt_log_row(
         "topic": topic,
         "payload": payload_text,
         "payload_size": payload_size(payload),
-        "received_at": (received_at or datetime.now()).replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S"),
+        "received_at": format_db_utc(_normalize_received_at(received_at)),
         "is_json_valid": 1 if is_json_valid else 0,
         "is_topic_valid": 1 if is_topic_valid else 0,
         "error_message": ", ".join(error_parts) if error_parts else None,

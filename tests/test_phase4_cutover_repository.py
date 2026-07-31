@@ -272,6 +272,95 @@ def test_initialize_phase4_cutover_uses_existing_mqtt_watermark(
     }
 
 
+@pytest.mark.parametrize(
+    "received_at",
+    ["2026-07-21T04:30:00Z", "2026-07-21T04:30:09Z"],
+)
+def test_initialize_phase4_cutover_allows_current_open_mqtt_window(
+    migrated_db: Path,
+    received_at: str,
+) -> None:
+    with connect_database(migrated_db) as connection:
+        included_id = _insert_mqtt_log(
+            connection,
+            received_at="2026-07-21T04:29:59Z",
+        )
+        _insert_mqtt_log(connection, received_at=received_at)
+
+    summary = initialize_phase4_cutover(migrated_db, CUTOVER_AT)
+
+    for key in (
+        "mqtt_feature_builder+mqtt_logs",
+        "mqtt_message_rule+mqtt_logs",
+    ):
+        assert summary["checkpoints"][key]["last_processed_id"] == included_id
+
+
+def test_initialize_phase4_cutover_rejects_mqtt_timestamp_beyond_open_window(
+    migrated_db: Path,
+) -> None:
+    with connect_database(migrated_db) as connection:
+        event_id = _insert_detection_event(
+            connection,
+            event_type="ABNORMAL_TOPIC",
+            score_delta=-20,
+            applied_to_score=0,
+            detected_at="2026-07-21T04:29:59Z",
+        )
+        future_id = _insert_mqtt_log(
+            connection,
+            received_at="2026-07-21T04:30:10Z",
+        )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"mqtt_logs.*id={future_id}.*2026-07-21T04:30:10Z",
+    ):
+        initialize_phase4_cutover(migrated_db, CUTOVER_AT)
+
+    with connect_database(migrated_db) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM detector_checkpoints"
+        ).fetchone()[0] == 0
+        event = connection.execute(
+            "SELECT processed_at, processing_reason FROM detection_events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+        assert event["processed_at"] is None
+        assert event["processing_reason"] is None
+
+
+def test_initialize_phase4_cutover_rejects_unparseable_mqtt_timestamp(
+    migrated_db: Path,
+) -> None:
+    with connect_database(migrated_db) as connection:
+        event_id = _insert_detection_event(
+            connection,
+            event_type="ABNORMAL_TOPIC",
+            score_delta=-20,
+            applied_to_score=0,
+            detected_at="2026-07-21T04:29:59Z",
+        )
+        mqtt_id = _insert_mqtt_log(connection, received_at="not-a-timestamp")
+
+    with pytest.raises(
+        ValueError,
+        match=rf"mqtt_logs.*id={mqtt_id}.*not-a-timestamp",
+    ):
+        initialize_phase4_cutover(migrated_db, CUTOVER_AT)
+
+    with connect_database(migrated_db) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM detector_checkpoints"
+        ).fetchone()[0] == 0
+        event = connection.execute(
+            "SELECT processed_at, processing_reason FROM detection_events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+        assert event["processed_at"] is None
+        assert event["processing_reason"] is None
+
+
 def test_initialize_phase4_cutover_rejects_mqtt_watermark_after_cutover(
     migrated_db: Path,
 ) -> None:
