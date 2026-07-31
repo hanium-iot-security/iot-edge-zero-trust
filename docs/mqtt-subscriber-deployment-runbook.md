@@ -61,8 +61,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now mqtt-subscriber.service
 ```
 
-실제 운영 DB나 `.env`를 복사하거나 Git에 포함하지 않습니다. 저장소에는 Unit과 이
-Runbook만 포함합니다.
+실제 운영 DB나 `.env`를 복사하거나 Git에 포함하지 않습니다. 저장소에는 Unit,
+Runbook과 배포 계약 테스트만 포함하며, 실제 운영 DB와 `.env`는 포함하지 않습니다.
 
 ## 5. 설치 상태와 Unit 검증
 
