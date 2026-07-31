@@ -4,6 +4,7 @@ from pathlib import Path
 
 SYSTEMD_DIR = Path("infra/systemd")
 TIME_WAIT_UNIT = "systemd-time-wait-sync.service"
+RUNBOOK = Path("docs/systemd-time-sync-startup-runbook.md")
 
 
 def read_unit(name: str) -> ConfigParser:
@@ -48,3 +49,15 @@ def test_non_window_services_are_not_broadened_by_this_fix() -> None:
         unit = read_unit(name)
         assert TIME_WAIT_UNIT not in tokens(unit, "After"), name
         assert TIME_WAIT_UNIT not in tokens(unit, "Wants"), name
+
+
+def test_time_sync_runbook_documents_preflight_offline_policy_and_rollback() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+
+    assert "systemd-time-wait-sync.service" in text
+    assert "/run/systemd/timesync/synchronized" in text
+    assert "NTP 서버에 도달할 수 없는 환경" in text
+    assert "systemd-analyze verify" in text
+    assert "설치 전 백업" in text
+    assert "Rollback" in text
+    assert "대규모 `LATE_CAPTURE`" in text
