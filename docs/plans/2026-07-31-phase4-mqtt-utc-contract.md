@@ -2,7 +2,7 @@
 
 **목표:** MQTT Subscriber가 신규 수신 시각을 UTC `Z` 형식으로 저장하고, Cutover가 비정상 MQTT Timestamp를 사전에 차단하며, 기존 Legacy Row·Phase 4 Runtime·API·React Dashboard와의 정합성을 유지한다.
 
-**구현 방식:** 입력 시점에서 aware datetime만 UTC로 정규화하고, Phase 4 공통 시간 Helper를 재사용한다. Cutover는 DB 변경 전에 MQTT Timestamp Preflight를 수행한다. Legacy Timestamp Parser는 기존 Row 호환을 위해 유지하고, API의 최근 로그 정렬만 `unixepoch()` 기반으로 보완한다.
+**구현 방식:** 입력 시점에서 aware datetime만 UTC로 정규화하고, Phase 4 공통 시간 Helper를 재사용한다. Cutover는 DB 변경 전에 MQTT Timestamp Preflight를 수행한다. Legacy Timestamp Parser는 기존 Row 호환을 위해 유지한다. 출처가 다른 공백 Timestamp의 실제 Instant는 문자열만으로 복원하지 않고, MQTT API는 DB 적재순을 사용하며 Frontend는 필드별로 명시된 해석만 수행한다.
 
 **기술 스택:** Python 3.10, SQLite, SQLAlchemy, pytest, FastAPI, React
 
@@ -17,6 +17,8 @@
 - `mqtt_logs.received_at`과 `devices.last_seen_at`은 동일한 문자열을 사용한다.
 - Cutover는 `received_at >= cutover_at + 10초` 또는 파싱 불가능한 Row가 있으면 DB 변경 전에 실패한다.
 - 실제 DB 보정과 실제 Cutover는 별도 승인 전까지 실행하지 않는다.
+- 모든 Legacy 공백 Timestamp를 UTC 또는 KST로 일괄 해석하지 않는다.
+- Frontend 외부 테스트 Framework나 의존성을 추가하지 않는다.
 
 ---
 
@@ -29,13 +31,19 @@
 - `edge/detection/phase4_cutover_repository.py`
   - Cutover Transaction의 첫 단계로 MQTT Timestamp Preflight를 추가한다.
 - `backend/app/services/mqtt_log_query_service.py`
-  - Legacy 공백 형식과 신규 `Z` 형식이 섞여도 실제 시각순으로 조회되도록 정렬한다.
+  - Timestamp 문자열 의미와 무관하게 최신 DB 적재순으로 조회한다.
 - `tests/test_mqtt_feature_pipeline.py`
   - Subscriber UTC 계약과 `last_seen_at` 저장 일치를 검증한다.
 - `tests/test_phase4_cutover_repository.py`
   - Cutover Timestamp Preflight와 Rollback 불변성을 검증한다.
-- `tests/test_mqtt_log_query_service.py`
-  - 혼합 Timestamp 형식의 API 조회 순서를 검증한다.
+- `tests/test_api_mqtt_feature_logs.py`
+  - 기존 MQTT API 경계에서 혼합 Timestamp의 DB 적재순을 검증한다.
+- `frontend/src/utils/mqttTimestamp.js`
+  - MQTT 화면 전용 Parser·Formatter·경과 시간 Helper를 제공한다.
+- `frontend/src/utils/mqttTimestamp.test.js`
+  - Node 내장 Test Runner로 Offset·Legacy KST·모호한 값·오류 처리를 검증한다.
+- `frontend/src/pages/Logs.jsx`, `frontend/src/pages/Devices.jsx`
+  - 동일한 MQTT Timestamp Utility를 필드별 정책으로 사용한다.
 - `docs/db-schema.md`
   - 신규 Subscriber의 UTC 저장 계약과 Legacy Row 호환 범위를 명시한다.
 - `docs/phase4-cutover-runbook.md`
@@ -49,8 +57,6 @@
   - 기존 MVP 테스트와 Legacy Feature 형식을 보존한다. Phase 4 전환 후에는 기존 CLI가 Checkpoint 존재를 보고 실행을 거부한다.
 - `edge/detection/mqtt_adapters.py`
   - 이미 `unixepoch()`와 `parse_db_utc()`를 사용하므로 신규 UTC `Z` Row와 호환된다.
-- Frontend `Logs.jsx`, `Devices.jsx`
-  - `new Date(value)`로 ISO UTC를 파싱하고 `Asia/Seoul`로 표시하므로 코드 변경이 필요 없다.
 - DB Migration
   - SQLite의 기존 DATETIME 컬럼은 UTC `Z` 문자열을 저장할 수 있고, `CURRENT_TIMESTAMP` 기반 Legacy UTC 문자열도 `unixepoch()`로 해석 가능하다.
 
@@ -180,6 +186,12 @@ python -m pytest tests/test_mqtt_feature_pipeline.py -q
 **인터페이스:**
 - 입력: `insert_mqtt_log(db, row)`
 - 출력: 한 메시지에 대해 `mqtt_logs.received_at == devices.last_seen_at`
+
+테스트 Import는 실제 호출부에 맞춰 다음을 사용한다.
+
+```python
+from edge.mqtt.subscriber import build_mqtt_log_row, insert_mqtt_log
+```
 
 - [ ] **2.1 DB 저장 정합성 실패 테스트 추가**
 
@@ -403,26 +415,27 @@ python -m pytest tests/test_phase4_cutover_repository.py -q
 
 ---
 
-## Task 4: 혼합 Timestamp 형식 API 정렬
+## Task 4: MQTT API 적재순 정렬
 
 **파일:**
-- 생성: `tests/test_mqtt_log_query_service.py`
+- 수정: `tests/test_api_mqtt_feature_logs.py`
 - 수정: `backend/app/services/mqtt_log_query_service.py`
 
 **인터페이스:**
-- 입력: Legacy `YYYY-MM-DD HH:MM:SS`와 신규 `YYYY-MM-DDTHH:MM:SSZ`가 섞인 `mqtt_logs`
-- 출력: `/api/mqtt-logs` 조회가 실제 Epoch 내림차순
+- 입력: 의미가 다른 Legacy 공백값과 신규 Offset 포함 값이 섞인 `mqtt_logs`
+- 출력: `/api/mqtt-logs` 조회가 DB 수신·적재 순서인 `id DESC`
 
-- [ ] **4.1 문자열 정렬 결함을 재현하는 실패 테스트 작성**
+- [ ] **4.1 문자열 정렬 결함을 기존 API 테스트에서 재현**
 
 ```python
 from sqlalchemy import text
 
-from backend.app.services.mqtt_log_query_service import list_mqtt_logs
+from backend.app.main import app
+from fastapi.testclient import TestClient
 from tests.conftest import cleanup_device
 
 
-def test_list_mqtt_logs_orders_mixed_timestamp_formats_by_actual_time(db_session) -> None:
+def test_mqtt_logs_api_orders_mixed_timestamps_by_ingestion_id(db_session) -> None:
     device_id = "test_mqtt_order"
     cleanup_device(db_session, device_id)
     db_session.execute(
@@ -443,18 +456,18 @@ def test_list_mqtt_logs_orders_mixed_timestamp_formats_by_actual_time(db_session
             )
             VALUES
                 (:device_id, 'iot/test_mqtt_order/sensor', '{}', 2,
-                 '2026-07-31 10:00:09', 1, 1),
+                 '2026-07-31T10:00:01Z', 1, 1),
                 (:device_id, 'iot/test_mqtt_order/sensor', '{}', 2,
-                 '2026-07-31T10:00:01Z', 1, 1)
+                 '2026-07-31 10:00:09', 1, 1)
             """
         ),
         {"device_id": device_id},
     )
     db_session.commit()
 
-    result = list_mqtt_logs(db_session, device_id=device_id)
+    response = TestClient(app).get(f"/api/mqtt-logs?device_id={device_id}")
 
-    assert [row["received_at"] for row in result["items"]] == [
+    assert [row["received_at"] for row in response.json()["items"]] == [
         "2026-07-31 10:00:09",
         "2026-07-31T10:00:01Z",
     ]
@@ -464,37 +477,74 @@ def test_list_mqtt_logs_orders_mixed_timestamp_formats_by_actual_time(db_session
 - [ ] **4.2 현재 문자열 정렬로 실패하는지 확인**
 
 ```bash
-python -m pytest tests/test_mqtt_log_query_service.py -q
+python -m pytest tests/test_api_mqtt_feature_logs.py -q
 ```
 
-예상: `T` 문자가 공백보다 뒤에서 정렬돼 실제 시각과 반대 순서로 실패한다.
+예상: 문자열 정렬이 나중에 적재된 공백값보다 먼저 적재된 `Z` 값을 앞에 두어 실패한다.
 
 - [ ] **4.3 최소 정렬 수정**
 
 ```sql
-ORDER BY unixepoch(received_at) DESC, id DESC
+ORDER BY id DESC
 ```
 
-응답 Timestamp 문자열 자체는 변환하지 않는다. 기존 API 계약과 Frontend 표시를 보존한다.
+응답 Timestamp 문자열 자체는 변환하지 않는다. 이 순서는 실제 시각순이 아니라 DB 적재순임을 문서화한다.
 
 - [ ] **4.4 API Query 테스트 통과 확인**
 
 ```bash
-python -m pytest tests/test_mqtt_log_query_service.py -q
+python -m pytest tests/test_api_mqtt_feature_logs.py -q
 ```
 
 예상: PASS.
 
 ---
 
-## Task 5: Phase 4 Runtime 정합성 회귀
+## Task 5: Frontend MQTT Timestamp 경계
+
+**파일:**
+- 생성: `frontend/src/utils/mqttTimestamp.js`
+- 생성: `frontend/src/utils/mqttTimestamp.test.js`
+- 수정: `frontend/src/pages/Logs.jsx`
+- 수정: `frontend/src/pages/Devices.jsx`
+- 수정: `frontend/package.json`
+
+- [ ] **5.1 Node 내장 Test Runner로 RED 확인**
+
+다음을 검증한다.
+
+- `Z`와 명시적 Offset은 같은 Instant로 파싱한다.
+- Legacy KST 모드를 명시한 `2026-07-31 19:00:01`은 `2026-07-31T10:00:01Z`가 된다.
+- 두 값은 화면에서 같은 KST 시각으로 표시된다.
+- Devices 경과 시간 계산은 같은 Instant를 사용한다.
+- 모드를 지정하지 않은 Naive 값과 잘못된 값은 `null`로 거부한다.
+
+외부 Test Framework를 추가하지 않고 `node:test`, `node:assert/strict`를 사용한다.
+
+- [ ] **5.2 두 화면에 필드별 정책 적용**
+
+- `Logs.jsx`: Offset 포함 값만 변환하고 Legacy 공백값은 시간대 미확인으로 표시한다.
+- `Devices.jsx`: `last_seen_at`에 한해 Legacy 공백값을 KST로 해석한다.
+- 다른 화면과 Timestamp에는 이 Utility를 적용하지 않는다.
+
+- [ ] **5.3 Frontend 검증**
+
+```bash
+npm test
+npm run lint
+npm run build
+```
+
+---
+
+## Task 6: Phase 4 Runtime 정합성 회귀
 
 **파일:**
 - 수정: `tests/test_phase4_detection_core.py`
 - 검증: `edge/features/collect_feature_logs.py`
 - 검증: `edge/detection/mqtt_adapters.py`
 
-- [ ] **5.1 Legacy UTC 공백 형식과 신규 `Z` 형식 혼합 Source 테스트 추가**
+- [ ] **6.1 Legacy UTC 공백 형식과 신규 `Z` 형식 혼합 Source 테스트 추가**
 
 ```python
 def test_mqtt_feature_producer_accepts_legacy_utc_and_canonical_z_rows(
@@ -530,7 +580,7 @@ def test_mqtt_feature_producer_accepts_legacy_utc_and_canonical_z_rows(
         assert row["min_message_interval"] == 5.0
 ```
 
-- [ ] **5.2 회귀 테스트 실행**
+- [ ] **6.2 회귀 테스트 실행**
 
 ```bash
 python -m pytest \
@@ -543,14 +593,14 @@ python -m pytest \
 
 ---
 
-## Task 6: 문서 정합성
+## Task 7: 문서 정합성
 
 **파일:**
 - 수정: `docs/db-schema.md`
 - 수정: `docs/phase4-cutover-runbook.md`
 - 검증: `docs/phase4-mqtt-utc-contract.md`
 
-- [ ] **6.1 DB Schema 문서 보완**
+- [ ] **7.1 DB Schema 문서 보완**
 
 `mqtt_logs.received_at`에 다음을 명시한다.
 
@@ -560,7 +610,7 @@ python -m pytest \
 
 `devices.last_seen_at`에는 Subscriber가 `mqtt_logs.received_at`과 같은 UTC 문자열을 저장한다고 명시한다.
 
-- [ ] **6.2 Cutover Runbook 보완**
+- [ ] **7.2 Cutover Runbook 보완**
 
 실제 Cutover 전 확인 항목에 다음을 추가한다.
 
@@ -574,7 +624,7 @@ ORDER BY id;
 
 결과가 있으면 실제 Cutover를 중단하고 Timestamp 출처를 확인하도록 명시한다.
 
-- [ ] **6.3 Legacy Collector 운영 경계 명시**
+- [ ] **7.3 Legacy Collector 운영 경계 명시**
 
 UTC Subscriber 코드 반영 후에도 실제 Phase 4 Cutover 전까지는 다음을 유지한다.
 
@@ -585,27 +635,27 @@ UTC Subscriber 코드 반영 후에도 실제 Phase 4 Cutover 전까지는 다�
 
 ---
 
-## Task 7: 최종 검증
+## Task 8: 최종 검증
 
-- [ ] **7.1 관련 테스트 전체 실행**
+- [ ] **8.1 관련 테스트 전체 실행**
 
 ```bash
 python -m pytest \
   tests/test_mqtt_feature_pipeline.py \
-  tests/test_mqtt_log_query_service.py \
+  tests/test_api_mqtt_feature_logs.py \
   tests/test_phase4_cutover_repository.py \
   tests/test_phase4_detection_core.py \
   tests/test_mqtt_feature_builder_runtime.py \
   -q
 ```
 
-- [ ] **7.2 전체 Python 회귀 테스트 실행**
+- [ ] **8.2 전체 Python 회귀 테스트 실행**
 
 ```bash
 python -m pytest -q
 ```
 
-- [ ] **7.3 변경 파일 점검**
+- [ ] **8.3 변경 파일 점검**
 
 ```bash
 git diff --check
@@ -613,7 +663,7 @@ git status --short
 git diff --stat develop...HEAD
 ```
 
-- [ ] **7.4 실제 운영 단계 전 보류 확인**
+- [ ] **8.4 실제 운영 단계 전 보류 확인**
 
 다음 작업은 이 코드 PR 병합 후 별도 승인으로 수행한다.
 
@@ -632,7 +682,8 @@ git diff --stat develop...HEAD
 - `mqtt_logs.received_at`과 `devices.last_seen_at`이 일치한다.
 - Cutover가 비정상 미래·파싱 불가능 MQTT Row를 DB 변경 전에 차단한다.
 - Phase 4 Producer와 MQTT Message Rule이 신규 `Z` Row를 기존과 동일하게 처리한다.
-- API가 Legacy 공백 형식과 신규 `Z` 형식을 실제 시각순으로 반환한다.
-- React Dashboard는 기존 KST 표시와 최근 통신 계산을 유지한다.
-- 전체 Python 테스트가 통과한다.
+- API가 Timestamp 문자열과 무관하게 DB 적재순으로 반환한다.
+- React Logs는 모호한 Legacy MQTT 공백값을 추정하지 않고, Devices는 Subscriber가 쓴 Legacy `last_seen_at`만 KST로 해석한다.
+- MQTT·Phase 4 관련 Python 테스트가 모두 통과한다.
+- Windows 전체 기준선의 기존 Firewall Wrapper 26개 외에 신규 실패가 없다.
 - 운영 DB와 실제 Cutover는 별도 승인 전까지 변경되지 않는다.

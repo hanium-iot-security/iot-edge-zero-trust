@@ -20,6 +20,11 @@ Phase 4의 MQTT 수집·Feature 생성·Detection·Cutover 경로가 동일한 U
 3. Cutover는 파싱 불가능하거나 비정상적으로 미래인 MQTT 시각이 있으면 Checkpoint를 만들지 않는다.
 4. 기존 운영 DB 보정은 전체 일괄 변환이 아니라 검증된 대상만 백업 후 수행한다.
 
+Legacy 공백 Timestamp에는 서로 다른 의미가 공존할 수 있다. 기존 Subscriber가 Pi의
+`Asia/Seoul` Local Time으로 만든 값과 SQLite `CURRENT_TIMESTAMP`가 만든 UTC 값은 모두
+`YYYY-MM-DD HH:MM:SS` 형태다. 문자열만으로 출처를 구분할 수 없으므로 프로젝트 전체 또는
+`mqtt_logs` 전체에 UTC·KST 중 하나를 일괄 적용하지 않는다.
+
 ## 2. 현재 구현과 문제 경계
 
 ### 2.1 MQTT Subscriber
@@ -150,6 +155,36 @@ Subscriber가 생성한 UTC 문자열 하나를 두 Query에 재사용한다.
 UTC-aware 값으로 수정한다. 운영 Runtime의 일반 메시지 수신은 `received_at`을 전달하지 않으므로
 기본 UTC Clock 경로를 사용한다.
 
+### 4.6 Legacy 공백 Timestamp의 의미 경계
+
+- `parse_db_utc()`가 Naive DB 문자열을 UTC로 보는 동작은 기존 Phase 4 Runtime 호환 계약이므로
+  변경하지 않는다. 이는 해당 Row의 실제 생성 시각이 UTC였음을 증명하는 기능은 아니다.
+- 기존 Subscriber가 `mqtt_logs.received_at`과 `devices.last_seen_at`에 함께 쓴 공백 문자열은
+  Pi가 `Asia/Seoul`일 때 KST Local Naive 값이다.
+- `mqtt_logs.received_at`의 DB 기본값 `CURRENT_TIMESTAMP`가 만든 공백 문자열은 UTC다.
+- 동일 문자열 모양만으로 두 출처를 구분할 수 없으므로 Frontend와 API가 모든 MQTT 공백값을
+  UTC 또는 KST로 추정하지 않는다.
+- 실제 운영 DB 보정은 출처가 검증된 Row만 대상으로 하며 이번 코드 변경에서는 수행하지 않는다.
+
+### 4.7 MQTT API와 Frontend 표시 계약
+
+`GET /api/mqtt-logs`의 기본 정렬은 실제 시각순이 아니라 DB 수신·적재 순서다.
+
+```sql
+ORDER BY id DESC
+```
+
+Timezone 출처가 없는 Legacy 공백값으로 실제 Instant를 복원할 수 없으므로 `unixepoch()` 기반
+정렬을 실제 시각순이라고 표현하지 않는다.
+
+Frontend는 MQTT 전용 공통 Parser를 사용한다.
+
+- `Z` 또는 명시적 Offset이 있는 값은 그 Offset대로 파싱한다.
+- `devices.last_seen_at`의 Legacy 공백값은 Subscriber 저장 경로에 근거해 KST로 파싱한다.
+- `mqtt_logs.received_at`의 Legacy 공백값은 출처가 모호하므로 임의 변환하지 않고 시간대 미확인으로 표시한다.
+- 잘못된 문자열은 안전하게 거부한다.
+- 이 규칙을 다른 테이블 Timestamp에 전역 적용하지 않는다.
+
 ## 5. Cutover MQTT Timestamp Preflight
 
 ### 5.1 위치
@@ -272,6 +307,13 @@ tests/test_phase4_detection_core.py
 
 관련 테스트 통과 후 전체 `pytest`를 실행한다.
 
+### 6.4 API·Frontend 테스트
+
+- MQTT Logs API가 혼합 Timestamp 문자열과 무관하게 `id DESC` 적재순을 반환하는지 검증한다.
+- Node 내장 `node:test`와 `assert`만 사용해 명시적 Offset, KST Legacy 모드, 모호한 Naive 값,
+  잘못된 값, KST 표시와 Devices 경과 시간 계산을 검증한다.
+- 외부 Frontend 테스트 의존성은 추가하지 않는다.
+
 ## 7. 운영 DB 보정 원칙
 
 운영 DB 보정은 코드 수정과 자동 테스트가 병합되고 Pi에 반영된 뒤 별도 승인으로 수행한다.
@@ -345,5 +387,7 @@ UTC 코드 수정과 운영 DB 보정 후 Smoke Test를 다시 실행한다.
 - 파싱 불가능하거나 허용 범위를 넘는 미래 MQTT Row가 있으면 Cutover가 실패함
 - 정상 DB에서 MQTT 관련 두 Checkpoint가 완료된 Cutover 경계의 최대 Source ID와 일치함
 - 관련 테스트와 전체 회귀 테스트가 통과함
+- MQTT Logs API가 DB 적재순으로 일관되게 반환됨
+- Frontend가 명시적 Offset과 Devices Legacy KST를 안전하게 처리하고 모호한 MQTT Log 공백값을 추정하지 않음
 - 실기기 DB 보정은 검증된 Backup과 별도 승인 아래 수행됨
 - 실제 Phase 4 Cutover는 별도 승인 전까지 실행하지 않음
