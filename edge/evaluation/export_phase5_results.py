@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+from datetime import datetime, timedelta
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,7 +19,13 @@ from edge.evaluation.phase5_evaluator import (
     evaluate_phase5_run,
     summarize_evaluation_rows,
 )
-from edge.phase5.contracts import RunManifest, RunManifestValidationError
+from edge.phase5.contracts import (
+    ManifestStatus,
+    RUN_MANIFEST_SHA256_SIDECAR_SUFFIX,
+    RunManifest,
+    RunManifestValidationError,
+    run_manifest_sha256,
+)
 
 
 JSONL_FILENAME = "phase5-evaluation.jsonl"
@@ -94,7 +102,11 @@ def export_phase5_results(
     csv_path = output_dir / CSV_FILENAME
     summary_path = output_dir / SUMMARY_FILENAME
 
-    existing_rows = _load_existing_jsonl(jsonl_path, evaluation_schema_version)
+    existing_rows = _load_existing_jsonl(
+        jsonl_path,
+        evaluation_schema_version,
+        source_commit,
+    )
     row = evaluate_phase5_run(
         manifest,
         db_path=db_path,
@@ -104,7 +116,11 @@ def export_phase5_results(
     )
     rows = _dedupe_rows([*existing_rows, row])
     _write_jsonl_atomically(jsonl_path, rows)
-    loaded_rows = _load_existing_jsonl(jsonl_path, evaluation_schema_version)
+    loaded_rows = _load_existing_jsonl(
+        jsonl_path,
+        evaluation_schema_version,
+        source_commit,
+    )
     _write_csv_atomically(csv_path, loaded_rows)
     summary = summarize_evaluation_rows(
         loaded_rows,
@@ -193,13 +209,23 @@ def _validate_inputs(
         raise Phase5ExportEnvironmentError(f"database not found: {db_path}")
 
     try:
-        manifest = RunManifest.from_json(manifest_path.read_text(encoding="utf-8"))
+        manifest_text = manifest_path.read_text(encoding="utf-8")
+        manifest = RunManifest.from_json(manifest_text)
     except OSError as exc:
         raise Phase5ExportError(f"failed to read manifest: {manifest_path}") from exc
     except json.JSONDecodeError as exc:
         raise Phase5ExportError(f"invalid manifest JSON: {manifest_path}") from exc
 
+    _validate_manifest_sidecar(manifest_path, manifest)
     scenario_result = _load_matching_scenario_result(scenario_results_path, manifest)
+    scenario_result["_manifest_sha256"] = hashlib.sha256(
+        manifest_text.encode("utf-8")
+    ).hexdigest()
+    scenario_result["_scenario_result_sha256"] = _canonical_json_sha256(
+        scenario_result,
+        exclude_meta=True,
+    )
+    scenario_result["_db_snapshot_sha256"] = _file_sha256(db_path)
     return manifest, scenario_result
 
 
@@ -209,19 +235,28 @@ def _load_matching_scenario_result(
 ) -> dict[str, Any]:
     rows = _load_jsonl(path, "scenario results")
     matching: list[dict[str, Any]] = []
-    for row in rows:
-        run_id = row.get("run_id")
-        session_id = row.get("session_id")
-        scenario_id = row.get("scenario_id")
-        if run_id is not None and run_id != manifest.run_id:
+    malformed: list[str] = []
+    for index, row in enumerate(rows, start=1):
+        issue = _scenario_result_contract_issue(row, manifest)
+        if issue is not None:
+            malformed.append(f"line {index}: {issue}")
             continue
-        if session_id is not None and session_id != manifest.session_id:
+        if row["run_id"] != manifest.run_id:
             continue
-        if scenario_id is not None and scenario_id != manifest.scenario.scenario_id:
+        if row["scenario_id"] != manifest.scenario.scenario_id:
+            continue
+        if manifest.session_id is not None and row["session_id"] != manifest.session_id:
             continue
         matching.append(row)
+    if malformed:
+        raise Phase5ExportError(
+            "scenario results contain invalid official rows: "
+            + "; ".join(malformed)
+        )
     if not matching:
-        return {}
+        raise Phase5ExportError(
+            "scenario results contain no row for the manifest identity"
+        )
     if len(matching) > 1:
         raise Phase5ExportError(
             "scenario results contain multiple rows for the manifest identity"
@@ -229,9 +264,44 @@ def _load_matching_scenario_result(
     return matching[0]
 
 
+def _scenario_result_contract_issue(
+    row: Mapping[str, Any],
+    manifest: RunManifest,
+) -> str | None:
+    for field_name in ("run_id", "scenario_id"):
+        if not isinstance(row.get(field_name), str) or not row[field_name].strip():
+            return f"{field_name} is required"
+    if manifest.session_id is not None:
+        if not isinstance(row.get("session_id"), str) or not row["session_id"].strip():
+            return "session_id is required for captured runs"
+    elif row.get("session_id") not in {None, ""}:
+        return "session_id must be null or omitted for pre-capture runs"
+    raw_status = row.get("scenario_status")
+    try:
+        ManifestStatus(raw_status)
+    except ValueError:
+        return "scenario_status must be a ManifestStatus value"
+    if not isinstance(row.get("capture_eligible"), bool):
+        return "capture_eligible must be boolean"
+    if row.get("capture_eligible") is False:
+        reason = row.get("capture_exclusion_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            return "capture_exclusion_reason is required when capture_eligible=false"
+    if "block_confirmed" in row and not isinstance(row["block_confirmed"], bool):
+        return "block_confirmed must be boolean when present"
+    if row.get("block_confirmed") is True:
+        if _parse_utc_timestamp(row.get("block_confirmed_at")) is None:
+            return "block_confirmed_at is required when block_confirmed=true"
+    elif row.get("block_confirmed_at") is not None:
+        if _parse_utc_timestamp(row.get("block_confirmed_at")) is None:
+            return "block_confirmed_at must be a UTC timestamp"
+    return None
+
+
 def _load_existing_jsonl(
     path: Path,
     evaluation_schema_version: str,
+    source_commit: str,
 ) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -245,6 +315,11 @@ def _load_existing_jsonl(
         if not isinstance(row.get("evaluation_identity"), str):
             raise Phase5ExportError(
                 f"existing JSONL is missing evaluation_identity at line {index}"
+            )
+        if row.get("source_commit") != source_commit:
+            raise Phase5ExportError(
+                "existing JSONL source_commit mismatch at "
+                f"line {index}: {row.get('source_commit')!r}"
             )
     return rows
 
@@ -277,6 +352,14 @@ def _dedupe_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     by_identity: dict[str, dict[str, Any]] = {}
     for row in rows:
         identity = str(row["evaluation_identity"])
+        existing = by_identity.get(identity)
+        if existing is not None:
+            if _canonical_json(existing) != _canonical_json(row):
+                raise Phase5ExportError(
+                    "evaluation JSONL contains conflicting rows for identity: "
+                    f"{identity}"
+                )
+            continue
         by_identity[identity] = row
     return sorted(
         by_identity.values(),
@@ -287,6 +370,70 @@ def _dedupe_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
             str(row.get("evaluation_identity")),
         ),
     )
+
+
+def _validate_manifest_sidecar(path: Path, manifest: RunManifest) -> None:
+    sidecar_path = path.with_name(path.name + RUN_MANIFEST_SHA256_SIDECAR_SUFFIX)
+    if not sidecar_path.exists():
+        return
+    expected = run_manifest_sha256(manifest)
+    sidecar_parts = sidecar_path.read_text(encoding="utf-8").strip().split()
+    if not sidecar_parts:
+        raise Phase5ExportError(f"run manifest SHA256 sidecar is empty: {sidecar_path}")
+    actual = sidecar_parts[0]
+    if actual != expected:
+        raise Phase5ExportError(
+            f"run manifest SHA256 sidecar mismatch: {sidecar_path}"
+        )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise Phase5ExportError(f"failed to read input artifact: {path}") from exc
+    return digest.hexdigest()
+
+
+def _canonical_json_sha256(
+    payload: Mapping[str, Any],
+    *,
+    exclude_meta: bool = False,
+) -> str:
+    if exclude_meta:
+        payload = {
+            key: value
+            for key, value in payload.items()
+            if not str(key).startswith("_")
+        }
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _canonical_json(payload: Mapping[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _parse_utc_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    if parsed.utcoffset() != timedelta(0):
+        return None
+    return parsed
 
 
 def _write_jsonl_atomically(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:

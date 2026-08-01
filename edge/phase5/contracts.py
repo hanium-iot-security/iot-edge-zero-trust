@@ -12,6 +12,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+import hashlib
 from ipaddress import ip_address
 import json
 import re
@@ -22,6 +23,7 @@ from edge.trust.trust_policy import SCORE_DELTA_BY_EVENT
 
 RUN_MANIFEST_SCHEMA_VERSION = "phase5-run-manifest-v1"
 SUPPORTED_RUN_MANIFEST_SCHEMA_VERSIONS = (RUN_MANIFEST_SCHEMA_VERSION,)
+RUN_MANIFEST_SHA256_SIDECAR_SUFFIX = ".sha256"
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 _WINDOWS_DRIVE_PATTERN = re.compile(r"^[A-Za-z]:")
@@ -49,7 +51,7 @@ class ManifestStatus(str, Enum):
 
 
 class EvaluationScope(str, Enum):
-    FULL_RUN = "FULL_RUN"
+    FULL_E2E = "FULL_E2E"
     DETECTION_ONLY = "DETECTION_ONLY"
     TRUST_ONLY = "TRUST_ONLY"
     FIREWALL_ONLY = "FIREWALL_ONLY"
@@ -188,7 +190,7 @@ class ExpectedOutcome:
     trust_score_change_expected: bool = False
     firewall_expected: bool = False
     block_expected: bool = False
-    evaluation_scope: EvaluationScope = EvaluationScope.FULL_RUN
+    evaluation_scope: EvaluationScope = EvaluationScope.FULL_E2E
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -357,13 +359,58 @@ class RunArtifact:
         }
 
 
+@dataclass(frozen=True)
+class ManifestReference:
+    relative_path: str
+    schema_version: str
+    sha256: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "relative_path",
+            _normalize_relative_path(
+                self.relative_path,
+                "session_manifest_ref.relative_path",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "schema_version",
+            _require_non_empty_string(
+                self.schema_version,
+                "session_manifest_ref.schema_version",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "sha256",
+            _normalize_sha256(self.sha256, "session_manifest_ref.sha256"),
+        )
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ManifestReference":
+        return cls(
+            relative_path=payload["relative_path"],
+            schema_version=payload["schema_version"],
+            sha256=payload["sha256"],
+        )
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "relative_path": self.relative_path,
+            "schema_version": self.schema_version,
+            "sha256": self.sha256,
+        }
+
+
 @dataclass(frozen=True, kw_only=True)
 class RunManifest:
     run_id: str
-    session_id: str
+    session_id: str | None
     scenario: ScenarioReference
-    target_device_id: str
-    source_ip: str
+    target_device_id: str | None
+    source_ip: str | None
     execution_node: ExecutionNode
     evaluation_scope: EvaluationScope
     is_active: bool
@@ -377,7 +424,10 @@ class RunManifest:
     external_observations: Mapping[str, datetime] = field(default_factory=dict)
     matched_ids: MatchedResultIds = field(default_factory=MatchedResultIds)
     artifacts: tuple[RunArtifact, ...] = ()
-    session_manifest_ref: str | None = None
+    session_manifest_ref: ManifestReference | None = None
+    failure_stage: str | None = None
+    failure_reason_code: str | None = None
+    failure_reason: str | None = None
 
     def __post_init__(self) -> None:
         require_supported_run_manifest_schema_version(
@@ -391,17 +441,17 @@ class RunManifest:
         object.__setattr__(
             self,
             "session_id",
-            _require_non_empty_string(self.session_id, "session_id"),
+            _normalize_optional_string(self.session_id, "session_id"),
         )
         object.__setattr__(
             self,
             "target_device_id",
-            _require_non_empty_string(self.target_device_id, "target_device_id"),
+            _normalize_optional_string(self.target_device_id, "target_device_id"),
         )
         object.__setattr__(
             self,
             "source_ip",
-            _normalize_ip_address(self.source_ip, "source_ip"),
+            _normalize_optional_ip_address(self.source_ip, "source_ip"),
         )
         object.__setattr__(
             self,
@@ -461,6 +511,15 @@ class RunManifest:
         ended_at = _normalize_optional_datetime(self.ended_at, "ended_at")
         if observation_deadline_at < started_at:
             raise ValueError("observation_deadline_at must not be earlier than started_at")
+        if attack_started_at is not None and attack_started_at < started_at:
+            raise ValueError("attack_started_at must not be earlier than started_at")
+        if (
+            attack_started_at is not None
+            and attack_started_at > observation_deadline_at
+        ):
+            raise ValueError(
+                "attack_started_at must not be later than observation_deadline_at"
+            )
         if ended_at is not None and ended_at < started_at:
             raise ValueError("ended_at must not be earlier than started_at")
         object.__setattr__(self, "started_at", started_at)
@@ -489,14 +548,38 @@ class RunManifest:
             )
         )
         object.__setattr__(self, "artifacts", artifacts)
+        session_manifest_ref = self.session_manifest_ref
+        if isinstance(session_manifest_ref, Mapping):
+            session_manifest_ref = ManifestReference.from_dict(session_manifest_ref)
+        if session_manifest_ref is not None and not isinstance(
+            session_manifest_ref,
+            ManifestReference,
+        ):
+            raise ValueError("session_manifest_ref must be a ManifestReference")
         object.__setattr__(
             self,
             "session_manifest_ref",
+            session_manifest_ref,
+        )
+        object.__setattr__(
+            self,
+            "failure_stage",
+            _normalize_optional_string(self.failure_stage, "failure_stage"),
+        )
+        object.__setattr__(
+            self,
+            "failure_reason_code",
             _normalize_optional_string(
-                self.session_manifest_ref,
-                "session_manifest_ref",
+                self.failure_reason_code,
+                "failure_reason_code",
             ),
         )
+        object.__setattr__(
+            self,
+            "failure_reason",
+            _normalize_optional_string(self.failure_reason, "failure_reason"),
+        )
+        _require_pre_capture_failure_invariant(self)
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "RunManifest":
@@ -527,6 +610,9 @@ class RunManifest:
                 for artifact in payload.get("artifacts", ())
             ),
             session_manifest_ref=payload.get("session_manifest_ref"),
+            failure_stage=payload.get("failure_stage"),
+            failure_reason_code=payload.get("failure_reason_code"),
+            failure_reason=payload.get("failure_reason"),
         )
 
     @classmethod
@@ -566,7 +652,14 @@ class RunManifest:
             "statuses": self.statuses.to_dict(),
             "matched_ids": self.matched_ids.to_dict(),
             "artifacts": [artifact.to_dict() for artifact in self.artifacts],
-            "session_manifest_ref": self.session_manifest_ref,
+            "session_manifest_ref": (
+                None
+                if self.session_manifest_ref is None
+                else self.session_manifest_ref.to_dict()
+            ),
+            "failure_stage": self.failure_stage,
+            "failure_reason_code": self.failure_reason_code,
+            "failure_reason": self.failure_reason,
         }
 
     def to_json(self) -> str:
@@ -586,6 +679,22 @@ def require_supported_run_manifest_schema_version(value: str) -> str:
     if not is_supported_run_manifest_schema_version(value):
         raise ValueError(f"unsupported run manifest schema version: {value!r}")
     return value
+
+
+def run_manifest_sha256(manifest: RunManifest | Mapping[str, Any] | str) -> str:
+    """Return the canonical digest used by run-manifest.json.sha256."""
+    if isinstance(manifest, RunManifest):
+        payload = manifest.to_json()
+    elif isinstance(manifest, Mapping):
+        payload = json.dumps(
+            manifest,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    else:
+        payload = manifest
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def validate_run_manifest_dict(payload: Mapping[str, Any]) -> ManifestValidationResult:
@@ -608,13 +717,13 @@ def validate_run_manifest_dict(payload: Mapping[str, Any]) -> ManifestValidation
 
     _validate_schema_version(payload.get("run_manifest_schema_version"), errors)
     _validate_non_empty_string(payload.get("run_id"), "run_id", errors)
-    _validate_non_empty_string(payload.get("session_id"), "session_id", errors)
-    _validate_non_empty_string(
+    _validate_optional_string(payload.get("session_id"), "session_id", errors)
+    _validate_optional_string(
         payload.get("target_device_id"),
         "target_device_id",
         errors,
     )
-    _validate_ip_address(payload.get("source_ip"), "source_ip", errors)
+    _validate_optional_ip_address(payload.get("source_ip"), "source_ip", errors)
     _validate_enum_value(
         EvaluationScope,
         payload.get("evaluation_scope"),
@@ -630,11 +739,18 @@ def validate_run_manifest_dict(payload: Mapping[str, Any]) -> ManifestValidation
     _validate_matched_ids(payload.get("matched_ids"), errors)
     _validate_artifacts(payload.get("artifacts"), errors)
     _validate_observations(payload.get("external_observations"), errors)
-    _validate_optional_string(
+    _validate_manifest_reference(
         payload.get("session_manifest_ref"),
         "session_manifest_ref",
         errors,
     )
+    _validate_optional_string(payload.get("failure_stage"), "failure_stage", errors)
+    _validate_optional_string(
+        payload.get("failure_reason_code"),
+        "failure_reason_code",
+        errors,
+    )
+    _validate_optional_string(payload.get("failure_reason"), "failure_reason", errors)
 
     started_at = _validate_datetime(payload.get("started_at"), "started_at", errors)
     observation_deadline_at = _validate_datetime(
@@ -642,7 +758,7 @@ def validate_run_manifest_dict(payload: Mapping[str, Any]) -> ManifestValidation
         "observation_deadline_at",
         errors,
     )
-    _validate_optional_datetime(
+    attack_started_at = _validate_optional_datetime(
         payload.get("attack_started_at"),
         "attack_started_at",
         errors,
@@ -655,6 +771,23 @@ def validate_run_manifest_dict(payload: Mapping[str, Any]) -> ManifestValidation
                 "INVALID_TIME_ORDER",
                 "observation_deadline_at",
                 "must not be earlier than started_at",
+            )
+        if attack_started_at is not None and attack_started_at < started_at:
+            _add_error(
+                errors,
+                "INVALID_TIME_ORDER",
+                "attack_started_at",
+                "must not be earlier than started_at",
+            )
+        if (
+            attack_started_at is not None
+            and attack_started_at > observation_deadline_at
+        ):
+            _add_error(
+                errors,
+                "INVALID_TIME_ORDER",
+                "attack_started_at",
+                "must not be later than observation_deadline_at",
             )
     if started_at is not None and ended_at is not None and ended_at < started_at:
         _add_error(
@@ -673,6 +806,8 @@ def validate_run_manifest_dict(payload: Mapping[str, Any]) -> ManifestValidation
                 "expected_outcome.evaluation_scope",
                 "must match evaluation_scope",
             )
+
+    _validate_pre_capture_failure_payload(payload, errors)
 
     return ManifestValidationResult(tuple(errors))
 
@@ -701,6 +836,69 @@ def require_single_active_run(manifests: Iterable[RunManifest]) -> None:
     result = validate_single_active_run(manifests)
     if not result.is_valid:
         raise RunManifestValidationError(result.errors)
+
+
+def _require_pre_capture_failure_invariant(manifest: RunManifest) -> None:
+    identity_missing = (
+        manifest.session_id is None
+        or manifest.target_device_id is None
+        or manifest.source_ip is None
+    )
+    if not identity_missing:
+        return
+    missing = [
+        field_name
+        for field_name in ("failure_stage", "failure_reason_code", "failure_reason")
+        if getattr(manifest, field_name) is None
+    ]
+    if missing:
+        raise ValueError(
+            "pre-capture failure runs with null session/device/source fields "
+            f"must include {', '.join(missing)}"
+        )
+    if manifest.is_active:
+        raise ValueError("pre-capture failure runs must not be active")
+    if manifest.statuses.final_status == ManifestStatus.SUCCESS:
+        raise ValueError("pre-capture failure runs must not have SUCCESS final_status")
+
+
+def _validate_pre_capture_failure_payload(
+    payload: Mapping[str, Any],
+    errors: list[ManifestValidationIssue],
+) -> None:
+    identity_missing = any(
+        payload.get(field_name) is None
+        for field_name in ("session_id", "target_device_id", "source_ip")
+    )
+    if not identity_missing:
+        return
+    for field_name in ("failure_stage", "failure_reason_code", "failure_reason"):
+        if not isinstance(payload.get(field_name), str) or not payload[field_name].strip():
+            _add_error(
+                errors,
+                "PRE_CAPTURE_FAILURE_REASON_REQUIRED",
+                field_name,
+                "pre-capture failure runs with null session/device/source fields "
+                "must include failure stage, reason code, and reason",
+            )
+    if payload.get("is_active") is True:
+        _add_error(
+            errors,
+            "PRE_CAPTURE_FAILURE_ACTIVE",
+            "is_active",
+            "pre-capture failure runs must not be active",
+        )
+    statuses = payload.get("statuses")
+    if (
+        isinstance(statuses, Mapping)
+        and statuses.get("final_status") == ManifestStatus.SUCCESS.value
+    ):
+        _add_error(
+            errors,
+            "PRE_CAPTURE_FAILURE_SUCCESS",
+            "statuses.final_status",
+            "pre-capture failure runs must not have SUCCESS final_status",
+        )
 
 
 _STATUS_FIELDS = (
@@ -741,6 +939,9 @@ _RUN_MANIFEST_FIELDS = frozenset(
         "matched_ids",
         "artifacts",
         "session_manifest_ref",
+        "failure_stage",
+        "failure_reason_code",
+        "failure_reason",
     }
 )
 
@@ -788,6 +989,7 @@ _ARTIFACT_FIELDS = frozenset(
         "sha256",
     }
 )
+_MANIFEST_REF_FIELDS = frozenset({"relative_path", "schema_version", "sha256"})
 
 
 def _add_error(
@@ -998,6 +1200,30 @@ def _validate_artifacts(
         _validate_sha256(artifact.get("sha256"), f"{prefix}.sha256", errors)
 
 
+def _validate_manifest_reference(
+    value: Any,
+    field_path: str,
+    errors: list[ManifestValidationIssue],
+) -> None:
+    if value is None:
+        return
+    if not isinstance(value, Mapping):
+        _add_error(errors, "INVALID_TYPE", field_path, "must be an object")
+        return
+    _validate_allowed_keys(value, _MANIFEST_REF_FIELDS, field_path, errors)
+    _validate_relative_path(
+        value.get("relative_path"),
+        f"{field_path}.relative_path",
+        errors,
+    )
+    _validate_non_empty_string(
+        value.get("schema_version"),
+        f"{field_path}.schema_version",
+        errors,
+    )
+    _validate_sha256(value.get("sha256"), f"{field_path}.sha256", errors)
+
+
 def _validate_observations(
     value: Any,
     errors: list[ManifestValidationIssue],
@@ -1088,6 +1314,16 @@ def _validate_ip_address(
         ip_address(value.strip())
     except ValueError:
         _add_error(errors, "INVALID_IP", field_path, "must be a valid IP address")
+
+
+def _validate_optional_ip_address(
+    value: Any,
+    field_path: str,
+    errors: list[ManifestValidationIssue],
+) -> None:
+    if value is None:
+        return
+    _validate_ip_address(value, field_path, errors)
 
 
 def _validate_enum_value(
@@ -1188,6 +1424,12 @@ def _normalize_ip_address(value: Any, field_path: str) -> str:
         return str(ip_address(text))
     except ValueError as exc:
         raise ValueError(f"{field_path} must be a valid IP address") from exc
+
+
+def _normalize_optional_ip_address(value: Any, field_path: str) -> str | None:
+    if value is None:
+        return None
+    return _normalize_ip_address(value, field_path)
 
 
 def _coerce_enum(enum_type: type[Enum], value: Any, field_path: str) -> Any:

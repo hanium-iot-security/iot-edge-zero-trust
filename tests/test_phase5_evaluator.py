@@ -36,7 +36,7 @@ def _manifest(**overrides: object) -> RunManifest:
         "target_device_id": "esp32_01",
         "source_ip": "192.168.0.50",
         "execution_node": {"node_id": "pi-lab-01", "registered": True},
-        "evaluation_scope": "FULL_RUN",
+        "evaluation_scope": "FULL_E2E",
         "is_active": False,
         "started_at": "2026-08-01T01:00:00Z",
         "attack_started_at": "2026-08-01T01:00:05Z",
@@ -47,7 +47,7 @@ def _manifest(**overrides: object) -> RunManifest:
             "trust_score_change_expected": True,
             "firewall_expected": True,
             "block_expected": True,
-            "evaluation_scope": "FULL_RUN",
+            "evaluation_scope": "FULL_E2E",
         },
         "statuses": _statuses(),
     }
@@ -74,13 +74,20 @@ def _normal_manifest(**overrides: object) -> RunManifest:
         "trust_score_change_expected": False,
         "firewall_expected": False,
         "block_expected": False,
-        "evaluation_scope": "FULL_RUN",
+        "evaluation_scope": "FULL_E2E",
     }
     return _manifest(
         scenario={"scenario_id": "normal-baseline"},
         expected_outcome=expected,
         **overrides,
     )
+
+
+def _scoped_manifest(scope: str) -> RunManifest:
+    payload = _manifest().to_dict()
+    payload["evaluation_scope"] = scope
+    payload["expected_outcome"]["evaluation_scope"] = scope
+    return RunManifest.from_dict(payload)
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -246,7 +253,15 @@ def _insert_detection(
     )
 
 
-def _insert_trust(conn: sqlite3.Connection, *, history_id: int = 1, event_ids: list[int] | None = None, created_at: str = "2026-08-01T01:00:22Z") -> None:
+def _insert_trust(
+    conn: sqlite3.Connection,
+    *,
+    history_id: int = 1,
+    event_ids: list[int] | None = None,
+    created_at: str = "2026-08-01T01:00:22Z",
+    window_start: str = "2026-08-01T01:00:10Z",
+    window_end: str = "2026-08-01T01:00:20Z",
+) -> None:
     conn.execute(
         """
         INSERT INTO trust_score_history (
@@ -263,13 +278,28 @@ def _insert_trust(conn: sqlite3.Connection, *, history_id: int = 1, event_ids: l
             policy_version,
             created_at
         )
-        VALUES (?, 'esp32_01', '2026-08-01T01:00:10Z', '2026-08-01T01:00:20Z', 100, -20, -20, -20, 80, ?, 'phase4-trust-v2', ?)
+        VALUES (?, 'esp32_01', ?, ?, 100, -20, -20, -20, 80, ?, 'phase4-trust-v2', ?)
         """,
-        (history_id, json.dumps(event_ids or [1]), created_at),
+        (
+            history_id,
+            window_start,
+            window_end,
+            json.dumps(event_ids or [1]),
+            created_at,
+        ),
     )
 
 
-def _insert_firewall(conn: sqlite3.Connection, *, rule_id: int = 1, trigger_event_id: int = 1, source_ip: str = "192.168.0.50", status: str = "APPLIED", applied_at: str | None = "2026-08-01T01:00:24Z") -> None:
+def _insert_firewall(
+    conn: sqlite3.Connection,
+    *,
+    rule_id: int = 1,
+    trigger_event_id: int = 1,
+    source_ip: str = "192.168.0.50",
+    status: str = "APPLIED",
+    applied_at: str | None = "2026-08-01T01:00:24Z",
+    released_at: str | None = None,
+) -> None:
     conn.execute(
         """
         INSERT INTO firewall_rules (
@@ -280,11 +310,12 @@ def _insert_firewall(conn: sqlite3.Connection, *, rule_id: int = 1, trigger_even
             reason,
             trigger_event_id,
             created_at,
-            applied_at
+            applied_at,
+            released_at
         )
-        VALUES (?, 'esp32_01', ?, ?, 'PACKET_RATE_ANOMALY', ?, '2026-08-01T01:00:23Z', ?)
+        VALUES (?, 'esp32_01', ?, ?, 'PACKET_RATE_ANOMALY', ?, '2026-08-01T01:00:23Z', ?, ?)
         """,
-        (rule_id, source_ip, status, trigger_event_id, applied_at),
+        (rule_id, source_ip, status, trigger_event_id, applied_at, released_at),
     )
 
 
@@ -298,21 +329,27 @@ def _seed_success(conn: sqlite3.Connection) -> None:
 
 
 def _evaluate(path: Path, manifest: RunManifest | None = None, scenario_result: dict[str, object] | None = None) -> dict[str, object]:
+    active_manifest = manifest or _manifest()
+    default_scenario_result: dict[str, object] = {
+        "run_id": active_manifest.run_id,
+        "session_id": active_manifest.session_id,
+        "scenario_id": active_manifest.scenario.scenario_id,
+        "scenario_status": "SUCCESS",
+        "capture_eligible": True,
+        "traffic_label": "attack",
+        "block_confirmed": True,
+        "block_confirmed_at": "2026-08-01T01:00:30Z",
+        "detection_observed_at": "2026-08-01T01:00:25Z",
+        "trust_observed_at": "2026-08-01T01:00:26Z",
+    }
+    if scenario_result is not None:
+        default_scenario_result.update(scenario_result)
     return evaluate_phase5_run(
-        manifest or _manifest(),
+        active_manifest,
         db_path=path,
         evaluation_schema_version=PHASE5_EVALUATION_SCHEMA_VERSION,
         source_commit=SOURCE_COMMIT,
-        scenario_result=scenario_result or {
-            "run_id": "run-001",
-            "session_id": "11111111-1111-4111-8111-111111111111",
-            "scenario_id": "packet-flood",
-            "traffic_label": "attack",
-            "block_confirmed": True,
-            "block_confirmed_at": "2026-08-01T01:00:30Z",
-            "detection_observed_at": "2026-08-01T01:00:25Z",
-            "trust_observed_at": "2026-08-01T01:00:26Z",
-        },
+        scenario_result=default_scenario_result,
     )
 
 
@@ -547,6 +584,126 @@ def test_capture_ineligible_is_excluded_from_valid_success_denominator(db_path: 
     assert row["data_status"] == "CAPTURE_INELIGIBLE"
     assert row["valid_run"] is False
     assert row["success_denominator_included"] is False
+    assert row["classification"]["basis"] == "excluded_from_official_metrics"
+
+
+@pytest.mark.parametrize(
+    ("scope", "applicable_stages"),
+    [
+        ("FULL_E2E", {"detection", "trust", "firewall", "block"}),
+        ("DETECTION_ONLY", {"detection"}),
+        ("TRUST_ONLY", {"trust"}),
+        ("FIREWALL_ONLY", {"firewall"}),
+        ("BLOCK_ONLY", {"block"}),
+        ("DATA_ONLY", set()),
+    ],
+)
+def test_evaluation_scope_marks_out_of_scope_stages_not_applicable(
+    db_path: Path,
+    scope: str,
+    applicable_stages: set[str],
+) -> None:
+    with _connect(db_path) as conn:
+        _seed_success(conn)
+
+    row = _evaluate(db_path, manifest=_scoped_manifest(scope))
+
+    for stage in ("detection", "trust", "firewall", "block"):
+        status = row["statuses"][f"{stage}_status"]
+        if stage in applicable_stages:
+            assert status == "SUCCESS"
+        else:
+            assert status == "NOT_APPLICABLE"
+
+
+def test_missing_scenario_result_is_not_treated_as_success(db_path: Path) -> None:
+    with _connect(db_path) as conn:
+        _seed_success(conn)
+
+    row = evaluate_phase5_run(
+        _manifest(),
+        db_path=db_path,
+        evaluation_schema_version=PHASE5_EVALUATION_SCHEMA_VERSION,
+        source_commit=SOURCE_COMMIT,
+        scenario_result={},
+    )
+
+    assert row["scenario_status"] == "NOT_EVALUATED"
+    assert row["data_status"] == "HOLD"
+    assert row["final_status"] == "HOLD"
+
+
+def test_block_confirmation_true_requires_valid_timestamp(db_path: Path) -> None:
+    with _connect(db_path) as conn:
+        _seed_success(conn)
+
+    row = _evaluate(
+        db_path,
+        scenario_result={
+            "block_confirmed": True,
+            "block_confirmed_at": None,
+        },
+    )
+
+    assert row["block"]["confirmed_success"] is False
+    assert row["block"]["reason"] == "BLOCK_CONFIRMATION_TIMESTAMP_INVALID"
+    assert row["block_status"] == "FAILED"
+
+
+def test_non_bool_block_confirmation_is_not_evaluable(db_path: Path) -> None:
+    with _connect(db_path) as conn:
+        _seed_success(conn)
+
+    row = _evaluate(db_path, scenario_result={"block_confirmed": "yes"})
+
+    assert row["block"]["block_confirmed"] is None
+    assert row["block"]["evaluable"] is False
+    assert row["block_status"] == "FAILED"
+
+
+def test_removed_firewall_rule_preserves_historical_apply_success(db_path: Path) -> None:
+    with _connect(db_path) as conn:
+        _seed_device(conn)
+        _seed_packet_session(conn)
+        _insert_detection(conn)
+        _insert_trust(conn)
+        _insert_firewall(
+            conn,
+            status="REMOVED",
+            applied_at="2026-08-01T01:00:24Z",
+            released_at="2026-08-01T01:00:50Z",
+        )
+        conn.commit()
+
+    row = _evaluate(db_path)
+
+    assert row["firewall"]["rule_applied"] is True
+    assert row["firewall"]["rule_applied_during_run"] is True
+    assert row["firewall"]["currently_applied"] is False
+    assert row["firewall_status"] == "SUCCESS"
+
+
+def test_duplicate_penalty_detects_event_reused_across_history_rows(db_path: Path) -> None:
+    with _connect(db_path) as conn:
+        _seed_device(conn)
+        _seed_packet_session(conn)
+        _insert_detection(conn)
+        _insert_trust(conn, history_id=1, event_ids=[1])
+        _insert_trust(
+            conn,
+            history_id=2,
+            event_ids=[1],
+            created_at="2026-08-01T01:00:23Z",
+            window_start="2026-08-01T01:00:20Z",
+            window_end="2026-08-01T01:00:30Z",
+        )
+        _insert_firewall(conn)
+        conn.commit()
+
+    row = _evaluate(db_path)
+
+    assert row["trust"]["duplicate_penalty_suspected"] is True
+    assert row["trust"]["duplicate_penalty_event_counts"] == {"1": 2}
 
 
 def test_environment_error_for_missing_table(tmp_path: Path) -> None:
@@ -590,6 +747,32 @@ def test_summary_separates_valid_and_overall_metrics(db_path: Path, tmp_path: Pa
     assert summary["environment_error_ratio"] == 0.5
 
 
+def test_summary_excludes_capture_ineligible_from_official_classification_and_latency(
+    db_path: Path,
+) -> None:
+    with _connect(db_path) as conn:
+        _seed_success(conn)
+
+    row = _evaluate(
+        db_path,
+        scenario_result={
+            "capture_eligible": False,
+            "capture_exclusion_reason": "timing_metadata_missing",
+        },
+    )
+    summary = summarize_evaluation_rows(
+        [row],
+        evaluation_schema_version=PHASE5_EVALUATION_SCHEMA_VERSION,
+        source_commit=SOURCE_COMMIT,
+    )
+
+    assert summary["valid_runs"] == 0
+    assert summary["classification"]["tp"] == 0
+    assert summary["classification"]["fn"] == 0
+    assert summary["classification"]["precision"] is None
+    assert summary["latency_statistics"] == {}
+
+
 def test_zero_denominator_metrics_are_null() -> None:
     summary = summarize_evaluation_rows(
         [],
@@ -599,4 +782,5 @@ def test_zero_denominator_metrics_are_null() -> None:
 
     assert summary["overall_attempt_success_rate"] is None
     assert summary["classification"]["precision"] is None
-    assert summary["classification"]["normal_window_fpr"] is None
+    assert summary["classification"]["normal_run_fpr"] is None
+    assert summary["classification"]["normal_window_fpr"]["value"] is None

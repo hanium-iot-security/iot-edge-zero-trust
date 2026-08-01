@@ -11,11 +11,16 @@ import sqlite3
 from typing import Any, Mapping, Sequence
 
 from edge.detection.phase4_time import parse_db_utc
-from edge.phase5.contracts import ManifestStatus, RunManifest
+from edge.phase5.contracts import EvaluationScope, ManifestStatus, RunManifest
 
 
 PHASE5_EVALUATION_SCHEMA_VERSION = "phase5-evaluation-v1"
 LATENCY_NO_SAMPLES_REASON = "NO_SAMPLES"
+_INPUT_DIGEST_META_KEYS = (
+    "_manifest_sha256",
+    "_scenario_result_sha256",
+    "_db_snapshot_sha256",
+)
 
 
 class Phase5EvaluationError(ValueError):
@@ -173,13 +178,22 @@ def evaluate_phase5_run(
 def evaluation_identity(
     manifest: RunManifest,
     evaluation_schema_version: str,
+    *,
+    source_commit: str | None = None,
+    manifest_sha256: str | None = None,
+    scenario_result_sha256: str | None = None,
+    db_snapshot_sha256: str | None = None,
 ) -> str:
     return ":".join(
         (
             evaluation_schema_version,
             manifest.run_id,
-            manifest.session_id,
+            _identity_part(manifest.session_id),
             manifest.scenario.scenario_id,
+            _identity_part(source_commit),
+            _identity_part(manifest_sha256),
+            _identity_part(scenario_result_sha256),
+            _identity_part(db_snapshot_sha256),
         )
     )
 
@@ -207,12 +221,6 @@ def summarize_evaluation_rows(
         for reason in row.get("failure_reasons", []):
             failure_reason_counts[str(reason.get("code"))] += 1
 
-        classification = row.get("classification", {})
-        tp += int(bool(classification.get("tp")))
-        fp += int(bool(classification.get("fp")))
-        tn += int(bool(classification.get("tn")))
-        fn += int(bool(classification.get("fn")))
-
         final_status = row.get("final_status")
         data_status = row.get("statuses", {}).get("data_status")
         if final_status == ManifestStatus.ENVIRONMENT_ERROR.value:
@@ -223,12 +231,17 @@ def summarize_evaluation_rows(
             valid_runs += 1
             if final_status == ManifestStatus.SUCCESS.value:
                 valid_successes += 1
+            classification = row.get("classification", {})
+            tp += int(bool(classification.get("tp")))
+            fp += int(bool(classification.get("fp")))
+            tn += int(bool(classification.get("tn")))
+            fn += int(bool(classification.get("fn")))
 
-        for latency in row.get("latencies", []):
-            if latency.get("calculable") is True:
-                latency_values.setdefault(str(latency["name"]), []).append(
-                    float(latency["milliseconds"])
-                )
+            for latency in row.get("latencies", []):
+                if latency.get("calculable") is True:
+                    latency_values.setdefault(str(latency["name"]), []).append(
+                        float(latency["milliseconds"])
+                    )
 
     return {
         "evaluation_schema_version": evaluation_schema_version,
@@ -246,6 +259,7 @@ def summarize_evaluation_rows(
             total_attempts,
         ),
         "classification": {
+            "official_basis": "valid_run_true_only",
             "tp": tp,
             "fp": fp,
             "tn": tn,
@@ -253,7 +267,11 @@ def summarize_evaluation_rows(
             "precision": _ratio(tp, tp + fp),
             "recall": _ratio(tp, tp + fn),
             "f1": _f1(tp, fp, fn),
-            "normal_window_fpr": _ratio(fp, fp + tn),
+            "normal_run_fpr": _ratio(fp, fp + tn),
+            "normal_window_fpr": {
+                "value": None,
+                "reason": "WINDOW_LEVEL_ROWS_NOT_EMITTED",
+            },
             "attack_session_tpr": _ratio(tp, tp + fn),
         },
         "environment_error_ratio": _ratio(environment_errors, total_attempts),
@@ -317,17 +335,29 @@ def _evaluate_with_connection(
         firewall,
         block,
     )
-    classification = _classification(manifest, detection)
     valid_run = statuses["data_status"] not in {
         ManifestStatus.ENVIRONMENT_ERROR.value,
         ManifestStatus.CAPTURE_INELIGIBLE.value,
+        ManifestStatus.HOLD.value,
+        ManifestStatus.NOT_EVALUATED.value,
     }
+    classification = _classification(manifest, detection, valid_run=valid_run)
+    input_digests = _input_digests(scenario_result)
 
     return {
         "evaluation_schema_version": evaluation_schema_version,
         "source_commit": source_commit,
+        "source_commit_verification": _source_commit_verification(),
         "run_manifest_schema_version": manifest.run_manifest_schema_version,
-        "evaluation_identity": evaluation_identity(manifest, evaluation_schema_version),
+        "evaluation_identity": evaluation_identity(
+            manifest,
+            evaluation_schema_version,
+            source_commit=source_commit,
+            manifest_sha256=input_digests.get("manifest_sha256"),
+            scenario_result_sha256=input_digests.get("scenario_result_sha256"),
+            db_snapshot_sha256=input_digests.get("db_snapshot_sha256"),
+        ),
+        "input_digests": input_digests,
         "run_id": manifest.run_id,
         "session_id": manifest.session_id,
         "scenario": manifest.scenario.to_dict(),
@@ -368,7 +398,7 @@ def _evaluate_with_connection(
         "latencies": latencies,
         "classification": classification,
         "artifacts": [artifact.to_dict() for artifact in manifest.artifacts],
-        "session_manifest_ref": manifest.session_manifest_ref,
+        "session_manifest_ref": _manifest_ref_payload(manifest),
     }
 
 
@@ -430,11 +460,24 @@ def _evaluate_detection(
 
         packet_session_id = event["packet_session_id"]
         source_ip = event["event_source_ip"]
-        device_matches = event["device_id"] == manifest.target_device_id
-        source_matches = source_ip == manifest.source_ip
-        session_matches = packet_session_id == manifest.session_id
+        device_matches = (
+            manifest.target_device_id is not None
+            and event["device_id"] == manifest.target_device_id
+        )
+        source_matches = (
+            manifest.source_ip is not None
+            and source_ip == manifest.source_ip
+        )
+        session_matches = (
+            manifest.session_id is not None
+            and packet_session_id == manifest.session_id
+        )
 
-        if packet_session_id is not None and not session_matches:
+        if (
+            packet_session_id is not None
+            and manifest.session_id is not None
+            and not session_matches
+        ):
             excluded["session_id_mismatch"] += 1
             continue
         if session_matches:
@@ -655,10 +698,17 @@ def _evaluate_trust(
         }
     )
     duplicate_check_available = bool(matched)
-    duplicate_suspected = any(
-        len(row["representative_event_ids"]) != len(set(row["representative_event_ids"]))
+    representative_counter: Counter[int] = Counter(
+        event_id
         for row in matched
+        for event_id in row["representative_event_ids"]
     )
+    duplicate_counts = {
+        str(event_id): count
+        for event_id, count in sorted(representative_counter.items())
+        if count > 1
+    }
+    duplicate_suspected = bool(duplicate_counts)
 
     return {
         "query_available": True,
@@ -678,8 +728,9 @@ def _evaluate_trust(
         "isolated": _select_device_status(conn, manifest.target_device_id) == "isolated",
         "duplicate_penalty_check_available": duplicate_check_available,
         "duplicate_penalty_suspected": duplicate_suspected,
+        "duplicate_penalty_event_counts": duplicate_counts,
         "duplicate_penalty_basis": (
-            "representative_event_ids_json"
+            "representative_event_ids_json_across_matched_history_rows"
             if duplicate_check_available
             else "TRUST_HISTORY_NOT_MATCHED"
         ),
@@ -775,8 +826,14 @@ def _evaluate_firewall(
             row["trigger_event_id"] is not None
             and int(row["trigger_event_id"]) in detection_ids
         )
-        device_matches = row["device_id"] in {None, manifest.target_device_id}
-        source_matches = row["source_ip"] == manifest.source_ip
+        device_matches = (
+            manifest.target_device_id is not None
+            and row["device_id"] in {None, manifest.target_device_id}
+        )
+        source_matches = (
+            manifest.source_ip is not None
+            and row["source_ip"] == manifest.source_ip
+        )
         if direct_trigger or (in_range and device_matches and source_matches):
             row["matching_strategy"] = (
                 "trigger_event_id"
@@ -792,6 +849,17 @@ def _evaluate_firewall(
         else:
             excluded["outside_observation_window_or_bad_timestamp"] += 1
 
+    historically_applied_rows = [
+        row
+        for row in matched
+        if _firewall_historically_applied(
+            row,
+            attack_started_at=attack_started_at,
+            observation_deadline_at=observation_deadline_at,
+        )
+    ]
+    currently_applied = any(row["status"] == "APPLIED" for row in matched)
+
     return {
         "query_available": True,
         "evaluable": True,
@@ -806,7 +874,9 @@ def _evaluate_firewall(
             }
         ),
         "rule_created": bool(matched),
-        "rule_applied": any(row["status"] == "APPLIED" for row in matched),
+        "rule_applied": bool(historically_applied_rows),
+        "rule_applied_during_run": bool(historically_applied_rows),
+        "currently_applied": currently_applied,
         "rule_statuses": sorted({str(row["status"]) for row in matched}),
         "first_firewall_created_at": _min_timestamp(
             row["created_at"] for row in matched if row["created_at"] is not None
@@ -840,6 +910,23 @@ def _normalize_firewall_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _firewall_historically_applied(
+    row: Mapping[str, Any],
+    *,
+    attack_started_at: datetime,
+    observation_deadline_at: datetime,
+) -> bool:
+    applied_at = row.get("parsed_applied_at")
+    if applied_at is None:
+        return False
+    if applied_at < attack_started_at or applied_at > observation_deadline_at:
+        return False
+    released_at = row.get("parsed_released_at")
+    if released_at is not None and released_at < applied_at:
+        return False
+    return row.get("status") in {"APPLIED", "REMOVED"}
+
+
 def _evaluate_block(
     scenario_result: Mapping[str, Any],
     firewall: Mapping[str, Any],
@@ -849,15 +936,30 @@ def _evaluate_block(
         scenario_result.get("block_confirmed_at"),
         "block_confirmed_at",
     )
+    block_confirmed_is_bool = isinstance(block_confirmed, bool)
+    confirmed_success = (
+        block_confirmed is True
+        and block_confirmed_at["parsed"] is not None
+        and block_confirmed_at["error"] is None
+    )
+    if not block_confirmed_is_bool:
+        reason = "BLOCK_CONFIRMATION_INVALID_TYPE"
+    elif block_confirmed is True and not confirmed_success:
+        reason = "BLOCK_CONFIRMATION_TIMESTAMP_INVALID"
+    else:
+        reason = None
     return {
-        "block_confirmed": block_confirmed if isinstance(block_confirmed, bool) else None,
+        "block_confirmed": block_confirmed if block_confirmed_is_bool else None,
         "block_confirmed_at": block_confirmed_at["formatted"],
         "block_confirmed_at_parse_error": block_confirmed_at["error"],
         "db_rule_and_external_confirmation_linked": (
-            bool(firewall["firewall_rule_ids"]) and block_confirmed is True
+            bool(firewall["firewall_rule_ids"]) and confirmed_success
         ),
-        "evaluable": block_confirmed is not None,
-        "reason": None if block_confirmed is not None else "BLOCK_CONFIRMATION_MISSING",
+        "confirmed_success": confirmed_success,
+        "evaluable": block_confirmed_is_bool and (
+            block_confirmed is False or confirmed_success
+        ),
+        "reason": reason,
     }
 
 
@@ -869,99 +971,176 @@ def _stage_statuses(
     firewall: Mapping[str, Any],
     block: Mapping[str, Any],
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
+    in_scope = _scope_stage_names(manifest.evaluation_scope)
     statuses = {
-        "scenario_status": ManifestStatus.SUCCESS.value,
-        "detection_status": ManifestStatus.NOT_EVALUATED.value,
-        "trust_status": ManifestStatus.NOT_EVALUATED.value,
-        "firewall_status": ManifestStatus.NOT_EVALUATED.value,
-        "block_status": ManifestStatus.NOT_EVALUATED.value,
-        "data_status": ManifestStatus.SUCCESS.value,
+        "scenario_status": _scenario_status(scenario_result),
+        "detection_status": ManifestStatus.NOT_APPLICABLE.value,
+        "trust_status": ManifestStatus.NOT_APPLICABLE.value,
+        "firewall_status": ManifestStatus.NOT_APPLICABLE.value,
+        "block_status": ManifestStatus.NOT_APPLICABLE.value,
+        "data_status": ManifestStatus.NOT_APPLICABLE.value,
         "final_status": ManifestStatus.SUCCESS.value,
     }
     failure_reasons: list[dict[str, str]] = []
 
-    if scenario_result.get("capture_eligible") is False:
-        statuses["data_status"] = ManifestStatus.CAPTURE_INELIGIBLE.value
+    if statuses["scenario_status"] != ManifestStatus.SUCCESS.value:
         failure_reasons.append(
             {
-                "stage": "data",
-                "code": "CAPTURE_INELIGIBLE",
+                "stage": "scenario",
+                "code": "SCENARIO_RESULT_NOT_SUCCESS",
                 "message": str(
-                    scenario_result.get("capture_exclusion_reason")
-                    or "capture is not eligible"
+                    scenario_result.get("scenario_failure_reason")
+                    or scenario_result.get("scenario_status")
+                    or "scenario result is missing or not successful"
                 ),
             }
         )
 
+    if "data" in in_scope:
+        capture_eligible = scenario_result.get("capture_eligible")
+        if capture_eligible is True:
+            statuses["data_status"] = ManifestStatus.SUCCESS.value
+        elif capture_eligible is False:
+            statuses["data_status"] = ManifestStatus.CAPTURE_INELIGIBLE.value
+            failure_reasons.append(
+                {
+                    "stage": "data",
+                    "code": "CAPTURE_INELIGIBLE",
+                    "message": str(
+                        scenario_result.get("capture_exclusion_reason")
+                        or "capture is not eligible"
+                    ),
+                }
+            )
+        else:
+            statuses["data_status"] = ManifestStatus.HOLD.value
+            failure_reasons.append(
+                {
+                    "stage": "data",
+                    "code": "CAPTURE_ELIGIBLE_MISSING_OR_INVALID",
+                    "message": "scenario_result.capture_eligible must be boolean",
+                }
+            )
+
     expected = manifest.expected_outcome
-    statuses["detection_status"] = _expected_bool_status(
-        expected.detection_expected,
-        bool(detection["matched_expected_event"]),
-        bool(detection["matched_detection_event_ids"]),
-    )
-    if statuses["detection_status"] == ManifestStatus.FAILED.value:
-        failure_reasons.append(
-            {
-                "stage": "detection",
-                "code": "DETECTION_EXPECTATION_MISMATCH",
-                "message": "detection result did not match expected outcome",
-            }
+    if "detection" in in_scope:
+        statuses["detection_status"] = _expected_bool_status(
+            expected.detection_expected,
+            bool(detection["matched_expected_event"]),
+            bool(detection["matched_detection_event_ids"]),
         )
+        if statuses["detection_status"] == ManifestStatus.FAILED.value:
+            failure_reasons.append(
+                {
+                    "stage": "detection",
+                    "code": "DETECTION_EXPECTATION_MISMATCH",
+                    "message": "detection result did not match expected outcome",
+                }
+            )
 
-    trust_changed = bool(trust["trust_score_history_ids"]) and trust["total_score_delta"] != 0
-    statuses["trust_status"] = _expected_bool_status(
-        expected.trust_score_change_expected,
-        trust_changed,
-        trust_changed,
-    )
-    if statuses["trust_status"] == ManifestStatus.FAILED.value:
-        failure_reasons.append(
-            {
-                "stage": "trust",
-                "code": "TRUST_EXPECTATION_MISMATCH",
-                "message": "trust score change did not match expected outcome",
-            }
+    if "trust" in in_scope:
+        trust_changed = (
+            bool(trust["trust_score_history_ids"])
+            and trust["total_score_delta"] != 0
         )
+        statuses["trust_status"] = _expected_bool_status(
+            expected.trust_score_change_expected,
+            trust_changed,
+            trust_changed,
+        )
+        if statuses["trust_status"] == ManifestStatus.FAILED.value:
+            failure_reasons.append(
+                {
+                    "stage": "trust",
+                    "code": "TRUST_EXPECTATION_MISMATCH",
+                    "message": "trust score change did not match expected outcome",
+                }
+            )
 
-    firewall_applied = bool(firewall["rule_applied"])
-    statuses["firewall_status"] = _expected_bool_status(
-        expected.firewall_expected,
-        firewall_applied,
-        bool(firewall["firewall_rule_ids"]),
-    )
-    if statuses["firewall_status"] == ManifestStatus.FAILED.value:
-        failure_reasons.append(
-            {
-                "stage": "firewall",
-                "code": "FIREWALL_EXPECTATION_MISMATCH",
-                "message": "firewall rule state did not match expected outcome",
-            }
+    if "firewall" in in_scope:
+        firewall_applied = bool(firewall["rule_applied"])
+        statuses["firewall_status"] = _expected_bool_status(
+            expected.firewall_expected,
+            firewall_applied,
+            bool(firewall["firewall_rule_ids"]),
         )
+        if statuses["firewall_status"] == ManifestStatus.FAILED.value:
+            failure_reasons.append(
+                {
+                    "stage": "firewall",
+                    "code": "FIREWALL_EXPECTATION_MISMATCH",
+                    "message": "firewall rule state did not match expected outcome",
+                }
+            )
 
-    if expected.block_expected:
-        statuses["block_status"] = (
-            ManifestStatus.SUCCESS.value
-            if block["block_confirmed"] is True
-            else ManifestStatus.FAILED.value
-        )
-    else:
-        statuses["block_status"] = ManifestStatus.NOT_APPLICABLE.value
-    if statuses["block_status"] == ManifestStatus.FAILED.value:
-        failure_reasons.append(
-            {
-                "stage": "block",
-                "code": "BLOCK_EXPECTATION_MISMATCH",
-                "message": "external block confirmation did not match expected outcome",
-            }
-        )
+    if "block" in in_scope:
+        if expected.block_expected:
+            statuses["block_status"] = (
+                ManifestStatus.SUCCESS.value
+                if block["confirmed_success"] is True
+                else ManifestStatus.FAILED.value
+            )
+        else:
+            statuses["block_status"] = _expected_bool_status(
+                False,
+                False,
+                block["block_confirmed"] is True,
+            )
+        if statuses["block_status"] == ManifestStatus.FAILED.value:
+            failure_reasons.append(
+                {
+                    "stage": "block",
+                    "code": "BLOCK_EXPECTATION_MISMATCH",
+                    "message": "external block confirmation did not match expected outcome",
+                }
+            )
 
+    applicable_statuses = [
+        value
+        for key, value in statuses.items()
+        if key != "final_status" and value != ManifestStatus.NOT_APPLICABLE.value
+    ]
     if statuses["data_status"] == ManifestStatus.CAPTURE_INELIGIBLE.value:
         statuses["final_status"] = ManifestStatus.CAPTURE_INELIGIBLE.value
-    elif any(value == ManifestStatus.FAILED.value for value in statuses.values()):
+    elif ManifestStatus.ENVIRONMENT_ERROR.value in applicable_statuses:
+        statuses["final_status"] = ManifestStatus.ENVIRONMENT_ERROR.value
+    elif ManifestStatus.HOLD.value in applicable_statuses:
+        statuses["final_status"] = ManifestStatus.HOLD.value
+    elif ManifestStatus.NOT_EVALUATED.value in applicable_statuses:
+        statuses["final_status"] = ManifestStatus.NOT_EVALUATED.value
+    elif ManifestStatus.FAILED.value in applicable_statuses:
         statuses["final_status"] = ManifestStatus.FAILED.value
     else:
         statuses["final_status"] = ManifestStatus.SUCCESS.value
     return statuses, failure_reasons
+
+
+def _scenario_status(scenario_result: Mapping[str, Any]) -> str:
+    if not scenario_result:
+        return ManifestStatus.NOT_EVALUATED.value
+    raw_status = scenario_result.get("scenario_status")
+    if raw_status is None:
+        return ManifestStatus.NOT_EVALUATED.value
+    try:
+        return ManifestStatus(raw_status).value
+    except ValueError:
+        return ManifestStatus.HOLD.value
+
+
+def _scope_stage_names(scope: EvaluationScope) -> set[str]:
+    if scope == EvaluationScope.FULL_E2E:
+        return {"data", "detection", "trust", "firewall", "block"}
+    if scope == EvaluationScope.DETECTION_ONLY:
+        return {"data", "detection"}
+    if scope == EvaluationScope.TRUST_ONLY:
+        return {"data", "trust"}
+    if scope == EvaluationScope.FIREWALL_ONLY:
+        return {"data", "firewall"}
+    if scope == EvaluationScope.BLOCK_ONLY:
+        return {"data", "block"}
+    if scope == EvaluationScope.DATA_ONLY:
+        return {"data"}
+    return {"data"}
 
 
 def _expected_bool_status(
@@ -977,7 +1156,17 @@ def _expected_bool_status(
 def _classification(
     manifest: RunManifest,
     detection: Mapping[str, Any],
+    *,
+    valid_run: bool,
 ) -> dict[str, bool | str]:
+    if not valid_run:
+        return {
+            "tp": False,
+            "fp": False,
+            "tn": False,
+            "fn": False,
+            "basis": "excluded_from_official_metrics",
+        }
     expected_detection = manifest.expected_outcome.detection_expected
     matched_expected = bool(detection["matched_expected_event"])
     any_detection = bool(detection["matched_detection_event_ids"])
@@ -1149,6 +1338,7 @@ def _environment_error_row(
     reason: str,
     scenario_result: Mapping[str, Any],
 ) -> dict[str, Any]:
+    input_digests = _input_digests(scenario_result)
     statuses = {
         "scenario_status": ManifestStatus.ENVIRONMENT_ERROR.value,
         "detection_status": ManifestStatus.ENVIRONMENT_ERROR.value,
@@ -1161,8 +1351,17 @@ def _environment_error_row(
     return {
         "evaluation_schema_version": evaluation_schema_version,
         "source_commit": source_commit,
+        "source_commit_verification": _source_commit_verification(),
         "run_manifest_schema_version": manifest.run_manifest_schema_version,
-        "evaluation_identity": evaluation_identity(manifest, evaluation_schema_version),
+        "evaluation_identity": evaluation_identity(
+            manifest,
+            evaluation_schema_version,
+            source_commit=source_commit,
+            manifest_sha256=input_digests.get("manifest_sha256"),
+            scenario_result_sha256=input_digests.get("scenario_result_sha256"),
+            db_snapshot_sha256=input_digests.get("db_snapshot_sha256"),
+        ),
+        "input_digests": input_digests,
         "run_id": manifest.run_id,
         "session_id": manifest.session_id,
         "scenario": manifest.scenario.to_dict(),
@@ -1225,6 +1424,7 @@ def _environment_error_row(
         "block": {
             "block_confirmed": None,
             "block_confirmed_at": None,
+            "confirmed_success": False,
             "evaluable": False,
             "reason": reason_code,
         },
@@ -1244,7 +1444,7 @@ def _environment_error_row(
             "basis": "not_evaluable",
         },
         "artifacts": [artifact.to_dict() for artifact in manifest.artifacts],
-        "session_manifest_ref": manifest.session_manifest_ref,
+        "session_manifest_ref": _manifest_ref_payload(manifest),
     }
 
 
@@ -1380,7 +1580,9 @@ def _public_firewall_row(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _select_device_status(conn: sqlite3.Connection, device_id: str) -> str | None:
+def _select_device_status(conn: sqlite3.Connection, device_id: str | None) -> str | None:
+    if device_id is None:
+        return None
     row = conn.execute(
         "SELECT status FROM devices WHERE device_id = :device_id",
         {"device_id": device_id},
@@ -1416,6 +1618,49 @@ def _external_observations(
     return dict(sorted(observations.items()))
 
 
+def _input_digests(scenario_result: Mapping[str, Any]) -> dict[str, str | None]:
+    return {
+        "manifest_sha256": _optional_meta_digest(
+            scenario_result,
+            "_manifest_sha256",
+        ),
+        "scenario_result_sha256": _optional_meta_digest(
+            scenario_result,
+            "_scenario_result_sha256",
+        ),
+        "db_snapshot_sha256": _optional_meta_digest(
+            scenario_result,
+            "_db_snapshot_sha256",
+        ),
+    }
+
+
+def _optional_meta_digest(
+    scenario_result: Mapping[str, Any],
+    key: str,
+) -> str | None:
+    value = scenario_result.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _source_commit_verification() -> dict[str, bool | str]:
+    return {
+        "method": "explicit_cli_arg",
+        "head_verified": False,
+        "dirty_worktree_verified": False,
+    }
+
+
+def _identity_part(value: str | None) -> str:
+    return "null" if value is None else str(value)
+
+
+def _manifest_ref_payload(manifest: RunManifest) -> dict[str, str] | None:
+    if manifest.session_manifest_ref is None:
+        return None
+    return manifest.session_manifest_ref.to_dict()
+
+
 def _evaluation_unit(
     manifest: RunManifest,
     scenario_result: Mapping[str, Any],
@@ -1423,13 +1668,13 @@ def _evaluation_unit(
     if isinstance(scenario_result.get("evaluation_unit"), str):
         return str(scenario_result["evaluation_unit"])
     if str(scenario_result.get("traffic_label", "")).lower() == "normal":
-        return "normal_window"
+        return "normal_run"
     if str(scenario_result.get("traffic_label", "")).lower() == "attack":
         return "attack_session"
     return (
         "attack_session"
         if manifest.expected_outcome.detection_expected
-        else "normal_window"
+        else "normal_run"
     )
 
 
@@ -1528,7 +1773,7 @@ def _nearest_rank(sorted_values: Sequence[float], percentile: float) -> float:
     return sorted_values[min(rank - 1, len(sorted_values) - 1)]
 
 
-def _packet_rule_candidate_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+def _packet_rule_candidate_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     counter: Counter[str] = Counter()
     for row in rows:
         for event_type in row.get("detection", {}).get("actual_event_types", []):
@@ -1538,7 +1783,10 @@ def _packet_rule_candidate_summary(rows: Sequence[Mapping[str, Any]]) -> dict[st
                 "NON_MQTT_TRAFFIC",
             }:
                 counter[str(event_type)] += 1
-    return dict(sorted(counter.items()))
+    return {
+        "basis": "event_type_run_count_not_candidate_fpr",
+        "counts": dict(sorted(counter.items())),
+    }
 
 
 def _require_non_empty_string(value: Any, field_name: str) -> str:

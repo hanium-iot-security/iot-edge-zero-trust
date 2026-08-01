@@ -142,6 +142,8 @@ def scenario_results_path(tmp_path: Path) -> Path:
                 "run_id": "run-001",
                 "session_id": "11111111-1111-4111-8111-111111111111",
                 "scenario_id": "packet-flood",
+                "scenario_status": "SUCCESS",
+                "capture_eligible": True,
                 "traffic_label": "attack",
                 "block_confirmed": True,
                 "block_confirmed_at": "2026-08-01T01:00:30Z",
@@ -165,7 +167,7 @@ def _manifest(**overrides: object) -> RunManifest:
         "target_device_id": "esp32_01",
         "source_ip": "192.168.0.50",
         "execution_node": {"node_id": "pi-lab-01", "registered": True},
-        "evaluation_scope": "FULL_RUN",
+        "evaluation_scope": "FULL_E2E",
         "is_active": False,
         "started_at": "2026-08-01T01:00:00Z",
         "attack_started_at": "2026-08-01T01:00:05Z",
@@ -176,7 +178,7 @@ def _manifest(**overrides: object) -> RunManifest:
             "trust_score_change_expected": True,
             "firewall_expected": True,
             "block_expected": True,
-            "evaluation_scope": "FULL_RUN",
+            "evaluation_scope": "FULL_E2E",
         },
         "statuses": {
             "scenario_status": "NOT_EVALUATED",
@@ -327,7 +329,19 @@ def test_rows_are_written_in_deterministic_order(
     )
     second_results = tmp_path / "scenario-results-2.jsonl"
     second_results.write_text(
-        json.dumps({"run_id": "run-000", "traffic_label": "attack"}) + "\n",
+        json.dumps(
+            {
+                "run_id": "run-000",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "scenario_id": "packet-flood",
+                "scenario_status": "SUCCESS",
+                "capture_eligible": True,
+                "traffic_label": "attack",
+                "block_confirmed": True,
+                "block_confirmed_at": "2026-08-01T01:00:30Z",
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -506,7 +520,8 @@ def test_summary_records_null_when_metric_denominator_is_zero(
     summary = json.loads((output_dir / SUMMARY_FILENAME).read_text(encoding="utf-8"))
 
     assert summary["classification"]["precision"] is None
-    assert summary["classification"]["normal_window_fpr"] is None
+    assert summary["classification"]["normal_run_fpr"] is None
+    assert summary["classification"]["normal_window_fpr"]["value"] is None
 
 
 def test_scenario_results_identity_must_not_be_ambiguous(
@@ -521,6 +536,86 @@ def test_scenario_results_identity_must_not_be_ambiguous(
     )
 
     with pytest.raises(Phase5ExportError):
+        _export(
+            manifest_path=manifest_path,
+            scenario_results_path=scenario_results,
+            db_path=db_path,
+            output_dir=tmp_path / "out",
+        )
+
+
+@pytest.mark.parametrize(
+    "scenario_payload",
+    [
+        {},
+        {"run_id": "run-001", "scenario_id": "packet-flood"},
+        {
+            "run_id": "run-001",
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "scenario_id": "packet-flood",
+            "scenario_status": "SUCCESS",
+        },
+        {
+            "run_id": "run-001",
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "scenario_id": "packet-flood",
+            "scenario_status": "SUCCESS",
+            "capture_eligible": True,
+            "block_confirmed": "yes",
+        },
+        {
+            "run_id": "run-001",
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "scenario_id": "packet-flood",
+            "scenario_status": "SUCCESS",
+            "capture_eligible": True,
+            "block_confirmed": True,
+        },
+    ],
+)
+def test_invalid_official_scenario_result_rows_are_rejected(
+    manifest_path: Path,
+    db_path: Path,
+    tmp_path: Path,
+    scenario_payload: dict[str, object],
+) -> None:
+    scenario_results = tmp_path / "scenario-results.jsonl"
+    scenario_results.write_text(
+        json.dumps(scenario_payload, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(Phase5ExportError):
+        _export(
+            manifest_path=manifest_path,
+            scenario_results_path=scenario_results,
+            db_path=db_path,
+            output_dir=tmp_path / "out",
+        )
+
+
+def test_missing_matching_scenario_result_is_rejected(
+    manifest_path: Path,
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    scenario_results = tmp_path / "scenario-results.jsonl"
+    scenario_results.write_text(
+        json.dumps(
+            {
+                "run_id": "other-run",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "scenario_id": "packet-flood",
+                "scenario_status": "SUCCESS",
+                "capture_eligible": True,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(Phase5ExportError, match="no row"):
         _export(
             manifest_path=manifest_path,
             scenario_results_path=scenario_results,
@@ -546,6 +641,97 @@ def test_invalid_source_commit_is_rejected_before_outputs(
         )
 
     assert not (tmp_path / "out" / JSONL_FILENAME).exists()
+
+
+def test_existing_jsonl_with_different_source_commit_is_rejected(
+    manifest_path: Path,
+    scenario_results_path: Path,
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    (output_dir / JSONL_FILENAME).write_text(
+        json.dumps(
+            {
+                "evaluation_schema_version": PHASE5_EVALUATION_SCHEMA_VERSION,
+                "evaluation_identity": "identity",
+                "source_commit": "c" * 40,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(Phase5ExportError, match="source_commit mismatch"):
+        _export(
+            manifest_path=manifest_path,
+            scenario_results_path=scenario_results_path,
+            db_path=db_path,
+            output_dir=output_dir,
+        )
+
+
+def test_same_identity_with_different_row_content_is_rejected() -> None:
+    from edge.evaluation.export_phase5_results import _dedupe_rows
+
+    first = {
+        "evaluation_identity": "same",
+        "run_id": "run-001",
+        "session_id": "session-001",
+        "scenario": {"scenario_id": "packet-flood"},
+        "final_status": "SUCCESS",
+    }
+    second = first | {"final_status": "FAILED"}
+
+    with pytest.raises(Phase5ExportError, match="conflicting rows"):
+        _dedupe_rows([first, second])
+
+
+def test_changed_manifest_input_gets_distinct_evaluation_identity(
+    manifest_path: Path,
+    scenario_results_path: Path,
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "out"
+    first = _export(
+        manifest_path=manifest_path,
+        scenario_results_path=scenario_results_path,
+        db_path=db_path,
+        output_dir=output_dir,
+    )
+    manifest_path.write_text(
+        _manifest(run_id="run-002").to_json(),
+        encoding="utf-8",
+    )
+    scenario_results_path.write_text(
+        json.dumps(
+            {
+                "run_id": "run-002",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "scenario_id": "packet-flood",
+                "scenario_status": "SUCCESS",
+                "capture_eligible": True,
+                "traffic_label": "attack",
+                "block_confirmed": True,
+                "block_confirmed_at": "2026-08-01T01:00:30Z",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    second = _export(
+        manifest_path=manifest_path,
+        scenario_results_path=scenario_results_path,
+        db_path=db_path,
+        output_dir=output_dir,
+    )
+
+    assert first["row_count"] == 1
+    assert second["row_count"] == 2
 
 
 def test_missing_database_returns_environment_error_exit_code(

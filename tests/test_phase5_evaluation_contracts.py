@@ -7,13 +7,16 @@ import pytest
 
 from edge.phase5.contracts import (
     RUN_MANIFEST_SCHEMA_VERSION,
+    RUN_MANIFEST_SHA256_SIDECAR_SUFFIX,
     EvaluationScope,
     ExpectedOutcome,
+    ManifestReference,
     ManifestStatus,
     RunArtifact,
     RunManifest,
     RunManifestValidationError,
     RunStageStatuses,
+    run_manifest_sha256,
     validate_run_manifest_dict,
     validate_single_active_run,
 )
@@ -36,7 +39,7 @@ def _manifest_dict(**overrides: object) -> dict[str, object]:
             "hostname": "iot-edge-pi-01",
             "registered": True,
         },
-        "evaluation_scope": "FULL_RUN",
+        "evaluation_scope": "FULL_E2E",
         "is_active": True,
         "started_at": "2026-08-01T01:00:00Z",
         "attack_started_at": "2026-08-01T01:00:05Z",
@@ -54,7 +57,7 @@ def _manifest_dict(**overrides: object) -> dict[str, object]:
             "trust_score_change_expected": True,
             "firewall_expected": True,
             "block_expected": True,
-            "evaluation_scope": "FULL_RUN",
+            "evaluation_scope": "FULL_E2E",
         },
         "statuses": {
             "scenario_status": "SUCCESS",
@@ -79,7 +82,11 @@ def _manifest_dict(**overrides: object) -> dict[str, object]:
                 "sha256": "A" * 64,
             },
         ],
-        "session_manifest_ref": "normal-sessions/session-manifest.json",
+        "session_manifest_ref": {
+            "relative_path": "normal-sessions/session-manifest.json",
+            "schema_version": "packet-if-dataset-manifest-v1",
+            "sha256": "b" * 64,
+        },
     }
     payload.update(overrides)
     return payload
@@ -188,6 +195,76 @@ def test_start_deadline_and_end_time_order_is_validated(
         error.code == "INVALID_TIME_ORDER" and error.field_path == field_name
         for error in result.errors
     )
+
+
+@pytest.mark.parametrize(
+    "attack_started_at",
+    [
+        "2026-08-01T00:59:59Z",
+        "2026-08-01T01:01:01Z",
+    ],
+)
+def test_attack_started_at_must_be_inside_run_window(attack_started_at: str) -> None:
+    payload = _manifest_dict(attack_started_at=attack_started_at)
+
+    result = validate_run_manifest_dict(payload)
+
+    assert not result.is_valid
+    assert any(
+        error.code == "INVALID_TIME_ORDER"
+        and error.field_path == "attack_started_at"
+        for error in result.errors
+    )
+
+
+def test_pre_capture_failure_allows_null_session_identity_with_reason() -> None:
+    payload = _manifest_dict(
+        session_id=None,
+        target_device_id=None,
+        source_ip=None,
+        is_active=False,
+        statuses=_manifest_dict()["statuses"]
+        | {
+            "scenario_status": "FAILED",
+            "data_status": "FAILED",
+            "final_status": "FAILED",
+        },
+        failure_stage="capture_start",
+        failure_reason_code="CAPTURE_START_FAILED",
+        failure_reason="capture failed before session allocation",
+    )
+
+    result = validate_run_manifest_dict(payload)
+    manifest = RunManifest.from_dict(payload)
+
+    assert result.is_valid
+    assert manifest.session_id is None
+    assert manifest.failure_reason_code == "CAPTURE_START_FAILED"
+
+
+def test_null_session_identity_requires_failed_reason_invariant() -> None:
+    payload = _manifest_dict(session_id=None, is_active=False)
+
+    result = validate_run_manifest_dict(payload)
+
+    assert not result.is_valid
+    assert any(
+        error.code == "PRE_CAPTURE_FAILURE_REASON_REQUIRED"
+        for error in result.errors
+    )
+
+
+def test_full_run_scope_name_is_not_supported() -> None:
+    payload = _manifest_dict(
+        evaluation_scope="FULL_RUN",
+        expected_outcome=_manifest_dict()["expected_outcome"]
+        | {"evaluation_scope": "FULL_RUN"},
+    )
+
+    result = validate_run_manifest_dict(payload)
+
+    assert not result.is_valid
+    assert any(error.field_path == "evaluation_scope" for error in result.errors)
 
 
 def test_two_simultaneously_active_runs_are_rejected() -> None:
@@ -313,7 +390,7 @@ def test_expected_outcome_and_stage_statuses_serialize_as_contract_values() -> N
         target_device_id="esp32_01",
         source_ip="192.168.0.50",
         execution_node={"node_id": "pi-lab-01", "registered": True},
-        evaluation_scope=EvaluationScope.FULL_RUN,
+        evaluation_scope=EvaluationScope.FULL_E2E,
         is_active=False,
         started_at=datetime(2026, 8, 1, 1, 0, 0, tzinfo=timezone.utc),
         observation_deadline_at=datetime(2026, 8, 1, 1, 1, 0, tzinfo=timezone.utc),
@@ -323,7 +400,7 @@ def test_expected_outcome_and_stage_statuses_serialize_as_contract_values() -> N
             trust_score_change_expected=True,
             firewall_expected=False,
             block_expected=False,
-            evaluation_scope=EvaluationScope.FULL_RUN,
+            evaluation_scope=EvaluationScope.FULL_E2E,
         ),
         statuses=RunStageStatuses(
             scenario_status=ManifestStatus.SUCCESS,
@@ -352,7 +429,11 @@ def test_packet_if_dataset_manifest_is_not_embedded_in_run_manifest() -> None:
 
     assert "packet_if_dataset_manifest" not in payload
     assert "dataset_manifest" not in payload
-    assert payload["session_manifest_ref"] == "normal-sessions/session-manifest.json"
+    assert payload["session_manifest_ref"] == {
+        "relative_path": "normal-sessions/session-manifest.json",
+        "schema_version": "packet-if-dataset-manifest-v1",
+        "sha256": "b" * 64,
+    }
 
     invalid = _manifest_dict(packet_if_dataset_manifest={"sessions": []})
     result = validate_run_manifest_dict(invalid)
@@ -361,6 +442,29 @@ def test_packet_if_dataset_manifest_is_not_embedded_in_run_manifest() -> None:
         and error.field_path == "$.packet_if_dataset_manifest"
         for error in result.errors
     )
+
+
+def test_session_manifest_ref_is_verifiable_reference_object() -> None:
+    manifest = RunManifest.from_dict(_manifest_dict())
+
+    assert manifest.session_manifest_ref == ManifestReference(
+        relative_path="normal-sessions/session-manifest.json",
+        schema_version="packet-if-dataset-manifest-v1",
+        sha256="b" * 64,
+    )
+
+    result = validate_run_manifest_dict(
+        _manifest_dict(session_manifest_ref="normal-sessions/session-manifest.json")
+    )
+    assert not result.is_valid
+    assert any(error.code == "INVALID_TYPE" for error in result.errors)
+
+
+def test_run_manifest_sha256_sidecar_contract_uses_canonical_json() -> None:
+    manifest = RunManifest.from_dict(_manifest_dict())
+
+    assert RUN_MANIFEST_SHA256_SIDECAR_SUFFIX == ".sha256"
+    assert run_manifest_sha256(manifest) == run_manifest_sha256(manifest.to_dict())
 
 
 def test_invalid_manifest_reports_field_level_errors() -> None:
