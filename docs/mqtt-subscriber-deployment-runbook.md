@@ -196,3 +196,103 @@ journalctl --utc -u mqtt-subscriber.service -n 100 --no-pager
 - Rollback 여부와 복원한 Backup 경로
 
 실제 Pi에서 수행하지 않은 절차는 완료로 표시하지 않습니다.
+
+## 12. 실제 배포 결과: 2026-08-01
+
+### 12.1 적용 기준
+
+- 적용 브랜치: `develop`
+- 적용 Commit: `9bd9478f23f24e960b70bbfe61cf2d54af3a8a94`
+- Pi 저장소: `/home/pi/iot-edge-zero-trust`
+- 설치 Unit: `/etc/systemd/system/mqtt-subscriber.service`
+
+Pi 저장소는 `d6772656f691cbd813c818519626632e695edde3`에서 병합된 `develop` Commit으로 Fast-forward 갱신했고, 갱신 후 `origin/develop`과 일치함을 확인했습니다.
+
+### 12.2 Backup과 Unit 설치
+
+기존 Unit Backup:
+
+```text
+/etc/systemd/system/mqtt-subscriber.service.20260731T162952Z.bak
+```
+
+저장소 Unit을 설치한 뒤 `systemctl daemon-reload`와 `systemd-analyze verify`를 수행했습니다. 검증 과정에서 Unit 문법 오류는 출력되지 않았습니다.
+
+저장소본과 설치본 SHA256:
+
+```text
+697cc28b1f6cf0863b6a7e2e87def93c856a0a0689e6eeba196564fc88d03723
+```
+
+두 파일의 SHA256이 일치했고 설치 상태는 `enabled / active`였습니다.
+
+### 12.3 서비스 재시작 검증
+
+재시작 전후 MQTT Row 수:
+
+```text
+BEFORE=7037
+AFTER=7043
+MQTT_ROW_INCREASE=PASS
+```
+
+재시작 후 다음을 확인했습니다.
+
+- Main PID 변경과 정상 재기동
+- `NRestarts=0`
+- MQTT Broker `localhost:1883`, Topic `#` 연결 완료
+- `esp32_01`, `esp32_02` MQTT Row 저장 재개
+- 반복되는 Traceback, DB 오류, Broker 연결 실패 없음
+
+### 12.4 Pi 재부팅 검증
+
+운영자 승인 후 Pi를 재부팅했습니다.
+
+- 부팅 시각: `2026-08-01 01:37:20 KST`
+- Failed Unit: 없음
+- `mqtt-subscriber.service`: `enabled / active`
+- 저장소본·설치본 SHA256: 일치
+- NTP 동기화: `yes`
+- Timezone: `Asia/Seoul`
+
+재부팅 후 MQTT Row 수:
+
+```text
+BEFORE=7196
+AFTER=7202
+MQTT_ROW_INCREASE=PASS
+```
+
+최신 Row에서 `esp32_01`, `esp32_02`의 정상 Publish를 모두 확인했습니다.
+
+함께 확인한 Runtime 서비스:
+
+```text
+mosquitto.service                 enabled / active
+mqtt-subscriber.service           enabled / active
+mqtt-feature-builder.service      enabled / active
+detection-orchestrator.service    enabled / active
+firewall-worker.service           enabled / active
+packet-capture.service            enabled / active
+gateway-metrics.service           enabled / active
+iot-edge-api.service              enabled / active
+```
+
+API와 DB 확인:
+
+```text
+API Health: status=ok, database=ok, db_connected=true
+SQLite integrity_check=ok
+foreign_key_violations=0
+```
+
+### 12.5 최종 판정
+
+- 저장소 Unit 정식 설치: 완료
+- 기존 Unit Backup: 완료
+- Unit SHA256 일치: 완료
+- 서비스 재시작 후 MQTT 적재 복구: 완료
+- Pi 재부팅 후 자동 시작: 완료
+- Rollback: 수행하지 않음
+
+이 결과는 `docs/phase4-completion-report.md`의 Phase 4 전체 완료 판정과 함께 관리합니다.
