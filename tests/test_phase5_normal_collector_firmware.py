@@ -23,3 +23,23 @@ def test_phase5_firmware_has_local_config_gate_and_supported_device_slots() -> N
     assert "#define PHASE5_CONFIGURED 0" in config
     assert "#define PHASE5_DEVICE_SLOT 1" in config
     assert "#define PHASE5_NORMAL_PROFILE 0" in config
+
+
+def test_all_profiles_keep_required_canonical_fields_without_synthetic_sensors() -> None:
+    source = _source()
+
+    for field in ("device_id", "sequence", "uptime_s"):
+        assert f'\\"{field}\\"' in source
+    for forbidden in ("temp", "hum", "bat"):
+        assert f'\\"{forbidden}\\"' not in source
+    assert "WiFi.RSSI()" in source
+    assert "ESP.getFreeHeap()" in source
+
+
+def test_profiles_isolate_interval_and_payload_variation() -> None:
+    source = _source()
+
+    assert "PHASE5_NORMAL_PROFILE == 0 || PHASE5_NORMAL_PROFILE == 2" in source
+    assert "random(4000, 6001)" in source
+    assert "PHASE5_NORMAL_PROFILE == 2 || PHASE5_NORMAL_PROFILE == 3" in source
+    assert "sequence % 3" in source

@@ -22,3 +22,38 @@ const char* DEVICE_ID = "esp32_02";
 #else
 #error "PHASE5_DEVICE_SLOT must be 1 or 2."
 #endif
+
+const unsigned long FIXED_PUBLISH_INTERVAL_MS = 5000UL;
+
+unsigned long sequenceNumber = 0;
+
+bool profileUsesPayloadVariation() {
+  return PHASE5_NORMAL_PROFILE == 2 || PHASE5_NORMAL_PROFILE == 3;
+}
+
+unsigned long chooseNextPublishIntervalMs() {
+  if (PHASE5_NORMAL_PROFILE == 0 || PHASE5_NORMAL_PROFILE == 2) {
+    return FIXED_PUBLISH_INTERVAL_MS;
+  }
+  return static_cast<unsigned long>(random(4000, 6001));
+}
+
+String buildCanonicalPayload(unsigned long sequence) {
+  String payload = String("{\"device_id\":\"") + DEVICE_ID +
+                   "\",\"sequence\":" + sequence +
+                   ",\"uptime_s\":" + (millis() / 1000UL);
+
+  if (!profileUsesPayloadVariation()) {
+    return payload + "}";
+  }
+
+  unsigned long variation = sequence % 3;
+  if (variation >= 1) {
+    payload += String(",\"rssi\":") + WiFi.RSSI();
+  }
+  if (variation == 2) {
+    payload += String(",\"free_heap\":") +
+               static_cast<unsigned long>(ESP.getFreeHeap());
+  }
+  return payload + "}";
+}
