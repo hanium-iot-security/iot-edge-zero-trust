@@ -7,7 +7,27 @@ ESP32 정상 telemetry 펌웨어와 공격 모드 펌웨어를 이 디렉터리�
 ```txt
 normal_sender/
 attack_sender/
+phase5_normal_collector/
 ```
+
+## phase5_normal_collector
+
+`phase5_normal_collector/phase5_normal_collector.ino`는 Notion 정책 v1.0의
+정상 Pilot을 위한 Phase 5 전용 Firmware입니다. 기존 `normal_sender`의 MVP
+Payload·Mode를 재사용하지 않고 다음 계약을 사용합니다.
+
+- `NORMAL_PROFILE=0..3`
+- 필수 Canonical Payload: `device_id`, `sequence`, `uptime_s`
+- 실제 측정 선택 필드: `rssi`, `free_heap`
+- Device ID 기반 Topic·MQTT Client ID
+- Firmware·Payload Schema Version과 Profile 부팅 로그
+- 100 bytes 초과 Payload 전송 거부
+
+실제 Wi-Fi·Broker·Device Slot·Profile 설정은 Git에서 제외되는
+`phase5_firmware_config.h`에만 저장합니다. Arduino IDE Compile·Upload,
+ESP32 #1·#2 식별 대조, Serial·MQTT·DB Smoke와 Profile 3 승인 Gate는
+[`docs/phase5-normal-firmware-runbook.md`](../../docs/phase5-normal-firmware-runbook.md)를
+따릅니다.
 
 ## MQTT 설정
 
