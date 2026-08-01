@@ -239,4 +239,3 @@ PR #45의 Run·Session Manifest 계약이 확정되면 같은 항목을 공통 M
 - PR #45의 Run·Session Manifest 계약 확정
 - ESP32 두 대의 물리 Device·Device ID·실제 IP 매핑 확인
 - Raspberry Pi Cold Boot·NTP·Subscriber·Feature·Packet Capture Smoke 통과
-

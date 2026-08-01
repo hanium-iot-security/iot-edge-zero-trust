@@ -328,4 +328,3 @@ Expected: 신규·기존 Firmware 테스트 모두 통과, 비-Wrapper 전체 �
 - [ ] **Step 5: 최종 상태 보고**
 
 커밋 목록, RED 증거, GREEN 결과, Arduino Compile Matrix, 전체 회귀, 변경하지 않은 영역, 실기기 Upload 전 Gate를 보고한다. Push·PR·실기기 Upload는 별도 사용자 지시 전 수행하지 않는다.
-
