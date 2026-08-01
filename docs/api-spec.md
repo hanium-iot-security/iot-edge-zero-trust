@@ -113,6 +113,11 @@ MVP에서는 중복 endpoint를 줄이기 위해 기기별 feature/event 조회�
 
 예: `/api/mqtt-logs?device_id=esp32_01&limit=100`
 
+`GET /api/mqtt-logs`는 `id DESC`인 DB 수신·적재 순서로 반환합니다. 기존 Subscriber의
+KST Local Naive 공백값과 SQLite `CURRENT_TIMESTAMP`의 UTC 공백값은 문자열만으로 구분할 수
+없으므로 이 순서를 실제 Timestamp 순서라고 표현하지 않습니다. 응답의 `received_at` 원문은
+변환하지 않습니다.
+
 ## Health 응답
 
 ```json

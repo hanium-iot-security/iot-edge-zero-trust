@@ -16,32 +16,21 @@ import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
 import StatusBadge from "../components/StatusBadge";
 import SummaryCard from "../components/SummaryCard";
+import {
+  formatMqttLogTimestamp,
+  formatMqttTimestampKST,
+} from "../utils/mqttTimestamp";
 
 const DEFAULT_LIMIT = 20;
 const POLLING_INTERVAL_MS = 10_000;
 const IS_DEV = import.meta.env.DEV;
 
 function formatKST(dateString) {
-  if (!dateString) {
-    return "-";
-  }
-
-  const date = new Date(dateString);
-
-  if (Number.isNaN(date.getTime())) {
-    return "-";
-  }
-
-  return new Intl.DateTimeFormat("ko-KR", {
-    timeZone: "Asia/Seoul",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).format(date);
+  return formatMqttTimestampKST(
+    dateString,
+    undefined,
+    "시간대 미확인",
+  );
 }
 
 function formatNumber(value, maximumFractionDigits = 0) {
@@ -626,7 +615,7 @@ export default function Logs() {
       header: "Received At",
       width: 190,
       render: (value) =>
-        formatKST(value),
+        formatMqttLogTimestamp(value),
     },
     {
       key: "detail",
@@ -1080,7 +1069,7 @@ export default function Logs() {
                 <span>Received At</span>
 
                 <strong>
-                  {formatKST(
+                  {formatMqttLogTimestamp(
                     selectedLog.received_at
                   )}
                 </strong>
