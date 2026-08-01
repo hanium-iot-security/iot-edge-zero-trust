@@ -353,8 +353,12 @@ Core의 Local 검증은 Test Split만 사용하는 아래 평가 명령을 실�
 
 - 공통 Phase 5 Run Manifest Schema가 병합되고 동결됨
 - Packet IF Dataset Manifest v2가 병합되고 동결됨
-- Dataset Exporter와 Loader가 v2 계약을 검증함
+- Dataset Exporter와 Loader가 v2 및 `source_capture_group_id` 계약을 검증함
 - 공식 Session·Split과 Source Capture Group이 사전에 동결됨
+
+현재 Core는 Session ID 기준 누수만 차단합니다. P5-JM-01 완료를 위해서는 v2
+병합 시 동일 Source Capture Group이 Train·Validation·Test·Holdout 사이에
+나뉘지 않는 검증을 추가해야 합니다.
 
 `packet-if-evaluation-v1`은 평가 출력의 Schema Version이며 공통 Run Manifest
 Schema Version과 별개입니다. 이 평가 Core는 `run_id` 등 공통 Run Manifest
@@ -382,7 +386,10 @@ python -m ai.evaluate_packet_isolation_forest \
 목록이 Artifact 생성 시 Metadata에 고정된 전체 Dataset Bundle 계약과 정확히
 일치하지 않으면 평가를 시작하지 않습니다. 기존 평가 Directory를 덮어쓰지
 않으며 Row별 JSONL, 전체·Label·Session·Scenario별 JSON·CSV Summary와 파일
-SHA256 Manifest를 하나의 Version Directory로 게시합니다.
+SHA256 Manifest를 하나의 Version Directory로 게시합니다. Git Worktree에서는
+clean 상태와 전달 SHA·현재 HEAD 일치를 Evaluator가 다시 검증합니다.
+Evaluation Manifest SHA256은 `evaluation-manifest.json.sha256` Sidecar에
+기록하여 Manifest와 함께 원자적으로 게시합니다.
 
 평가 계약, 지표와 인계 절차는
 [Packet IF Phase 5 평가 가이드](packet-if-phase5-evaluation.md)를 따릅니다.

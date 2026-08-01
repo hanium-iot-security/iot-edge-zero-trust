@@ -11,8 +11,12 @@ Offline Test 평가 Core를 재현하는 절차를 설명합니다.
 
 - 공통 Phase 5 Run Manifest Schema 병합·동결
 - Packet IF Dataset Manifest v2 병합·동결
-- Dataset Exporter·Loader의 v2 계약 검증
+- Dataset Exporter·Loader의 v2 계약과 `source_capture_group_id` 검증
 - 공식 Session·Split·Source Capture Group 사전 동결
+
+현재 Core는 Session ID 기준 누수만 차단합니다. P5-JM-01 완료로 판정하려면
+Dataset Manifest v2 병합 시 동일 `source_capture_group_id`가 Train·Validation·
+Test·Holdout 사이에 나뉘지 않는 검증을 추가해야 합니다.
 
 `packet-if-evaluation-v1`은 평가 출력 Bundle의 Schema Version이며 공통 Run
 Manifest Schema Version과 별개입니다. 본 모듈은 `run_id`를 비롯한 공통 Run
@@ -58,6 +62,9 @@ Anomaly Score가 Threshold와 같으면 정상으로 판정합니다.
 - `PACKET_IF_EXPECTED_BUNDLE_SHA256`은 Artifact Directory 외부에서 전달받은
   값이어야 합니다.
 - 평가 Source 변경사항을 Commit한 깨끗한 Revision에서 실행합니다.
+- Git Worktree에서는 Evaluator가 clean 상태와 전달 SHA·현재 HEAD 일치를
+  다시 검증합니다.
+- `.git`이 없는 배포 환경에서는 `--git-commit-sha`를 필수로 전달합니다.
 - 매 실행마다 새로운 평가 Version Directory를 사용합니다.
 
 ## 실행
@@ -80,8 +87,10 @@ python -m ai.evaluate_packet_isolation_forest \
 ```
 
 `--git-commit-sha`를 생략하면 `git rev-parse HEAD`로 현재 Revision을
-확인합니다. Git이 없는 실행 환경에서는 소문자 40자리 Commit SHA를 반드시
-명시합니다.
+확인합니다. Git Worktree가 Dirty하거나 명시한 SHA가 현재 HEAD와 다르면 평가를
+거부합니다. Git이 없는 실행 환경에서는 소문자 40자리 Commit SHA를 반드시
+명시하며, 이 경우 `worktree_clean`은 `null`로 기록합니다. 검증 결과는
+Evaluation JSON과 Manifest의 `evaluation_source`에 기록합니다.
 
 ## 출력 Bundle
 
@@ -90,18 +99,21 @@ data/evaluations/packet-if-eval-v1/
 ├── packet-if-predictions.jsonl
 ├── packet-if-evaluation.json
 ├── packet-if-evaluation.csv
-└── evaluation-manifest.json
+├── evaluation-manifest.json
+└── evaluation-manifest.json.sha256
 ```
 
 - `packet-if-predictions.jsonl`: Test Row별 Score·판정·Feature·Source 식별자
 - `packet-if-evaluation.json`: 전체·Label·Session·Scenario별 평가 Summary
 - `packet-if-evaluation.csv`: 보고서와 Spreadsheet용 파생 Summary
 - `evaluation-manifest.json`: 입력 Provenance와 출력 파일별 크기·SHA256
+- `evaluation-manifest.json.sha256`: Evaluation Manifest 검증용 SHA256 Sidecar
 
-Manifest 자체의 SHA256은 CLI 결과로 출력하며 Manifest 내부에 다시 넣지
-않습니다. 기존 출력 Directory는 덮어쓰지 않습니다. 평가 중 오류가 발생하면
-완성되지 않은 최종 Directory를 게시하지 않으며, 재평가는 새로운 Version
-Directory에서 수행합니다.
+Manifest 자체의 SHA256은 Manifest 내부에 넣지 않고 표준 `sha256sum` 형식의
+Sidecar에 기록하며 CLI에도 출력합니다. Manifest와 Sidecar는 같은 Staging
+Directory에서 생성하여 함께 게시합니다. 기존 출력 Directory는 덮어쓰지
+않습니다. 평가 중 오류가 발생하면 완성되지 않은 최종 Directory를 게시하지
+않으며, 재평가는 새로운 Version Directory에서 수행합니다.
 
 실제 Dataset, Model과 평가 출력은 Git에 Commit하지 않습니다.
 CSV의 외부 문자열이 `=`, `+`, `-`, `@` 등 Spreadsheet 수식 접두사로
@@ -141,7 +153,7 @@ Pi 배포 담당자에게 아래 값을 함께 전달합니다.
 - Capture Policy Version
 - Artifact Metadata의 학습 Source Commit SHA
 - 평가 실행 Source Commit SHA
-- Evaluation Manifest SHA256
+- Evaluation Manifest와 `evaluation-manifest.json.sha256` Sidecar
 - Offline 평가 Summary
 
 Pi E2E에는 Train·Validation·Offline Test와 Threshold 산정에 사용하지 않은

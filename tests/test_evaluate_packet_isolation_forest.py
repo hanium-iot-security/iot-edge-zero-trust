@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from ai import evaluate_packet_isolation_forest as evaluator
 from ai.evaluate_packet_isolation_forest import (
     PACKET_IF_EVALUATION_CSV_FILENAME,
     PACKET_IF_EVALUATION_FILENAME,
+    PACKET_IF_EVALUATION_MANIFEST_SHA256_FILENAME,
     PACKET_IF_EVALUATION_SCHEMA_VERSION,
     PACKET_IF_PREDICTIONS_FILENAME,
     evaluate_packet_if_test_split,
@@ -308,6 +310,15 @@ def _patch_verified_inputs(
         "predict_packet_feature_rows",
         _predictions_for_rows,
     )
+    monkeypatch.setattr(
+        evaluator,
+        "_resolve_evaluation_git_provenance",
+        lambda explicit_sha: evaluator._EvaluationGitProvenance(
+            commit_sha=explicit_sha or GIT_COMMIT_SHA,
+            worktree_clean=True,
+            verification_mode="git_worktree_verified",
+        ),
+    )
     return dataset_path, manifest_path, artifact_dir
 
 
@@ -440,6 +451,9 @@ def test_evaluate_writes_metrics_and_verified_immutable_bundle(
     assert result.model_version == MODEL_VERSION
     assert result.threshold == THRESHOLD
     assert result.manifest_sha256 == file_sha256(result.manifest_path)
+    assert result.manifest_sha256_path.read_text(encoding="ascii") == (
+        f"{result.manifest_sha256}  evaluation-manifest.json\n"
+    )
 
     summary = json.loads(result.evaluation_path.read_text(encoding="utf-8"))
     assert summary["evaluation_schema_version"] == (PACKET_IF_EVALUATION_SCHEMA_VERSION)
@@ -456,6 +470,11 @@ def test_evaluate_writes_metrics_and_verified_immutable_bundle(
             "row_tpr": "packet_feature_window",
             "attack_session_tpr": "capture_session",
         },
+    }
+    assert summary["evaluation_source"] == {
+        "git_commit_sha": GIT_COMMIT_SHA,
+        "worktree_clean": True,
+        "verification_mode": "git_worktree_verified",
     }
     assert summary["overall"]["tp"] == 1
     assert summary["overall"]["fp"] == 1
@@ -521,6 +540,14 @@ def test_evaluate_writes_metrics_and_verified_immutable_bundle(
         dataset_path
     )
     assert evaluation_manifest["inputs"]["artifact"]["bundle_sha256"] == (BUNDLE_SHA256)
+    assert evaluation_manifest["evaluation_source"] == {
+        "git_commit_sha": GIT_COMMIT_SHA,
+        "worktree_clean": True,
+        "verification_mode": "git_worktree_verified",
+    }
+    assert evaluation_manifest["manifest_sha256_sidecar"] == (
+        PACKET_IF_EVALUATION_MANIFEST_SHA256_FILENAME
+    )
     assert {item["relative_path"] for item in evaluation_manifest["outputs"]} == {
         PACKET_IF_PREDICTIONS_FILENAME,
         PACKET_IF_EVALUATION_FILENAME,
@@ -589,6 +616,10 @@ def test_evaluate_cli_loads_real_dataset_and_publishes_bundle(
         git_commit_sha=GIT_COMMIT_SHA,
     )
     output_dir = tmp_path / "packet-if-eval-integration-v1"
+    repository_root = Path(__file__).resolve().parents[1]
+    python_path = str(repository_root)
+    if os.environ.get("PYTHONPATH"):
+        python_path = f"{python_path}{os.pathsep}{os.environ['PYTHONPATH']}"
 
     completed = subprocess.run(
         [
@@ -610,7 +641,8 @@ def test_evaluate_cli_loads_real_dataset_and_publishes_bundle(
             "--git-commit-sha",
             GIT_COMMIT_SHA,
         ],
-        cwd=Path(__file__).resolve().parents[1],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": python_path},
         capture_output=True,
         text=True,
         check=False,
@@ -631,6 +663,15 @@ def test_evaluate_cli_loads_real_dataset_and_publishes_bundle(
     )
     assert summary["dataset"]["dataset_sha256"] == file_sha256(dataset_path)
     assert summary["dataset"]["manifest_sha256"] == file_sha256(manifest_path)
+    assert summary["evaluation_source"] == {
+        "git_commit_sha": GIT_COMMIT_SHA,
+        "worktree_clean": None,
+        "verification_mode": "explicit_sha_without_git_worktree",
+    }
+    sidecar_path = output_dir / PACKET_IF_EVALUATION_MANIFEST_SHA256_FILENAME
+    assert sidecar_path.read_text(encoding="ascii").endswith(
+        "  evaluation-manifest.json\n"
+    )
 
 
 def test_evaluate_rejects_capture_policy_mismatch_before_prediction(
@@ -825,6 +866,42 @@ def test_evaluate_cleans_partial_bundle_after_write_failure(
     assert not list(tmp_path.glob(".packet-if-eval-v1.*.tmp"))
 
 
+def test_evaluate_does_not_publish_when_sidecar_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset_path, manifest_path, artifact_dir = _patch_verified_inputs(
+        monkeypatch,
+        tmp_path,
+    )
+    output_dir = tmp_path / "packet-if-eval-v1"
+
+    def fail_sidecar(
+        _destination: Path,
+        *,
+        sha256: str,
+        filename: str,
+    ) -> None:
+        raise OSError(f"sidecar write failed: {sha256}:{filename}")
+
+    monkeypatch.setattr(evaluator, "_write_sha256_sidecar", fail_sidecar)
+
+    with pytest.raises(OSError, match="sidecar write failed"):
+        evaluate_packet_isolation_forest(
+            dataset_path=dataset_path,
+            manifest_path=manifest_path,
+            artifact_dir=artifact_dir,
+            output_dir=output_dir,
+            expected_bundle_sha256=BUNDLE_SHA256,
+            evaluation_git_commit_sha=GIT_COMMIT_SHA,
+            evaluated_at=EVALUATED_AT,
+        )
+
+    assert not output_dir.exists()
+    assert not (tmp_path / ".packet-if-eval-v1.evaluation.lock").exists()
+    assert not list(tmp_path.glob(".packet-if-eval-v1.*.tmp"))
+
+
 def test_evaluate_rejects_dataset_changed_during_evaluation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1002,6 +1079,102 @@ def test_csv_summary_escapes_spreadsheet_formula_prefixes() -> None:
     assert row["scope_value"].startswith("'")
     assert row["traffic_labels"].startswith("'")
     assert row["scenario"].startswith("'")
+
+
+def test_git_provenance_accepts_clean_worktree_and_matching_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(
+        command: list[str], **_kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        if command == ["git", "rev-parse", "--is-inside-work-tree"]:
+            return subprocess.CompletedProcess(command, 0, "true\n", "")
+        if command == ["git", "rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(command, 0, f"{GIT_COMMIT_SHA}\n", "")
+        if command == ["git", "status", "--porcelain", "--untracked-files=all"]:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        raise AssertionError(f"unexpected Git command: {command}")
+
+    monkeypatch.setattr(evaluator.subprocess, "run", fake_run)
+    monkeypatch.setattr(evaluator, "_has_git_marker", lambda path: True)
+
+    provenance = evaluator._resolve_evaluation_git_provenance(GIT_COMMIT_SHA)
+
+    assert provenance == evaluator._EvaluationGitProvenance(
+        commit_sha=GIT_COMMIT_SHA,
+        worktree_clean=True,
+        verification_mode="git_worktree_verified",
+    )
+
+
+def test_git_provenance_rejects_dirty_worktree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(
+        command: list[str], **_kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        if command == ["git", "rev-parse", "--is-inside-work-tree"]:
+            return subprocess.CompletedProcess(command, 0, "true\n", "")
+        if command == ["git", "rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(command, 0, f"{GIT_COMMIT_SHA}\n", "")
+        if command == ["git", "status", "--porcelain", "--untracked-files=all"]:
+            return subprocess.CompletedProcess(command, 0, " M ai/evaluator.py\n", "")
+        raise AssertionError(f"unexpected Git command: {command}")
+
+    monkeypatch.setattr(evaluator.subprocess, "run", fake_run)
+    monkeypatch.setattr(evaluator, "_has_git_marker", lambda path: True)
+
+    with pytest.raises(RuntimeError, match="clean Git worktree"):
+        evaluator._resolve_evaluation_git_provenance(GIT_COMMIT_SHA)
+
+
+def test_git_provenance_rejects_explicit_sha_that_differs_from_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    different_sha = "d" * 40
+
+    def fake_run(
+        command: list[str], **_kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        if command == ["git", "rev-parse", "--is-inside-work-tree"]:
+            return subprocess.CompletedProcess(command, 0, "true\n", "")
+        if command == ["git", "rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(command, 0, f"{GIT_COMMIT_SHA}\n", "")
+        if command == ["git", "status", "--porcelain", "--untracked-files=all"]:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        raise AssertionError(f"unexpected Git command: {command}")
+
+    monkeypatch.setattr(evaluator.subprocess, "run", fake_run)
+    monkeypatch.setattr(evaluator, "_has_git_marker", lambda path: True)
+
+    with pytest.raises(ValueError, match="does not match current Git HEAD"):
+        evaluator._resolve_evaluation_git_provenance(different_sha)
+
+
+def test_git_provenance_allows_explicit_sha_without_git_worktree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        evaluator.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            128,
+            "",
+            "fatal: not a git repository",
+        ),
+    )
+    monkeypatch.setattr(evaluator, "_has_git_marker", lambda path: False)
+
+    provenance = evaluator._resolve_evaluation_git_provenance(GIT_COMMIT_SHA)
+
+    assert provenance == evaluator._EvaluationGitProvenance(
+        commit_sha=GIT_COMMIT_SHA,
+        worktree_clean=None,
+        verification_mode="explicit_sha_without_git_worktree",
+    )
+    with pytest.raises(RuntimeError, match="required outside a Git worktree"):
+        evaluator._resolve_evaluation_git_provenance(None)
 
 
 def _format_utc(value: datetime) -> str:

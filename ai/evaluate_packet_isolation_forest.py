@@ -46,6 +46,9 @@ PACKET_IF_PREDICTIONS_FILENAME = "packet-if-predictions.jsonl"
 PACKET_IF_EVALUATION_FILENAME = "packet-if-evaluation.json"
 PACKET_IF_EVALUATION_CSV_FILENAME = "packet-if-evaluation.csv"
 PACKET_IF_EVALUATION_MANIFEST_FILENAME = "evaluation-manifest.json"
+PACKET_IF_EVALUATION_MANIFEST_SHA256_FILENAME = (
+    f"{PACKET_IF_EVALUATION_MANIFEST_FILENAME}.sha256"
+)
 
 _OUTPUT_FILENAMES = (
     PACKET_IF_PREDICTIONS_FILENAME,
@@ -87,10 +90,18 @@ class PacketIFEvaluationResult:
     evaluation_path: Path
     evaluation_csv_path: Path
     manifest_path: Path
+    manifest_sha256_path: Path
     row_count: int
     model_version: str
     threshold: float
     manifest_sha256: str
+
+
+@dataclass(frozen=True)
+class _EvaluationGitProvenance:
+    commit_sha: str
+    worktree_clean: bool | None
+    verification_mode: str
 
 
 def evaluate_packet_isolation_forest(
@@ -106,9 +117,9 @@ def evaluate_packet_isolation_forest(
 ) -> PacketIFEvaluationResult:
     """Verify all inputs, evaluate only Test, and publish an immutable bundle."""
     _validate_output_destination(output_dir)
-    commit_sha = evaluation_git_commit_sha or _current_git_commit_sha()
-    _validate_git_commit_sha(commit_sha)
     evaluated_at_text = _format_utc(evaluated_at or datetime.now(timezone.utc))
+    git_provenance = _resolve_evaluation_git_provenance(evaluation_git_commit_sha)
+    commit_sha = git_provenance.commit_sha
     dataset_sha256 = file_sha256(dataset_path)
     dataset_manifest_sha256 = file_sha256(manifest_path)
 
@@ -142,6 +153,8 @@ def evaluate_packet_isolation_forest(
         dataset_sha256=dataset_sha256,
         dataset_manifest_sha256=dataset_manifest_sha256,
         evaluation_git_commit_sha=commit_sha,
+        evaluation_git_worktree_clean=git_provenance.worktree_clean,
+        evaluation_git_verification_mode=git_provenance.verification_mode,
         evaluated_at=evaluated_at_text,
     )
 
@@ -158,6 +171,9 @@ def evaluate_packet_isolation_forest(
         evaluation_path = staging_dir / PACKET_IF_EVALUATION_FILENAME
         evaluation_csv_path = staging_dir / PACKET_IF_EVALUATION_CSV_FILENAME
         manifest_output_path = staging_dir / PACKET_IF_EVALUATION_MANIFEST_FILENAME
+        manifest_sha256_output_path = (
+            staging_dir / PACKET_IF_EVALUATION_MANIFEST_SHA256_FILENAME
+        )
 
         _write_jsonl(predictions_path, evaluation_rows)
         _write_json(evaluation_path, summary)
@@ -171,6 +187,12 @@ def evaluate_packet_isolation_forest(
             "evaluation_schema_version": PACKET_IF_EVALUATION_SCHEMA_VERSION,
             "evaluated_at": evaluated_at_text,
             "evaluation_git_commit_sha": commit_sha,
+            "evaluation_source": {
+                "git_commit_sha": commit_sha,
+                "worktree_clean": git_provenance.worktree_clean,
+                "verification_mode": git_provenance.verification_mode,
+            },
+            "manifest_sha256_sidecar": (PACKET_IF_EVALUATION_MANIFEST_SHA256_FILENAME),
             "inputs": {
                 "dataset": {
                     "filename": dataset_path.name,
@@ -189,18 +211,28 @@ def evaluate_packet_isolation_forest(
             "outputs": output_files,
         }
         _write_json(manifest_output_path, evaluation_manifest)
+        evaluation_manifest_sha256 = file_sha256(manifest_output_path)
+        _write_sha256_sidecar(
+            manifest_sha256_output_path,
+            sha256=evaluation_manifest_sha256,
+            filename=PACKET_IF_EVALUATION_MANIFEST_FILENAME,
+        )
 
     published_manifest = output_dir / PACKET_IF_EVALUATION_MANIFEST_FILENAME
+    published_manifest_sha256_path = (
+        output_dir / PACKET_IF_EVALUATION_MANIFEST_SHA256_FILENAME
+    )
     return PacketIFEvaluationResult(
         output_dir=output_dir,
         predictions_path=output_dir / PACKET_IF_PREDICTIONS_FILENAME,
         evaluation_path=output_dir / PACKET_IF_EVALUATION_FILENAME,
         evaluation_csv_path=output_dir / PACKET_IF_EVALUATION_CSV_FILENAME,
         manifest_path=published_manifest,
+        manifest_sha256_path=published_manifest_sha256_path,
         row_count=int(summary["overall"]["row_count"]),
         model_version=artifact.model_version,
         threshold=artifact.threshold,
-        manifest_sha256=file_sha256(published_manifest),
+        manifest_sha256=evaluation_manifest_sha256,
     )
 
 
@@ -315,6 +347,8 @@ def _build_evaluation_summary(
     dataset_sha256: str,
     dataset_manifest_sha256: str,
     evaluation_git_commit_sha: str,
+    evaluation_git_worktree_clean: bool | None,
+    evaluation_git_verification_mode: str,
     evaluated_at: str,
 ) -> dict[str, Any]:
     by_label = {
@@ -366,6 +400,11 @@ def _build_evaluation_summary(
         "evaluation_schema_version": PACKET_IF_EVALUATION_SCHEMA_VERSION,
         "evaluated_at": evaluated_at,
         "evaluation_git_commit_sha": evaluation_git_commit_sha,
+        "evaluation_source": {
+            "git_commit_sha": evaluation_git_commit_sha,
+            "worktree_clean": evaluation_git_worktree_clean,
+            "verification_mode": evaluation_git_verification_mode,
+        },
         "classification_contract": {
             "actual_positive": f"traffic_label == {ATTACK_LABEL!r}",
             "predicted_positive": "is_anomaly == true",
@@ -632,6 +671,18 @@ def _write_json(destination: Path, payload: dict[str, Any]) -> None:
     _fsync_file(destination)
 
 
+def _write_sha256_sidecar(
+    destination: Path,
+    *,
+    sha256: str,
+    filename: str,
+) -> None:
+    with destination.open("w", encoding="ascii", newline="\n") as handle:
+        handle.write(f"{sha256}  {filename}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def _write_evaluation_csv(
     destination: Path,
     summary: dict[str, Any],
@@ -801,19 +852,93 @@ def _validate_git_commit_sha(value: str) -> None:
         )
 
 
-def _current_git_commit_sha() -> str:
+def _resolve_evaluation_git_provenance(
+    explicit_commit_sha: str | None,
+) -> _EvaluationGitProvenance:
+    if explicit_commit_sha is not None:
+        _validate_git_commit_sha(explicit_commit_sha)
+
     try:
-        result = subprocess.run(
+        worktree_probe = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        if _has_git_marker(Path.cwd()):
+            raise RuntimeError(
+                "unable to verify Packet IF evaluation Git worktree"
+            ) from exc
+        return _explicit_non_git_provenance(explicit_commit_sha)
+
+    if worktree_probe.returncode != 0 or worktree_probe.stdout.strip() != "true":
+        if _has_git_marker(Path.cwd()):
+            raise RuntimeError(
+                "unable to verify Packet IF evaluation Git worktree: "
+                f"{worktree_probe.stderr.strip()}"
+            )
+        return _explicit_non_git_provenance(explicit_commit_sha)
+
+    try:
+        head_result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             check=True,
             capture_output=True,
             text=True,
         )
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise RuntimeError("unable to resolve current Git commit SHA") from exc
-    commit_sha = result.stdout.strip()
-    _validate_git_commit_sha(commit_sha)
-    return commit_sha
+        raise RuntimeError(
+            "unable to verify Packet IF evaluation Git provenance"
+        ) from exc
+
+    head_commit_sha = head_result.stdout.strip()
+    _validate_git_commit_sha(head_commit_sha)
+    if explicit_commit_sha is not None and explicit_commit_sha != head_commit_sha:
+        raise ValueError(
+            "evaluation_git_commit_sha does not match current Git HEAD: "
+            f"expected={head_commit_sha}, actual={explicit_commit_sha}"
+        )
+
+    dirty_entries = status_result.stdout.strip().splitlines()
+    if dirty_entries:
+        preview = ", ".join(dirty_entries[:5])
+        if len(dirty_entries) > 5:
+            preview = f"{preview}, ..."
+        raise RuntimeError(
+            f"Packet IF evaluation requires a clean Git worktree: {preview}"
+        )
+
+    return _EvaluationGitProvenance(
+        commit_sha=head_commit_sha,
+        worktree_clean=True,
+        verification_mode="git_worktree_verified",
+    )
+
+
+def _explicit_non_git_provenance(
+    explicit_commit_sha: str | None,
+) -> _EvaluationGitProvenance:
+    if explicit_commit_sha is None:
+        raise RuntimeError("--git-commit-sha is required outside a Git worktree")
+    return _EvaluationGitProvenance(
+        commit_sha=explicit_commit_sha,
+        worktree_clean=None,
+        verification_mode="explicit_sha_without_git_worktree",
+    )
+
+
+def _has_git_marker(path: Path) -> bool:
+    resolved = path.resolve()
+    return any(
+        (candidate / ".git").exists() for candidate in (resolved, *resolved.parents)
+    )
 
 
 def main() -> None:
