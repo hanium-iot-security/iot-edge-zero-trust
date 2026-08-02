@@ -369,7 +369,14 @@ def test_attack_e2e_success_matches_session_source_and_expected_event(db_path: P
     row = _evaluate(db_path)
 
     assert row["final_status"] == "SUCCESS"
-    assert row["classification"] == {"tp": True, "fp": False, "tn": False, "fn": False, "basis": "expected_event_types"}
+    assert row["classification"] == {
+        "tp": True,
+        "fp": False,
+        "tn": False,
+        "fn": False,
+        "basis": "expected_event_types",
+        "included_in_official_metrics": True,
+    }
     assert row["matched_ids"]["detection_event_ids"] == [1]
     assert row["matched_ids"]["trust_score_history_ids"] == [1]
     assert row["matched_ids"]["firewall_rule_ids"] == [1]
@@ -614,6 +621,67 @@ def test_evaluation_scope_marks_out_of_scope_stages_not_applicable(
             assert status == "SUCCESS"
         else:
             assert status == "NOT_APPLICABLE"
+
+
+@pytest.mark.parametrize("scope", ["DATA_ONLY", "TRUST_ONLY"])
+def test_scope_without_detection_excludes_official_classification(
+    db_path: Path,
+    scope: str,
+) -> None:
+    with _connect(db_path) as conn:
+        _seed_success(conn)
+
+    row = _evaluate(db_path, manifest=_scoped_manifest(scope))
+    summary = summarize_evaluation_rows(
+        [row],
+        evaluation_schema_version=PHASE5_EVALUATION_SCHEMA_VERSION,
+        source_commit=SOURCE_COMMIT,
+    )
+
+    assert row["classification"]["basis"] == "scope_not_applicable"
+    assert row["classification"]["included_in_official_metrics"] is False
+    assert summary["classification"]["tp"] == 0
+    assert summary["classification"]["fp"] == 0
+    assert summary["classification"]["tn"] == 0
+    assert summary["classification"]["fn"] == 0
+    assert summary["classification"]["precision"] is None
+
+
+def test_data_only_scope_excludes_all_stage_latencies(db_path: Path) -> None:
+    with _connect(db_path) as conn:
+        _seed_success(conn)
+
+    row = _evaluate(db_path, manifest=_scoped_manifest("DATA_ONLY"))
+    summary = summarize_evaluation_rows(
+        [row],
+        evaluation_schema_version=PHASE5_EVALUATION_SCHEMA_VERSION,
+        source_commit=SOURCE_COMMIT,
+    )
+
+    assert row["latencies"] == []
+    assert summary["latency_statistics"] == {}
+
+
+def test_trust_only_scope_omits_detection_firewall_and_block_latencies(
+    db_path: Path,
+) -> None:
+    with _connect(db_path) as conn:
+        _seed_success(conn)
+
+    row = _evaluate(db_path, manifest=_scoped_manifest("TRUST_ONLY"))
+    latency_names = {latency["name"] for latency in row["latencies"]}
+    summary = summarize_evaluation_rows(
+        [row],
+        evaluation_schema_version=PHASE5_EVALUATION_SCHEMA_VERSION,
+        source_commit=SOURCE_COMMIT,
+    )
+
+    assert latency_names == {
+        "trust_processing_latency",
+        "trust_observation_delay",
+    }
+    assert "trust_processing_latency" in summary["latency_statistics"]
+    assert "detection_processing_latency" not in summary["latency_statistics"]
 
 
 def test_missing_scenario_result_is_not_treated_as_success(db_path: Path) -> None:

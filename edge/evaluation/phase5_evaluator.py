@@ -232,10 +232,11 @@ def summarize_evaluation_rows(
             if final_status == ManifestStatus.SUCCESS.value:
                 valid_successes += 1
             classification = row.get("classification", {})
-            tp += int(bool(classification.get("tp")))
-            fp += int(bool(classification.get("fp")))
-            tn += int(bool(classification.get("tn")))
-            fn += int(bool(classification.get("fn")))
+            if classification.get("included_in_official_metrics") is True:
+                tp += int(bool(classification.get("tp")))
+                fp += int(bool(classification.get("fp")))
+                tn += int(bool(classification.get("tn")))
+                fn += int(bool(classification.get("fn")))
 
             for latency in row.get("latencies", []):
                 if latency.get("calculable") is True:
@@ -259,7 +260,7 @@ def summarize_evaluation_rows(
             total_attempts,
         ),
         "classification": {
-            "official_basis": "valid_run_true_only",
+            "official_basis": "valid_run_true_and_detection_scope_true",
             "tp": tp,
             "fp": fp,
             "tn": tn,
@@ -296,6 +297,7 @@ def _evaluate_with_connection(
 ) -> dict[str, Any]:
     attack_started_at = manifest.attack_started_at or manifest.started_at
     observation_deadline_at = manifest.observation_deadline_at
+    scope_stage_names = _scope_stage_names(manifest.evaluation_scope)
     detection = _evaluate_detection(
         manifest,
         conn,
@@ -326,6 +328,7 @@ def _evaluate_with_connection(
         block,
         scenario_result,
         attack_started_at=attack_started_at,
+        scope_stage_names=scope_stage_names,
     )
     statuses, failure_reasons = _stage_statuses(
         manifest,
@@ -341,7 +344,12 @@ def _evaluate_with_connection(
         ManifestStatus.HOLD.value,
         ManifestStatus.NOT_EVALUATED.value,
     }
-    classification = _classification(manifest, detection, valid_run=valid_run)
+    classification = _classification(
+        manifest,
+        detection,
+        valid_run=valid_run,
+        scope_stage_names=scope_stage_names,
+    )
     input_digests = _input_digests(scenario_result)
 
     return {
@@ -1158,6 +1166,7 @@ def _classification(
     detection: Mapping[str, Any],
     *,
     valid_run: bool,
+    scope_stage_names: set[str],
 ) -> dict[str, bool | str]:
     if not valid_run:
         return {
@@ -1166,6 +1175,16 @@ def _classification(
             "tn": False,
             "fn": False,
             "basis": "excluded_from_official_metrics",
+            "included_in_official_metrics": False,
+        }
+    if "detection" not in scope_stage_names:
+        return {
+            "tp": False,
+            "fp": False,
+            "tn": False,
+            "fn": False,
+            "basis": "scope_not_applicable",
+            "included_in_official_metrics": False,
         }
     expected_detection = manifest.expected_outcome.detection_expected
     matched_expected = bool(detection["matched_expected_event"])
@@ -1176,6 +1195,7 @@ def _classification(
         "tn": not expected_detection and not any_detection,
         "fn": expected_detection and not matched_expected,
         "basis": "expected_event_types",
+        "included_in_official_metrics": True,
     }
 
 
@@ -1188,6 +1208,7 @@ def _build_latencies(
     scenario_result: Mapping[str, Any],
     *,
     attack_started_at: datetime,
+    scope_stage_names: set[str],
 ) -> list[dict[str, Any]]:
     detection_ts = _parse_result_timestamp(detection["first_detection_timestamp"])
     trust_ts = _parse_result_timestamp(trust["first_trust_history_created_at"])
@@ -1203,72 +1224,92 @@ def _build_latencies(
         "trust_observed_at",
     )
 
-    return [
-        _latency(
-            "detection_processing_latency",
-            "internal_processing",
-            attack_started_at,
-            detection_ts,
-            "manifest.attack_started_at",
-            "detection_events.detected_at",
-        ),
-        _latency(
-            "trust_processing_latency",
-            "internal_processing",
-            detection_ts,
-            trust_ts,
-            "detection_events.detected_at",
-            "trust_score_history.created_at",
-        ),
-        _latency(
-            "firewall_creation_latency",
-            "internal_processing",
-            detection_ts if firewall["trigger_event_ids"] else None,
-            firewall_created_ts,
-            "firewall_rules.trigger_event_id detection_events.detected_at",
-            "firewall_rules.created_at",
-        ),
-        _latency(
-            "firewall_apply_latency",
-            "internal_processing",
-            firewall_created_ts,
-            firewall_applied_ts,
-            "firewall_rules.created_at",
-            "firewall_rules.applied_at",
-        ),
-        _latency(
-            "block_e2e_latency",
-            "external_confirmation",
-            attack_started_at,
-            block_ts,
-            "manifest.attack_started_at",
-            "scenario_result.block_confirmed_at",
-        ),
-        _latency(
-            "detection_observation_delay",
-            "external_observation_delay",
-            detection_ts,
-            detection_observed["parsed"],
-            "detection_events.detected_at",
-            "scenario_result.detection_observed_at",
-        ),
-        _latency(
-            "trust_observation_delay",
-            "external_observation_delay",
-            trust_ts,
-            trust_observed["parsed"],
-            "trust_score_history.created_at",
-            "scenario_result.trust_observed_at",
-        ),
-        _latency(
-            "block_observation_delay",
-            "external_observation_delay",
-            firewall_applied_ts,
-            block_ts,
-            "firewall_rules.applied_at",
-            "scenario_result.block_confirmed_at",
-        ),
-    ]
+    latencies: list[dict[str, Any]] = []
+    if "detection" in scope_stage_names:
+        latencies.extend(
+            [
+                _latency(
+                    "detection_processing_latency",
+                    "internal_processing",
+                    attack_started_at,
+                    detection_ts,
+                    "manifest.attack_started_at",
+                    "detection_events.detected_at",
+                ),
+                _latency(
+                    "detection_observation_delay",
+                    "external_observation_delay",
+                    detection_ts,
+                    detection_observed["parsed"],
+                    "detection_events.detected_at",
+                    "scenario_result.detection_observed_at",
+                ),
+            ]
+        )
+    if "trust" in scope_stage_names:
+        latencies.extend(
+            [
+                _latency(
+                    "trust_processing_latency",
+                    "internal_processing",
+                    detection_ts,
+                    trust_ts,
+                    "detection_events.detected_at",
+                    "trust_score_history.created_at",
+                ),
+                _latency(
+                    "trust_observation_delay",
+                    "external_observation_delay",
+                    trust_ts,
+                    trust_observed["parsed"],
+                    "trust_score_history.created_at",
+                    "scenario_result.trust_observed_at",
+                ),
+            ]
+        )
+    if "firewall" in scope_stage_names:
+        latencies.extend(
+            [
+                _latency(
+                    "firewall_creation_latency",
+                    "internal_processing",
+                    detection_ts if firewall["trigger_event_ids"] else None,
+                    firewall_created_ts,
+                    "firewall_rules.trigger_event_id detection_events.detected_at",
+                    "firewall_rules.created_at",
+                ),
+                _latency(
+                    "firewall_apply_latency",
+                    "internal_processing",
+                    firewall_created_ts,
+                    firewall_applied_ts,
+                    "firewall_rules.created_at",
+                    "firewall_rules.applied_at",
+                ),
+            ]
+        )
+    if "block" in scope_stage_names:
+        latencies.extend(
+            [
+                _latency(
+                    "block_e2e_latency",
+                    "external_confirmation",
+                    attack_started_at,
+                    block_ts,
+                    "manifest.attack_started_at",
+                    "scenario_result.block_confirmed_at",
+                ),
+                _latency(
+                    "block_observation_delay",
+                    "external_observation_delay",
+                    firewall_applied_ts,
+                    block_ts,
+                    "firewall_rules.applied_at",
+                    "scenario_result.block_confirmed_at",
+                ),
+            ]
+        )
+    return latencies
 
 
 def _latency(
@@ -1442,6 +1483,7 @@ def _environment_error_row(
             "tn": False,
             "fn": False,
             "basis": "not_evaluable",
+            "included_in_official_metrics": False,
         },
         "artifacts": [artifact.to_dict() for artifact in manifest.artifacts],
         "session_manifest_ref": _manifest_ref_payload(manifest),
@@ -1648,6 +1690,10 @@ def _source_commit_verification() -> dict[str, bool | str]:
         "method": "explicit_cli_arg",
         "head_verified": False,
         "dirty_worktree_verified": False,
+        "meaning": (
+            "source_commit was supplied by CLI and not verified against local Git HEAD"
+        ),
+        "follow_up": "verify HEAD and dirty worktree in the official runner",
     }
 
 

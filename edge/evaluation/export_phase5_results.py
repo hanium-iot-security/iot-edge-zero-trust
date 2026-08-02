@@ -237,7 +237,7 @@ def _load_matching_scenario_result(
     matching: list[dict[str, Any]] = []
     malformed: list[str] = []
     for index, row in enumerate(rows, start=1):
-        issue = _scenario_result_contract_issue(row, manifest)
+        issue = _scenario_result_common_contract_issue(row)
         if issue is not None:
             malformed.append(f"line {index}: {issue}")
             continue
@@ -245,7 +245,11 @@ def _load_matching_scenario_result(
             continue
         if row["scenario_id"] != manifest.scenario.scenario_id:
             continue
-        if manifest.session_id is not None and row["session_id"] != manifest.session_id:
+        issue = _scenario_result_manifest_contract_issue(row, manifest)
+        if issue is not None:
+            malformed.append(f"line {index}: {issue}")
+            continue
+        if manifest.session_id is not None and row.get("session_id") != manifest.session_id:
             continue
         matching.append(row)
     if malformed:
@@ -264,18 +268,13 @@ def _load_matching_scenario_result(
     return matching[0]
 
 
-def _scenario_result_contract_issue(
-    row: Mapping[str, Any],
-    manifest: RunManifest,
-) -> str | None:
+def _scenario_result_common_contract_issue(row: Mapping[str, Any]) -> str | None:
     for field_name in ("run_id", "scenario_id"):
         if not isinstance(row.get(field_name), str) or not row[field_name].strip():
             return f"{field_name} is required"
-    if manifest.session_id is not None:
-        if not isinstance(row.get("session_id"), str) or not row["session_id"].strip():
-            return "session_id is required for captured runs"
-    elif row.get("session_id") not in {None, ""}:
-        return "session_id must be null or omitted for pre-capture runs"
+    if "session_id" in row and row["session_id"] is not None:
+        if not isinstance(row["session_id"], str) or not row["session_id"].strip():
+            return "session_id must be null or a non-empty string"
     raw_status = row.get("scenario_status")
     try:
         ManifestStatus(raw_status)
@@ -295,6 +294,19 @@ def _scenario_result_contract_issue(
     elif row.get("block_confirmed_at") is not None:
         if _parse_utc_timestamp(row.get("block_confirmed_at")) is None:
             return "block_confirmed_at must be a UTC timestamp"
+    return None
+
+
+def _scenario_result_manifest_contract_issue(
+    row: Mapping[str, Any],
+    manifest: RunManifest,
+) -> str | None:
+    if manifest.session_id is not None:
+        if not isinstance(row.get("session_id"), str) or not row["session_id"].strip():
+            return "session_id is required for captured runs"
+        return None
+    if row.get("session_id") not in {None, ""}:
+        return "session_id must be null or omitted for pre-capture runs"
     return None
 
 

@@ -309,6 +309,47 @@ def test_same_input_rerun_does_not_duplicate_rows(
     assert (output_dir / JSONL_FILENAME).read_text(encoding="utf-8") == first_jsonl
 
 
+def test_mixed_scenario_jsonl_allows_other_pre_capture_failure_row(
+    manifest_path: Path,
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    scenario_results = tmp_path / "scenario-results.jsonl"
+    rows = [
+        {
+            "run_id": "pre-capture-run",
+            "session_id": None,
+            "scenario_id": "pre-capture-failure",
+            "scenario_status": "FAILED",
+            "capture_eligible": False,
+            "capture_exclusion_reason": "capture failed before session allocation",
+        },
+        {
+            "run_id": "run-001",
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "scenario_id": "packet-flood",
+            "scenario_status": "SUCCESS",
+            "capture_eligible": True,
+            "traffic_label": "attack",
+            "block_confirmed": True,
+            "block_confirmed_at": "2026-08-01T01:00:30Z",
+        },
+    ]
+    scenario_results.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    result = _export(
+        manifest_path=manifest_path,
+        scenario_results_path=scenario_results,
+        db_path=db_path,
+        output_dir=tmp_path / "out",
+    )
+
+    assert result["row_count"] == 1
+
+
 def test_rows_are_written_in_deterministic_order(
     manifest_path: Path,
     scenario_results_path: Path,
@@ -477,6 +518,15 @@ def test_schema_version_and_commit_are_recorded(
 
     assert row["evaluation_schema_version"] == PHASE5_EVALUATION_SCHEMA_VERSION
     assert row["source_commit"] == SOURCE_COMMIT
+    assert row["source_commit_verification"] == {
+        "method": "explicit_cli_arg",
+        "head_verified": False,
+        "dirty_worktree_verified": False,
+        "meaning": (
+            "source_commit was supplied by CLI and not verified against local Git HEAD"
+        ),
+        "follow_up": "verify HEAD and dirty worktree in the official runner",
+    }
 
 
 def test_summary_latency_statistics(
