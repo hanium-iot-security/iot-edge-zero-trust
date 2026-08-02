@@ -718,6 +718,34 @@ def test_block_confirmation_true_requires_valid_timestamp(db_path: Path) -> None
     assert row["block_status"] == "FAILED"
 
 
+@pytest.mark.parametrize(
+    "block_confirmed_at",
+    [
+        "2026-08-01T01:00:04Z",
+        "2026-08-01T01:01:01Z",
+    ],
+)
+def test_block_confirmation_outside_observation_window_is_not_success(
+    db_path: Path,
+    block_confirmed_at: str,
+) -> None:
+    with _connect(db_path) as conn:
+        _seed_success(conn)
+
+    row = _evaluate(
+        db_path,
+        scenario_result={
+            "block_confirmed": True,
+            "block_confirmed_at": block_confirmed_at,
+        },
+    )
+
+    assert row["block"]["confirmed_success"] is False
+    assert row["block"]["reason"] == "BLOCK_CONFIRMATION_OUTSIDE_OBSERVATION_WINDOW"
+    assert row["block_status"] == "FAILED"
+    assert row["final_status"] == "FAILED"
+
+
 def test_non_bool_block_confirmation_is_not_evaluable(db_path: Path) -> None:
     with _connect(db_path) as conn:
         _seed_success(conn)

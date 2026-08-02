@@ -319,7 +319,12 @@ def _evaluate_with_connection(
         attack_started_at=attack_started_at,
         observation_deadline_at=observation_deadline_at,
     )
-    block = _evaluate_block(scenario_result, firewall)
+    block = _evaluate_block(
+        scenario_result,
+        firewall,
+        attack_started_at=attack_started_at,
+        observation_deadline_at=observation_deadline_at,
+    )
     latencies = _build_latencies(
         manifest,
         detection,
@@ -938,6 +943,9 @@ def _firewall_historically_applied(
 def _evaluate_block(
     scenario_result: Mapping[str, Any],
     firewall: Mapping[str, Any],
+    *,
+    attack_started_at: datetime,
+    observation_deadline_at: datetime,
 ) -> dict[str, Any]:
     block_confirmed = scenario_result.get("block_confirmed")
     block_confirmed_at = _parse_external_observation(
@@ -945,15 +953,23 @@ def _evaluate_block(
         "block_confirmed_at",
     )
     block_confirmed_is_bool = isinstance(block_confirmed, bool)
+    confirmed_at = block_confirmed_at["parsed"]
+    confirmed_in_observation_window = (
+        confirmed_at is not None
+        and attack_started_at <= confirmed_at <= observation_deadline_at
+    )
     confirmed_success = (
         block_confirmed is True
-        and block_confirmed_at["parsed"] is not None
+        and confirmed_at is not None
         and block_confirmed_at["error"] is None
+        and confirmed_in_observation_window
     )
     if not block_confirmed_is_bool:
         reason = "BLOCK_CONFIRMATION_INVALID_TYPE"
-    elif block_confirmed is True and not confirmed_success:
+    elif block_confirmed is True and block_confirmed_at["error"] is not None:
         reason = "BLOCK_CONFIRMATION_TIMESTAMP_INVALID"
+    elif block_confirmed is True and not confirmed_in_observation_window:
+        reason = "BLOCK_CONFIRMATION_OUTSIDE_OBSERVATION_WINDOW"
     else:
         reason = None
     return {
