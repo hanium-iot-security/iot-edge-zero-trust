@@ -159,10 +159,23 @@ iot/esp32_02/sensor {"device_id":"esp32_02","sequence":1,"uptime_s":5}
 
 Profile 2·3에서는 `sequence`에 따라 `rssi`, `free_heap`이 선택적으로 포함될 수 있다. 모든 메시지에는 필수 세 필드가 있어야 한다.
 
-운영 DB를 수정하지 않고 최근 수신만 조회한다.
+운영 DB를 수정하지 않고 최근 수신만 조회한다. 저장소의 운영 설정 키는
+`DATABASE_URL`이며, `DATABASE_PATH`는 정의되어 있지 않다. 먼저 실제 Pi의
+`.env`에 기록된 SQLite URL과 파일 경로를 대조하고, 그 파일을 `DB_PATH`로
+명시한다. 아래 경로는 저장소 기본값을 `/home/pi/iot-edge-zero-trust`에서
+해석한 예시이므로 `.env`의 값이 다르면 그대로 사용하지 않는다.
 
 ```bash
-sqlite3 "$DATABASE_PATH" "
+cd /home/pi/iot-edge-zero-trust
+grep -E '^DATABASE_URL=' .env
+
+DB_PATH=/home/pi/iot-edge-zero-trust/backend/data/iot_security.db
+test -f "$DB_PATH" || {
+  echo "운영 DB 파일을 찾지 못했습니다: $DB_PATH" >&2
+  exit 1
+}
+
+sqlite3 -readonly -header -column "$DB_PATH" "
 SELECT id, device_id, topic, payload_size, received_at,
        is_json_valid, is_topic_valid, error_message
 FROM mqtt_logs
@@ -170,6 +183,51 @@ WHERE device_id IN ('esp32_01', 'esp32_02')
 ORDER BY id DESC
 LIMIT 20;"
 ```
+
+`test -f`와 `sqlite3 -readonly`를 생략하지 않는다. 잘못된 경로에 빈 SQLite
+DB가 생성되는 것을 막고, Smoke 중 운영 DB를 실수로 변경하지 않기 위한 Gate다.
+
+`devices.last_seen_at`, 기기별 최신 MQTT Feature Window, MQTT Feature Builder의
+전역 Checkpoint를 각각 확인한다.
+
+```bash
+sqlite3 -readonly -header -column "$DB_PATH" "
+SELECT d.device_id,
+       d.last_seen_at,
+       (
+         SELECT m.received_at
+         FROM mqtt_logs AS m
+         WHERE m.device_id = d.device_id
+         ORDER BY m.id DESC
+         LIMIT 1
+       ) AS latest_mqtt_received_at
+FROM devices AS d
+WHERE d.device_id IN ('esp32_01', 'esp32_02')
+ORDER BY d.device_id;"
+
+sqlite3 -readonly -header -column "$DB_PATH" "
+SELECT id, device_id, window_start, window_end, publish_count,
+       avg_payload_size, avg_message_interval
+FROM feature_logs
+WHERE id IN (
+  SELECT MAX(id)
+  FROM feature_logs
+  WHERE device_id IN ('esp32_01', 'esp32_02')
+  GROUP BY device_id
+)
+ORDER BY device_id;"
+
+sqlite3 -readonly -header -column "$DB_PATH" "
+SELECT detector_name, source_table, last_processed_id,
+       last_completed_window_end, updated_at
+FROM detector_checkpoints
+WHERE detector_name = 'mqtt_feature_builder'
+  AND source_table = 'mqtt_logs';"
+```
+
+Checkpoint는 기기별 Row가 아니라 `mqtt_logs` Source 전체에 대한 Producer
+Watermark다. Smoke 전·후 값을 기록하고, 기기별 `feature_logs`의 최신 Window와
+함께 전진했는지 확인한다.
 
 통과 조건:
 
@@ -179,7 +237,115 @@ LIMIT 20;"
 - `devices.last_seen_at`이 같은 수신 시각으로 전진한다.
 - MQTT Feature Builder Checkpoint와 `feature_logs` Window가 계속 전진한다.
 
-## 9. Profile별 Pilot 전 확인
+## 9. Capture Session·Profile 실행 경계
+
+Packet Capture Runtime은 서비스 시작 시 UUIDv4 `session_id`를 하나 생성하고,
+정상 중지 또는 실패 전까지 같은 Session을 사용한다. 따라서 Capture가 실행 중인
+상태에서 Firmware, Profile 또는 수집 Device 구성을 바꾸지 않는다.
+
+Pilot 또는 공식 수집은 다음 순서로 수행한다.
+
+1. 수집 전에 Run ID, Train·Validation·Test Split, Profile, 포함 Device 목록을
+   실행 기록에 사전 배정한다.
+2. 기존 Capture Session이 실행 중이면 `packet-capture.service`를 정상 중지하고
+   이전 Session이 `COMPLETED`로 마감됐는지 확인한다.
+3. Firmware를 Upload하고 Serial·MQTT·DB Smoke가 안정적으로 통과할 때까지
+   Packet Capture를 시작하지 않는다.
+4. Profile과 Device 구성을 확정한 뒤 Capture Service를 시작하고 Runtime이 새로
+   생성한 `session_id`를 확인한다.
+5. 확인한 `session_id`를 사전 배정한 Run·Split 실행 기록에 연결한다. PR #45의
+   공통 Manifest 계약이 확정된 뒤에는 같은 연결을 공식 Manifest에 기록한다.
+6. 한 Capture Session 안에서는 Firmware Commit, Profile, Device Slot과 포함
+   Device 목록을 변경하지 않는다.
+7. 수집을 마치면 Service를 정상 중지하고 Session 상태와 Window 연속성을 확인한다.
+
+```bash
+sudo systemctl stop packet-capture.service
+systemctl is-active packet-capture.service
+sqlite3 -readonly -header -column "$DB_PATH" "
+SELECT session_id, status, ended_at
+FROM packet_capture_sessions
+ORDER BY id DESC
+LIMIT 1;"
+
+# Firmware Upload와 Serial·MQTT·DB Smoke 완료 후 실행한다.
+sudo systemctl start packet-capture.service
+systemctl is-active packet-capture.service
+journalctl --utc -u packet-capture.service -n 50 --no-pager
+
+SESSION_ID="$(sqlite3 -readonly "$DB_PATH" \
+  "SELECT session_id FROM packet_capture_sessions ORDER BY id DESC LIMIT 1;")"
+test -n "$SESSION_ID"
+printf 'capture_session_id=%s\n' "$SESSION_ID"
+```
+
+- 두 ESP32를 함께 수집하면 두 장비를 같은 Profile로 운영하고 두 Device ID를
+  실행 기록에 명시한다.
+- 기기별로 수집하면 다른 Sender를 중지한 상태에서 Device마다 별도 Capture
+  Session을 시작한다.
+- Profile을 전환하려면 현재 Capture Service를 정상 중지하고 기존 Session이
+  `COMPLETED`인지 확인한 뒤, 새 Profile Smoke와 새 Session 시작 절차를 반복한다.
+
+수집 종료 후 다음 조회로 Session과 Window 상태를 확인한다.
+기존 운영 방식에 따라 Packet Feature Extractor가 남은 `READY` Segment를 모두
+`PROCESSED` 또는 `EMPTY`로 마감한 뒤 최종 Gate를 판정한다. Extractor 실행 방식이
+확정되지 않았거나 `READY`가 남아 있으면 완료로 기록하지 않고 `HOLD`로 둔다.
+
+```bash
+sudo systemctl stop packet-capture.service
+
+sqlite3 -readonly -header -column "$DB_PATH" "
+SELECT session_id, status, started_at, first_window_start, ended_at,
+       capture_gap_start, capture_gap_end
+FROM packet_capture_sessions
+WHERE session_id = '$SESSION_ID';"
+
+sqlite3 -readonly -header -column "$DB_PATH" "
+SELECT COUNT(*) AS total_windows,
+       CAST((unixepoch(MAX(window_end)) - unixepoch(MIN(window_start))) / 10
+            AS INTEGER) AS expected_contiguous_windows,
+       SUM(CASE WHEN status IN ('PROCESSED', 'EMPTY') THEN 1 ELSE 0 END)
+         AS processed_or_empty_windows,
+       SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed_windows,
+       MIN(window_start) AS first_segment_start,
+       MAX(window_end) AS last_segment_end
+FROM packet_capture_segments
+WHERE capture_session_id = (
+  SELECT id FROM packet_capture_sessions WHERE session_id = '$SESSION_ID'
+);"
+
+sqlite3 -readonly -header -column "$DB_PATH" "
+SELECT device_id, COUNT(*) AS feature_windows,
+       MIN(window_start) AS first_feature_window,
+       MAX(window_end) AS last_feature_window
+FROM feature_logs
+WHERE device_id IN ('esp32_01', 'esp32_02')
+  AND unixepoch(window_start) >= unixepoch((
+    SELECT first_window_start
+    FROM packet_capture_sessions
+    WHERE session_id = '$SESSION_ID'
+  ))
+  AND unixepoch(window_end) <= unixepoch((
+    SELECT ended_at
+    FROM packet_capture_sessions
+    WHERE session_id = '$SESSION_ID'
+  ))
+GROUP BY device_id
+ORDER BY device_id;"
+```
+
+통과 조건은 Session `COMPLETED`, `total_windows=expected_contiguous_windows`,
+모든 Segment가 `PROCESSED` 또는 `EMPTY`, `failed_windows=0`, 적격성 검사를
+통과한 Profile·Device별 유효 Feature Window 60개 이상이다. 단순
+`feature_windows` 개수만으로 적격을 확정하지 않는다.
+
+정상 중지·Profile 전환처럼 Capture가 멈춘 구간은 새 Session의
+`capture_gap_start`·`capture_gap_end`에 첫 Window 이전 감사 정보로 기록될 수
+있다. 이 값을 임의로 NULL로 바꾸거나 삭제하지 않는다. 첫 Window 이후 수집 구간
+내부에 누락·FAILED Window가 없어야 하며, 정책이 해당 사전 Gap까지 허용하지 않으면
+그 Session은 `HOLD`로 기록하고 공식 Dataset에서 제외한다.
+
+## 10. Profile별 Pilot 전 확인
 
 ### Profile 0
 
@@ -202,9 +368,11 @@ LIMIT 20;"
 - Profile 2의 Payload 변화와 4~6초 간격을 결합한다.
 - Profile 1·2의 Pilot 판정이 승인되기 전에는 Firmware Smoke까지만 수행한다.
 
-각 Profile Pilot은 기기·Profile별 독립 Session ID를 사용하고 단순 경과 시간이 아니라 적격성 검사를 통과한 유효 Window 60개를 목표로 한다.
+각 Profile Pilot은 9절의 실행 경계에 따라 기기·Profile별 독립 Session ID를
+사용하고, 단순 경과 시간이 아니라 적격성 검사를 통과한 유효 Window 60개를
+목표로 한다.
 
-## 10. 실행 기록
+## 11. 실행 기록
 
 각 Compile·Upload·Smoke 기록에 다음을 남긴다.
 
@@ -213,6 +381,7 @@ LIMIT 20;"
 - Payload Schema Version
 - Device Slot·Device ID·COM Port·실제 IP
 - Profile 번호·이름
+- Run ID·Split·Capture Session ID·포함 Device 목록
 - Verify·Upload 결과
 - Serial 부팅 계약
 - MQTT Topic·대표 Payload
@@ -221,7 +390,7 @@ LIMIT 20;"
 
 PR #45의 Run·Session Manifest 계약이 확정되면 같은 항목을 공통 Manifest에 연결한다. 계약 확정 전 임의의 공식 Manifest Schema를 만들지 않는다.
 
-## 11. 중단과 복구
+## 12. 중단과 복구
 
 - Device 매핑 오류: 즉시 전송을 중단하고 올바른 Device Slot으로 다시 Verify·Upload한다.
 - MQTT·Feature 오류: 원본 로그를 보존하고 `HOLD`로 기록한다.
@@ -229,7 +398,7 @@ PR #45의 Run·Session Manifest 계약이 확정되면 같은 항목을 공통 M
 - 정상 Firmware 복구가 필요하면 마지막으로 검증된 Firmware Commit과 Device Slot을 사용해 다시 Upload한다.
 - 운영 DB, Trust Score, Device Status, Firewall Rule을 임의 SQL로 수정하지 않는다.
 
-## 12. 공식 수집 Gate
+## 13. 공식 수집 Gate
 
 다음이 모두 완료된 뒤에만 공식 정상 Session 수집을 시작한다.
 
