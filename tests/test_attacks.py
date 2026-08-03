@@ -56,8 +56,8 @@ class TestFloodingAttack:
         count = 30
         assert count > 15
 
-    def test_flooding_interval_below_threshold(self):
-        """min_message_interval < 1.0 탐지 기준 충족 확인."""
+    def test_flooding_interval_is_retained_as_rapid_publish_evidence(self):
+        """짧은 발행 간격이 공격 분석용 Feature Evidence로 남는지 확인."""
         interval = 0.2
         assert interval < 1.0
 
