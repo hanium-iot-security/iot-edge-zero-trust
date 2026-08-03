@@ -1,0 +1,742 @@
+"""Scenario Runner 실행 엔진 + CLI.
+
+P5-SW-01 담당 작업 구현. ``edge/phase5/contracts.py``의 ``RunManifest``로 ``run-manifest.json``을 쓰고, 
+``edge/evaluation/export_phase5_results.py``가 실제로 요구하는 계약에 맞춰 ``scenario-result.jsonl``을 쓴다.
+
+.. important::
+   ``export_phase5_results._scenario_result_common_contract_issue`` /
+   ``_scenario_result_manifest_contract_issue`` 가 강제하는 ``scenario-result`` 행 계약 (``docs/phase5-evaluation-contract.md`` 참고):
+
+   - ``run_id``, ``scenario_id``: 비어있지 않은 문자열 (Manifest와 동일)
+   - ``session_id``: Manifest.session_id가 있으면 동일한 값(비어있지 않은 문자열)이어야 하고, Manifest.session_id가 None이면 null 또는 생략해야 함
+   - ``scenario_status``: **반드시 ``ManifestStatus`` 값** 중 하나 (SUCCESS/FAILED/HOLD/NOT_APPLICABLE/ENVIRONMENT_ERROR/CAPTURE_INELIGIBLE/NOT_EVALUATED)
+     SCENARIO_FAILED/RESET_FAILED 같은 임의 문자열은 이 필드에 그대로 쓰면 안 된다.
+   - ``capture_eligible``: bool 필수. False면 ``capture_exclusion_reason`` 필수
+   - ``block_confirmed``/``block_confirmed_at``: 있을 때만 서로 짝을 맞춰 검증됨
+
+   파일 형식도 JSON이 아니라 **JSONL**이다 (``_load_jsonl``로 라인 단위 파싱).
+
+   ``capture_eligible`` 판정 기준(Packet Capture Timing/Window 등)은 Scenario Runner가 실행 시점에 알 수 없는 정보라,
+   여기서는 "공격 Process가 실제로 시작됐는가"만으로 보수적으로 True/False를 정한다. 실제 Packet Capture 적격성을 보고 이 값을 재작성해야 하는지 PR에서 확인 필요.**
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import subprocess
+import sys
+import uuid
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+from edge.phase5.contracts import (
+    RUN_MANIFEST_SCHEMA_VERSION,
+    EvaluationScope,
+    ExecutionNode,
+    ExpectedOutcome,
+    ManifestStatus,
+    RunManifest,
+    RunManifestValidationError,
+    RunStageStatuses,
+    ScenarioReference,
+    run_manifest_sha256,
+)
+from edge.scenarios.cleanup import (
+    BaselineCheck,
+    CleanupHook,
+    default_baseline_check,
+    default_cleanup_hook,
+)
+from edge.scenarios.packet_scenarios import is_packet_rule_gate_confirmed
+from edge.scenarios.scenario_registry import (
+    SCENARIOS,
+    ScenarioDefinition,
+    get_scenario,
+)
+
+DEFAULT_RUNS_ROOT = Path("data/phase5/runs")
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 120.0
+DEFAULT_OBSERVATION_BUFFER_SECONDS = 30.0
+
+AWAITING_SESSION_CORRELATION = "AWAITING_SESSION_CORRELATION"
+
+class ScenarioExecStatus(str, Enum):
+    SUCCESS = "SUCCESS"
+    SCENARIO_FAILED = "SCENARIO_FAILED"
+    RESET_FAILED = "RESET_FAILED"
+    ENVIRONMENT_ERROR = "ENVIRONMENT_ERROR"
+    HOLD = "HOLD"
+
+
+class DuplicateRunIdError(ValueError):
+    """이미 사용된 run_id를 다시 사용하려는 경우."""
+
+
+class MissingRequiredInputError(ValueError):
+    """필수 인자 누락."""
+
+
+def compare_event_types(
+    expected_event_types: list[str] | tuple[str, ...],
+    actual_event_types: list[str] | tuple[str, ...],
+) -> dict[str, list[str]]:
+    """예상 Event Type과 실제 Detection Event Type을 비교한다 (순수 함수)."""
+    expected = set(expected_event_types)
+    actual = set(actual_event_types)
+    return {
+        "matched": sorted(expected & actual),
+        "missing": sorted(expected - actual),
+        "unexpected": sorted(actual - expected),
+    }
+
+
+def _compute_execution_volume(
+    defn: ScenarioDefinition, args: dict[str, str]
+) -> dict[str, Any]:
+    try:
+        if defn.volume_strategy == "count_arg":
+            planned = int(args.get(defn.volume_arg_name, 0))
+        elif defn.volume_strategy == "duration_x_rate":
+            duration = float(args.get("duration", defn.duration_seconds))
+            rate = float(args.get("rate_pps", 0))
+            planned = int(duration * rate)
+        elif defn.volume_strategy == "port_range":
+            start = int(args.get("start_port", 0))
+            end = int(args.get("end_port", 0))
+            planned = max(end - start + 1, 0)
+        else:
+            planned = 0
+    except (TypeError, ValueError):
+        planned = 0
+    return {"unit": defn.volume_unit, "planned": planned, "basis": defn.volume_strategy}
+
+
+def _utc_now() -> datetime:
+    """UTC 현재 시각을 '초 단위'로 내림 처리해 반환한다.
+
+    ``detection_events.detected_at``(및 evaluator의 ``parse_db_utc``)은 초
+    단위 정밀도만 허용한다. Scenario Runner가 마이크로초까지 포함된 ``attack_started_at``을 쓰면, 같은 초에 기록된(초 단위로 truncate된)
+    실제 Detection Event가 "공격 시작 이전"으로 오판되어 탐지 매칭이 실패하는 경계 문제가 생기므로 항상 초 단위로 맞춘다.
+    """
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def _iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _exec_status_to_manifest_status(status: str) -> ManifestStatus:
+    return {
+        ScenarioExecStatus.SUCCESS: ManifestStatus.SUCCESS,
+        ScenarioExecStatus.SCENARIO_FAILED: ManifestStatus.FAILED,
+        ScenarioExecStatus.RESET_FAILED: ManifestStatus.ENVIRONMENT_ERROR,
+        ScenarioExecStatus.ENVIRONMENT_ERROR: ManifestStatus.ENVIRONMENT_ERROR,
+        ScenarioExecStatus.HOLD: ManifestStatus.HOLD,
+    }[status]
+
+
+# ---------------------------------------------------------------------------
+# scenario-result.jsonl 행 — export_phase5_results.py가 강제하는 계약을 따른다
+# ---------------------------------------------------------------------------
+@dataclass
+class ScenarioResultRow:
+    # --- exporter 공식 계약 (docs/phase5-evaluation-contract.md) ---
+    run_id: str
+    scenario_id: str
+    session_id: str | None
+    scenario_status: str  # ManifestStatus.value 중 하나 (필수)
+    capture_eligible: bool  # 필수
+    capture_exclusion_reason: str | None  # capture_eligible=False면 필수
+    block_confirmed: bool | None = None
+    block_confirmed_at: str | None = None
+
+    scenario_version: str = ""
+    target_device_id: str | None = None
+    source_ip: str | None = None
+    execution_node: str = ""
+    command: list[str] = field(default_factory=list)
+    started_at: str | None = None
+    attack_started_at: str | None = None
+    ended_at: str | None = None
+    expected_event_types: list[str] = field(default_factory=list)
+    execution_volume: dict[str, Any] = field(default_factory=dict)
+    exit_code: int | None = None
+    scenario_runner_status: str = ""  # ScenarioExecStatus 값 (SCENARIO_FAILED/RESET_FAILED 등 세부 구분)
+    cleanup_attempted: bool = False
+    cleanup_ok: bool = True
+    cleanup_failure_reason: str | None = None
+    stdout_path: str | None = None
+    stderr_path: str | None = None
+    error_reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        if payload.get("block_confirmed") is None:
+            payload.pop("block_confirmed", None)
+        if payload.get("block_confirmed_at") is None:
+            payload.pop("block_confirmed_at", None)
+        return payload
+
+
+def _write_scenario_result_jsonl(run_dir: Path, row: ScenarioResultRow) -> None:
+    """단일 Run은 단일 행(JSONL 1줄)만 남긴다 — exporter는 run_id+scenario_id로 정확히 1개 행을 찾는다."""
+    path = run_dir / "scenario-result.jsonl"
+    line = json.dumps(row.to_dict(), ensure_ascii=False, sort_keys=True)
+    path.write_text(line + "\n", encoding="utf-8")
+    digest = hashlib.sha256((line + "\n").encode("utf-8")).hexdigest()
+    path.with_suffix(path.suffix + ".sha256").write_text(digest + "\n", encoding="utf-8")
+
+
+class ScenarioRunner:
+    """단일 시나리오를 1회 실행하고 run_id 기준 증적을 남긴다."""
+
+    def __init__(
+        self,
+        *,
+        execution_node: str,
+        execution_node_registered: bool = False,
+        runs_root: Path = DEFAULT_RUNS_ROOT,
+        baseline_check: BaselineCheck = default_baseline_check,
+        cleanup_hook: CleanupHook = default_cleanup_hook,
+        command_timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        observation_buffer_seconds: float = DEFAULT_OBSERVATION_BUFFER_SECONDS,
+        python_executable: str = sys.executable,
+    ) -> None:
+        self.execution_node = execution_node
+        self.execution_node_registered = execution_node_registered
+        self.runs_root = Path(runs_root)
+        self.baseline_check = baseline_check
+        self.cleanup_hook = cleanup_hook
+        self.command_timeout_seconds = command_timeout_seconds
+        self.observation_buffer_seconds = observation_buffer_seconds
+        self.python_executable = python_executable
+
+    def run(
+        self,
+        scenario_id: str,
+        *,
+        run_id: str | None = None,
+        target_device_id: str | None = None,
+        source_ip: str | None = None,
+        session_id: str | None = None,
+        extra_args: dict[str, str] | None = None,
+        dry_run: bool = False,
+    ) -> tuple[ScenarioResultRow, RunManifest]:
+        defn = get_scenario(scenario_id)
+
+        if defn.requires_target_device_id and not target_device_id:
+            raise MissingRequiredInputError(
+                f"{scenario_id}는 target_device_id가 필요합니다."
+            )
+        if defn.requires_target_source_ip and not source_ip:
+            raise MissingRequiredInputError(f"{scenario_id}는 source_ip가 필요합니다.")
+
+        run_id = run_id or str(uuid.uuid4())
+        run_dir = self.runs_root / run_id
+        if run_dir.exists():
+            raise DuplicateRunIdError(f"run_id 중복: {run_id!r} ({run_dir})")
+
+        if defn.requires_packet_rule_gate and not is_packet_rule_gate_confirmed():
+            return self._finalize(
+                defn=defn,
+                run_id=run_id,
+                session_id=session_id,
+                target_device_id=target_device_id,
+                source_ip=source_ip,
+                run_dir=run_dir,
+                exec_status=ScenarioExecStatus.HOLD,
+                command=self._build_command(defn, dict(defn.default_args)),
+                exit_code=None,
+                started_at=_utc_now(),
+                attack_started_at=None,
+                ended_at=None,
+                stdout_path=None,
+                stderr_path=None,
+                error_reason=(
+                    "packet_rule_gate_not_confirmed: Phase 4 Packet Rule "
+                    "Orchestrator 등록·Local Smoke Test 결과가 아직 확인되지 "
+                    "않았습니다."
+                ),
+                cleanup_attempted=False,
+                cleanup_ok=True,
+                cleanup_failure_reason=None,
+            )
+
+        evaluation_scope = EvaluationScope(defn.evaluation_scope)
+        if not self.execution_node_registered and evaluation_scope == EvaluationScope.FULL_E2E:
+            evaluation_scope = EvaluationScope.DETECTION_ONLY
+
+        args = dict(defn.default_args)
+        if extra_args:
+            args.update(extra_args)
+        if target_device_id and defn.series != "PACKET_ANOMALY":
+            args["device_id"] = target_device_id
+        if source_ip and defn.series == "PACKET_ANOMALY":
+            args.setdefault("target", source_ip)
+
+        command = self._build_command(defn, args)
+        started_at = _utc_now()
+
+        baseline_ok, baseline_reason = self.baseline_check()
+        if not baseline_ok:
+            return self._finalize(
+                defn=defn,
+                run_id=run_id,
+                session_id=session_id,
+                target_device_id=target_device_id,
+                source_ip=source_ip,
+                run_dir=run_dir,
+                exec_status=ScenarioExecStatus.ENVIRONMENT_ERROR,
+                command=command,
+                exit_code=None,
+                started_at=started_at,
+                attack_started_at=None,
+                ended_at=None,
+                stdout_path=None,
+                stderr_path=None,
+                error_reason=f"baseline_check_failed: {baseline_reason}",
+                cleanup_attempted=False,
+                cleanup_ok=True,
+                cleanup_failure_reason=None,
+                evaluation_scope=evaluation_scope,
+            )
+
+        attack_started_at = _utc_now()
+        exit_code: int | None = None
+        stdout_path: Path | None = None
+        stderr_path: Path | None = None
+        error_reason: str | None = None
+        exec_status = ScenarioExecStatus.SUCCESS
+
+        if dry_run:
+            exit_code = 0
+        else:
+            logs_dir = run_dir / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            stdout_path = logs_dir / f"{defn.scenario_id}__{run_id}__stdout.log"
+            stderr_path = logs_dir / f"{defn.scenario_id}__{run_id}__stderr.log"
+            try:
+                with stdout_path.open("w", encoding="utf-8") as out_fh, stderr_path.open(
+                    "w", encoding="utf-8"
+                ) as err_fh:
+                    completed = subprocess.run(
+                        command,
+                        stdout=out_fh,
+                        stderr=err_fh,
+                        timeout=self.command_timeout_seconds,
+                        check=False,
+                        shell=False,  # shell=True 없이 실행
+                    )
+                exit_code = completed.returncode
+                if exit_code != 0:
+                    exec_status = ScenarioExecStatus.SCENARIO_FAILED
+                    error_reason = f"non_zero_exit_code={exit_code}"
+            except subprocess.TimeoutExpired:
+                exec_status = ScenarioExecStatus.SCENARIO_FAILED
+                error_reason = "command_timeout"
+            except OSError as exc:
+                return self._finalize(
+                    defn=defn,
+                    run_id=run_id,
+                    session_id=session_id,
+                    target_device_id=target_device_id,
+                    source_ip=source_ip,
+                    run_dir=run_dir,
+                    exec_status=ScenarioExecStatus.ENVIRONMENT_ERROR,
+                    command=command,
+                    exit_code=None,
+                    started_at=started_at,
+                    attack_started_at=attack_started_at,
+                    ended_at=_utc_now(),
+                    stdout_path=None,
+                    stderr_path=None,
+                    error_reason=f"environment_error: {exc}",
+                    cleanup_attempted=False,
+                    cleanup_ok=True,
+                    cleanup_failure_reason=None,
+                    evaluation_scope=evaluation_scope,
+                )
+
+        ended_at = _utc_now()
+        cleanup_ok, cleanup_reason = self.cleanup_hook()
+        if not cleanup_ok:
+            exec_status = ScenarioExecStatus.RESET_FAILED
+
+        execution_volume = _compute_execution_volume(defn, args)
+
+        return self._finalize(
+            defn=defn,
+            run_id=run_id,
+            session_id=session_id,
+            target_device_id=target_device_id,
+            source_ip=source_ip,
+            run_dir=run_dir,
+            exec_status=exec_status,
+            command=command,
+            exit_code=exit_code,
+            started_at=started_at,
+            attack_started_at=attack_started_at,
+            ended_at=ended_at,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            error_reason=error_reason,
+            cleanup_attempted=True,
+            cleanup_ok=cleanup_ok,
+            cleanup_failure_reason=cleanup_reason,
+            execution_volume=execution_volume,
+            evaluation_scope=evaluation_scope,
+        )
+
+    # ------------------------------------------------------------------
+    def _finalize(
+        self,
+        *,
+        defn: ScenarioDefinition,
+        run_id: str,
+        session_id: str | None,
+        target_device_id: str | None,
+        source_ip: str | None,
+        run_dir: Path,
+        exec_status: str,
+        command: list[str],
+        exit_code: int | None,
+        started_at: datetime,
+        attack_started_at: datetime | None,
+        ended_at: datetime | None,
+        stdout_path: Path | None,
+        stderr_path: Path | None,
+        error_reason: str | None,
+        cleanup_attempted: bool,
+        cleanup_ok: bool,
+        cleanup_failure_reason: str | None,
+        execution_volume: dict[str, Any] | None = None,
+        evaluation_scope: EvaluationScope | None = None,
+    ) -> tuple[ScenarioResultRow, RunManifest]:
+        execution_volume = execution_volume or _compute_execution_volume(
+            defn, dict(defn.default_args)
+        )
+        evaluation_scope = evaluation_scope or EvaluationScope(defn.evaluation_scope)
+        manifest_status = _exec_status_to_manifest_status(exec_status)
+
+        # capture_eligible: 공격 Process가 실제로 시작됐는지만으로 보수적으로 판정한다. 실제 Packet Capture 적격성은 여기서 알 수 없다.
+        capture_eligible = attack_started_at is not None
+        capture_exclusion_reason = (
+            None if capture_eligible else (error_reason or exec_status)
+        )
+
+        row = ScenarioResultRow(
+            run_id=run_id,
+            scenario_id=defn.scenario_id,
+            session_id=session_id,
+            scenario_status=manifest_status.value,
+            capture_eligible=capture_eligible,
+            capture_exclusion_reason=capture_exclusion_reason,
+            scenario_version=defn.scenario_version,
+            target_device_id=target_device_id,
+            source_ip=source_ip,
+            execution_node=self.execution_node,
+            command=command,
+            started_at=_iso(started_at),
+            attack_started_at=_iso(attack_started_at),
+            ended_at=_iso(ended_at),
+            expected_event_types=list(defn.expected_event_types),
+            execution_volume=execution_volume,
+            exit_code=exit_code,
+            scenario_runner_status=exec_status,
+            cleanup_attempted=cleanup_attempted,
+            cleanup_ok=cleanup_ok,
+            cleanup_failure_reason=cleanup_failure_reason,
+            stdout_path=str(stdout_path) if stdout_path else None,
+            stderr_path=str(stderr_path) if stderr_path else None,
+            error_reason=error_reason,
+        )
+
+        manifest = self._build_run_manifest(
+            defn=defn,
+            run_id=run_id,
+            session_id=session_id,
+            target_device_id=target_device_id,
+            source_ip=source_ip,
+            started_at=started_at,
+            attack_started_at=attack_started_at,
+            ended_at=ended_at,
+            evaluation_scope=evaluation_scope,
+            manifest_status=manifest_status,
+            exec_status=exec_status,
+            error_reason=error_reason,
+        )
+
+        run_dir.mkdir(parents=True, exist_ok=True)
+        _write_scenario_result_jsonl(run_dir, row)
+        self._write_run_manifest(run_dir, manifest)
+        return row, manifest
+
+    def _build_run_manifest(
+        self,
+        *,
+        defn: ScenarioDefinition,
+        run_id: str,
+        session_id: str | None,
+        target_device_id: str | None,
+        source_ip: str | None,
+        started_at: datetime,
+        attack_started_at: datetime | None,
+        ended_at: datetime | None,
+        evaluation_scope: EvaluationScope,
+        manifest_status: ManifestStatus,
+        exec_status: str,
+        error_reason: str | None,
+    ) -> RunManifest:
+        observation_deadline_at = (
+            ended_at + timedelta(seconds=self.observation_buffer_seconds)
+            if ended_at is not None
+            else started_at
+        )
+
+        downgraded = evaluation_scope != EvaluationScope(defn.evaluation_scope)
+        expected_outcome = ExpectedOutcome(
+            expected_event_types=tuple(defn.expected_event_types),
+            detection_expected=defn.detection_expected,
+            trust_score_change_expected=defn.trust_change_expected and not downgraded,
+            firewall_expected=defn.firewall_rule_expected and not downgraded,
+            block_expected=defn.block_expected and not downgraded,
+            evaluation_scope=evaluation_scope,
+        )
+
+        identity_missing = (
+            session_id is None or target_device_id is None or source_ip is None
+        )
+        if exec_status != ScenarioExecStatus.SUCCESS:
+            failure_stage = "scenario_execution"
+            failure_reason_code = exec_status
+            failure_reason = error_reason or exec_status
+        elif identity_missing:
+            failure_stage = "session_correlation"
+            failure_reason_code = AWAITING_SESSION_CORRELATION
+            failure_reason = (
+                "Scenario Runner 실행은 완료되었으나 session_id/target_device_id/"
+                "source_ip 중 일부가 아직 확정되지 않았습니다. evaluation exporter가 "
+                "Detection Event 상관분석 후 재작성해야 합니다."
+            )
+        else:
+            failure_stage = None
+            failure_reason_code = None
+            failure_reason = None
+
+        statuses = RunStageStatuses(
+            scenario_status=manifest_status,
+            detection_status=ManifestStatus.NOT_EVALUATED,
+            trust_status=ManifestStatus.NOT_EVALUATED,
+            firewall_status=ManifestStatus.NOT_EVALUATED,
+            block_status=ManifestStatus.NOT_EVALUATED,
+            data_status=ManifestStatus.NOT_EVALUATED,
+            final_status=(
+                manifest_status
+                if manifest_status != ManifestStatus.SUCCESS
+                else ManifestStatus.NOT_EVALUATED
+            ),
+        )
+
+        return RunManifest(
+            run_manifest_schema_version=RUN_MANIFEST_SCHEMA_VERSION,
+            run_id=run_id,
+            session_id=session_id,
+            scenario=ScenarioReference(
+                scenario_id=defn.scenario_id,
+                scenario_version=defn.scenario_version,
+            ),
+            target_device_id=target_device_id,
+            source_ip=source_ip,
+            execution_node=ExecutionNode(
+                node_id=self.execution_node,
+                registered=self.execution_node_registered,
+            ),
+            evaluation_scope=evaluation_scope,
+            is_active=False,
+            started_at=started_at,
+            attack_started_at=attack_started_at,
+            observation_deadline_at=observation_deadline_at,
+            ended_at=ended_at,
+            expected_outcome=expected_outcome,
+            statuses=statuses,
+            failure_stage=failure_stage,
+            failure_reason_code=failure_reason_code,
+            failure_reason=failure_reason,
+        )
+
+    def _write_run_manifest(self, run_dir: Path, manifest: RunManifest) -> None:
+        manifest_json = manifest.to_json()
+        (run_dir / "run-manifest.json").write_text(manifest_json, encoding="utf-8")
+        (run_dir / "run-manifest.json.sha256").write_text(
+            run_manifest_sha256(manifest) + "\n", encoding="utf-8"
+        )
+
+    def _build_command(
+        self, defn: ScenarioDefinition, args: dict[str, str]
+    ) -> list[str]:
+        command = [self.python_executable, "-m", defn.module]
+        for key, value in args.items():
+            command.append(f"--{key}")
+            command.append(str(value))
+        return command
+
+
+# ---------------------------------------------------------------------------
+# 반복 실행
+# ---------------------------------------------------------------------------
+@dataclass
+class BatchSummary:
+    scenario_id: str
+    requested_runs: int
+    executed_runs: int = 0
+    success_runs: int = 0
+    status_counts: dict[str, int] = field(default_factory=dict)
+    stopped_early: bool = False
+    stop_reason: str | None = None
+    results: list[ScenarioResultRow] = field(default_factory=list)
+
+
+def run_repeated(
+    runner: ScenarioRunner,
+    scenario_id: str,
+    times: int,
+    *,
+    target_device_id: str | None = None,
+    source_ip: str | None = None,
+    session_id: str | None = None,
+    dry_run: bool = False,
+) -> BatchSummary:
+    summary = BatchSummary(scenario_id=scenario_id, requested_runs=times)
+
+    for _ in range(times):
+        result, _manifest = runner.run(
+            scenario_id,
+            target_device_id=target_device_id,
+            source_ip=source_ip,
+            session_id=session_id,
+            dry_run=dry_run,
+        )
+        summary.executed_runs += 1
+        summary.results.append(result)
+        status = result.scenario_runner_status
+        summary.status_counts[status] = summary.status_counts.get(status, 0) + 1
+        if status == ScenarioExecStatus.SUCCESS:
+            summary.success_runs += 1
+
+        if status == ScenarioExecStatus.RESET_FAILED:
+            summary.stopped_early = True
+            summary.stop_reason = "RESET_FAILED: Baseline 복구 실패로 반복 실행을 중단했습니다."
+            break
+        if status == ScenarioExecStatus.HOLD:
+            summary.stopped_early = True
+            summary.stop_reason = "HOLD: Packet Rule Gate가 아직 확인되지 않았습니다."
+            break
+
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Phase 5 Scenario Runner")
+    p.add_argument("--scenario")
+    p.add_argument("--list", action="store_true")
+    p.add_argument("--target-device-id", default=None)
+    p.add_argument("--source-ip", default=None, help="Packet 계열 시나리오의 대상 IP")
+    p.add_argument(
+        "--execution-node-registered",
+        action="store_true",
+        help="Attack Node가 DB에 등록된 IP인 경우에만 지정. 지정하지 않으면 "
+        "FULL_E2E가 DETECTION_ONLY로 강제 하향됩니다.",
+    )
+    p.add_argument("--execution-node", default="unspecified-node")
+    p.add_argument("--session-id", default=None)
+    p.add_argument("--run-id", default=None)
+    p.add_argument("--times", default=1, type=int)
+    p.add_argument("--runs-root", default=str(DEFAULT_RUNS_ROOT))
+    p.add_argument("--dry-run", action="store_true")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = _parse_args()
+
+    if args.list or not args.scenario:
+        print("사용 가능한 scenario_id:")
+        for scenario_id, defn in sorted(SCENARIOS.items()):
+            hw = " (실기기 전용/Packet Gate 필요)" if defn.requires_packet_rule_gate else ""
+            print(f"  - {scenario_id} [{defn.evaluation_scope}]{hw}: {defn.description}")
+            print(
+                f"      최소 실행 {defn.min_functional_runs}회, "
+                f"정량 기준선 목표 {defn.target_baseline_runs}회 (문서 4.6)"
+            )
+        return 0
+
+    runner = ScenarioRunner(
+        execution_node=args.execution_node,
+        execution_node_registered=args.execution_node_registered,
+        runs_root=Path(args.runs_root),
+    )
+
+    try:
+        if args.times == 1 and args.run_id:
+            result, _manifest = runner.run(
+                args.scenario,
+                run_id=args.run_id,
+                target_device_id=args.target_device_id,
+                source_ip=args.source_ip,
+                session_id=args.session_id,
+                dry_run=args.dry_run,
+            )
+            print(
+                f"[ScenarioRunner] run_id={result.run_id} "
+                f"scenario_status={result.scenario_status} "
+                f"scenario_runner_status={result.scenario_runner_status}"
+            )
+            return 0 if result.scenario_runner_status == ScenarioExecStatus.SUCCESS else 1
+
+        summary = run_repeated(
+            runner,
+            args.scenario,
+            args.times,
+            target_device_id=args.target_device_id,
+            source_ip=args.source_ip,
+            session_id=args.session_id,
+            dry_run=args.dry_run,
+        )
+    except (
+        KeyError,
+        DuplicateRunIdError,
+        MissingRequiredInputError,
+        RunManifestValidationError,
+    ) as exc:
+        print(f"[ScenarioRunner] 실행 거부: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"[ScenarioRunner] scenario_id={summary.scenario_id}")
+    print(
+        f"  requested={summary.requested_runs} executed={summary.executed_runs} "
+        f"success={summary.success_runs}"
+    )
+    print(f"  status_counts={summary.status_counts}")
+    if summary.stopped_early:
+        print(f"  [중단] {summary.stop_reason}")
+    for result in summary.results:
+        print(
+            f"  - run_id={result.run_id} scenario_status={result.scenario_status} "
+            f"exit_code={result.exit_code}"
+        )
+
+    return 0 if not summary.stopped_early else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
