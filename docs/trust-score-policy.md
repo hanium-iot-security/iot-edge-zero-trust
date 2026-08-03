@@ -51,7 +51,7 @@ MVP에서는 기기가 `isolated` 상태가 된 이후 추가 보안 이벤트�
 | event_type | score_delta | 비고 |
 | --- | ---: | --- |
 | `DEVICE_ID_MISMATCH` | -25 | 기기 신원 불일치 |
-| `ABNORMAL_PUBLISH_RATE` | -20 | 과도한 publish 또는 짧은 메시지 간격 |
+| `ABNORMAL_PUBLISH_RATE` | -20 | 10초 Window의 `publish_count > 15` |
 | `ABNORMAL_TOPIC` | -20 | 허용되지 않은 topic 접근 |
 | `LARGE_PAYLOAD` | -15 | payload 크기 초과 |
 | `AI_ANOMALY` | -15 | Isolation Forest 이상 탐지 |

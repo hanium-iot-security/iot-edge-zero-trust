@@ -51,15 +51,40 @@ class TestDetectFeatureRules:
     def test_publish_count_16_triggers(self):
         assert ABNORMAL_PUBLISH_RATE in _event_types(detect_feature_rules(_feature(publish_count=16)))
 
-    # ABNORMAL_PUBLISH_RATE — min_message_interval
+    def test_backlog_compressed_normal_window_does_not_trigger_any_rule(self):
+        events = detect_feature_rules(
+            _feature(publish_count=4, min_message_interval=0.0)
+        )
+
+        assert events == []
+
+    def test_publish_count_above_threshold_triggers_single_high_rate_event(self):
+        events = detect_feature_rules(
+            _feature(publish_count=16, min_message_interval=5.0)
+        )
+
+        assert events == [
+            {"event_type": ABNORMAL_PUBLISH_RATE, "severity": "high"}
+        ]
+
+    def test_publish_count_and_short_interval_trigger_single_rate_event(self):
+        events = detect_feature_rules(
+            _feature(publish_count=16, min_message_interval=0.0)
+        )
+
+        assert events == [
+            {"event_type": ABNORMAL_PUBLISH_RATE, "severity": "high"}
+        ]
+
+    # min_message_interval은 수집하지만 단독 Rule 조건으로 사용하지 않음
     def test_interval_1_0_is_normal(self):
         assert detect_feature_rules(_feature(min_message_interval=1.0)) == []
 
-    def test_interval_below_1_0_triggers(self):
-        assert ABNORMAL_PUBLISH_RATE in _event_types(detect_feature_rules(_feature(min_message_interval=0.9)))
+    def test_interval_below_1_0_does_not_trigger_alone(self):
+        assert detect_feature_rules(_feature(min_message_interval=0.9)) == []
 
-    def test_interval_0_0_triggers(self):
-        assert ABNORMAL_PUBLISH_RATE in _event_types(detect_feature_rules(_feature(min_message_interval=0.0)))
+    def test_interval_0_0_does_not_trigger_alone(self):
+        assert detect_feature_rules(_feature(min_message_interval=0.0)) == []
 
     # LARGE_PAYLOAD
     def test_payload_5120_is_normal(self):
