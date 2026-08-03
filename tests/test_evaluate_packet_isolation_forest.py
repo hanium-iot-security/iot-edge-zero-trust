@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -617,7 +618,16 @@ def test_evaluate_cli_loads_real_dataset_and_publishes_bundle(
     )
     output_dir = tmp_path / "packet-if-eval-integration-v1"
     repository_root = Path(__file__).resolve().parents[1]
-    python_path = str(repository_root)
+    cli_repository = tmp_path / "cli-repository"
+    shutil.copytree(
+        repository_root / "ai",
+        cli_repository / "ai",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    shutil.copy2(repository_root / ".gitignore", cli_repository / ".gitignore")
+    cli_commit_sha = _commit_git_repository(cli_repository)
+
+    python_path = f"{cli_repository}{os.pathsep}{repository_root}"
     if os.environ.get("PYTHONPATH"):
         python_path = f"{python_path}{os.pathsep}{os.environ['PYTHONPATH']}"
 
@@ -639,10 +649,14 @@ def test_evaluate_cli_loads_real_dataset_and_publishes_bundle(
             "--output-dir",
             str(output_dir),
             "--git-commit-sha",
-            GIT_COMMIT_SHA,
+            cli_commit_sha,
         ],
         cwd=tmp_path,
-        env={**os.environ, "PYTHONPATH": python_path},
+        env={
+            **os.environ,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": python_path,
+        },
         capture_output=True,
         text=True,
         check=False,
@@ -664,9 +678,9 @@ def test_evaluate_cli_loads_real_dataset_and_publishes_bundle(
     assert summary["dataset"]["dataset_sha256"] == file_sha256(dataset_path)
     assert summary["dataset"]["manifest_sha256"] == file_sha256(manifest_path)
     assert summary["evaluation_source"] == {
-        "git_commit_sha": GIT_COMMIT_SHA,
-        "worktree_clean": None,
-        "verification_mode": "explicit_sha_without_git_worktree",
+        "git_commit_sha": cli_commit_sha,
+        "worktree_clean": True,
+        "verification_mode": "git_worktree_verified",
     }
     sidecar_path = output_dir / PACKET_IF_EVALUATION_MANIFEST_SHA256_FILENAME
     assert sidecar_path.read_text(encoding="ascii").endswith(
@@ -1081,6 +1095,40 @@ def test_csv_summary_escapes_spreadsheet_formula_prefixes() -> None:
     assert row["scenario"].startswith("'")
 
 
+def _initialize_git_repository(path: Path, *, content: str) -> str:
+    path.mkdir()
+    tracked_file = path / "tracked.txt"
+    tracked_file.write_text(content, encoding="utf-8")
+
+    return _commit_git_repository(path)
+
+
+def _commit_git_repository(path: Path) -> str:
+
+    def run_git(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=path,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    run_git("init", "--quiet")
+    run_git("add", ".")
+    run_git(
+        "-c",
+        "user.name=Packet IF Test",
+        "-c",
+        "user.email=packet-if-test@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "initial",
+    )
+    return run_git("rev-parse", "HEAD").stdout.strip()
+
+
 def test_git_provenance_accepts_clean_worktree_and_matching_head(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1105,6 +1153,53 @@ def test_git_provenance_accepts_clean_worktree_and_matching_head(
         worktree_clean=True,
         verification_mode="git_worktree_verified",
     )
+
+
+def test_git_provenance_uses_code_repository_when_cwd_is_another_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    code_repository = tmp_path / "code-repository"
+    caller_repository = tmp_path / "caller-repository"
+    code_head = _initialize_git_repository(code_repository, content="code\n")
+    caller_head = _initialize_git_repository(caller_repository, content="caller\n")
+    assert code_head != caller_head
+
+    monkeypatch.setattr(
+        evaluator,
+        "_EVALUATION_REPOSITORY_ROOT",
+        code_repository,
+    )
+    monkeypatch.chdir(caller_repository)
+
+    provenance = evaluator._resolve_evaluation_git_provenance(code_head)
+
+    assert provenance == evaluator._EvaluationGitProvenance(
+        commit_sha=code_head,
+        worktree_clean=True,
+        verification_mode="git_worktree_verified",
+    )
+
+
+def test_git_provenance_rejects_dirty_code_repository_when_cwd_is_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    code_repository = tmp_path / "code-repository"
+    caller_repository = tmp_path / "caller-repository"
+    code_head = _initialize_git_repository(code_repository, content="code\n")
+    _initialize_git_repository(caller_repository, content="caller\n")
+    (code_repository / "tracked.txt").write_text("dirty code\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        evaluator,
+        "_EVALUATION_REPOSITORY_ROOT",
+        code_repository,
+    )
+    monkeypatch.chdir(caller_repository)
+
+    with pytest.raises(RuntimeError, match="clean Git worktree"):
+        evaluator._resolve_evaluation_git_provenance(code_head)
 
 
 def test_git_provenance_rejects_dirty_worktree(

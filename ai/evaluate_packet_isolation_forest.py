@@ -41,6 +41,8 @@ from ai.predict_packet_isolation_forest import (
 
 logger = logging.getLogger(__name__)
 
+_EVALUATION_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
 PACKET_IF_EVALUATION_SCHEMA_VERSION = "packet-if-evaluation-v1"
 PACKET_IF_PREDICTIONS_FILENAME = "packet-if-predictions.jsonl"
 PACKET_IF_EVALUATION_FILENAME = "packet-if-evaluation.json"
@@ -858,27 +860,28 @@ def _resolve_evaluation_git_provenance(
     if explicit_commit_sha is not None:
         _validate_git_commit_sha(explicit_commit_sha)
 
+    repository_root = _EVALUATION_REPOSITORY_ROOT
+    if not _has_git_marker(repository_root):
+        return _explicit_non_git_provenance(explicit_commit_sha)
+
     try:
         worktree_probe = subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
             check=False,
             capture_output=True,
             text=True,
+            cwd=repository_root,
         )
     except OSError as exc:
-        if _has_git_marker(Path.cwd()):
-            raise RuntimeError(
-                "unable to verify Packet IF evaluation Git worktree"
-            ) from exc
-        return _explicit_non_git_provenance(explicit_commit_sha)
+        raise RuntimeError(
+            "unable to verify Packet IF evaluation Git worktree"
+        ) from exc
 
     if worktree_probe.returncode != 0 or worktree_probe.stdout.strip() != "true":
-        if _has_git_marker(Path.cwd()):
-            raise RuntimeError(
-                "unable to verify Packet IF evaluation Git worktree: "
-                f"{worktree_probe.stderr.strip()}"
-            )
-        return _explicit_non_git_provenance(explicit_commit_sha)
+        raise RuntimeError(
+            "unable to verify Packet IF evaluation Git worktree: "
+            f"{worktree_probe.stderr.strip()}"
+        )
 
     try:
         head_result = subprocess.run(
@@ -886,12 +889,14 @@ def _resolve_evaluation_git_provenance(
             check=True,
             capture_output=True,
             text=True,
+            cwd=repository_root,
         )
         status_result = subprocess.run(
             ["git", "status", "--porcelain", "--untracked-files=all"],
             check=True,
             capture_output=True,
             text=True,
+            cwd=repository_root,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise RuntimeError(
@@ -935,10 +940,7 @@ def _explicit_non_git_provenance(
 
 
 def _has_git_marker(path: Path) -> bool:
-    resolved = path.resolve()
-    return any(
-        (candidate / ".git").exists() for candidate in (resolved, *resolved.parents)
-    )
+    return (path.resolve() / ".git").exists()
 
 
 def main() -> None:

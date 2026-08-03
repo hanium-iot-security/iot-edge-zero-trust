@@ -387,7 +387,9 @@ python -m ai.evaluate_packet_isolation_forest \
 일치하지 않으면 평가를 시작하지 않습니다. 기존 평가 Directory를 덮어쓰지
 않으며 Row별 JSONL, 전체·Label·Session·Scenario별 JSON·CSV Summary와 파일
 SHA256 Manifest를 하나의 Version Directory로 게시합니다. Git Worktree에서는
-clean 상태와 전달 SHA·현재 HEAD 일치를 Evaluator가 다시 검증합니다.
+clean 상태와 전달 SHA·현재 HEAD 일치를 Evaluator가 다시 검증합니다. Git 검증은
+호출한 Shell의 CWD가 아니라 평가 모듈이 위치한 Repository Root를 기준으로
+수행합니다.
 Evaluation Manifest SHA256은 `evaluation-manifest.json.sha256` Sidecar에
 기록하여 Manifest와 함께 원자적으로 게시합니다.
 

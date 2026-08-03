@@ -64,6 +64,8 @@ Anomaly Score가 Threshold와 같으면 정상으로 판정합니다.
 - 평가 Source 변경사항을 Commit한 깨끗한 Revision에서 실행합니다.
 - Git Worktree에서는 Evaluator가 clean 상태와 전달 SHA·현재 HEAD 일치를
   다시 검증합니다.
+- Git 검증은 호출한 Shell의 현재 Directory가 아니라 평가 모듈이 위치한
+  Repository Root를 기준으로 수행합니다.
 - `.git`이 없는 배포 환경에서는 `--git-commit-sha`를 필수로 전달합니다.
 - 매 실행마다 새로운 평가 Version Directory를 사용합니다.
 
@@ -88,7 +90,8 @@ python -m ai.evaluate_packet_isolation_forest \
 
 `--git-commit-sha`를 생략하면 `git rev-parse HEAD`로 현재 Revision을
 확인합니다. Git Worktree가 Dirty하거나 명시한 SHA가 현재 HEAD와 다르면 평가를
-거부합니다. Git이 없는 실행 환경에서는 소문자 40자리 Commit SHA를 반드시
+거부합니다. 이 검증은 실행 CWD와 무관하게 평가 코드 Repository를 기준으로
+수행합니다. Git이 없는 실행 환경에서는 소문자 40자리 Commit SHA를 반드시
 명시하며, 이 경우 `worktree_clean`은 `null`로 기록합니다. 검증 결과는
 Evaluation JSON과 Manifest의 `evaluation_source`에 기록합니다.
 
