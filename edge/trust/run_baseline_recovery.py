@@ -41,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     dry_run = subparsers.add_parser("dry-run", help="변경 없이 실행 가능성을 확인")
     _add_target_arguments(dry_run)
-    dry_run.add_argument("--artifact-dir", type=Path)
+    dry_run.add_argument("--artifact-dir", type=Path, required=True)
 
     execute = subparsers.add_parser("execute", help="Backup 후 조건부 복구 실행")
     _add_target_arguments(execute)
@@ -58,16 +58,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.expected_trust_scores,
         )
         if args.mode == "dry-run":
-            artifact_dir = args.artifact_dir
-            if artifact_dir is None:
-                artifact_dir = args.db_path.expanduser().resolve().parent / (
-                    "baseline-recovery-artifacts"
-                )
             result = inspect_baseline_recovery(
                 db_path=args.db_path,
                 device_ids=args.devices,
                 expected_trust_scores=expected_scores,
-                artifact_dir=artifact_dir,
+                artifact_dir=args.artifact_dir,
             )
         else:
             result = execute_baseline_recovery(

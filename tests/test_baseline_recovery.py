@@ -78,12 +78,45 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _insert_detection_event(
+    database: Path,
+    *,
+    device_id: str = "esp32_01",
+    processed_at: str | None = None,
+    processing_reason: str | None = None,
+) -> int:
+    with sqlite3.connect(database) as connection:
+        event_id = connection.execute(
+            """
+            INSERT INTO detection_events (
+                device_id, detector_type, event_type, severity,
+                score_delta, applied_to_score, description,
+                analysis_window_start, analysis_window_end, detected_at,
+                processed_at, processing_reason
+            )
+            VALUES (
+                ?, 'MQTT_RULE', 'ABNORMAL_PUBLISH_RATE', 'HIGH',
+                -20, 0, 'pending trust event',
+                '2026-08-03T00:00:00Z', '2026-08-03T00:00:10Z',
+                '2026-08-03T00:00:11Z', ?, ?
+            )
+            """,
+            (device_id, processed_at, processing_reason),
+        ).lastrowid
+        connection.commit()
+    assert event_id is not None
+    return int(event_id)
+
+
 def _seed_preserved_history(database: Path) -> tuple[str, ...]:
     preserved_tables = (
+        "mqtt_logs",
+        "feature_logs",
         "detection_events",
         "trust_score_history",
         "isolation_history",
         "firewall_rules",
+        "gateway_metrics",
         "detector_checkpoints",
         "packet_capture_sessions",
         "packet_capture_segments",
@@ -95,14 +128,39 @@ def _seed_preserved_history(database: Path) -> tuple[str, ...]:
             """
             INSERT INTO detection_events (
                 device_id, detector_type, event_type, severity,
-                score_delta, applied_to_score, description, detected_at
+                score_delta, applied_to_score, description, detected_at,
+                processed_at, processing_reason
             )
             VALUES (
                 'esp32_01', 'MQTT_RULE', 'ABNORMAL_PUBLISH_RATE', 'HIGH',
-                -20, 1, 'preserve me', '2026-08-03T00:00:10Z'
+                -20, 1, 'preserve me', '2026-08-03T00:00:10Z',
+                '2026-08-03T00:00:11Z', 'APPLIED'
             )
             """
         ).lastrowid
+        connection.execute(
+            """
+            INSERT INTO mqtt_logs (
+                device_id, topic, payload, payload_size, received_at,
+                is_json_valid, is_topic_valid
+            )
+            VALUES (
+                'esp32_01', 'devices/esp32_01/data', '{"temperature":25}',
+                18, '2026-08-03T00:00:09Z', 1, 1
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO feature_logs (
+                device_id, window_start, window_end, publish_count, topic_count
+            )
+            VALUES (
+                'esp32_01', '2026-08-03T00:00:00Z',
+                '2026-08-03T00:00:10Z', 1, 1
+            )
+            """
+        )
         connection.execute(
             """
             INSERT INTO trust_score_history (
@@ -138,6 +196,15 @@ def _seed_preserved_history(database: Path) -> tuple[str, ...]:
             )
             """,
             (event_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO gateway_metrics (
+                collected_at, memory_percent, disk_percent,
+                interface_metrics_json
+            )
+            VALUES ('2026-08-03T00:00:10Z', 30.0, 40.0, '{}')
+            """
         )
         connection.execute(
             """
@@ -252,6 +319,12 @@ def test_dry_run_reports_two_isolated_devices_without_changing_database(
         "count": 0,
         "statuses": ["PENDING", "APPLIED"],
     }
+    assert result["pending_trust_event_check"] == {
+        "passed": True,
+        "count": 0,
+        "event_ids": [],
+        "events": [],
+    }
     assert result["devices"] == [
         {
             "device_id": "esp32_01",
@@ -276,6 +349,49 @@ def test_dry_run_reports_two_isolated_devices_without_changing_database(
     assert "--confirm RESET-TO-NORMAL-100" in command
     assert _device_rows(db_path) == before
     assert not (tmp_path / "artifacts").exists()
+
+
+def test_dry_run_pending_trust_event_blocks_and_reports_event_details(
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    core = _load_core()
+    event_id = _insert_detection_event(db_path)
+    artifacts = tmp_path / "artifacts"
+    before = {
+        "devices": _device_rows(db_path),
+        "events": _table_rows(db_path, "detection_events"),
+    }
+
+    result = core.inspect_baseline_recovery(
+        db_path=db_path,
+        device_ids=["esp32_01"],
+        expected_trust_scores={"esp32_01": 20},
+        artifact_dir=artifacts,
+    )
+
+    assert result["can_execute"] is False
+    assert result["pending_trust_event_check"] == {
+        "passed": False,
+        "count": 1,
+        "event_ids": [event_id],
+        "events": [
+            {
+                "id": event_id,
+                "device_id": "esp32_01",
+                "detector_type": "MQTT_RULE",
+                "event_type": "ABNORMAL_PUBLISH_RATE",
+                "analysis_window_start": "2026-08-03T00:00:00Z",
+                "analysis_window_end": "2026-08-03T00:00:10Z",
+                "detected_at": "2026-08-03T00:00:11Z",
+                "processing_reason": None,
+            }
+        ],
+    }
+    assert "미처리 Detection Event" in result["preflight_errors"][-1]
+    assert _device_rows(db_path) == before["devices"]
+    assert _table_rows(db_path, "detection_events") == before["events"]
+    assert not artifacts.exists()
 
 
 def test_dry_run_rejects_missing_device_without_changing_database(
@@ -555,6 +671,108 @@ def test_execute_rejects_active_firewall_rule_before_backup(
     assert not artifacts.exists() or not list(artifacts.glob("*.db"))
 
 
+def test_execute_pending_trust_event_rejects_before_any_artifact_or_change(
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    core = _load_core()
+    _insert_detection_event(db_path)
+    artifacts = tmp_path / "artifacts"
+    before = {
+        "devices": _device_rows(db_path),
+        "events": _table_rows(db_path, "detection_events"),
+    }
+
+    with pytest.raises(core.BaselineRecoveryError, match="미처리 Detection Event"):
+        core.execute_baseline_recovery(
+            db_path=db_path,
+            device_ids=["esp32_01"],
+            expected_trust_scores={"esp32_01": 20},
+            artifact_dir=artifacts,
+            confirm="RESET-TO-NORMAL-100",
+        )
+
+    assert _device_rows(db_path) == before["devices"]
+    assert _table_rows(db_path, "detection_events") == before["events"]
+    assert not artifacts.exists()
+
+
+def test_execute_pending_trust_event_writes_only_failure_json_when_dir_exists(
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    core = _load_core()
+    event_id = _insert_detection_event(db_path)
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+
+    with pytest.raises(core.BaselineRecoveryError, match=str(event_id)):
+        core.execute_baseline_recovery(
+            db_path=db_path,
+            device_ids=["esp32_01"],
+            expected_trust_scores={"esp32_01": 20},
+            artifact_dir=artifacts,
+            confirm="RESET-TO-NORMAL-100",
+        )
+
+    assert list(artifacts.glob("*.db")) == []
+    logs = list(artifacts.glob("*.json"))
+    assert len(logs) == 1
+    failure = json.loads(logs[0].read_text(encoding="utf-8"))
+    assert failure["result"] == "FAILED"
+    assert failure["backup_path"] is None
+    assert str(event_id) in failure["error"]
+
+
+def test_processed_trust_event_does_not_block_recovery(
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    core = _load_core()
+    _insert_detection_event(
+        db_path,
+        processed_at="2026-08-03T00:00:12Z",
+        processing_reason="NOT_REPRESENTATIVE",
+    )
+
+    result = core.execute_baseline_recovery(
+        db_path=db_path,
+        device_ids=["esp32_01"],
+        expected_trust_scores={"esp32_01": 20},
+        artifact_dir=tmp_path / "artifacts",
+        confirm="RESET-TO-NORMAL-100",
+    )
+
+    assert result["result"] == "SUCCESS"
+    assert _rows(
+        db_path,
+        "SELECT status, trust_score FROM devices WHERE device_id = 'esp32_01'",
+    ) == [("normal", 100)]
+
+
+def test_other_device_pending_trust_event_does_not_block_selected_device(
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    core = _load_core()
+    event_id = _insert_detection_event(db_path, device_id="esp32_02")
+
+    result = core.execute_baseline_recovery(
+        db_path=db_path,
+        device_ids=["esp32_01"],
+        expected_trust_scores={"esp32_01": 20},
+        artifact_dir=tmp_path / "artifacts",
+        confirm="RESET-TO-NORMAL-100",
+    )
+
+    assert result["result"] == "SUCCESS"
+    assert _rows(
+        db_path,
+        "SELECT processed_at FROM detection_events WHERE id = ?",
+        (event_id,),
+    ) == [(None,)]
+
+
 def test_execute_rejects_wrong_confirmation_before_backup(
     db_path: Path,
     tmp_path: Path,
@@ -662,7 +880,7 @@ def test_conditional_update_mismatch_rolls_back_all_devices(
     assert _device_rows(db_path) == before
 
 
-def test_execute_preserves_all_history_checkpoint_and_packet_tables(
+def test_execute_preserves_history_mqtt_feature_gateway_and_packet_tables(
     db_path: Path,
     tmp_path: Path,
 ) -> None:
@@ -739,6 +957,29 @@ def test_cli_rejects_missing_expected_score_before_backup(
     assert "--expected-trust-score" in capsys.readouterr().err
     assert _device_rows(db_path) == before
     assert not artifacts.exists()
+
+
+def test_cli_dry_run_requires_explicit_artifact_dir(
+    db_path: Path,
+    capsys,
+) -> None:
+    cli = _load_cli()
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "dry-run",
+                "--db-path",
+                str(db_path),
+                "--device",
+                "esp32_01",
+                "--expected-trust-score",
+                "esp32_01=20",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    assert "--artifact-dir" in capsys.readouterr().err
 
 
 def test_cli_dry_run_returns_nonzero_with_json_when_device_is_ineligible(

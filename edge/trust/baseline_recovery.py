@@ -93,6 +93,7 @@ def inspect_baseline_recovery(
                 device_ids=device_ids,
                 source_ips=[row["ip_address"] for row in devices.values()],
             )
+            pending_events = _fetch_pending_trust_events(connection, device_ids)
     except sqlite3.DatabaseError as exc:
         raise BaselineRecoveryError(f"Database 사전 검증 실패: {exc}") from exc
 
@@ -105,6 +106,12 @@ def inspect_baseline_recovery(
         preflight_errors.append(
             "대상 Device 또는 IP에 활성 Firewall Rule이 있습니다: "
             f"rule_ids={rule_ids}"
+        )
+    if pending_events:
+        event_ids = [int(event["id"]) for event in pending_events]
+        preflight_errors.append(
+            "대상 Device에 Trust Score v2 미처리 Detection Event가 있습니다: "
+            f"event_ids={event_ids}"
         )
 
     device_report = [
@@ -138,6 +145,12 @@ def inspect_baseline_recovery(
             }
             for rule in active_rules
         ]
+    pending_event_check: dict[str, object] = {
+        "passed": not pending_events,
+        "count": len(pending_events),
+        "event_ids": [int(event["id"]) for event in pending_events],
+        "events": [_pending_event_report(event) for event in pending_events],
+    }
     return {
         "mode": "dry-run",
         "database_path": str(database),
@@ -147,6 +160,7 @@ def inspect_baseline_recovery(
         "preflight_errors": preflight_errors,
         "devices": device_report,
         "active_firewall_rule_check": firewall_check,
+        "pending_trust_event_check": pending_event_check,
         "execute_command": _build_execute_command(
             database=database,
             artifacts=artifacts,
@@ -200,6 +214,13 @@ def execute_baseline_recovery(
             raise BaselineRecoveryError(
                 "대상 Device 또는 IP에 활성 Firewall Rule이 있습니다: "
                 f"rule_ids={rule_ids}"
+            )
+        pending_events = _fetch_pending_trust_events(connection, device_ids)
+        if pending_events:
+            event_ids = [int(event["id"]) for event in pending_events]
+            raise BaselineRecoveryError(
+                "대상 Device에 Trust Score v2 미처리 Detection Event가 있습니다: "
+                f"event_ids={event_ids}"
             )
 
         artifacts.mkdir(parents=True, exist_ok=True)
@@ -480,6 +501,38 @@ def _fetch_active_firewall_rules(
         """,
         tuple(parameters),
     ).fetchall()
+
+
+def _fetch_pending_trust_events(
+    connection: sqlite3.Connection,
+    device_ids: Sequence[str],
+) -> list[sqlite3.Row]:
+    placeholders = ", ".join("?" for _ in device_ids)
+    return connection.execute(
+        f"""
+        SELECT id, device_id, detector_type, event_type,
+               analysis_window_start, analysis_window_end, detected_at,
+               processing_reason
+        FROM detection_events
+        WHERE device_id IN ({placeholders})
+          AND processed_at IS NULL
+        ORDER BY id ASC
+        """,
+        tuple(device_ids),
+    ).fetchall()
+
+
+def _pending_event_report(event: sqlite3.Row) -> dict[str, object]:
+    return {
+        "id": int(event["id"]),
+        "device_id": str(event["device_id"]),
+        "detector_type": str(event["detector_type"]),
+        "event_type": str(event["event_type"]),
+        "analysis_window_start": event["analysis_window_start"],
+        "analysis_window_end": event["analysis_window_end"],
+        "detected_at": event["detected_at"],
+        "processing_reason": event["processing_reason"],
+    }
 
 
 def _require_expected_device_state(
