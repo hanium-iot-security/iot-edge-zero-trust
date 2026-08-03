@@ -31,18 +31,31 @@ def load_ip_device_map(db: Session) -> dict[str, str]:
     }
 
 
-def fetch_ready_segments(db: Session, *, limit: int) -> list[dict[str, Any]]:
+def fetch_ready_segments(
+    db: Session,
+    *,
+    limit: int,
+    session_id: str | None = None,
+) -> list[dict[str, Any]]:
     rows = db.execute(
         text(
             """
-            SELECT id, file_name, window_start, window_end
-            FROM packet_capture_segments
-            WHERE status = 'READY'
-            ORDER BY window_start ASC, id ASC
+            SELECT
+                pcsg.id,
+                pcsg.file_name,
+                pcsg.window_start,
+                pcsg.window_end,
+                pcs.session_id
+            FROM packet_capture_segments pcsg
+            JOIN packet_capture_sessions pcs
+                ON pcs.id = pcsg.capture_session_id
+            WHERE pcsg.status = 'READY'
+              AND (:session_id IS NULL OR pcs.session_id = :session_id)
+            ORDER BY pcsg.window_start ASC, pcsg.id ASC
             LIMIT :limit
             """
         ),
-        {"limit": limit},
+        {"limit": limit, "session_id": session_id},
     ).mappings()
     return [dict(row) for row in rows]
 
@@ -51,10 +64,20 @@ def get_segment_status_by_file_name(
     db: Session,
     *,
     file_name: str,
+    session_id: str | None = None,
 ) -> str | None:
     row = db.execute(
-        text("SELECT status FROM packet_capture_segments WHERE file_name = :file_name"),
-        {"file_name": file_name},
+        text(
+            """
+            SELECT pcsg.status
+            FROM packet_capture_segments pcsg
+            JOIN packet_capture_sessions pcs
+                ON pcs.id = pcsg.capture_session_id
+            WHERE pcsg.file_name = :file_name
+              AND (:session_id IS NULL OR pcs.session_id = :session_id)
+            """
+        ),
+        {"file_name": file_name, "session_id": session_id},
     ).first()
     return str(row[0]) if row is not None else None
 
