@@ -241,9 +241,9 @@ def test_runner_applies_new_database_in_order(tmp_path: Path) -> None:
     result = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [1, 2, 3]
+        assert result.applied_versions == [1, 2, 3, 4]
         assert result.baselined_versions == []
-        assert _migration_versions(connection) == [1, 2, 3]
+        assert _migration_versions(connection) == [1, 2, 3, 4]
         assert _table_exists(connection, "packet_capture_sessions")
         assert _table_exists(connection, "trust_score_history")
 
@@ -615,8 +615,8 @@ def test_runner_applies_002_and_003_to_existing_001_db_and_preserves_rows(
 
     with connect_database(db_path) as connection:
         assert result.baselined_versions == [1]
-        assert result.applied_versions == [2, 3]
-        assert _migration_versions(connection) == [1, 2, 3]
+        assert result.applied_versions == [2, 3, 4]
+        assert _migration_versions(connection) == [1, 2, 3, 4]
         device = connection.execute(
             "SELECT device_id, status, trust_score FROM devices"
         ).fetchone()
@@ -657,10 +657,10 @@ def test_runner_skips_already_applied_migrations(tmp_path: Path) -> None:
     second = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert first.applied_versions == [1, 2, 3]
+        assert first.applied_versions == [1, 2, 3, 4]
         assert second.applied_versions == []
-        assert second.skipped_versions == [1, 2, 3]
-        assert _migration_versions(connection) == [1, 2, 3]
+        assert second.skipped_versions == [1, 2, 3, 4]
+        assert _migration_versions(connection) == [1, 2, 3, 4]
 
 
 def test_runner_sorts_migration_files_by_version(tmp_path: Path) -> None:
@@ -795,8 +795,8 @@ def test_failed_002_migration_can_be_retried_after_fix(tmp_path: Path) -> None:
     result = apply_migrations(db_path, migrations_dir)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [2, 3]
-        assert _migration_versions(connection) == [1, 2, 3]
+        assert result.applied_versions == [2, 3, 4]
+        assert _migration_versions(connection) == [1, 2, 3, 4]
         assert not _table_exists(connection, "retry_marker")
         assert _table_exists(connection, "packet_capture_sessions")
         assert "failed_retry_column" not in _column_names(
@@ -1794,8 +1794,8 @@ def test_phase4_migration_applies_003_to_existing_002_and_preserves_segments(
     result = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [3]
-        assert _migration_versions(connection) == [1, 2, 3]
+        assert result.applied_versions == [3, 4]
+        assert _migration_versions(connection) == [1, 2, 3, 4]
         assert {
             "actual_capture_started_at",
             "capture_stop_requested_at",
