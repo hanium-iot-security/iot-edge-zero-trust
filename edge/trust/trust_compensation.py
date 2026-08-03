@@ -13,13 +13,16 @@ import sqlite3
 from typing import Any
 from uuid import uuid4
 
-from edge.trust.trust_policy import status_for_trust_score
+from edge.trust.trust_policy import apply_score_delta, status_for_trust_score
+from edge.trust.trust_score_v2 import WINDOW_DELTA_CAP
 
 
 CONFIRMATION = "APPLY-TRUST-COMPENSATION"
 SUPPORTED_HISTORY_POLICY = "trust-score-v2"
 APPLIED_PROCESSING_REASON = "APPLIED_TO_TRUST"
 COMPENSATION_TABLE = "trust_score_compensations"
+COMPENSATION_MIGRATION_VERSION = 4
+COMPENSATION_MIGRATION_NAME = "trust_score_compensation"
 
 
 class TrustCompensationError(RuntimeError):
@@ -493,11 +496,9 @@ def _inspect_connection(
     expected_trust_score: int,
 ) -> dict[str, Any]:
     errors: list[str] = []
-    if not _table_exists(connection, COMPENSATION_TABLE):
-        errors.append(
-            "Trust Score Compensation Migration이 적용되지 않았습니다: "
-            f"missing_table={COMPENSATION_TABLE}"
-        )
+    migration_errors = _compensation_migration_errors(connection)
+    if migration_errors:
+        errors.extend(migration_errors)
         return {
             "errors": errors,
             "device": None,
@@ -592,8 +593,16 @@ def _inspect_connection(
             history_id=int(row["id"]),
             errors=errors,
         )
+        if parsed is None or source_event_id not in parsed:
+            continue
         if parsed == [source_event_id]:
             matching_histories.append(row)
+        else:
+            errors.append(
+                "Source Event가 여러 Event와 연결된 Trust History에 포함되어 "
+                "v1에서 보상할 수 없습니다: "
+                f"history_id={row['id']}, event_ids={parsed}"
+            )
 
     history: sqlite3.Row | None = None
     if not matching_histories:
@@ -614,6 +623,9 @@ def _inspect_connection(
                 f"actual={history['policy_version']}"
             )
         actual_delta = int(history["actual_delta"])
+        calculated_delta = int(history["calculated_delta"])
+        capped_delta = int(history["capped_delta"])
+        expected_capped_delta = max(calculated_delta, WINDOW_DELTA_CAP)
         if actual_delta >= 0:
             errors.append(
                 "Source Trust History actual_delta는 음수여야 합니다: "
@@ -621,15 +633,29 @@ def _inspect_connection(
             )
         history_previous = int(history["previous_score"])
         history_new = int(history["new_score"])
+        if capped_delta != expected_capped_delta:
+            errors.append(
+                "Source Trust History capped_delta가 Trust Score v2 정책과 "
+                "일치하지 않습니다: "
+                f"calculated_delta={calculated_delta}, "
+                f"expected_capped_delta={expected_capped_delta}, "
+                f"actual_capped_delta={capped_delta}"
+            )
+        expected_new_score = apply_score_delta(history_previous, capped_delta)
+        if history_new != expected_new_score:
+            errors.append(
+                "Source Trust History new_score가 Trust Score v2 정책과 "
+                "일치하지 않습니다: "
+                f"previous={history_previous}, capped_delta={capped_delta}, "
+                f"expected_new={expected_new_score}, actual_new={history_new}"
+            )
         if history_new - history_previous != actual_delta:
             errors.append(
                 "Source Trust History 산술이 일치하지 않습니다: "
                 f"previous={history_previous}, actual_delta={actual_delta}, "
                 f"new={history_new}"
             )
-        if event is not None and int(history["calculated_delta"]) != int(
-            event["score_delta"]
-        ):
+        if event is not None and calculated_delta != int(event["score_delta"]):
             errors.append(
                 "Source History calculated_delta와 Event score_delta가 다릅니다: "
                 f"calculated_delta={history['calculated_delta']}, "
@@ -763,12 +789,32 @@ def _parse_representative_event_ids(
             f"history_id={history_id}"
         )
         return None
-    if len(parsed) != 1:
-        errors.append(
-            "representative_event_ids_json은 정확히 하나의 Event만 포함해야 합니다: "
-            f"history_id={history_id}, event_ids={parsed}"
-        )
     return parsed
+
+
+def _compensation_migration_errors(
+    connection: sqlite3.Connection,
+) -> list[str]:
+    errors: list[str] = []
+    migration_row: sqlite3.Row | tuple[object, ...] | None = None
+    if _table_exists(connection, "schema_migrations"):
+        migration_row = connection.execute(
+            "SELECT name FROM schema_migrations WHERE version = ?",
+            (COMPENSATION_MIGRATION_VERSION,),
+        ).fetchone()
+    if migration_row is None or str(migration_row[0]) != COMPENSATION_MIGRATION_NAME:
+        actual_name = None if migration_row is None else str(migration_row[0])
+        errors.append(
+            "Trust Score Compensation Migration metadata가 없거나 일치하지 않습니다: "
+            f"expected_version={COMPENSATION_MIGRATION_VERSION}, "
+            f"expected_name={COMPENSATION_MIGRATION_NAME}, actual_name={actual_name}"
+        )
+    if not _table_exists(connection, COMPENSATION_TABLE):
+        errors.append(
+            "Trust Score Compensation Migration 테이블이 존재하지 않습니다: "
+            f"missing_table={COMPENSATION_TABLE}"
+        )
+    return errors
 
 
 def _fetch_active_firewall_rules(

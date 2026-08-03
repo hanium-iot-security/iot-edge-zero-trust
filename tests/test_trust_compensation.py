@@ -254,6 +254,11 @@ def test_dry_run_calculates_exact_compensation_without_changing_db_or_artifacts(
             ("history_id",),
             "calculated_delta",
         ),
+        (
+            "UPDATE trust_score_history SET capped_delta = -10, actual_delta = -10, new_score = 90 WHERE id = ?",
+            ("history_id",),
+            "capped_delta",
+        ),
     ],
 )
 def test_dry_run_rejects_ineligible_source_contracts_without_artifacts(
@@ -359,7 +364,7 @@ def test_dry_run_rejects_missing_source_history(
     [
         ("not-json", "JSON"),
         (json.dumps(["1"]), "정수 ID"),
-        (json.dumps([1, 2]), "정확히 하나"),
+        (json.dumps([1, 2]), "여러 Event와 연결"),
         (json.dumps([]), "연결된 Trust History"),
     ],
 )
@@ -420,6 +425,81 @@ def test_dry_run_rejects_multiple_histories_for_source_event(
 
     assert result["can_execute"] is False
     assert any("여러 Trust History" in error for error in result["preflight_errors"])
+
+
+def _insert_unrelated_history(
+    database: Path,
+    representative_event_ids: list[int],
+) -> None:
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            INSERT INTO trust_score_history (
+                device_id, analysis_window_start, analysis_window_end,
+                previous_score, calculated_delta, capped_delta, actual_delta,
+                new_score, representative_event_ids_json, policy_version
+            )
+            VALUES (
+                'esp32_01', '2026-08-03T06:39:40Z',
+                '2026-08-03T06:39:50Z', 100, -10, -10, -10, 90,
+                ?, 'trust-score-v2'
+            )
+            """,
+            (json.dumps(representative_event_ids),),
+        )
+        connection.commit()
+
+
+def test_dry_run_ignores_unrelated_multi_event_history(
+    compensation_db: dict[str, object], tmp_path: Path
+) -> None:
+    database = compensation_db["db_path"]
+    assert isinstance(database, Path)
+    _insert_unrelated_history(database, [31, 32])
+
+    result = _inspect(compensation_db, tmp_path / "artifacts")
+
+    assert result["can_execute"] is True
+
+
+def test_dry_run_rejects_source_history_with_additional_event(
+    compensation_db: dict[str, object], tmp_path: Path
+) -> None:
+    database = compensation_db["db_path"]
+    assert isinstance(database, Path)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            UPDATE trust_score_history
+            SET representative_event_ids_json = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps([compensation_db["event_id"], 32]),
+                compensation_db["history_id"],
+            ),
+        )
+        connection.commit()
+
+    result = _inspect(compensation_db, tmp_path / "artifacts")
+
+    assert result["can_execute"] is False
+    assert any(
+        "Source Event가 여러 Event와 연결" in error
+        for error in result["preflight_errors"]
+    )
+
+
+def test_dry_run_ignores_unrelated_single_event_history(
+    compensation_db: dict[str, object], tmp_path: Path
+) -> None:
+    database = compensation_db["db_path"]
+    assert isinstance(database, Path)
+    _insert_unrelated_history(database, [31])
+
+    result = _inspect(compensation_db, tmp_path / "artifacts")
+
+    assert result["can_execute"] is True
 
 
 def test_dry_run_rejects_pending_event_active_firewall_and_existing_compensation(
@@ -890,6 +970,40 @@ def test_execute_rejects_missing_migration_before_backup(
             artifact_dir=artifacts,
             confirm=core.CONFIRMATION,
         )
+
+    assert not artifacts.exists()
+
+
+@pytest.mark.parametrize(
+    "corrupt_migration_contract",
+    [
+        "DELETE FROM schema_migrations WHERE version = 4",
+        "UPDATE schema_migrations SET name = 'wrong_name' WHERE version = 4",
+        "DROP TABLE trust_score_compensations",
+    ],
+    ids=["missing-version-row", "wrong-version-name", "missing-table"],
+)
+def test_migration_contract_mismatch_is_rejected_before_artifacts(
+    compensation_db: dict[str, object],
+    tmp_path: Path,
+    corrupt_migration_contract: str,
+) -> None:
+    database = compensation_db["db_path"]
+    assert isinstance(database, Path)
+    with sqlite3.connect(database) as connection:
+        connection.execute(corrupt_migration_contract)
+        connection.commit()
+    artifacts = tmp_path / "artifacts"
+    core = _load_core()
+
+    dry_run = _inspect(compensation_db, artifacts)
+
+    assert dry_run["can_execute"] is False
+    assert any("Migration" in error for error in dry_run["preflight_errors"])
+    assert not artifacts.exists()
+
+    with pytest.raises(core.TrustCompensationError, match="Migration"):
+        _execute(compensation_db, artifacts)
 
     assert not artifacts.exists()
 

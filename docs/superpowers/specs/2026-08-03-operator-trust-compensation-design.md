@@ -92,10 +92,13 @@ CLI는 Backup 또는 DB 변경 전에 다음을 검증하고, Execute Transactio
 
 - 대상 Device의 History 중 `representative_event_ids_json`이 정수 ID 배열
   `[source_event_id]`와 정확히 일치하는 Row가 하나뿐이다.
-- 손상 JSON, 문자열 ID, 여러 Event, 동일 Event를 가리키는 여러 History는
-  모두 거부한다.
+- Source Event를 포함하지 않는 정상 정수 배열은 관계없는 History로 무시한다.
+- Source Event를 다른 Event와 함께 포함한 History, 손상 JSON, 문자열 ID,
+  동일 Event를 가리키는 여러 History는 모두 거부한다.
 - `policy_version = 'trust-score-v2'`다.
 - `actual_delta < 0`이다.
+- `capped_delta = max(calculated_delta, -30)`이다.
+- `new_score`는 `previous_score + capped_delta`를 `0..100`으로 clamp한 값이다.
 - `new_score - previous_score = actual_delta`다.
 - 단일 대표 Event의 `calculated_delta = source_event.score_delta`다.
 
@@ -104,8 +107,9 @@ CLI는 Backup 또는 DB 변경 전에 다음을 검증하고, Execute Transactio
 - 같은 Event 또는 History의 기존 Compensation이 없다.
 - 대상 Device에 `processed_at IS NULL` Detection Event가 없다.
 - 대상 Device 또는 실제 IP에 `PENDING`·`APPLIED` Firewall Rule이 없다.
-- `trust_score_compensations` 테이블이 없으면 Migration 미적용으로 판단해
-  Backup 생성 전에 거부한다.
+- `schema_migrations`에 정확한 `(4, 'trust_score_compensation')` Row가 없거나
+  `trust_score_compensations` 테이블이 없으면 Migration 미적용 또는 불일치로
+  판단해 Backup 생성 전에 거부한다.
 
 ## 5. 보상 계산과 상태 불변 계약
 

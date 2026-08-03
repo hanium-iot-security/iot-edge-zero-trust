@@ -17,11 +17,15 @@ v1은 보상 전후의 정책 상태가 같은 경우만 지원합니다. 현재
   `processing_reason='APPLIED_TO_TRUST'`, `score_delta < 0`이어야 합니다.
 - Source Trust History는 `policy_version='trust-score-v2'`이고
   `representative_event_ids_json`이 정확한 정수 배열 `[source_event_id]`여야 합니다.
+  Source Event를 포함하지 않는 정상 정수 배열은 관계없는 History로 무시하지만,
+  Source Event와 다른 Event를 함께 포함하는 History는 v1에서 거부합니다.
 - History의 점수 산술과 `actual_delta`가 Event 감점과 일치해야 합니다.
 - 대상 Device의 미처리 Event와 대상 Device/IP의 `PENDING`·`APPLIED` Firewall Rule이
   없어야 합니다.
 - 같은 Event 또는 History를 보상한 감사 Row가 없어야 합니다.
-- 004 Migration이 없으면 Artifact Directory와 Backup을 만들기 전에 거부합니다.
+- `schema_migrations`의 정확한 `(4, 'trust_score_compensation')` Row와
+  `trust_score_compensations` 테이블 중 하나라도 없으면 Artifact Directory와
+  Backup을 만들기 전에 거부합니다.
 - 보상 점수는 `-actual_delta`로만 계산하며 운영자가 임의 Delta나 최종 점수를
   입력할 수 없습니다. 100 초과 값은 cap하지 않고 거부합니다.
 
@@ -47,7 +51,9 @@ FROM sqlite_master
 WHERE type = 'table' AND name = 'trust_score_compensations';
 ```
 
-두 결과가 없으면 실행하지 않습니다. CLI도 같은 조건을 Backup보다 먼저 검사합니다.
+첫 결과는 `version=4`, `name='trust_score_compensation'`이어야 하고 두 번째 결과는
+정확히 `trust_score_compensations`여야 합니다. 하나라도 없거나 이름이 다르면
+실행하지 않습니다. CLI도 두 조건을 Backup보다 먼저 검사합니다.
 
 ## 5. Source 증적 확인
 
@@ -69,8 +75,11 @@ WHERE device_id = 'esp32_01'
 ORDER BY id;
 ```
 
-`representative_event_ids_json`은 문자열 ID(`['21']`), 손상 JSON, 복수 Event를
-허용하지 않습니다.
+`representative_event_ids_json`은 문자열 ID(`['21']`)와 손상 JSON을 허용하지
+않습니다. `[31, 32]`처럼 Source Event 21을 포함하지 않는 정상 다중 Event History는
+무시하지만, `[21, 32]`처럼 Source Event와 다른 Event를 함께 포함하면 거부합니다.
+Source History는 `capped_delta=max(calculated_delta, -30)`, 점수 범위 clamp,
+`actual_delta=new_score-previous_score` 산술도 충족해야 합니다.
 
 ## 6. Dry-run
 
