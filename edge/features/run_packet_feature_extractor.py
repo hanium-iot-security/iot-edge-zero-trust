@@ -13,6 +13,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -46,6 +47,7 @@ from edge.features.packet_feature_utils import (
     build_packet_features,
     parse_pcap,
 )
+from edge.packet.capture_session_repository import get_capture_session_by_session_id
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,10 @@ DEFAULT_PROCESSED_DIR = Path("data/pcap/processed")
 DEFAULT_FAILED_DIR = Path("data/pcap/failed")
 DEFAULT_LIMIT = 10
 DEFAULT_LOCK_PATH = Path("data/pcap/.extractor.lock")
+
+
+class ExtractorPreflightError(ValueError):
+    """Extractor가 DB나 PCAP을 변경하기 전에 발견한 실행 조건 오류."""
 
 
 @contextlib.contextmanager
@@ -134,6 +140,8 @@ def reconcile_orphaned_files(
     ready_dir: Path,
     processed_dir: Path,
     failed_dir: Path,
+    *,
+    session_id: str | None = None,
 ) -> int:
     """ready_dir 안 파일 중 DB 상태가 READY가 아닌 것을 올바른 디렉터리로 이동합니다.
 
@@ -144,7 +152,11 @@ def reconcile_orphaned_files(
         return 0
     moved = 0
     for pcap_file in sorted(ready_dir.glob("*.pcap")):
-        status = get_segment_status_by_file_name(db, file_name=pcap_file.name)
+        status = get_segment_status_by_file_name(
+            db,
+            file_name=pcap_file.name,
+            session_id=session_id,
+        )
         if status is None:
             continue  # DB에 없는 파일: 무시
         try:
@@ -174,8 +186,41 @@ def _load_ip_device_map(db: Session) -> dict[str, str]:
     return load_ip_device_map(db)
 
 
-def _fetch_ready_segments(db: Session, limit: int) -> list[dict[str, Any]]:
-    return fetch_ready_segments(db, limit=limit)
+def _fetch_ready_segments(
+    db: Session,
+    limit: int,
+    *,
+    session_id: str | None = None,
+) -> list[dict[str, Any]]:
+    return fetch_ready_segments(db, limit=limit, session_id=session_id)
+
+
+def _validate_session_id(session_id: str) -> str:
+    try:
+        parsed = UUID(session_id)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ExtractorPreflightError(
+            f"--session-id는 canonical UUIDv4 형식이어야 합니다: {session_id!r}"
+        ) from exc
+    if parsed.version != 4 or str(parsed) != session_id:
+        raise ExtractorPreflightError(
+            f"--session-id는 canonical UUIDv4 형식이어야 합니다: {session_id!r}"
+        )
+    return session_id
+
+
+def _require_completed_capture_session(db: Session, session_id: str) -> None:
+    capture_session = get_capture_session_by_session_id(db, session_id=session_id)
+    if capture_session is None:
+        raise ExtractorPreflightError(
+            f"Capture Session이 존재하지 않습니다: session_id={session_id}"
+        )
+    status = str(capture_session["status"])
+    if status != "COMPLETED":
+        raise ExtractorPreflightError(
+            "--session-id 모드는 COMPLETED Capture Session만 처리합니다: "
+            f"session_id={session_id}, status={status}"
+        )
 
 
 def _update_segment(
@@ -307,8 +352,14 @@ def extract_packet_features(
     limit: int = DEFAULT_LIMIT,
     capture_scope: str = CAPTURE_SCOPE_DEFAULT,
     lock_path: Path = DEFAULT_LOCK_PATH,
+    session_id: str | None = None,
 ) -> int:
     """READY segment를 limit 개까지 처리하고 처리 시도 수를 반환합니다."""
+    if limit < 1:
+        raise ExtractorPreflightError(f"--limit은 1 이상이어야 합니다: {limit}")
+    selected_session_id = (
+        _validate_session_id(session_id) if session_id is not None else None
+    )
     pi_ip = settings.capture_interface_ip
     if not pi_ip:
         raise ValueError("CAPTURE_INTERFACE_IP가 설정되지 않았습니다.")
@@ -316,10 +367,27 @@ def extract_packet_features(
 
     with _acquire_lock(lock_path):
         with SessionLocal() as db:
+            if selected_session_id is None:
+                logger.warning(
+                    "--session-id 미지정: 모든 Capture Session의 전체 READY backlog와 "
+                    "전역 Reconciliation을 처리합니다."
+                )
+            else:
+                _require_completed_capture_session(db, selected_session_id)
             # 이전 실행에서 커밋 후 이동 실패한 파일을 먼저 복구
-            reconcile_orphaned_files(db, ready_dir, processed_dir, failed_dir)
+            reconcile_orphaned_files(
+                db,
+                ready_dir,
+                processed_dir,
+                failed_dir,
+                session_id=selected_session_id,
+            )
             ip_device_map = _load_ip_device_map(db)
-            segments = _fetch_ready_segments(db, limit)
+            segments = _fetch_ready_segments(
+                db,
+                limit,
+                session_id=selected_session_id,
+            )
 
         count = 0
         for segment in segments:
@@ -380,20 +448,30 @@ def main() -> None:
     parser.add_argument("--ready-dir", type=Path, default=DEFAULT_READY_DIR)
     parser.add_argument("--processed-dir", type=Path, default=DEFAULT_PROCESSED_DIR)
     parser.add_argument("--failed-dir", type=Path, default=DEFAULT_FAILED_DIR)
+    parser.add_argument(
+        "--session-id",
+        type=str,
+        default=None,
+        help="처리할 COMPLETED Capture Session의 canonical UUIDv4",
+    )
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--capture-scope", type=str, default=CAPTURE_SCOPE_DEFAULT)
     parser.add_argument("--lock-path", type=Path, default=DEFAULT_LOCK_PATH)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    count = extract_packet_features(
-        ready_dir=args.ready_dir,
-        processed_dir=args.processed_dir,
-        failed_dir=args.failed_dir,
-        limit=args.limit,
-        capture_scope=args.capture_scope,
-        lock_path=args.lock_path,
-    )
+    try:
+        count = extract_packet_features(
+            ready_dir=args.ready_dir,
+            processed_dir=args.processed_dir,
+            failed_dir=args.failed_dir,
+            limit=args.limit,
+            capture_scope=args.capture_scope,
+            lock_path=args.lock_path,
+            session_id=args.session_id,
+        )
+    except ExtractorPreflightError as exc:
+        parser.error(str(exc))
     print(f"처리 완료: {count} segments")
 
 

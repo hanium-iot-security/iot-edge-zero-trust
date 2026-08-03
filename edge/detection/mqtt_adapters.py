@@ -444,7 +444,6 @@ def _feature_evidence(
     thresholds = {
         "ABNORMAL_PUBLISH_RATE": {
             "publish_count": "> 15",
-            "min_message_interval": "< 1.0",
         },
         "LARGE_PAYLOAD": {"max_payload_size": "> 5120"},
         "MALFORMED_PAYLOAD": {"malformed_payload_count": ">= 3"},

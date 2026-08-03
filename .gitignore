@@ -19,6 +19,7 @@ frontend/dist/
 .env
 .env.*
 !.env.example
+firmware/esp32/phase5_normal_collector/phase5_firmware_config.h
 
 # Database and logs
 *.db

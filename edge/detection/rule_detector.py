@@ -28,7 +28,6 @@ RULE_EVENT_TYPES = {
 AI_EVENT_TYPES = {AI_ANOMALY}
 
 PUBLISH_COUNT_THRESHOLD = 15
-MIN_MESSAGE_INTERVAL_THRESHOLD = 1.0
 LARGE_PAYLOAD_BYTES = 5120
 MALFORMED_PAYLOAD_THRESHOLD = 3
 ABNORMAL_TOPIC_THRESHOLD = 3
@@ -58,10 +57,7 @@ def detect_feature_rules(feature_row: dict[str, Any]) -> list[dict[str, Any]]:
     """feature_logs row에서 Rule 이벤트 목록을 반환합니다. DB 접근 없음."""
     events: list[dict[str, Any]] = []
 
-    if (
-        int(feature_row["publish_count"]) > PUBLISH_COUNT_THRESHOLD
-        or float(feature_row["min_message_interval"]) < MIN_MESSAGE_INTERVAL_THRESHOLD
-    ):
+    if int(feature_row["publish_count"]) > PUBLISH_COUNT_THRESHOLD:
         events.append({"event_type": ABNORMAL_PUBLISH_RATE, "severity": _FEATURE_SEVERITY[ABNORMAL_PUBLISH_RATE]})
 
     if int(feature_row["max_payload_size"]) > LARGE_PAYLOAD_BYTES:
