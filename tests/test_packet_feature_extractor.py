@@ -5,6 +5,7 @@ from __future__ import annotations
 import calendar
 import multiprocessing
 import socket
+import sys
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -35,6 +36,7 @@ PI_IP = "192.168.0.20"
 ESP_IP = "192.168.0.10"
 EXTERNAL_IP = "10.0.0.5"
 SESSION_UUID = "11111111-1111-4111-8111-111111111111"
+OTHER_SESSION_UUID = "22222222-2222-4222-8222-222222222222"
 WINDOW_START_STR = "2026-07-16T10:00:00Z"
 WINDOW_END_STR = "2026-07-16T10:00:10Z"
 WINDOW_START_DT = datetime(2026, 7, 16, 10, 0, 0)
@@ -110,16 +112,33 @@ def ready_dir(tmp_path: Path) -> Path:
     return d
 
 
-def _insert_capture_session(db_session, session_uuid: str = SESSION_UUID) -> int:
+def _insert_capture_session(
+    db_session,
+    session_uuid: str = SESSION_UUID,
+    *,
+    capture_interface: str = "eth0",
+    status: str = "RUNNING",
+) -> int:
     db_session.execute(
         text(
             """
             INSERT INTO packet_capture_sessions
-                (session_id, capture_interface, started_at)
-            VALUES (:sid, 'eth0', '2026-07-16 10:00:00')
+                (session_id, capture_interface, started_at, ended_at, status)
+            VALUES (
+                :sid,
+                :capture_interface,
+                '2026-07-16T10:00:00Z',
+                :ended_at,
+                :status
+            )
             """
         ),
-        {"sid": session_uuid},
+        {
+            "sid": session_uuid,
+            "capture_interface": capture_interface,
+            "ended_at": "2026-07-16T10:10:00Z" if status != "RUNNING" else None,
+            "status": status,
+        },
     )
     db_session.commit()
     row = db_session.execute(
@@ -135,6 +154,7 @@ def _insert_segment(
     file_name: str = "test.pcap",
     window_start: str = WINDOW_START_STR,
     window_end: str = WINDOW_END_STR,
+    capture_interface: str = "eth0",
 ) -> dict:
     db_session.execute(
         text(
@@ -142,12 +162,13 @@ def _insert_segment(
             INSERT INTO packet_capture_segments
                 (capture_session_id, file_name, capture_interface,
                  window_start, window_end, status)
-            VALUES (:csid, :fname, 'eth0', :ws, :we, 'READY')
+            VALUES (:csid, :fname, :capture_interface, :ws, :we, 'READY')
             """
         ),
         {
             "csid": capture_session_id,
             "fname": file_name,
+            "capture_interface": capture_interface,
             "ws": window_start,
             "we": window_end,
         },
@@ -584,6 +605,440 @@ def _make_test_session_factory(db_path: Path):
         connect_args={"check_same_thread": False},
     )
     return sessionmaker(autocommit=False, autoflush=False, bind=engine), engine
+
+
+def _configure_test_extractor(monkeypatch, module, session_factory) -> None:
+    monkeypatch.setattr(module.settings, "capture_interface_ip", PI_IP)
+    monkeypatch.setattr(module, "SessionLocal", session_factory)
+
+
+def test_session_mode_processes_only_selected_completed_session_with_limit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import edge.features.run_packet_feature_extractor as mod
+
+    db_path = tmp_path / "test.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    TestSession, engine = _make_test_session_factory(db_path)
+
+    with TestSession() as db:
+        session_a = _insert_capture_session(db, status="COMPLETED")
+        session_b = _insert_capture_session(
+            db,
+            OTHER_SESSION_UUID,
+            capture_interface="eth1",
+            status="COMPLETED",
+        )
+        segment_a_first = _insert_segment(db, session_a, file_name="a-first.pcap")
+        segment_a_second = _insert_segment(
+            db,
+            session_a,
+            file_name="a-second.pcap",
+            window_start="2026-07-16T10:00:10Z",
+            window_end="2026-07-16T10:00:20Z",
+        )
+        segment_b = _insert_segment(
+            db,
+            session_b,
+            file_name="b-first.pcap",
+            capture_interface="eth1",
+        )
+
+    ready_dir = tmp_path / "ready"
+    processed_dir = tmp_path / "processed"
+    failed_dir = tmp_path / "failed"
+    ready_dir.mkdir()
+    _write_pcap(ready_dir / "a-first.pcap", [(WINDOW_TS, ESP_IP, PI_IP)])
+    _write_pcap(
+        ready_dir / "a-second.pcap",
+        [(WINDOW_TS + 10.0, ESP_IP, PI_IP)],
+    )
+    _write_pcap(ready_dir / "b-first.pcap", [(WINDOW_TS, ESP_IP, PI_IP)])
+    _configure_test_extractor(monkeypatch, mod, TestSession)
+
+    count = mod.extract_packet_features(
+        ready_dir=ready_dir,
+        processed_dir=processed_dir,
+        failed_dir=failed_dir,
+        limit=1,
+        lock_path=tmp_path / ".lock",
+        session_id=SESSION_UUID,
+    )
+
+    with TestSession() as db:
+        assert _segment_status(db, segment_a_first["id"])["status"] == "PROCESSED"
+        assert _segment_status(db, segment_a_second["id"])["status"] == "READY"
+        assert _segment_status(db, segment_b["id"])["status"] == "READY"
+    assert count == 1
+    assert (processed_dir / "a-first.pcap").exists()
+    assert (ready_dir / "a-second.pcap").exists()
+    assert (ready_dir / "b-first.pcap").exists()
+    engine.dispose()
+
+
+def test_session_mode_reconciles_only_selected_session(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import edge.features.run_packet_feature_extractor as mod
+
+    db_path = tmp_path / "test.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    TestSession, engine = _make_test_session_factory(db_path)
+
+    with TestSession() as db:
+        session_a = _insert_capture_session(db, status="COMPLETED")
+        session_b = _insert_capture_session(
+            db,
+            OTHER_SESSION_UUID,
+            capture_interface="eth1",
+            status="COMPLETED",
+        )
+        segment_a = _insert_segment(db, session_a, file_name="a-orphan.pcap")
+        segment_b = _insert_segment(
+            db,
+            session_b,
+            file_name="b-orphan.pcap",
+            capture_interface="eth1",
+        )
+        db.execute(
+            text(
+                "UPDATE packet_capture_segments SET status = 'PROCESSED' "
+                "WHERE id = :id"
+            ),
+            {"id": segment_a["id"]},
+        )
+        db.execute(
+            text(
+                "UPDATE packet_capture_segments SET status = 'FAILED', "
+                "error_code = 'PCAP_PARSE_ERROR' WHERE id = :id"
+            ),
+            {"id": segment_b["id"]},
+        )
+        db.commit()
+
+    ready_dir = tmp_path / "ready"
+    processed_dir = tmp_path / "processed"
+    failed_dir = tmp_path / "failed"
+    ready_dir.mkdir()
+    (ready_dir / "a-orphan.pcap").write_bytes(b"session-a")
+    (ready_dir / "b-orphan.pcap").write_bytes(b"session-b")
+    _configure_test_extractor(monkeypatch, mod, TestSession)
+
+    count = mod.extract_packet_features(
+        ready_dir=ready_dir,
+        processed_dir=processed_dir,
+        failed_dir=failed_dir,
+        lock_path=tmp_path / ".lock",
+        session_id=SESSION_UUID,
+    )
+
+    assert count == 0
+    assert (processed_dir / "a-orphan.pcap").exists()
+    assert (ready_dir / "b-orphan.pcap").exists()
+    assert not (failed_dir / "b-orphan.pcap").exists()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("requested_session_id", "message"),
+    [
+        ("not-a-uuid", "UUIDv4"),
+        ("33333333-3333-4333-8333-333333333333", "존재하지"),
+    ],
+)
+def test_invalid_or_missing_session_is_rejected_before_reconciliation(
+    tmp_path: Path,
+    monkeypatch,
+    requested_session_id: str,
+    message: str,
+) -> None:
+    import edge.features.run_packet_feature_extractor as mod
+
+    db_path = tmp_path / "test.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    TestSession, engine = _make_test_session_factory(db_path)
+    with TestSession() as db:
+        session_pk = _insert_capture_session(
+            db,
+            OTHER_SESSION_UUID,
+            status="COMPLETED",
+        )
+        segment = _insert_segment(db, session_pk, file_name="sentinel.pcap")
+        db.execute(
+            text(
+                "UPDATE packet_capture_segments SET status = 'PROCESSED' "
+                "WHERE id = :id"
+            ),
+            {"id": segment["id"]},
+        )
+        db.commit()
+
+    ready_dir = tmp_path / "ready"
+    ready_dir.mkdir()
+    sentinel = ready_dir / "sentinel.pcap"
+    sentinel.write_bytes(b"unchanged")
+    _configure_test_extractor(monkeypatch, mod, TestSession)
+
+    with pytest.raises(ValueError, match=message):
+        mod.extract_packet_features(
+            ready_dir=ready_dir,
+            processed_dir=tmp_path / "processed",
+            failed_dir=tmp_path / "failed",
+            lock_path=tmp_path / ".lock",
+            session_id=requested_session_id,
+        )
+
+    with TestSession() as db:
+        assert _segment_status(db, segment["id"])["status"] == "PROCESSED"
+    assert sentinel.read_bytes() == b"unchanged"
+    assert not (tmp_path / "processed" / "sentinel.pcap").exists()
+    engine.dispose()
+
+
+@pytest.mark.parametrize("status", ["RUNNING", "FAILED"])
+def test_ineligible_session_is_rejected_before_reconciliation(
+    tmp_path: Path,
+    monkeypatch,
+    status: str,
+) -> None:
+    import edge.features.run_packet_feature_extractor as mod
+
+    db_path = tmp_path / "test.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    TestSession, engine = _make_test_session_factory(db_path)
+    with TestSession() as db:
+        session_pk = _insert_capture_session(db, status=status)
+        segment = _insert_segment(db, session_pk, file_name="target-orphan.pcap")
+        db.execute(
+            text(
+                "UPDATE packet_capture_segments SET status = 'PROCESSED' "
+                "WHERE id = :id"
+            ),
+            {"id": segment["id"]},
+        )
+        db.commit()
+
+    ready_dir = tmp_path / "ready"
+    ready_dir.mkdir()
+    target = ready_dir / "target-orphan.pcap"
+    target.write_bytes(b"unchanged")
+    _configure_test_extractor(monkeypatch, mod, TestSession)
+
+    with pytest.raises(ValueError, match="COMPLETED"):
+        mod.extract_packet_features(
+            ready_dir=ready_dir,
+            processed_dir=tmp_path / "processed",
+            failed_dir=tmp_path / "failed",
+            lock_path=tmp_path / ".lock",
+            session_id=SESSION_UUID,
+        )
+
+    with TestSession() as db:
+        assert _segment_status(db, segment["id"])["status"] == "PROCESSED"
+    assert target.read_bytes() == b"unchanged"
+    assert not (tmp_path / "processed" / "target-orphan.pcap").exists()
+    engine.dispose()
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_limit_below_one_is_rejected_before_reconciliation(
+    tmp_path: Path,
+    monkeypatch,
+    limit: int,
+) -> None:
+    import edge.features.run_packet_feature_extractor as mod
+
+    db_path = tmp_path / "test.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    TestSession, engine = _make_test_session_factory(db_path)
+    with TestSession() as db:
+        session_pk = _insert_capture_session(db, status="COMPLETED")
+        segment = _insert_segment(db, session_pk, file_name="limit-orphan.pcap")
+        db.execute(
+            text(
+                "UPDATE packet_capture_segments SET status = 'PROCESSED' "
+                "WHERE id = :id"
+            ),
+            {"id": segment["id"]},
+        )
+        db.commit()
+
+    ready_dir = tmp_path / "ready"
+    ready_dir.mkdir()
+    orphan = ready_dir / "limit-orphan.pcap"
+    orphan.write_bytes(b"unchanged")
+    _configure_test_extractor(monkeypatch, mod, TestSession)
+
+    with pytest.raises(ValueError, match="limit.*1"):
+        mod.extract_packet_features(
+            ready_dir=ready_dir,
+            processed_dir=tmp_path / "processed",
+            failed_dir=tmp_path / "failed",
+            limit=limit,
+            lock_path=tmp_path / ".lock",
+            session_id=SESSION_UUID,
+        )
+
+    assert orphan.read_bytes() == b"unchanged"
+    assert not (tmp_path / "processed" / "limit-orphan.pcap").exists()
+    engine.dispose()
+
+
+def test_session_mode_missing_file_marks_only_selected_session_failed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import edge.features.run_packet_feature_extractor as mod
+
+    db_path = tmp_path / "test.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    TestSession, engine = _make_test_session_factory(db_path)
+    with TestSession() as db:
+        session_a = _insert_capture_session(db, status="COMPLETED")
+        session_b = _insert_capture_session(
+            db,
+            OTHER_SESSION_UUID,
+            capture_interface="eth1",
+            status="COMPLETED",
+        )
+        target = _insert_segment(db, session_a, file_name="missing.pcap")
+        other = _insert_segment(
+            db,
+            session_b,
+            file_name="other.pcap",
+            capture_interface="eth1",
+        )
+
+    ready_dir = tmp_path / "ready"
+    ready_dir.mkdir()
+    _write_pcap(ready_dir / "other.pcap", [(WINDOW_TS, ESP_IP, PI_IP)])
+    _configure_test_extractor(monkeypatch, mod, TestSession)
+
+    count = mod.extract_packet_features(
+        ready_dir=ready_dir,
+        processed_dir=tmp_path / "processed",
+        failed_dir=tmp_path / "failed",
+        lock_path=tmp_path / ".lock",
+        session_id=SESSION_UUID,
+    )
+
+    with TestSession() as db:
+        assert _segment_status(db, target["id"])["status"] == "FAILED"
+        assert _segment_status(db, other["id"])["status"] == "READY"
+    assert count == 1
+    assert (ready_dir / "other.pcap").exists()
+    engine.dispose()
+
+
+def test_session_mode_rerun_does_not_reprocess_completed_segment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import edge.features.run_packet_feature_extractor as mod
+
+    db_path = tmp_path / "test.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    TestSession, engine = _make_test_session_factory(db_path)
+    with TestSession() as db:
+        session_pk = _insert_capture_session(db, status="COMPLETED")
+        segment = _insert_segment(db, session_pk, file_name="once.pcap")
+
+    ready_dir = tmp_path / "ready"
+    processed_dir = tmp_path / "processed"
+    ready_dir.mkdir()
+    _write_pcap(ready_dir / "once.pcap", [(WINDOW_TS, ESP_IP, PI_IP)])
+    _configure_test_extractor(monkeypatch, mod, TestSession)
+    kwargs = {
+        "ready_dir": ready_dir,
+        "processed_dir": processed_dir,
+        "failed_dir": tmp_path / "failed",
+        "lock_path": tmp_path / ".lock",
+        "session_id": SESSION_UUID,
+    }
+
+    first_count = mod.extract_packet_features(**kwargs)
+    second_count = mod.extract_packet_features(**kwargs)
+
+    with TestSession() as db:
+        feature_count = db.execute(
+            text(
+                "SELECT COUNT(*) FROM packet_feature_logs "
+                "WHERE capture_segment_id = :segment_id"
+            ),
+            {"segment_id": segment["id"]},
+        ).scalar_one()
+    assert first_count == 1
+    assert second_count == 0
+    assert feature_count == 1
+    assert (processed_dir / "once.pcap").exists()
+    engine.dispose()
+
+
+def test_session_id_omitted_preserves_global_mode_with_warning(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    import edge.features.run_packet_feature_extractor as mod
+
+    db_path = tmp_path / "test.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    TestSession, engine = _make_test_session_factory(db_path)
+    with TestSession() as db:
+        session_a = _insert_capture_session(db, status="COMPLETED")
+        session_b = _insert_capture_session(
+            db,
+            OTHER_SESSION_UUID,
+            capture_interface="eth1",
+            status="COMPLETED",
+        )
+        _insert_segment(db, session_a, file_name="global-a.pcap")
+        _insert_segment(
+            db,
+            session_b,
+            file_name="global-b.pcap",
+            capture_interface="eth1",
+        )
+
+    ready_dir = tmp_path / "ready"
+    ready_dir.mkdir()
+    _write_pcap(ready_dir / "global-a.pcap", [(WINDOW_TS, ESP_IP, PI_IP)])
+    _write_pcap(ready_dir / "global-b.pcap", [(WINDOW_TS, ESP_IP, PI_IP)])
+    _configure_test_extractor(monkeypatch, mod, TestSession)
+
+    with caplog.at_level("WARNING"):
+        count = mod.extract_packet_features(
+            ready_dir=ready_dir,
+            processed_dir=tmp_path / "processed",
+            failed_dir=tmp_path / "failed",
+            limit=2,
+            lock_path=tmp_path / ".lock",
+        )
+
+    assert count == 2
+    assert any("전체 READY" in record.message for record in caplog.records)
+    engine.dispose()
+
+
+def test_cli_invalid_session_exits_nonzero_with_clear_message(
+    monkeypatch,
+    capsys,
+) -> None:
+    import edge.features.run_packet_feature_extractor as mod
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_packet_feature_extractor", "--session-id", "not-a-uuid"],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        mod.main()
+
+    assert exc_info.value.code != 0
+    assert "UUIDv4" in capsys.readouterr().err
 
 
 def test_processed_file_moved_to_processed_dir(tmp_path: Path, monkeypatch) -> None:

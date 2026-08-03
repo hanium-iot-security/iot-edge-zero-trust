@@ -389,6 +389,79 @@ def test_packet_feature_ready_segments_and_query_filters(db_session: Session) ->
     assert "bytes_per_second" not in rows[0]
 
 
+def test_ready_segments_filter_by_session_before_limit_and_exclude_terminal_rows(
+    db_session: Session,
+) -> None:
+    session_a_pk = _create_session(db_session, session_id=SESSION_A)
+    session_b_pk = _create_session(
+        db_session,
+        session_id=SESSION_B,
+        capture_interface="eth1",
+    )
+    session_a_first = _insert_segment(
+        db_session,
+        session_pk=session_a_pk,
+        file_name="session-a-first.pcap",
+        start=_utc(10, 0, 0),
+    )
+    _insert_segment(
+        db_session,
+        session_pk=session_a_pk,
+        file_name="session-a-processed.pcap",
+        start=_utc(10, 0, 10),
+        status="PROCESSED",
+    )
+    _insert_segment(
+        db_session,
+        session_pk=session_a_pk,
+        file_name="session-a-empty.pcap",
+        start=_utc(10, 0, 20),
+        status="EMPTY",
+    )
+    session_b_first = _insert_segment(
+        db_session,
+        session_pk=session_b_pk,
+        file_name="session-b-first.pcap",
+        start=_utc(10, 0, 0),
+        capture_interface="eth1",
+    )
+    _insert_segment(
+        db_session,
+        session_pk=session_b_pk,
+        file_name="session-b-failed.pcap",
+        start=_utc(10, 0, 10),
+        capture_interface="eth1",
+        status="FAILED",
+    )
+    db_session.commit()
+
+    session_a = feature_repo.fetch_ready_segments(
+        db_session,
+        limit=1,
+        session_id=SESSION_A,
+    )
+    session_b = feature_repo.fetch_ready_segments(
+        db_session,
+        limit=1,
+        session_id=SESSION_B,
+    )
+
+    assert [row["id"] for row in session_a] == [session_a_first]
+    assert [row["id"] for row in session_b] == [session_b_first]
+    assert all(row["session_id"] == SESSION_A for row in session_a)
+    assert all(row["session_id"] == SESSION_B for row in session_b)
+    assert feature_repo.get_segment_status_by_file_name(
+        db_session,
+        file_name="session-b-first.pcap",
+        session_id=SESSION_A,
+    ) is None
+    assert feature_repo.get_segment_status_by_file_name(
+        db_session,
+        file_name="session-b-first.pcap",
+        session_id=SESSION_B,
+    ) == "READY"
+
+
 def test_packet_feature_repository_rollback_is_caller_controlled(
     db_session: Session,
 ) -> None:
