@@ -1,0 +1,799 @@
+"""Phase 5 Baseline Recovery의 SQLite 안전 계약 테스트."""
+
+from __future__ import annotations
+
+import importlib
+import hashlib
+import json
+from pathlib import Path
+import sqlite3
+
+import pytest
+
+from db.migration_runner import MIGRATIONS_DIR, apply_migrations
+
+
+def _load_core():
+    try:
+        return importlib.import_module("edge.trust.baseline_recovery")
+    except ModuleNotFoundError as exc:
+        pytest.fail(f"Baseline Recovery core is not implemented: {exc}")
+
+
+def _load_cli():
+    try:
+        return importlib.import_module("edge.trust.run_baseline_recovery")
+    except ModuleNotFoundError as exc:
+        pytest.fail(f"Baseline Recovery CLI is not implemented: {exc}")
+
+
+@pytest.fixture
+def db_path(tmp_path: Path) -> Path:
+    path = tmp_path / "baseline-recovery.db"
+    apply_migrations(path, MIGRATIONS_DIR)
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.executemany(
+            """
+            INSERT INTO devices (
+                device_id, ip_address, status, trust_score, last_seen_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                ("esp32_01", "192.168.0.4", "isolated", 20, "2026-08-03T00:00:00Z"),
+                ("esp32_02", "192.168.0.5", "isolated", 40, "2026-08-03T00:00:01Z"),
+                ("camera_01", "192.168.0.30", "warning", 60, "2026-08-03T00:00:02Z"),
+            ],
+        )
+        connection.commit()
+    return path
+
+
+def _rows(database: Path, query: str, parameters: tuple[object, ...] = ()) -> list[tuple]:
+    with sqlite3.connect(database) as connection:
+        return connection.execute(query, parameters).fetchall()
+
+
+def _device_rows(database: Path) -> list[tuple]:
+    return _rows(
+        database,
+        """
+        SELECT device_id, ip_address, status, trust_score, last_seen_at, created_at
+        FROM devices
+        ORDER BY device_id
+        """,
+    )
+
+
+def _table_rows(database: Path, table: str) -> list[tuple]:
+    return _rows(database, f'SELECT * FROM "{table}" ORDER BY rowid')
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _seed_preserved_history(database: Path) -> tuple[str, ...]:
+    preserved_tables = (
+        "detection_events",
+        "trust_score_history",
+        "isolation_history",
+        "firewall_rules",
+        "detector_checkpoints",
+        "packet_capture_sessions",
+        "packet_capture_segments",
+        "packet_feature_logs",
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        event_id = connection.execute(
+            """
+            INSERT INTO detection_events (
+                device_id, detector_type, event_type, severity,
+                score_delta, applied_to_score, description, detected_at
+            )
+            VALUES (
+                'esp32_01', 'MQTT_RULE', 'ABNORMAL_PUBLISH_RATE', 'HIGH',
+                -20, 1, 'preserve me', '2026-08-03T00:00:10Z'
+            )
+            """
+        ).lastrowid
+        connection.execute(
+            """
+            INSERT INTO trust_score_history (
+                device_id, analysis_window_start, analysis_window_end,
+                previous_score, calculated_delta, capped_delta, actual_delta,
+                new_score, representative_event_ids_json, policy_version
+            )
+            VALUES (
+                'esp32_01', '2026-08-03T00:00:00Z', '2026-08-03T00:00:10Z',
+                40, -20, -20, -20, 20, ?, 'trust-v2'
+            )
+            """,
+            (json.dumps([event_id]),),
+        )
+        connection.execute(
+            """
+            INSERT INTO isolation_history (
+                device_id, action, reason, trust_score, trigger_event_id
+            )
+            VALUES ('esp32_01', 'ISOLATED', 'preserve me', 20, ?)
+            """,
+            (event_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO firewall_rules (
+                device_id, source_ip, status, trigger_event_id,
+                applied_at, released_at
+            )
+            VALUES (
+                'esp32_01', '192.168.0.4', 'REMOVED', ?,
+                '2026-08-03T00:00:11Z', '2026-08-03T00:00:12Z'
+            )
+            """,
+            (event_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO detector_checkpoints (
+                detector_name, source_table, last_processed_id,
+                last_completed_window_end
+            )
+            VALUES (
+                'mqtt_message_rule', 'mqtt_logs', 123,
+                '2026-08-03T00:00:10Z'
+            )
+            """
+        )
+        session_pk = connection.execute(
+            """
+            INSERT INTO packet_capture_sessions (
+                session_id, capture_interface, started_at, first_window_start,
+                ended_at, status
+            )
+            VALUES (
+                '11111111-1111-4111-8111-111111111111', 'eth0',
+                '2026-08-03T00:00:00Z', '2026-08-03T00:00:00Z',
+                '2026-08-03T00:00:10Z', 'COMPLETED'
+            )
+            """
+        ).lastrowid
+        segment_pk = connection.execute(
+            """
+            INSERT INTO packet_capture_segments (
+                capture_session_id, file_name, capture_interface,
+                window_start, window_end, status, packet_count, processed_at
+            )
+            VALUES (
+                ?, 'preserved.pcap', 'eth0',
+                '2026-08-03T00:00:00Z', '2026-08-03T00:00:10Z',
+                'PROCESSED', 1, '2026-08-03T00:00:11Z'
+            )
+            """,
+            (session_pk,),
+        ).lastrowid
+        connection.execute(
+            """
+            INSERT INTO packet_feature_logs (
+                capture_segment_id, device_id, peer_ip, direction,
+                window_start, window_end, packet_count, total_bytes,
+                avg_packet_size, max_packet_size
+            )
+            VALUES (
+                ?, 'esp32_01', '192.168.0.4', 'INBOUND',
+                '2026-08-03T00:00:00Z', '2026-08-03T00:00:10Z',
+                1, 100, 100.0, 100
+            )
+            """,
+            (segment_pk,),
+        )
+        connection.commit()
+    return preserved_tables
+
+
+@pytest.mark.parametrize(
+    ("device_ids", "expectation_entries", "message"),
+    [
+        (["esp32_01", "esp32_02"], ["esp32_01=20"], "모든 --device"),
+        (["esp32_01"], ["esp32_01=20", "esp32_01=20"], "중복"),
+        (["esp32_01"], ["esp32_01=20", "esp32_02=20"], "대상에 없는"),
+        (["esp32_01"], ["esp32_01=-1"], "0~100"),
+        (["esp32_01"], ["esp32_01=101"], "0~100"),
+        (["esp32_01", "esp32_01"], ["esp32_01=20"], "--device 중복"),
+    ],
+)
+def test_parse_device_expectations_rejects_ambiguous_or_incomplete_input(
+    device_ids: list[str],
+    expectation_entries: list[str],
+    message: str,
+) -> None:
+    core = _load_core()
+
+    with pytest.raises(core.BaselineRecoveryError, match=message):
+        core.parse_device_expectations(device_ids, expectation_entries)
+
+
+def test_parse_device_expectations_returns_each_device_expected_score() -> None:
+    core = _load_core()
+
+    result = core.parse_device_expectations(
+        ["esp32_01", "esp32_02"],
+        ["esp32_02=40", "esp32_01=20"],
+    )
+
+    assert result == {"esp32_01": 20, "esp32_02": 40}
+
+
+def test_dry_run_reports_two_isolated_devices_without_changing_database(
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    core = _load_core()
+    before = _device_rows(db_path)
+
+    result = core.inspect_baseline_recovery(
+        db_path=db_path,
+        device_ids=["esp32_01", "esp32_02"],
+        expected_trust_scores={"esp32_01": 20, "esp32_02": 40},
+        artifact_dir=tmp_path / "artifacts",
+    )
+
+    assert result["mode"] == "dry-run"
+    assert result["can_execute"] is True
+    assert result["database_changed"] is False
+    assert result["active_firewall_rule_check"] == {
+        "passed": True,
+        "count": 0,
+        "statuses": ["PENDING", "APPLIED"],
+    }
+    assert result["devices"] == [
+        {
+            "device_id": "esp32_01",
+            "ip_address": "192.168.0.4",
+            "current": {"status": "isolated", "trust_score": 20},
+            "expected": {"status": "isolated", "trust_score": 20},
+            "proposed": {"status": "normal", "trust_score": 100},
+        },
+        {
+            "device_id": "esp32_02",
+            "ip_address": "192.168.0.5",
+            "current": {"status": "isolated", "trust_score": 40},
+            "expected": {"status": "isolated", "trust_score": 40},
+            "proposed": {"status": "normal", "trust_score": 100},
+        },
+    ]
+    command = result["execute_command"]
+    assert "--device esp32_01" in command
+    assert "--device esp32_02" in command
+    assert "--expected-trust-score esp32_01=20" in command
+    assert "--expected-trust-score esp32_02=40" in command
+    assert "--confirm RESET-TO-NORMAL-100" in command
+    assert _device_rows(db_path) == before
+    assert not (tmp_path / "artifacts").exists()
+
+
+def test_dry_run_rejects_missing_device_without_changing_database(
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    core = _load_core()
+    before = _device_rows(db_path)
+
+    with pytest.raises(core.BaselineRecoveryError, match="존재하지"):
+        core.inspect_baseline_recovery(
+            db_path=db_path,
+            device_ids=["esp32_01", "missing_device"],
+            expected_trust_scores={"esp32_01": 20, "missing_device": 20},
+            artifact_dir=tmp_path / "artifacts",
+        )
+
+    assert _device_rows(db_path) == before
+    assert not (tmp_path / "artifacts").exists()
+
+
+def test_dry_run_rejects_device_that_is_not_isolated(
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    core = _load_core()
+    before = _device_rows(db_path)
+
+    result = core.inspect_baseline_recovery(
+        db_path=db_path,
+        device_ids=["camera_01"],
+        expected_trust_scores={"camera_01": 60},
+        artifact_dir=tmp_path / "artifacts",
+    )
+
+    assert result["can_execute"] is False
+    assert "isolated" in result["preflight_errors"][0]
+    assert result["devices"][0]["current"] == {
+        "status": "warning",
+        "trust_score": 60,
+    }
+    assert _device_rows(db_path) == before
+
+
+def test_dry_run_rejects_changed_trust_score(
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    core = _load_core()
+    before = _device_rows(db_path)
+
+    result = core.inspect_baseline_recovery(
+        db_path=db_path,
+        device_ids=["esp32_01"],
+        expected_trust_scores={"esp32_01": 40},
+        artifact_dir=tmp_path / "artifacts",
+    )
+
+    assert result["can_execute"] is False
+    assert "예상 Trust Score" in result["preflight_errors"][0]
+    assert result["devices"][0]["expected"]["trust_score"] == 40
+    assert _device_rows(db_path) == before
+
+
+@pytest.mark.parametrize(
+    ("status", "rule_device_id", "source_ip"),
+    [
+        ("PENDING", "esp32_01", "192.168.0.99"),
+        ("APPLIED", None, "192.168.0.4"),
+    ],
+)
+def test_dry_run_rejects_active_firewall_rule_for_device_or_ip(
+    db_path: Path,
+    tmp_path: Path,
+    status: str,
+    rule_device_id: str | None,
+    source_ip: str,
+) -> None:
+    core = _load_core()
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            """
+            INSERT INTO firewall_rules (device_id, source_ip, status)
+            VALUES (?, ?, ?)
+            """,
+            (rule_device_id, source_ip, status),
+        )
+        connection.commit()
+    before = _device_rows(db_path)
+
+    result = core.inspect_baseline_recovery(
+        db_path=db_path,
+        device_ids=["esp32_01"],
+        expected_trust_scores={"esp32_01": 20},
+        artifact_dir=tmp_path / "artifacts",
+    )
+
+    assert result["can_execute"] is False
+    assert result["active_firewall_rule_check"]["passed"] is False
+    assert result["active_firewall_rule_check"]["count"] == 1
+    assert result["active_firewall_rule_check"]["rules"][0]["status"] == status
+    assert "Firewall" in result["preflight_errors"][0]
+    assert _device_rows(db_path) == before
+
+
+def test_execute_recovers_two_isolated_devices_and_creates_verified_artifacts(
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    core = _load_core()
+    artifacts = tmp_path / "artifacts"
+
+    result = core.execute_baseline_recovery(
+        db_path=db_path,
+        device_ids=["esp32_01", "esp32_02"],
+        expected_trust_scores={"esp32_01": 20, "esp32_02": 40},
+        artifact_dir=artifacts,
+        confirm="RESET-TO-NORMAL-100",
+    )
+
+    assert result["mode"] == "execute"
+    assert result["result"] == "SUCCESS"
+    assert result["integrity_check"] == "ok"
+    assert result["foreign_key_violations"] == []
+    assert result["devices"] == [
+        {
+            "device_id": "esp32_01",
+            "previous": {"status": "isolated", "trust_score": 20},
+            "current": {"status": "normal", "trust_score": 100},
+        },
+        {
+            "device_id": "esp32_02",
+            "previous": {"status": "isolated", "trust_score": 40},
+            "current": {"status": "normal", "trust_score": 100},
+        },
+    ]
+    backup_path = Path(result["backup_path"])
+    log_path = Path(result["log_path"])
+    assert backup_path.is_file()
+    assert log_path.is_file()
+    assert result["backup_sha256"] == _sha256(backup_path)
+    assert json.loads(log_path.read_text(encoding="utf-8"))["result"] == "SUCCESS"
+    assert _rows(backup_path, "PRAGMA integrity_check") == [("ok",)]
+    assert _rows(backup_path, "PRAGMA foreign_key_check") == []
+    assert _rows(
+        db_path,
+        "SELECT device_id, status, trust_score FROM devices ORDER BY device_id",
+    ) == [
+        ("camera_01", "warning", 60),
+        ("esp32_01", "normal", 100),
+        ("esp32_02", "normal", 100),
+    ]
+    assert _rows(
+        backup_path,
+        "SELECT device_id, status, trust_score FROM devices ORDER BY device_id",
+    ) == [
+        ("camera_01", "warning", 60),
+        ("esp32_01", "isolated", 20),
+        ("esp32_02", "isolated", 40),
+    ]
+
+
+def test_execute_recovers_only_selected_device(db_path: Path, tmp_path: Path) -> None:
+    core = _load_core()
+
+    core.execute_baseline_recovery(
+        db_path=db_path,
+        device_ids=["esp32_01"],
+        expected_trust_scores={"esp32_01": 20},
+        artifact_dir=tmp_path / "artifacts",
+        confirm="RESET-TO-NORMAL-100",
+    )
+
+    assert _rows(
+        db_path,
+        "SELECT device_id, status, trust_score FROM devices ORDER BY device_id",
+    ) == [
+        ("camera_01", "warning", 60),
+        ("esp32_01", "normal", 100),
+        ("esp32_02", "isolated", 40),
+    ]
+
+
+def test_execute_reports_json_log_failure_after_commit_and_preserves_backup(
+    db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core = _load_core()
+    artifacts = tmp_path / "artifacts"
+
+    def fail_json_log(*_args, **_kwargs) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(core, "_write_json_log", fail_json_log)
+
+    with pytest.raises(core.BaselineRecoveryError, match="JSON Log 저장 실패"):
+        core.execute_baseline_recovery(
+            db_path=db_path,
+            device_ids=["esp32_01"],
+            expected_trust_scores={"esp32_01": 20},
+            artifact_dir=artifacts,
+            confirm="RESET-TO-NORMAL-100",
+        )
+
+    assert _rows(
+        db_path,
+        "SELECT status, trust_score FROM devices WHERE device_id = 'esp32_01'",
+    ) == [("normal", 100)]
+    backups = list(artifacts.glob("baseline-recovery-*.db"))
+    assert len(backups) == 1
+    assert _rows(
+        backups[0],
+        "SELECT status, trust_score FROM devices WHERE device_id = 'esp32_01'",
+    ) == [("isolated", 20)]
+
+
+@pytest.mark.parametrize(
+    ("device_ids", "expected_scores", "message"),
+    [
+        (["missing_device"], {"missing_device": 20}, "존재하지"),
+        (["camera_01"], {"camera_01": 60}, "isolated"),
+        (["esp32_01"], {"esp32_01": 40}, "예상 Trust Score"),
+    ],
+)
+def test_execute_rejects_ineligible_device_before_backup(
+    db_path: Path,
+    tmp_path: Path,
+    device_ids: list[str],
+    expected_scores: dict[str, int],
+    message: str,
+) -> None:
+    core = _load_core()
+    before = _device_rows(db_path)
+    artifacts = tmp_path / "artifacts"
+
+    with pytest.raises(core.BaselineRecoveryError, match=message):
+        core.execute_baseline_recovery(
+            db_path=db_path,
+            device_ids=device_ids,
+            expected_trust_scores=expected_scores,
+            artifact_dir=artifacts,
+            confirm="RESET-TO-NORMAL-100",
+        )
+
+    assert _device_rows(db_path) == before
+    assert not artifacts.exists() or not list(artifacts.glob("*.db"))
+
+
+def test_execute_rejects_active_firewall_rule_before_backup(
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    core = _load_core()
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO firewall_rules (device_id, source_ip, status)
+            VALUES ('esp32_01', '192.168.0.4', 'APPLIED')
+            """
+        )
+        connection.commit()
+    before = _device_rows(db_path)
+    artifacts = tmp_path / "artifacts"
+
+    with pytest.raises(core.BaselineRecoveryError, match="Firewall"):
+        core.execute_baseline_recovery(
+            db_path=db_path,
+            device_ids=["esp32_01"],
+            expected_trust_scores={"esp32_01": 20},
+            artifact_dir=artifacts,
+            confirm="RESET-TO-NORMAL-100",
+        )
+
+    assert _device_rows(db_path) == before
+    assert not artifacts.exists() or not list(artifacts.glob("*.db"))
+
+
+def test_execute_rejects_wrong_confirmation_before_backup(
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    core = _load_core()
+    before = _device_rows(db_path)
+
+    with pytest.raises(core.BaselineRecoveryError, match="confirm"):
+        core.execute_baseline_recovery(
+            db_path=db_path,
+            device_ids=["esp32_01"],
+            expected_trust_scores={"esp32_01": 20},
+            artifact_dir=tmp_path / "artifacts",
+            confirm="yes",
+        )
+
+    assert _device_rows(db_path) == before
+    assert not (tmp_path / "artifacts").exists()
+
+
+def test_backup_failure_keeps_database_unchanged(
+    db_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    core = _load_core()
+    before = _device_rows(db_path)
+
+    def fail_backup(*_args, **_kwargs):
+        raise OSError("forced backup failure")
+
+    monkeypatch.setattr(core, "_create_backup", fail_backup, raising=False)
+
+    with pytest.raises(core.BaselineRecoveryError, match="Backup"):
+        core.execute_baseline_recovery(
+            db_path=db_path,
+            device_ids=["esp32_01"],
+            expected_trust_scores={"esp32_01": 20},
+            artifact_dir=tmp_path / "artifacts",
+            confirm="RESET-TO-NORMAL-100",
+        )
+
+    assert _device_rows(db_path) == before
+
+
+def test_one_device_update_failure_rolls_back_all_devices(
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    core = _load_core()
+    before = _device_rows(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_esp32_02_recovery
+            BEFORE UPDATE OF status, trust_score ON devices
+            WHEN OLD.device_id = 'esp32_02'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced update failure');
+            END
+            """
+        )
+        connection.commit()
+
+    with pytest.raises(core.BaselineRecoveryError, match="Update"):
+        core.execute_baseline_recovery(
+            db_path=db_path,
+            device_ids=["esp32_01", "esp32_02"],
+            expected_trust_scores={"esp32_01": 20, "esp32_02": 40},
+            artifact_dir=tmp_path / "artifacts",
+            confirm="RESET-TO-NORMAL-100",
+        )
+
+    assert _device_rows(db_path) == before
+
+
+def test_conditional_update_mismatch_rolls_back_all_devices(
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    core = _load_core()
+    before = _device_rows(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER change_second_expected_score
+            AFTER UPDATE OF status, trust_score ON devices
+            WHEN OLD.device_id = 'esp32_01'
+            BEGIN
+                UPDATE devices SET trust_score = 41 WHERE device_id = 'esp32_02';
+            END
+            """
+        )
+        connection.commit()
+
+    with pytest.raises(core.BaselineRecoveryError, match="조건부 Update"):
+        core.execute_baseline_recovery(
+            db_path=db_path,
+            device_ids=["esp32_01", "esp32_02"],
+            expected_trust_scores={"esp32_01": 20, "esp32_02": 40},
+            artifact_dir=tmp_path / "artifacts",
+            confirm="RESET-TO-NORMAL-100",
+        )
+
+    assert _device_rows(db_path) == before
+
+
+def test_execute_preserves_all_history_checkpoint_and_packet_tables(
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    core = _load_core()
+    preserved_tables = _seed_preserved_history(db_path)
+    before = {table: _table_rows(db_path, table) for table in preserved_tables}
+
+    core.execute_baseline_recovery(
+        db_path=db_path,
+        device_ids=["esp32_01"],
+        expected_trust_scores={"esp32_01": 20},
+        artifact_dir=tmp_path / "artifacts",
+        confirm="RESET-TO-NORMAL-100",
+    )
+
+    after = {table: _table_rows(db_path, table) for table in preserved_tables}
+    assert after == before
+
+
+def test_cli_dry_run_prints_json_without_creating_artifacts(
+    db_path: Path,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    cli = _load_cli()
+    artifacts = tmp_path / "artifacts"
+
+    exit_code = cli.main(
+        [
+            "dry-run",
+            "--db-path",
+            str(db_path),
+            "--device",
+            "esp32_01",
+            "--expected-trust-score",
+            "esp32_01=20",
+            "--artifact-dir",
+            str(artifacts),
+        ]
+    )
+
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["mode"] == "dry-run"
+    assert output["devices"][0]["device_id"] == "esp32_01"
+    assert not artifacts.exists()
+
+
+def test_cli_rejects_missing_expected_score_before_backup(
+    db_path: Path,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    cli = _load_cli()
+    artifacts = tmp_path / "artifacts"
+    before = _device_rows(db_path)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "execute",
+                "--db-path",
+                str(db_path),
+                "--device",
+                "esp32_01",
+                "--artifact-dir",
+                str(artifacts),
+                "--confirm",
+                "RESET-TO-NORMAL-100",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    assert "--expected-trust-score" in capsys.readouterr().err
+    assert _device_rows(db_path) == before
+    assert not artifacts.exists()
+
+
+def test_cli_dry_run_returns_nonzero_with_json_when_device_is_ineligible(
+    db_path: Path,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    cli = _load_cli()
+
+    exit_code = cli.main(
+        [
+            "dry-run",
+            "--db-path",
+            str(db_path),
+            "--device",
+            "camera_01",
+            "--expected-trust-score",
+            "camera_01=60",
+            "--artifact-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+
+    assert exit_code == 2
+    output = json.loads(capsys.readouterr().out)
+    assert output["mode"] == "dry-run"
+    assert output["can_execute"] is False
+    assert output["devices"][0]["current"]["status"] == "warning"
+
+
+def test_cli_execute_prints_result_and_log_path(
+    db_path: Path,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    cli = _load_cli()
+
+    exit_code = cli.main(
+        [
+            "execute",
+            "--db-path",
+            str(db_path),
+            "--device",
+            "esp32_01",
+            "--expected-trust-score",
+            "esp32_01=20",
+            "--artifact-dir",
+            str(tmp_path / "artifacts"),
+            "--confirm",
+            "RESET-TO-NORMAL-100",
+        ]
+    )
+
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["result"] == "SUCCESS"
+    assert Path(output["backup_path"]).is_file()
+    assert Path(output["log_path"]).is_file()
