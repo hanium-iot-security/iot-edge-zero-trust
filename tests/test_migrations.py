@@ -241,9 +241,9 @@ def test_runner_applies_new_database_in_order(tmp_path: Path) -> None:
     result = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [1, 2, 3]
+        assert result.applied_versions == [1, 2, 3, 4]
         assert result.baselined_versions == []
-        assert _migration_versions(connection) == [1, 2, 3]
+        assert _migration_versions(connection) == [1, 2, 3, 4]
         assert _table_exists(connection, "packet_capture_sessions")
         assert _table_exists(connection, "trust_score_history")
 
@@ -615,8 +615,8 @@ def test_runner_applies_002_and_003_to_existing_001_db_and_preserves_rows(
 
     with connect_database(db_path) as connection:
         assert result.baselined_versions == [1]
-        assert result.applied_versions == [2, 3]
-        assert _migration_versions(connection) == [1, 2, 3]
+        assert result.applied_versions == [2, 3, 4]
+        assert _migration_versions(connection) == [1, 2, 3, 4]
         device = connection.execute(
             "SELECT device_id, status, trust_score FROM devices"
         ).fetchone()
@@ -657,10 +657,10 @@ def test_runner_skips_already_applied_migrations(tmp_path: Path) -> None:
     second = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert first.applied_versions == [1, 2, 3]
+        assert first.applied_versions == [1, 2, 3, 4]
         assert second.applied_versions == []
-        assert second.skipped_versions == [1, 2, 3]
-        assert _migration_versions(connection) == [1, 2, 3]
+        assert second.skipped_versions == [1, 2, 3, 4]
+        assert _migration_versions(connection) == [1, 2, 3, 4]
 
 
 def test_runner_sorts_migration_files_by_version(tmp_path: Path) -> None:
@@ -795,8 +795,8 @@ def test_failed_002_migration_can_be_retried_after_fix(tmp_path: Path) -> None:
     result = apply_migrations(db_path, migrations_dir)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [2, 3]
-        assert _migration_versions(connection) == [1, 2, 3]
+        assert result.applied_versions == [2, 3, 4]
+        assert _migration_versions(connection) == [1, 2, 3, 4]
         assert not _table_exists(connection, "retry_marker")
         assert _table_exists(connection, "packet_capture_sessions")
         assert "failed_retry_column" not in _column_names(
@@ -1794,8 +1794,8 @@ def test_phase4_migration_applies_003_to_existing_002_and_preserves_segments(
     result = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [3]
-        assert _migration_versions(connection) == [1, 2, 3]
+        assert result.applied_versions == [3, 4]
+        assert _migration_versions(connection) == [1, 2, 3, 4]
         assert {
             "actual_capture_started_at",
             "capture_stop_requested_at",
@@ -2230,3 +2230,261 @@ def test_trust_score_history_api_uses_trust_score_history_table(
     assert body["items"][0]["previous_score"] == 100
     assert body["items"][0]["new_score"] == 80
     assert body["items"][0]["representative_event_ids"] == [1]
+
+
+def test_trust_score_compensation_schema_and_constraints(tmp_path: Path) -> None:
+    db_path = tmp_path / "trust-score-compensation.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+
+    with connect_database(db_path) as connection:
+        assert {
+            "id",
+            "operation_id",
+            "device_id",
+            "source_event_id",
+            "source_trust_history_id",
+            "previous_score",
+            "compensation_delta",
+            "new_score",
+            "reason",
+            "approved_by",
+            "backup_path",
+            "backup_sha256",
+            "created_at",
+        } <= _column_names(connection, "trust_score_compensations")
+
+        connection.execute(
+            """
+            INSERT INTO devices (device_id, ip_address, status, trust_score)
+            VALUES ('esp32_01', '192.168.0.4', 'normal', 80)
+            """
+        )
+        event_id = connection.execute(
+            """
+            INSERT INTO detection_events (
+                device_id, detector_type, event_type, severity,
+                score_delta, applied_to_score, processed_at, processing_reason
+            )
+            VALUES (
+                'esp32_01', 'MQTT_RULE', 'ABNORMAL_PUBLISH_RATE', 'high',
+                -20, 1, '2026-08-03T06:40:00Z', 'APPLIED_TO_TRUST'
+            )
+            """
+        ).lastrowid
+        history_id = connection.execute(
+            """
+            INSERT INTO trust_score_history (
+                device_id, analysis_window_start, analysis_window_end,
+                previous_score, calculated_delta, capped_delta, actual_delta,
+                new_score, representative_event_ids_json, policy_version
+            )
+            VALUES (
+                'esp32_01', '2026-08-03T06:39:30Z',
+                '2026-08-03T06:39:40Z', 100, -20, -20, -20, 80,
+                ?, 'trust-score-v2'
+            )
+            """,
+            (json.dumps([event_id]),),
+        ).lastrowid
+
+        values = {
+            "operation_id": "20260803T080000Z-111111111111",
+            "device_id": "esp32_01",
+            "source_event_id": event_id,
+            "source_trust_history_id": history_id,
+            "previous_score": 80,
+            "compensation_delta": 20,
+            "new_score": 100,
+            "reason": "subscriber backlog false positive",
+            "approved_by": "operator@example",
+            "backup_path": "/evidence/trust-compensation.db",
+            "backup_sha256": "a" * 64,
+        }
+        compensation_id = connection.execute(
+            """
+            INSERT INTO trust_score_compensations (
+                operation_id, device_id, source_event_id,
+                source_trust_history_id, previous_score,
+                compensation_delta, new_score, reason, approved_by,
+                backup_path, backup_sha256
+            )
+            VALUES (
+                :operation_id, :device_id, :source_event_id,
+                :source_trust_history_id, :previous_score,
+                :compensation_delta, :new_score, :reason, :approved_by,
+                :backup_path, :backup_sha256
+            )
+            """,
+            values,
+        ).lastrowid
+
+        for column_name, invalid_value in (
+            ("operation_id", " "),
+            ("previous_score", -1),
+            ("compensation_delta", 0),
+            ("new_score", 99),
+            ("reason", "   "),
+            ("approved_by", ""),
+            ("backup_path", " "),
+            ("backup_sha256", "A" * 64),
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    UPDATE trust_score_compensations
+                    SET {column_name} = ?
+                    WHERE id = ?
+                    """,
+                    (invalid_value, compensation_id),
+                )
+
+        event_id_2 = connection.execute(
+            """
+            INSERT INTO detection_events (
+                device_id, detector_type, event_type, severity,
+                score_delta, applied_to_score, processed_at, processing_reason
+            )
+            VALUES (
+                'esp32_01', 'MQTT_RULE', 'ABNORMAL_TOPIC', 'high',
+                -20, 1, '2026-08-03T06:40:10Z', 'APPLIED_TO_TRUST'
+            )
+            """
+        ).lastrowid
+        history_id_2 = connection.execute(
+            """
+            INSERT INTO trust_score_history (
+                device_id, analysis_window_start, analysis_window_end,
+                previous_score, calculated_delta, capped_delta, actual_delta,
+                new_score, representative_event_ids_json, policy_version
+            )
+            VALUES (
+                'esp32_01', '2026-08-03T06:39:40Z',
+                '2026-08-03T06:39:50Z', 80, -20, -20, -20, 60,
+                ?, 'trust-score-v2'
+            )
+            """,
+            (json.dumps([event_id_2]),),
+        ).lastrowid
+
+        for operation_id, duplicate_event_id, duplicate_history_id in (
+            (values["operation_id"], event_id_2, history_id_2),
+            ("duplicate-source-event", event_id, history_id_2),
+            ("duplicate-source-history", event_id_2, history_id),
+        ):
+            duplicate = dict(values)
+            duplicate.update(
+                {
+                    "operation_id": operation_id,
+                    "source_event_id": duplicate_event_id,
+                    "source_trust_history_id": duplicate_history_id,
+                }
+            )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO trust_score_compensations (
+                        operation_id, device_id, source_event_id,
+                        source_trust_history_id, previous_score,
+                        compensation_delta, new_score, reason, approved_by,
+                        backup_path, backup_sha256
+                    )
+                    VALUES (
+                        :operation_id, :device_id, :source_event_id,
+                        :source_trust_history_id, :previous_score,
+                        :compensation_delta, :new_score, :reason, :approved_by,
+                        :backup_path, :backup_sha256
+                    )
+                    """,
+                    duplicate,
+                )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "DELETE FROM detection_events WHERE id = ?",
+                (event_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "DELETE FROM trust_score_history WHERE id = ?",
+                (history_id,),
+            )
+
+
+def test_trust_score_compensation_migration_applies_004_to_existing_003(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "existing-003.db"
+    migrations_003_dir = tmp_path / "migrations-003"
+    _write_project_migrations_subset(
+        migrations_003_dir,
+        (
+            "001_init.sql",
+            "002_packet_gateway.sql",
+            "003_phase4_detection.sql",
+        ),
+    )
+    apply_migrations(db_path, migrations_003_dir)
+
+    with connect_database(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO devices (device_id, status, trust_score)
+            VALUES ('esp32_01', 'normal', 80)
+            """
+        )
+        event_id = connection.execute(
+            """
+            INSERT INTO detection_events (
+                device_id, detector_type, event_type, score_delta,
+                applied_to_score, processed_at, processing_reason
+            )
+            VALUES (
+                'esp32_01', 'MQTT_RULE', 'ABNORMAL_PUBLISH_RATE', -20,
+                1, '2026-08-03T06:40:00Z', 'APPLIED_TO_TRUST'
+            )
+            """
+        ).lastrowid
+        history_id = connection.execute(
+            """
+            INSERT INTO trust_score_history (
+                device_id, analysis_window_start, analysis_window_end,
+                previous_score, calculated_delta, capped_delta, actual_delta,
+                new_score, representative_event_ids_json, policy_version
+            )
+            VALUES (
+                'esp32_01', '2026-08-03T06:39:30Z',
+                '2026-08-03T06:39:40Z', 100, -20, -20, -20, 80,
+                ?, 'trust-score-v2'
+            )
+            """,
+            (json.dumps([event_id]),),
+        ).lastrowid
+        event_before = tuple(
+            connection.execute(
+                "SELECT * FROM detection_events WHERE id = ?", (event_id,)
+            ).fetchone()
+        )
+        history_before = tuple(
+            connection.execute(
+                "SELECT * FROM trust_score_history WHERE id = ?", (history_id,)
+            ).fetchone()
+        )
+
+    result = apply_migrations(db_path, MIGRATIONS_DIR)
+
+    with connect_database(db_path) as connection:
+        assert result.applied_versions == [4]
+        assert _migration_versions(connection) == [1, 2, 3, 4]
+        assert _table_exists(connection, "trust_score_compensations")
+        assert tuple(
+            connection.execute(
+                "SELECT * FROM detection_events WHERE id = ?", (event_id,)
+            ).fetchone()
+        ) == event_before
+        assert tuple(
+            connection.execute(
+                "SELECT * FROM trust_score_history WHERE id = ?", (history_id,)
+            ).fetchone()
+        ) == history_before
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

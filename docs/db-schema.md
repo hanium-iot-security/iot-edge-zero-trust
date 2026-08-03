@@ -282,6 +282,32 @@ Phase 4용 Trust Score window history 테이블입니다. Window별 실제 점�
 
 `(device_id, analysis_window_start, analysis_window_end)`는 중복될 수 없습니다.
 
+## trust_score_compensations
+
+운영자가 승인한 단일 Trust Score 보상의 불변 감사 기록입니다. Source Detection
+Event와 Source Trust History를 수정하지 않고, 어떤 감점을 어떤 Backup 근거로
+되돌렸는지 기록합니다.
+
+| 컬럼 | 타입 | 설명 |
+| --- | --- | --- |
+| id | INTEGER | primary key autoincrement |
+| operation_id | TEXT | 실행별 고유 식별자 |
+| device_id | TEXT | 대상 Device |
+| source_event_id | INTEGER | 보상 근거 Detection Event, unique |
+| source_trust_history_id | INTEGER | 보상 근거 Trust History, unique |
+| previous_score | INTEGER | 보상 전 점수 |
+| compensation_delta | INTEGER | 양수 보상량 |
+| new_score | INTEGER | 보상 후 점수 |
+| reason | TEXT | 운영 승인 사유 |
+| approved_by | TEXT | 승인자 식별 정보 |
+| backup_path | TEXT | 실행 전 SQLite Backup 경로 |
+| backup_sha256 | TEXT | Backup SHA256 소문자 64자리 |
+| created_at | DATETIME | 감사 Row 생성 시각 |
+
+`new_score = previous_score + compensation_delta`를 검사합니다. Event와 History는 각각
+한 번만 보상할 수 있고 모든 외래 키는 `ON DELETE RESTRICT`입니다. v1 CLI는
+`devices.trust_score`만 조건부 갱신하며 `devices.status`는 변경하지 않습니다.
+
 ## firewall_rules
 
 Phase 4용 firewall 요청/상태 테이블입니다. 이번 PR은 DB repository와 조회 API만 구현합니다. 격리 진입 시 Trust Score v2 transaction에서 `PENDING` row를 만들 수 있지만, 실제 iptables 실행과 worker reconciliation은 다른 담당 범위입니다. Repository는 `PENDING -> APPLIED`, `PENDING -> PENDING/FAILED`, `APPLIED -> REMOVED`, 관리자 재시도용 `FAILED -> PENDING`만 허용합니다.
