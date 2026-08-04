@@ -51,8 +51,7 @@ class EventComparisonReport:
 # analysis_window_end(=window_start_from/window_end_to)만 필터링 인자로 받고
 # detected_at으로는 직접 필터링하지 않는다. 그래서 DB 조회 단계에서는 실제
 # 관찰 구간보다 앞뒤로 여유를 두어 넓게 가져온 뒤, detected_at 기준 최종
-# 매칭은 Python에서 판정한다 (리뷰 피드백 #8 — Window *시작* 시각으로 좁혀
-# 조회하면 공격이 집계 Window 중간에 시작된 정상 탐지 Event가 누락될 수 있음).
+# 매칭은 Python에서 판정한다.
 _QUERY_MARGIN = timedelta(minutes=10)
 
 
@@ -101,7 +100,7 @@ def _matches_detected_at_window(
 
     ``analysis_window_start``가 아니라 실제 탐지 시각(``detected_at``)을 기준으로
     삼아, 집계 Window 중간에 공격이 시작된 경우에도 정상 탐지 Event가 missing으로
-    오판되지 않게 한다 (리뷰 피드백 #8).
+    오판되지 않게 한다.
     """
     detected_at = event.get("detected_at")
     if detected_at is None:
