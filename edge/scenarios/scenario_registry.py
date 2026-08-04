@@ -1,27 +1,27 @@
 """Scenario Registry."""
 
 from __future__ import annotations
- 
+
 from dataclasses import dataclass, field
- 
+
 from edge.phase5.contracts import EvaluationScope
- 
+
 # 대표 시나리오 3계열 (시나리오 우선순위 > 공식 반복 E2E 3계열)
 SERIES_MQTT_ABNORMAL_PUBLISH = "MQTT_ABNORMAL_PUBLISH"
 SERIES_IDENTITY_MESSAGE_POLICY = "IDENTITY_MESSAGE_POLICY"
 SERIES_PACKET_ANOMALY = "PACKET_ANOMALY"
- 
+
 ALL_SERIES = (
     SERIES_MQTT_ABNORMAL_PUBLISH,
     SERIES_IDENTITY_MESSAGE_POLICY,
     SERIES_PACKET_ANOMALY,
 )
- 
- 
+
+
 @dataclass(frozen=True)
 class ScenarioDefinition:
     """단일 시나리오 명세.
- 
+
     ``module``은 ``python -m <module>`` 형태로 실행할 attacks/ 스크립트다.
     ``default_args``의 key는 해당 스크립트 argparse 옵션 이름(언더스코어 표기, 예: ``device_id``)과 정확히 같아야 한다.
     """
