@@ -14,9 +14,11 @@ import pytest
 from edge.phase5.contracts import EvaluationScope, ManifestStatus
 from edge.scenarios.run_scenario import (
     DuplicateRunIdError,
+    InvalidRunIdError,
     MissingRequiredInputError,
     ScenarioExecStatus,
     ScenarioRunner,
+    UnsafeExecutionRefusedError,
     compare_event_types,
     run_repeated,
 )
@@ -54,15 +56,141 @@ def test_duplicate_run_id_is_rejected(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# run_id 경로 안전성
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "bad_run_id",
+    [
+        "../escape",
+        "../../etc/passwd",
+        "/absolute/path",
+        "a/b",
+        "a\\b",
+        "",
+        ".",
+        "..",
+    ],
+)
+def test_unsafe_run_id_is_rejected(tmp_path: Path, bad_run_id: str):
+    runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
+    with pytest.raises(InvalidRunIdError):
+        runner.run("mqtt_unknown_device", run_id=bad_run_id, dry_run=True)
+
+
+def test_safe_run_id_is_accepted(tmp_path: Path):
+    runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
+    result, _manifest = runner.run(
+        "mqtt_unknown_device", run_id="run-2026_08_04.001", dry_run=True
+    )
+    assert result.run_id == "run-2026_08_04.001"
+    assert (tmp_path / "run-2026_08_04.001").exists()
+
+
+# ---------------------------------------------------------------------------
+# Dry-run은 공식 실행과 완전히 분리된다
+# ---------------------------------------------------------------------------
+def test_dry_run_is_default_and_isolated_from_official_metrics(tmp_path: Path):
+    runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
+    # dry_run 인자를 생략해도 기본값이 True여야 한다 (실공격 오발동 방지).
+    result, manifest = runner.run("mqtt_unknown_device")
+
+    assert result.is_dry_run is True
+    assert result.scenario_runner_status == ScenarioExecStatus.DRY_RUN
+    assert result.attack_started_at is None
+    assert result.capture_eligible is False
+    assert result.capture_exclusion_reason == "DRY_RUN"
+    assert result.scenario_status == ManifestStatus.NOT_EVALUATED.value
+    assert manifest.statuses.scenario_status == ManifestStatus.NOT_EVALUATED
+    assert manifest.attack_started_at is None
+
+
+def test_dry_run_true_explicit_matches_default_behavior(tmp_path: Path):
+    runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
+    result, _manifest = runner.run("mqtt_unknown_device", dry_run=True)
+    assert result.scenario_runner_status == ScenarioExecStatus.DRY_RUN
+    assert result.exit_code is None
+
+
+# ---------------------------------------------------------------------------
+# non-dry-run 실행은 allow_execute=True가 없으면 거부된다
+# ---------------------------------------------------------------------------
+def test_non_dry_run_refused_without_allow_execute(tmp_path: Path):
+    runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
+    with pytest.raises(UnsafeExecutionRefusedError):
+        runner.run("mqtt_unknown_device", dry_run=False)
+
+
+def test_non_dry_run_allowed_with_allow_execute(tmp_path: Path):
+    runner = ScenarioRunner(
+        execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
+    )
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+        result, _manifest = runner.run("mqtt_unknown_device", dry_run=False)
+    assert result.scenario_runner_status == ScenarioExecStatus.SUCCESS
+    assert result.is_dry_run is False
+
+
+# ---------------------------------------------------------------------------
+# FULL_E2E 공식 실행은 session_id를 사전에 요구한다
+# ---------------------------------------------------------------------------
+def test_full_e2e_non_dry_run_requires_session_id(tmp_path: Path):
+    runner = ScenarioRunner(
+        execution_node="unit-test-node",
+        execution_node_registered=True,
+        runs_root=tmp_path,
+        allow_execute=True,
+    )
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+        with pytest.raises(MissingRequiredInputError):
+            runner.run(
+                "mqtt_abnormal_publish_rate",
+                target_device_id="esp32_02",
+                session_id=None,
+                dry_run=False,
+            )
+
+
+def test_full_e2e_non_dry_run_succeeds_with_session_id(tmp_path: Path):
+    runner = ScenarioRunner(
+        execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
+    )
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+        result, _manifest = runner.run(
+            "mqtt_abnormal_publish_rate",
+            target_device_id="esp32_02",
+            session_id="sess-1",
+            dry_run=False,
+        )
+    assert result.scenario_runner_status == ScenarioExecStatus.SUCCESS
+
+
+def test_detection_only_non_dry_run_does_not_require_session_id(tmp_path: Path):
+    runner = ScenarioRunner(
+        execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
+    )
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+        result, _manifest = runner.run(
+            "mqtt_unknown_device", session_id=None, dry_run=False
+        )
+    assert result.scenario_runner_status == ScenarioExecStatus.SUCCESS
+
+
+# ---------------------------------------------------------------------------
 # Packet Rule Gate / HOLD
 # ---------------------------------------------------------------------------
 def test_packet_scenario_holds_when_gate_not_confirmed(tmp_path: Path):
     with patch(
         "edge.scenarios.run_scenario.is_packet_rule_gate_confirmed", return_value=False
     ):
-        runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
+        runner = ScenarioRunner(
+            execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
+        )
         result, manifest = runner.run(
-            "packet_rate_flood", source_ip="192.168.0.10", dry_run=True
+            "packet_rate_flood", source_ip="192.168.0.10", dry_run=False
         )
     assert result.scenario_runner_status == ScenarioExecStatus.HOLD
     assert result.scenario_status == ManifestStatus.HOLD.value
@@ -76,8 +204,12 @@ def test_mqtt_scenario_runs_normally_even_when_packet_gate_not_confirmed(tmp_pat
     with patch(
         "edge.scenarios.run_scenario.is_packet_rule_gate_confirmed", return_value=False
     ):
-        runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
-        result, _manifest = runner.run("mqtt_unknown_device", dry_run=True)
+        runner = ScenarioRunner(
+            execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
+        )
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+            result, _manifest = runner.run("mqtt_unknown_device", dry_run=False)
     assert result.scenario_runner_status == ScenarioExecStatus.SUCCESS
 
 
@@ -85,10 +217,14 @@ def test_packet_scenario_runs_when_gate_confirmed(tmp_path: Path):
     with patch(
         "edge.scenarios.run_scenario.is_packet_rule_gate_confirmed", return_value=True
     ):
-        runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
-        result, _manifest = runner.run(
-            "packet_rate_flood", source_ip="192.168.0.10", dry_run=True
+        runner = ScenarioRunner(
+            execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
         )
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+            result, _manifest = runner.run(
+                "packet_rate_flood", source_ip="192.168.0.10", dry_run=False
+            )
     assert result.scenario_runner_status == ScenarioExecStatus.SUCCESS
 
 
@@ -103,10 +239,13 @@ def test_unregistered_node_downgrades_full_e2e_to_detection_only(tmp_path: Path)
             execution_node="unit-test-node",
             execution_node_registered=False,
             runs_root=tmp_path,
+            allow_execute=True,
         )
-        _result, manifest = runner.run(
-            "packet_rate_flood", source_ip="192.168.0.10", dry_run=True
-        )
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+            _result, manifest = runner.run(
+                "packet_rate_flood", source_ip="192.168.0.10", dry_run=False
+            )
     assert manifest.evaluation_scope == EvaluationScope.DETECTION_ONLY
     assert manifest.expected_outcome.evaluation_scope == EvaluationScope.DETECTION_ONLY
     assert manifest.expected_outcome.firewall_expected is False
@@ -121,10 +260,16 @@ def test_registered_node_keeps_full_e2e(tmp_path: Path):
             execution_node="unit-test-node",
             execution_node_registered=True,
             runs_root=tmp_path,
+            allow_execute=True,
         )
-        _result, manifest = runner.run(
-            "packet_rate_flood", source_ip="192.168.0.10", dry_run=True
-        )
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+            _result, manifest = runner.run(
+                "packet_rate_flood",
+                source_ip="192.168.0.10",
+                session_id="sess-registered-full-e2e",
+                dry_run=False,
+            )
     assert manifest.evaluation_scope == EvaluationScope.FULL_E2E
 
 
@@ -132,7 +277,9 @@ def test_registered_node_keeps_full_e2e(tmp_path: Path):
 # Mock — 실제 공격 명령 실행 안 함
 # ---------------------------------------------------------------------------
 def test_mocked_success_exit_code_maps_to_success(tmp_path: Path):
-    runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
+    runner = ScenarioRunner(
+        execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
+    )
     with patch("subprocess.run") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
         result, manifest = runner.run("mqtt_unknown_device", dry_run=False)
@@ -146,7 +293,9 @@ def test_mocked_success_exit_code_maps_to_success(tmp_path: Path):
 
 
 def test_mocked_non_zero_exit_code_maps_to_failed(tmp_path: Path):
-    runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
+    runner = ScenarioRunner(
+        execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
+    )
     with patch("subprocess.run") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=1)
         result, manifest = runner.run("mqtt_unknown_device", dry_run=False)
@@ -158,7 +307,9 @@ def test_mocked_non_zero_exit_code_maps_to_failed(tmp_path: Path):
 
 
 def test_mocked_timeout_maps_to_failed(tmp_path: Path):
-    runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
+    runner = ScenarioRunner(
+        execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
+    )
     with patch("subprocess.run") as mock_run:
         mock_run.side_effect = subprocess.TimeoutExpired(cmd=["x"], timeout=1.0)
         result, _manifest = runner.run("mqtt_unknown_device", dry_run=False)
@@ -168,7 +319,9 @@ def test_mocked_timeout_maps_to_failed(tmp_path: Path):
 
 
 def test_mocked_os_error_maps_to_environment_error(tmp_path: Path):
-    runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
+    runner = ScenarioRunner(
+        execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
+    )
     with patch("subprocess.run") as mock_run:
         mock_run.side_effect = FileNotFoundError("python 실행 파일을 찾을 수 없음")
         result, manifest = runner.run("mqtt_unknown_device", dry_run=False)
@@ -185,9 +338,14 @@ def test_cleanup_failure_maps_to_reset_failed(tmp_path: Path):
         return False, "iptables rule 제거 실패"
 
     runner = ScenarioRunner(
-        execution_node="unit-test-node", runs_root=tmp_path, cleanup_hook=failing_cleanup
+        execution_node="unit-test-node",
+        runs_root=tmp_path,
+        cleanup_hook=failing_cleanup,
+        allow_execute=True,
     )
-    result, manifest = runner.run("mqtt_unknown_device", dry_run=True)
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+        result, manifest = runner.run("mqtt_unknown_device", dry_run=False)
     assert result.scenario_runner_status == ScenarioExecStatus.RESET_FAILED
     assert result.cleanup_ok is False
     # exporter 계약에는 RESET_FAILED 개념이 없어 ENVIRONMENT_ERROR로 보수적으로 매핑
@@ -201,10 +359,17 @@ def test_cleanup_failure_maps_to_reset_failed(tmp_path: Path):
 # scenario-result.jsonl — exporter 공식 계약 필드
 # ---------------------------------------------------------------------------
 def test_scenario_result_satisfies_exporter_contract_fields(tmp_path: Path):
-    runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
-    result, manifest = runner.run(
-        "mqtt_abnormal_publish_rate", target_device_id="esp32_02", dry_run=True
+    runner = ScenarioRunner(
+        execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
     )
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+        result, manifest = runner.run(
+            "mqtt_abnormal_publish_rate",
+            target_device_id="esp32_02",
+            session_id="sess-contract",
+            dry_run=False,
+        )
 
     row = result.to_dict()
     # 필수 4종
@@ -219,10 +384,17 @@ def test_scenario_result_satisfies_exporter_contract_fields(tmp_path: Path):
 
 
 def test_scenario_result_contains_own_extra_fields(tmp_path: Path):
-    runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
-    result, _manifest = runner.run(
-        "mqtt_abnormal_publish_rate", target_device_id="esp32_02", dry_run=True
+    runner = ScenarioRunner(
+        execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
     )
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+        result, _manifest = runner.run(
+            "mqtt_abnormal_publish_rate",
+            target_device_id="esp32_02",
+            session_id="sess-extra",
+            dry_run=False,
+        )
 
     assert result.target_device_id == "esp32_02"
     assert result.command and result.started_at and result.ended_at
@@ -237,10 +409,14 @@ def test_packet_execution_volume_uses_duration_x_rate(tmp_path: Path):
     with patch(
         "edge.scenarios.run_scenario.is_packet_rule_gate_confirmed", return_value=True
     ):
-        runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
-        result, _manifest = runner.run(
-            "packet_rate_flood", source_ip="192.168.0.10", dry_run=True
+        runner = ScenarioRunner(
+            execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
         )
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+            result, _manifest = runner.run(
+                "packet_rate_flood", source_ip="192.168.0.10", dry_run=False
+            )
     assert result.execution_volume == {"unit": "packets", "planned": 960, "basis": "duration_x_rate"}
 
 
@@ -248,11 +424,15 @@ def test_port_scan_execution_volume_uses_port_range(tmp_path: Path):
     with patch(
         "edge.scenarios.run_scenario.is_packet_rule_gate_confirmed", return_value=True
     ):
-        runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
-        result, _manifest = runner.run(
-            "packet_port_scan", source_ip="192.168.0.10", dry_run=True
+        runner = ScenarioRunner(
+            execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
         )
-    assert result.execution_volume == {"unit": "ports", "planned": 1024, "basis": "port_range"}
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+            result, _manifest = runner.run(
+                "packet_port_scan", source_ip="192.168.0.10", dry_run=False
+            )
+    assert result.execution_volume == {"unit": "ports", "planned": 256, "basis": "port_range"}
 
 
 # ---------------------------------------------------------------------------
@@ -260,10 +440,17 @@ def test_port_scan_execution_volume_uses_port_range(tmp_path: Path):
 # 확인한 버그(초 경계 불일치로 탐지 매칭 실패) 재발 방지
 # ---------------------------------------------------------------------------
 def test_all_manifest_timestamps_have_zero_microseconds(tmp_path: Path):
-    runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
-    _result, manifest = runner.run(
-        "mqtt_abnormal_publish_rate", target_device_id="esp32_02", dry_run=True
+    runner = ScenarioRunner(
+        execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
     )
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+        _result, manifest = runner.run(
+            "mqtt_abnormal_publish_rate",
+            target_device_id="esp32_02",
+            session_id="sess-ts",
+            dry_run=False,
+        )
     for value in (
         manifest.started_at,
         manifest.attack_started_at,
@@ -299,13 +486,37 @@ def test_batch_stops_on_reset_failed(tmp_path: Path):
         return True, None
 
     runner = ScenarioRunner(
-        execution_node="unit-test-node", runs_root=tmp_path, cleanup_hook=flaky_cleanup
+        execution_node="unit-test-node",
+        runs_root=tmp_path,
+        cleanup_hook=flaky_cleanup,
+        allow_execute=True,
     )
-    summary = run_repeated(runner, "mqtt_unknown_device", times=5, dry_run=True)
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+        summary = run_repeated(runner, "mqtt_unknown_device", times=5, dry_run=False)
 
     assert summary.executed_runs == 2
     assert summary.stopped_early is True
     assert summary.results[-1].scenario_runner_status == ScenarioExecStatus.RESET_FAILED
+
+
+def test_batch_summary_has_failures_true_when_scenario_failed_present(tmp_path: Path):
+    """SCENARIO_FAILED가 있으면 조기 중단은 안 하더라도 has_failures는 True여야 한다."""
+    runner = ScenarioRunner(
+        execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
+    )
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=1)
+        summary = run_repeated(runner, "mqtt_unknown_device", times=2, dry_run=False)
+
+    assert summary.stopped_early is False  # SCENARIO_FAILED는 조기 중단 대상이 아님
+    assert summary.has_failures is True
+
+
+def test_batch_summary_has_failures_false_when_all_dry_run_or_success(tmp_path: Path):
+    runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
+    summary = run_repeated(runner, "mqtt_unknown_device", times=3, dry_run=True)
+    assert summary.has_failures is False
 
 
 # ---------------------------------------------------------------------------
@@ -330,15 +541,18 @@ def test_packet_scenarios_do_not_receive_device_id_arg(tmp_path: Path):
     with patch(
         "edge.scenarios.run_scenario.is_packet_rule_gate_confirmed", return_value=True
     ):
-        runner = ScenarioRunner(execution_node="unit-test-node", runs_root=tmp_path)
-        result, manifest = runner.run(
-            "packet_port_scan",
-            target_device_id="esp32_01",
-            source_ip="192.168.0.10",
-            dry_run=True,
+        runner = ScenarioRunner(
+            execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
         )
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+            result, manifest = runner.run(
+                "packet_port_scan",
+                target_device_id="esp32_01",
+                source_ip="192.168.0.10",
+                dry_run=False,
+            )
     assert "--device_id" not in result.command
-    assert "--target" in result.command
     assert manifest.target_device_id == "esp32_01"
     assert manifest.source_ip == "192.168.0.10"
 

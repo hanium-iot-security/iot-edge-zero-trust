@@ -9,12 +9,20 @@
 
 이 Gate 확인은 DB/Orchestrator 상태를 실제로 조회해야 하므로 Raspberry Pi 쪽에서 최종 확정한다. 이 모듈은 그 결과를 코드에 반영할 수 있는 단일 지점(``is_packet_rule_gate_confirmed``)만 제공하며, 안전 기본값은 **미확인
 (False → HOLD)** 이다.
+
+.. note:: FULL_E2E 격리 도달 가능성 (실측 필요)
+   packet_rate_flood(duration=12초)는 Capture Window(10초) 기준 최대 2개 Window에서만
+   감점이 발생할 수 있어, 현재 Trust 격리 임계값(30점 미만)까지 도달하는지는 실측으로
+   확인해야 한다. 이 카드에서는 duration을 임의로 늘리지 않았다 — Threshold·Trust 정책
+   변경은 Phase 5 제외 범위(Threshold 최종 확정은 Phase 6)이며, 실측 없이 duration만
+   늘리면 Packet Capture·평가 계약의 다른 가정(예: Window 수 기반 채점 로직)이 깨질 수
+   있다. FULL_E2E 유지 여부는 담당자가 실측 후 별도로 판단해야 한다.
 """
 
 from __future__ import annotations
- 
+
 import os
- 
+
 from edge.phase5.contracts import EvaluationScope
 from edge.scenarios.scenario_registry import (
     SERIES_PACKET_ANOMALY,
@@ -24,15 +32,15 @@ from edge.scenarios.scenario_registry import (
 from edge.trust.trust_policy import BYTE_RATE_ANOMALY, PACKET_RATE_ANOMALY, PORT_SCAN
 
 PACKET_RULE_GATE_CONFIRMED_DEFAULT = False
- 
- 
+
+
 def is_packet_rule_gate_confirmed() -> bool:
     env_override = os.environ.get("PHASE5_PACKET_RULE_GATE_CONFIRMED")
     if env_override is not None:
         return env_override.strip().lower() in {"1", "true", "yes", "y"}
     return PACKET_RULE_GATE_CONFIRMED_DEFAULT
- 
- 
+
+
 # --- 대표 (FULL_E2E) — Packet Rate 이상 ---------------------------------
 register(
     ScenarioDefinition(
@@ -61,7 +69,7 @@ register(
         volume_unit="packets",
     )
 )
- 
+
 # --- 보조 (DETECTION_ONLY) — Byte Rate 단독 조건 -------------------------
 # packet_rate(45pps)는 threshold(50) 미만으로 유지하고 payload를 키워
 # bytes_per_second만 threshold(100,000)를 넘기도록 구성한다 (45*2400=108,000).
@@ -93,16 +101,21 @@ register(
         volume_unit="packets",
     )
 )
- 
+
 # --- 보조 (DETECTION_ONLY) — Port Scan -----------------------------------
 register(
     ScenarioDefinition(
         scenario_id="packet_port_scan",
         series=SERIES_PACKET_ANOMALY,
         scenario_version="v1",
-        description="[보조] distinct_port_count > port_scan_distinct_port_threshold(기본 15)를 유발하는 TCP Connect Scan. 스캔 자체는 격리 대상이 아니라 탐지 검증이 목적.",
+        description=(
+            "[보조] distinct_port_count > port_scan_distinct_port_threshold(기본 15) "
+            "그리고(AND) syn_count > port_scan_syn_threshold(기본 15)를 함께 유발하는 "
+            "TCP Connect Scan. 실제 판정 조건은 OR가 아니라 AND다."
+            "스캔 자체는 격리 대상이 아니라 탐지 검증이 목적."
+        ),
         module="attacks.port_scan_attack",
-        default_args={"start_port": "1", "end_port": "1024", "timeout_ms": "150"},
+        default_args={"start_port": "1", "end_port": "256", "timeout_ms": "150"},
         evaluation_scope=EvaluationScope.DETECTION_ONLY.value,
         duration_seconds=0.0,  # port 수에 따라 가변 — volume_strategy로 별도 계산
         intensity="medium",

@@ -25,7 +25,7 @@ from attacks.large_payload_attack import _large_payload
 from attacks.malformed_payload_attack import _MALFORMED_POOL
 from attacks.abnormal_topic_attack import _ABNORMAL_TOPIC_POOL
 from attacks.unknown_device_attack import _fake_device_id
-from attacks.device_id_mismatch_attack import _mismatch_pair
+from attacks.device_id_mismatch_attack import _default_mismatch_pair
 from edge.mqtt.topic_utils import is_telemetry_topic
 
 
@@ -188,18 +188,21 @@ class TestUnknownDeviceAttack:
 # ── device_id_mismatch_attack ─────────────────────────────────────────────────
 
 class TestDeviceIdMismatchAttack:
-    def test_mismatch_pair_are_different(self):
+    def test_default_mismatch_pair_is_different(self):
         """topic_id와 payload_id가 서로 달라야 합니다."""
-        for _ in range(20):
-            topic_id, payload_id = _mismatch_pair()
-            assert topic_id != payload_id, \
-                f"topic_id와 payload_id가 같음: {topic_id!r}"
+        topic_id, payload_id = _default_mismatch_pair()
+        assert topic_id != payload_id, \
+            f"topic_id와 payload_id가 같음: {topic_id!r}"
 
-    def test_mismatch_pair_both_registered(self):
+    def test_default_mismatch_pair_both_registered(self):
         """두 값 모두 등록 기기여야 DEVICE_ID_MISMATCH로 처리됩니다."""
-        for _ in range(20):
-            topic_id, payload_id = _mismatch_pair()
-            assert topic_id in REGISTERED_DEVICES, \
-                f"topic_id {topic_id!r}가 미등록 기기"
-            assert payload_id in REGISTERED_DEVICES, \
-                f"payload_id {payload_id!r}가 미등록 기기"
+        topic_id, payload_id = _default_mismatch_pair()
+        assert topic_id in REGISTERED_DEVICES, \
+            f"topic_id {topic_id!r}가 미등록 기기"
+        assert payload_id in REGISTERED_DEVICES, \
+            f"payload_id {payload_id!r}가 미등록 기기"
+
+    def test_default_mismatch_pair_is_deterministic(self):
+        results = {_default_mismatch_pair() for _ in range(20)}
+        assert len(results) == 1, \
+            f"_default_mismatch_pair()가 매번 다른 값을 반환함: {results!r}"

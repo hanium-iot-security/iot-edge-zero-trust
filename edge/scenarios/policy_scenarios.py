@@ -5,10 +5,14 @@
   - 대표(FULL_E2E): ``mqtt_device_id_mismatch`` — 등록 기기이므로 Trust 반영·Firewall 적용·실제 차단까지 끝까지 검증 가능해 대표로 선정했다.
   - ``mqtt_unknown_device``는 미등록 기기라 Trust Score가 적용되지 않으므로 DETECTION_ONLY로 둔다.
   - 보조 Detection 시나리오: 비정상 Topic, 잘못된 Payload는 DETECTION_ONLY로 검증하고 공식 반복 FULL_E2E 목표 10회를 요구하지 않는다.
+
+.. note:: device_id_mismatch_attack.py는 ``--topic-device-id``/``--payload-device-id``를
+   지정하지 않으면 REGISTERED_DEVICES의 앞 두 값을 결정적으로 사용한다.
+   Manifest의 대상 Device와 실제 감점 대상이 어긋나지 않도록, 반복 실행 시 항상 같은 기기 쌍이 검증 대상이 된다.
 """
 
 from __future__ import annotations
- 
+
 from edge.detection.rule_detector import (
     ABNORMAL_TOPIC,
     DEVICE_ID_MISMATCH,
@@ -22,7 +26,7 @@ from edge.scenarios.scenario_registry import (
     ScenarioDefinition,
     register,
 )
- 
+
 # --- 대표 (FULL_E2E) ---------------------------------------------------
 register(
     ScenarioDefinition(
@@ -48,7 +52,7 @@ register(
         evidence_fields=("topic_device_id", "payload_device_id"),
     )
 )
- 
+
 # --- 보조 (DETECTION_ONLY) ---------------------------------------------
 register(
     ScenarioDefinition(
