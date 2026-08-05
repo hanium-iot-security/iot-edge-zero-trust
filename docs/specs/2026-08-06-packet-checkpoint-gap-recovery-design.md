@@ -230,6 +230,14 @@ Execute는 Plan의 inventory와 실제 inventory를 Backup 전에 비교하고, 
 이후 Canonical Plan 재생성 시 다시 비교한다. Entry 추가·삭제, 경로 변경, 크기 변경 또는
 SHA 변경이 하나라도 있으면 거부한다.
 
+Plan, Backup, Result JSON, Artifact와 Runtime Lock의 생성 경로는 resolved absolute Path로
+판정한다. Repository Root 밖의 경로는 허용하지만, Root 내부라면 생성 전에
+`git check-ignore` 등으로 실제 Git ignore 대상임을 검증한다. 내부이면서 ignore되지 않은 경로는
+파일이나 Directory를 만들기 전에 거부한다. 이를 통해 Dry-run Plan이나 Execute의
+Backup·Result·Lock이 untracked inventory를 바꿔 Execute가 자기 생성 파일 때문에 실패하는
+자기모순을 막는다. Recovery는 이 검증을 위해 기존 파일을 삭제하거나 `.gitignore`를
+수정하지 않는다.
+
 ## 10. Database Path 바인딩
 
 `--db-path`는 `expanduser().resolve(strict=True)`로 실제 절대경로를 구한다. 이 resolved
@@ -339,6 +347,13 @@ Dry-run은 DB를 Query-only로 열고 다음을 검증한다.
 | `SKIPPED_FAILED` | Session 상태가 `FAILED` | 실패 Gap으로 기록 |
 | `BLOCKING_RUNNING` | Session 상태가 `RUNNING` | Execute 거부 |
 | `TARGET_FULL_READY_COMPLETED` | 대상 Session이 COMPLETED이며 전체 Ready | 대상에만 허용 |
+
+RUNNING 검사는 현재 Checkpoint와 Target 사이에 한정하지 않는다. DB 전체
+`packet_capture_sessions`에서 `status='RUNNING'` Row가 한 건이라도 있으면 Dry-run Summary를
+Blocking으로 표시하고 `session_id`와 `started_at`을 나열한다. Execute는 Backup 생성 전에
+거부하며 해당 Row를 완료·실패 처리하거나 삭제·수정하지 않는다. 오래된 stale RUNNING Row도
+자동으로 무시하지 않고 승인된 Capture Session 정리 절차로 먼저 해결한다. 실제
+`packet-capture.service`와 공격·수집 Process 미실행 확인은 계속 Runbook 책임이다.
 
 `SKIPPED_FULL_READY_COMPLETED`는 처리 가능한 데이터를 의도적으로 건너뛰는 결정이므로
 일반 FAILED·미준비 Session Skip과 같은 경고로 취급하지 않는다. Plan의 최상위에 다음을
