@@ -11,9 +11,23 @@
 Scenario Runner는 기본적으로 항상 Dry-run으로 동작한다. 실제 공격을 실행하려면 아래 조건을 모두 만족해야 하며, 하나라도 빠지면 Runner가 실행 자체를 거부한다 (코드로 강제됨).
 
 1. CLI에 `--execute` 플래그를 명시해야 한다. 지정하지 않으면 무조건 Dry-run.
-2. `--execute`를 지정하더라도, `baseline_check`/`cleanup_hook`이 기본 no-op 구현(`default_baseline_check`/`default_cleanup_hook`)이면 `UnsafeExecutionRefusedError`로 실행이 거부된다. 즉 Pi에서 실제 DB·iptables·Device·MQTT 상태를 확인·복구하는 훅을 연결하기 전까지는 `--execute`를 줘도 공격이 실행되지 않는다.
+2. `--execute`와 함께 `--baseline-check-module`, `--cleanup-hook-module`로 실제 Pi 훅을 지정해야 한다. 이 두 옵션 없이 `--execute`만 주면 항상 거부된다 — CLI가 기본으로 만드는 `ScenarioRunner`에는 실제 훅이 연결되어 있지 않기 때문이다.
 
-> `[TODO: 실기기 검증 필요]` 실제 Pi용 `baseline_check`/`cleanup_hook` 구현체를 어디에 두고 어떻게 `ScenarioRunner`에 연결하는지는 `edge/scenarios/cleanup.py` 하단의 예시 뼈대(`pi_baseline_check`/`pi_cleanup_hook`)를 참고해 구현한 뒤, 이 문서에 실제 실행 스크립트 경로를 채워 넣는다.
+두 옵션은 `module.submodule:function_name` 형식으로 실제 훅 함수의 위치를 지정한다. 예:
+
+```bash
+python -m edge.scenarios.run_scenario \
+  --scenario mqtt_abnormal_publish_rate \
+  --target-device-id esp32_02 \
+  --session-id <실제 Capture Session ID> \
+  --execution-node <Pi 식별자> \
+  --execution-node-registered \
+  --baseline-check-module edge.scenarios.cleanup:pi_baseline_check \
+  --cleanup-hook-module edge.scenarios.cleanup:pi_cleanup_hook \
+  --execute
+```
+
+> `[TODO: 실기기 검증 필요]` `edge/scenarios/cleanup.py` 하단에 주석으로만 남아있는 `pi_baseline_check`/`pi_cleanup_hook` 예시 뼈대를 실제 구현으로 채우고 주석을 해제해야 위 명령이 동작한다. 뼈대를 채우지 않은 상태에서 위 두 옵션에 존재하지 않는 함수를 지정하면 `모듈 경로 형식이 올바르지 않습니다` 또는 `함수가 없습니다` 에러로 명확히 거부된다.
 
 이 게이트가 뚫리지 않았는데 `--execute`를 줬을 때 나오는 에러 메시지:
 
@@ -96,8 +110,12 @@ python -m edge.scenarios.run_scenario \
   --execution-node <Pi 식별자> \
   --execution-node-registered \
   --run-id run-2026-08-05-001 \
+  --baseline-check-module edge.scenarios.cleanup:pi_baseline_check \
+  --cleanup-hook-module edge.scenarios.cleanup:pi_cleanup_hook \
   --execute
 ```
+
+`--baseline-check-module`/`--cleanup-hook-module`은 §0에서 설명한 실제 Pi 훅 연결 옵션이다. 생략하면 실행이 거부된다.
 
 ### 반복 실행
 
@@ -111,6 +129,8 @@ python -m edge.scenarios.run_scenario \
   --execution-node <Pi 식별자> \
   --execution-node-registered \
   --times 10 \
+  --baseline-check-module edge.scenarios.cleanup:pi_baseline_check \
+  --cleanup-hook-module edge.scenarios.cleanup:pi_cleanup_hook \
   --execute
 ```
 
@@ -127,6 +147,8 @@ python -m edge.scenarios.run_scenario \
   --execution-node <Pi 식별자> \
   --execution-node-registered \
   --times 10 \
+  --baseline-check-module edge.scenarios.cleanup:pi_baseline_check \
+  --cleanup-hook-module edge.scenarios.cleanup:pi_cleanup_hook \
   --execute
 ```
 
