@@ -1,0 +1,1346 @@
+# Packet Checkpoint Gap Recovery Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 운영자가 승인한 Packet Detector 하나의 Checkpoint 시간 경계를 지정한 COMPLETED Capture Session의 시작점으로 안전하게 전진시키고, 모든 사전조건·백업·변경·감사 결과를 결정적으로 증명하는 Dry-run/Execute CLI를 구현한다.
+
+**Architecture:** `packet_checkpoint_recovery.py`가 Canonical Plan, Git/경로/Session/Lock Gate와 Execute 순서를 조정하고, `packet_checkpoint_recovery_repository.py`가 고정된 SQLite SELECT·조건부 UPDATE·Audit INSERT만 담당한다. Migration 005는 별도 운영 단계로 적용하며, Execute는 검증된 Plan JSON을 같은 DB·Repository 상태에서 재생성한 뒤 Checkpoint 1건과 Audit 1건만 단일 Transaction으로 변경한다. 기존 Manual Packet Rule/IF Runner는 이미 존재하는 `run_until_for_capture_session()`에 `--session-id`를 전달하도록 최소 수정한다.
+
+**Tech Stack:** Python 3.10, SQLite/sqlite3, SQLAlchemy Session, argparse, pathlib, hashlib, JSON, pytest, Git CLI, 기존 `edge.runtime_lock.single_instance_lock`, 기존 `edge.scripts.phase4_cutover_storage.create_sqlite_backup`.
+
+## Global Constraints
+
+- 구현 기준은 `origin/develop@65714579610afa077dbb486a8fee92b020634d1d`에서 생성된 `feat/packet-checkpoint-gap-recovery` Worktree다.
+- Recovery 대상은 `packet_rule` 또는 `packet_if` 하나이며 Source Table은 항상 `packet_feature_logs`다.
+- `last_processed_id`는 유지하고 `last_completed_window_end`와 `updated_at`만 Target Session의 `first_window_start`로 전진한다.
+- Trust Checkpoint, 과거 Detection Event, Trust History, Device, Isolation, Firewall, MQTT/Feature/Packet 데이터와 PCAP 파일은 변경하지 않는다.
+- Migration 005 적용과 Recovery Execute는 분리한다. CLI는 Migration을 자동 적용하지 않는다.
+- Raspberry Pi, 운영 DB, systemd, iptables, Packet Capture, 공격 프로세스는 구현·테스트 단계에서 접근하거나 실행하지 않는다.
+- 기존 Baseline Recovery와 Trust Compensation의 안전 패턴은 참고하되 private helper import나 광범위한 공통화는 하지 않는다.
+- SQLite Authorizer는 v1 범위에서 제외한다. 고정 SQL, 조건부 UPDATE, Row 수, Snapshot 회귀 테스트로 변경 범위를 증명한다.
+- 계획/백업/결과/Lock 생성 경로가 Repository 내부이면 파일 생성 전에 실제 Git ignore 대상인지 확인한다. `.gitignore`는 수정하지 않는다.
+- 모든 테스트는 독립 임시 SQLite DB와 임시 Git Repository를 사용한다.
+
+## File Map
+
+- Create: `db/migrations/005_packet_checkpoint_recovery.sql` — Audit Schema와 중복 실행 방지 Constraint.
+- Create: `edge/detection/packet_checkpoint_recovery_repository.py` — Recovery 전용 고정 SELECT, 조건부 Checkpoint UPDATE, Audit INSERT.
+- Create: `edge/detection/packet_checkpoint_recovery.py` — Canonical Plan, Git/경로/Session/Lock Gate, Dry-run과 Execute Workflow.
+- Create: `edge/detection/run_packet_checkpoint_recovery.py` — `dry-run`/`execute` argparse CLI와 Exit Code 2/3 출력 계약.
+- Create: `tests/test_packet_checkpoint_recovery.py` — Plan, Git, 경로, Session, Lock, Transaction, Artifact, 불변성 집중 테스트.
+- Create: `docs/packet-checkpoint-gap-recovery-runbook.md` — Migration과 Recovery를 분리한 운영 절차.
+- Modify: `tests/test_migrations.py` — Migration 005 Schema·Upgrade·Rollback 회귀.
+- Modify: `edge/detection/run_packet_rule_detector.py` — Manual Rule 실행을 Session-bound Stage 호출로 변경.
+- Modify: `tests/test_packet_rule_runner.py` — Rule Runner가 Session ID를 Stage에 전달하는 계약.
+- Modify: `edge/detection/run_packet_ai_detector.py` — Manual Packet IF 실행을 Session-bound Stage 호출로 변경.
+- Modify: `tests/test_run_packet_ai_detector.py` — Packet IF Runner Session binding 계약.
+- Modify: `docs/db-schema.md` — Migration 005와 Audit Table 계약.
+- Modify: `docs/phase4-detection-core.md` — Gap Recovery와 Manual Runner Session binding.
+
+## 공통 테스트 Fixture 계약
+
+Task 3에서 `tests/test_packet_checkpoint_recovery.py`에 아래 Test Support를 먼저 정의하고 이후 Task가 재사용한다.
+
+```python
+@dataclass(frozen=True)
+class RecoveryFixture:
+    db_path: Path
+    repository_root: Path
+    plan_output: Path
+    artifact_dir: Path
+    backup_path: Path
+    result_path: Path
+    pcap_dir: Path
+    current_session_id: str
+    target_session_id: str
+    detector_name: str
+
+def create_recovery_fixture(
+    tmp_path: Path,
+    *,
+    detector_name: str = "packet_rule",
+    intermediate_sessions: tuple[dict[str, object], ...] = (),
+) -> RecoveryFixture:
+    """Migration 001~005가 적용된 독립 DB와 깨끗한 임시 Git Repository를 만든다."""
+
+def database_snapshot(database: Path, tables: tuple[str, ...]) -> dict[str, tuple[tuple[object, ...], ...]]:
+    """각 Table의 `SELECT * ORDER BY rowid` 결과를 불변 tuple로 반환한다."""
+
+def checkpoint_snapshot(database: Path) -> tuple[tuple[object, ...], ...]:
+    """모든 detector_checkpoints Row를 Key 순으로 반환한다."""
+
+def file_hash_snapshot(root: Path) -> dict[str, str]:
+    """root 아래 일반 파일의 상대 POSIX 경로와 SHA256을 반환한다."""
+
+def unchanged_checkpoint_rows(
+    before: tuple[tuple[object, ...], ...],
+    after: tuple[tuple[object, ...], ...],
+    *,
+    requested_key: tuple[str, str],
+) -> bool:
+    """요청 Key를 제외한 Checkpoint Row가 동일한지 반환한다."""
+
+def valid_dry_run_kwargs(fixture: RecoveryFixture) -> dict[str, object]:
+    """inspect_packet_checkpoint_recovery()의 완전한 성공 인자를 반환한다."""
+
+def valid_execute_kwargs(fixture: RecoveryFixture, plan_file: Path) -> dict[str, object]:
+    """execute_packet_checkpoint_recovery()의 완전한 성공 인자를 반환한다."""
+```
+
+Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 뒤 Initial Commit을 만들고, 제품 Repository나 실제 DB 경로를 참조하지 않는다. UUID는 `uuid.UUID(..., version=4)` 검증을 통과하는 고정 Test ID를 사용한다.
+
+---
+
+### Task 1: Migration 005와 Audit Schema
+
+**Files:**
+- Create: `db/migrations/005_packet_checkpoint_recovery.sql`
+- Modify: `tests/test_migrations.py`
+
+**Interfaces:**
+- Consumes: `db.migration_runner.apply_migrations(db_path, migrations_dir)`와 기존 `schema_migrations(version, name, applied_at)` 계약.
+- Produces: `packet_checkpoint_recoveries` Table, `uq_packet_checkpoint_recovery_detector_target` Unique Index, `(5, 'packet_checkpoint_recovery')` Migration metadata.
+
+- [ ] **Step 1: 신규 DB의 Migration 005 생성 실패 테스트 작성**
+
+  `tests/test_migrations.py`에 다음 테스트를 추가한다.
+
+  ```python
+  def test_packet_checkpoint_recovery_schema_and_constraints(tmp_path: Path) -> None:
+      db_path = tmp_path / "recovery.db"
+      apply_migrations(db_path, MIGRATIONS_DIR)
+      with sqlite3.connect(db_path) as connection:
+          assert 5 in _migration_versions(connection)
+          assert _table_exists(connection, "packet_checkpoint_recoveries")
+          columns = _column_names(connection, "packet_checkpoint_recoveries")
+          assert {
+              "operation_id", "detector_name", "source_table",
+              "current_capture_session_id", "target_capture_session_id",
+              "last_processed_id_before", "last_processed_id_after",
+              "last_completed_window_end_before", "last_completed_window_end_after",
+              "updated_at_before", "updated_at_after", "plan_sha256", "plan_json",
+              "approved_by", "reason", "repository_commit", "database_path",
+              "backup_path", "backup_sha256", "created_at",
+          } <= columns
+  ```
+
+- [ ] **Step 2: RED 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_migrations.py::test_packet_checkpoint_recovery_schema_and_constraints -q`
+
+  Expected: FAIL — Migration 005가 없어 `packet_checkpoint_recoveries`가 존재하지 않는다.
+
+- [ ] **Step 3: Migration 005 최소 Schema 작성**
+
+  `db/migrations/005_packet_checkpoint_recovery.sql`에 다음 계약을 실제 SQLite DDL로 작성한다.
+
+  ```sql
+  CREATE TABLE packet_checkpoint_recoveries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      operation_id TEXT NOT NULL UNIQUE,
+      detector_name TEXT NOT NULL CHECK (detector_name IN ('packet_rule', 'packet_if')),
+      source_table TEXT NOT NULL CHECK (source_table = 'packet_feature_logs'),
+      current_capture_session_id TEXT NOT NULL,
+      target_capture_session_id TEXT NOT NULL,
+      last_processed_id_before INTEGER,
+      last_processed_id_after INTEGER,
+      last_completed_window_end_before TEXT NOT NULL,
+      last_completed_window_end_after TEXT NOT NULL,
+      updated_at_before TEXT NOT NULL,
+      updated_at_after TEXT NOT NULL,
+      plan_sha256 TEXT NOT NULL CHECK (length(plan_sha256) = 64),
+      plan_json TEXT NOT NULL,
+      skipped_session_count INTEGER NOT NULL CHECK (skipped_session_count >= 0),
+      skipped_processable_session_count INTEGER NOT NULL CHECK (skipped_processable_session_count >= 0),
+      approved_by TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      repository_commit TEXT NOT NULL CHECK (length(repository_commit) = 40),
+      database_path TEXT NOT NULL,
+      backup_path TEXT NOT NULL,
+      backup_sha256 TEXT NOT NULL CHECK (length(backup_sha256) = 64),
+      created_at TEXT NOT NULL,
+      CHECK (last_processed_id_before IS last_processed_id_after),
+      FOREIGN KEY (detector_name, source_table)
+          REFERENCES detector_checkpoints(detector_name, source_table) ON DELETE RESTRICT,
+      FOREIGN KEY (current_capture_session_id)
+          REFERENCES packet_capture_sessions(session_id) ON DELETE RESTRICT,
+      FOREIGN KEY (target_capture_session_id)
+          REFERENCES packet_capture_sessions(session_id) ON DELETE RESTRICT
+  );
+
+  CREATE UNIQUE INDEX uq_packet_checkpoint_recovery_detector_target
+      ON packet_checkpoint_recoveries(
+          detector_name, source_table, target_capture_session_id
+      );
+  ```
+
+  SHA와 UTC 문자열의 세부 형식은 Core에서도 검증하며, Migration 테스트에서는 잘못된 Detector, Source, 중복 operation/target, `last_processed_id` 변경, 음수 Skip count를 각각 거부하도록 확인한다.
+
+- [ ] **Step 4: GREEN 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_migrations.py::test_packet_checkpoint_recovery_schema_and_constraints -q`
+
+  Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+  ```powershell
+  git add db/migrations/005_packet_checkpoint_recovery.sql tests/test_migrations.py
+  git commit -m "feat: Packet Checkpoint Recovery Audit Migration 추가"
+  ```
+
+### Task 2: Migration 계약·회귀 테스트
+
+**Files:**
+- Modify: `tests/test_migrations.py`
+
+**Interfaces:**
+- Consumes: Task 1의 Migration 005와 기존 `_write_project_migrations_subset()`.
+- Produces: 004→005 Upgrade, Row 보존, Constraint, 실패 Rollback의 회귀 증거.
+
+- [ ] **Step 1: 004 DB Upgrade와 Row 보존 테스트 작성**
+
+  다음 테스트를 추가해 001~004만 적용한 DB에 기존 Checkpoint·Capture Session Row를 삽입하고 005 적용 후 동일함을 확인한다.
+
+  ```python
+  def test_packet_checkpoint_recovery_migration_applies_005_to_existing_004(
+      tmp_path: Path,
+  ) -> None:
+      old_dir = tmp_path / "old"
+      _write_project_migrations_subset(
+          old_dir,
+          (
+              "001_init.sql",
+              "002_packet_gateway.sql",
+              "003_phase4_detection.sql",
+              "004_trust_score_compensation.sql",
+          ),
+      )
+      db_path = tmp_path / "existing-004.db"
+      apply_migrations(db_path, old_dir)
+      with connect_database(db_path) as connection:
+          before = {
+              "checkpoints": tuple(connection.execute(
+                  "SELECT * FROM detector_checkpoints ORDER BY detector_name, source_table"
+              ).fetchall()),
+              "sessions": tuple(connection.execute(
+                  "SELECT * FROM packet_capture_sessions ORDER BY id"
+              ).fetchall()),
+          }
+      result = apply_migrations(db_path, MIGRATIONS_DIR)
+      assert result.applied_versions == [5]
+      with connect_database(db_path) as connection:
+          after = {
+              "checkpoints": tuple(connection.execute(
+                  "SELECT * FROM detector_checkpoints ORDER BY detector_name, source_table"
+              ).fetchall()),
+              "sessions": tuple(connection.execute(
+                  "SELECT * FROM packet_capture_sessions ORDER BY id"
+              ).fetchall()),
+          }
+      assert after == before
+  ```
+
+  함께 추가할 테스트 이름:
+
+  - `test_packet_checkpoint_recovery_rejects_duplicate_operation_id`
+  - `test_packet_checkpoint_recovery_rejects_duplicate_detector_target`
+  - `test_packet_checkpoint_recovery_rejects_changed_last_processed_id`
+  - `test_failed_005_migration_rolls_back_schema_and_version_record`
+
+- [ ] **Step 2: RED 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_migrations.py -k "packet_checkpoint_recovery or failed_005" -q`
+
+  Expected: 최소 한 테스트 FAIL — 005 Upgrade/Constraint 또는 Rollback 계약이 아직 충족되지 않는다.
+
+- [ ] **Step 3: Migration DDL을 테스트가 요구하는 최소 범위로 보정**
+
+  `005_packet_checkpoint_recovery.sql`의 Index, FK, CHECK만 수정하고 기존 Table은 재구성하지 않는다. Migration Runner는 변경하지 않는다.
+
+- [ ] **Step 4: GREEN 및 기존 Migration 회귀 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_migrations.py -q`
+
+  Expected: PASS; Migration 001~005 순서, 기존 Row 보존, 실패 Rollback 모두 통과.
+
+- [ ] **Step 5: Commit**
+
+  ```powershell
+  git add db/migrations/005_packet_checkpoint_recovery.sql tests/test_migrations.py
+  git commit -m "test: Packet Checkpoint Recovery Migration 계약 검증"
+  ```
+
+### Task 3: Canonical Plan과 결정적 SHA
+
+**Files:**
+- Create: `edge/detection/packet_checkpoint_recovery.py`
+- Create: `tests/test_packet_checkpoint_recovery.py`
+
+**Interfaces:**
+- Produces: `canonical_plan_binding(plan: Mapping[str, object]) -> dict[str, object]`, `canonical_plan_json(plan: Mapping[str, object]) -> str`, `calculate_plan_sha256(plan: Mapping[str, object]) -> str`, `attach_plan_sha256(payload: Mapping[str, object], *, generated_at: datetime) -> dict[str, object]`, `verify_plan_sha256(plan: Mapping[str, object]) -> None`.
+- Canonical SHA 제외 필드: `plan_sha256`, 생성/실행 시각, `operation_id`, Mode, Plan/Backup/Result 경로, Backup SHA, CLI 문자열, Branch, mtime, `data_version`, PID, Lock 획득 시각, Commit 후 검증 시각.
+
+- [ ] **Step 1: 결정성·변조 탐지 테스트 작성**
+
+  ```python
+  def test_canonical_plan_sha_is_independent_of_key_order_and_volatile_fields() -> None:
+      payload = {
+          "plan_schema_version": "packet-checkpoint-gap-recovery-plan-v1",
+          "repository_commit": "a" * 40,
+          "repository_root": "/repo",
+          "database_path": "/data/iot.db",
+          "detector_name": "packet_rule",
+          "source_table": "packet_feature_logs",
+      }
+      first = attach_plan_sha256(payload, generated_at=UTC_A)
+      second = attach_plan_sha256(dict(reversed(tuple(payload.items()))), generated_at=UTC_B)
+      assert first["plan_sha256"] == second["plan_sha256"]
+
+  def test_verify_plan_sha256_rejects_bound_field_tampering(tmp_path: Path) -> None:
+      fixture = create_recovery_fixture(tmp_path)
+      plan = inspect_packet_checkpoint_recovery(**valid_dry_run_kwargs(fixture))
+      plan["checkpoint"]["after"]["last_completed_window_end"] = OTHER_UTC
+      with pytest.raises(PacketCheckpointRecoveryError, match="plan SHA256"):
+          verify_plan_sha256(plan)
+  ```
+
+- [ ] **Step 2: RED 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "canonical_plan or plan_sha" -q`
+
+  Expected: FAIL — Module 또는 Canonical 함수가 없다.
+
+- [ ] **Step 3: Canonical 함수 최소 구현**
+
+  ```python
+  PLAN_SCHEMA_VERSION = "packet-checkpoint-gap-recovery-plan-v1"
+  _VOLATILE_PLAN_KEYS = frozenset({
+      "plan_sha256", "generated_at", "executed_at", "operation_id", "mode",
+      "plan_path", "artifact_dir", "backup_path", "result_path", "backup_sha256",
+      "execute_command", "repository_branch", "file_mtime_ns", "data_version",
+      "process_id", "lock_acquired_at", "post_commit_verified_at",
+  })
+
+  def canonical_plan_json(plan: Mapping[str, object]) -> str:
+      return json.dumps(
+          canonical_plan_binding(plan),
+          ensure_ascii=False,
+          sort_keys=True,
+          separators=(",", ":"),
+      )
+
+  def calculate_plan_sha256(plan: Mapping[str, object]) -> str:
+      return hashlib.sha256(canonical_plan_json(plan).encode("utf-8")).hexdigest()
+  ```
+
+  UTC 값은 `edge.detection.phase4_time.format_db_utc()`의 정수 초 `Z` 형식만 Plan에 넣고, List 순서가 계약인 `untracked_inventory`, Lock, Session 목록은 생성 단계에서 먼저 정렬한다.
+
+- [ ] **Step 4: GREEN 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "canonical_plan or plan_sha" -q`
+
+  Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+  ```powershell
+  git add edge/detection/packet_checkpoint_recovery.py tests/test_packet_checkpoint_recovery.py
+  git commit -m "feat: Gap Recovery Canonical Plan 계약 추가"
+  ```
+
+### Task 4: Git tracked/staged/untracked inventory 검증
+
+**Files:**
+- Modify: `edge/detection/packet_checkpoint_recovery.py`
+- Modify: `tests/test_packet_checkpoint_recovery.py`
+
+**Interfaces:**
+- Produces: `inspect_repository_state(repository_root: str | Path) -> dict[str, object]`.
+- Output: `repository_root`, `repository_commit`, `tracked_worktree_clean`, `staged_worktree_clean`, `untracked_inventory[{path,size,sha256}]`.
+
+- [ ] **Step 1: 임시 Git Repository 기반 테스트 작성**
+
+  테스트 이름:
+
+  - `test_repository_state_rejects_tracked_changes`
+  - `test_repository_state_rejects_staged_changes`
+  - `test_repository_state_records_untracked_path_size_and_sha256`
+  - `test_repository_state_does_not_modify_untracked_file_named_zero`
+  - `test_execute_rejects_changed_untracked_inventory_before_backup`
+
+  마지막 두 테스트는 `0` 파일의 Before/After bytes와 SHA를 비교하며 특정 SHA를 제품 코드에 넣지 않는다.
+
+- [ ] **Step 2: RED 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "repository_state or untracked_inventory" -q`
+
+  Expected: FAIL — Git 상태 검사 함수가 없다.
+
+- [ ] **Step 3: Git 명령과 Inventory 최소 구현**
+
+  ```python
+  def _git(repository_root: Path, *args: str) -> str:
+      return subprocess.run(
+          ["git", *args],
+          cwd=repository_root,
+          check=True,
+          capture_output=True,
+          text=True,
+          encoding="utf-8",
+      ).stdout
+
+  def _inventory_entry(repository_root: Path, relative_path: str) -> dict[str, object]:
+      absolute = (repository_root / relative_path).resolve(strict=True)
+      before = absolute.stat()
+      digest = file_sha256(absolute)
+      after = absolute.stat()
+      if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+          raise PacketCheckpointRecoveryError("untracked file changed during inventory")
+      return {"path": Path(relative_path).as_posix(), "size": after.st_size, "sha256": digest}
+
+  def inspect_repository_state(repository_root: str | Path) -> dict[str, object]:
+      root = Path(repository_root).expanduser().resolve(strict=True)
+      commit = _git(root, "rev-parse", "HEAD").strip()
+      tracked = _git(root, "diff", "--name-only", "--").splitlines()
+      staged = _git(root, "diff", "--cached", "--name-only", "--").splitlines()
+      untracked = _git(
+          root, "ls-files", "--others", "--exclude-standard", "-z"
+      ).split("\0")
+      inventory = [_inventory_entry(root, path) for path in untracked if path]
+      if tracked or staged:
+          raise PacketCheckpointRecoveryError("tracked/staged worktree must be clean")
+      return {
+          "repository_root": str(root),
+          "repository_commit": commit,
+          "tracked_worktree_clean": True,
+          "staged_worktree_clean": True,
+          "untracked_inventory": sorted(inventory, key=lambda row: row["path"]),
+      }
+  ```
+
+  `_inventory_entry()`는 일반 파일만 허용하고 Path를 읽기 전후 `stat()`해 크기 변화를 감지한다. 삭제·수정·이동·Stage·`git clean`은 호출하지 않는다.
+
+- [ ] **Step 4: GREEN 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "repository_state or untracked_inventory" -q`
+
+  Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+  ```powershell
+  git add edge/detection/packet_checkpoint_recovery.py tests/test_packet_checkpoint_recovery.py
+  git commit -m "feat: Gap Recovery Git Inventory 검증 추가"
+  ```
+
+### Task 5: 생성 경로 Git ignore Gate
+
+**Files:**
+- Modify: `edge/detection/packet_checkpoint_recovery.py`
+- Modify: `tests/test_packet_checkpoint_recovery.py`
+
+**Interfaces:**
+- Produces: `validate_generated_path(repository_root: Path, candidate: str | Path, *, field_name: str) -> Path`, `validate_generated_paths(*, repository_root: Path, plan_output: Path | None = None, artifact_dir: Path | None = None, backup_path: Path | None = None, result_path: Path | None = None, lock_paths: Sequence[Path] = ()) -> dict[str, object]`.
+- 검증 대상: Plan, Artifact Directory, Backup DB, Backup `.sha256` Sidecar, Result JSON, 모든 Runtime Lock 파일.
+
+- [ ] **Step 1: Repository 내부/외부 경로 테스트 작성**
+
+  테스트 이름:
+
+  - `test_generated_path_allows_path_outside_repository`
+  - `test_generated_path_allows_gitignored_path_inside_repository`
+  - `test_generated_path_rejects_unignored_path_before_creation`
+  - `test_generated_path_checks_backup_sha256_sidecar`
+  - `test_dry_run_plan_output_does_not_change_untracked_inventory`
+
+- [ ] **Step 2: RED 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "generated_path or gitignored or plan_output" -q`
+
+  Expected: FAIL — 생성 경로 Gate가 없다.
+
+- [ ] **Step 3: `git check-ignore` 기반 최소 구현**
+
+  ```python
+  def validate_generated_path(repository_root: Path, candidate: str | Path, *, field_name: str) -> Path:
+      path = Path(candidate).expanduser().resolve(strict=False)
+      if not path.is_relative_to(repository_root):
+          return path
+      relative = path.relative_to(repository_root)
+      result = subprocess.run(
+          ["git", "check-ignore", "--quiet", "--", relative.as_posix()],
+          cwd=repository_root,
+          check=False,
+      )
+      if result.returncode != 0:
+          raise PacketCheckpointRecoveryError(f"{field_name} must be Git-ignored")
+      return path
+  ```
+
+  Directory 자체가 아직 없을 때도 그 안에 생성할 대표 파일 경로를 `git check-ignore`에 전달한다. 모든 후보를 검증한 뒤에만 `mkdir`, Plan write, Backup, Lock 획득을 허용한다.
+
+- [ ] **Step 4: GREEN 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "generated_path or gitignored or plan_output" -q`
+
+  Expected: PASS; 거부 Case에서 파일과 Directory가 생성되지 않는다.
+
+- [ ] **Step 5: Commit**
+
+  ```powershell
+  git add edge/detection/packet_checkpoint_recovery.py tests/test_packet_checkpoint_recovery.py
+  git commit -m "feat: Gap Recovery 생성 경로 Gate 추가"
+  ```
+
+### Task 6: DB 절대경로 바인딩
+
+**Files:**
+- Modify: `edge/detection/packet_checkpoint_recovery.py`
+- Modify: `tests/test_packet_checkpoint_recovery.py`
+
+**Interfaces:**
+- Produces: `resolve_database_path(db_path: str | Path) -> Path`, `require_plan_database_path(plan: Mapping[str, object], db_path: str | Path) -> Path`.
+
+- [ ] **Step 1: 경로 바인딩 테스트 작성**
+
+  ```python
+  def test_execute_rejects_database_path_different_from_plan_before_backup(tmp_path: Path) -> None:
+      fixture = create_recovery_fixture(tmp_path)
+      plan = inspect_packet_checkpoint_recovery(**valid_dry_run_kwargs(fixture))
+      second_db = tmp_path / "other.db"
+      shutil.copy2(fixture.db_path, second_db)
+      before = second_db.read_bytes()
+      with pytest.raises(PacketCheckpointRecoveryError, match="database path"):
+          execute_packet_checkpoint_recovery(
+              **{
+                  **valid_execute_kwargs(fixture, fixture.plan_output),
+                  "db_path": second_db,
+              }
+          )
+      assert not fixture.artifact_dir.exists()
+      assert second_db.read_bytes() == before
+  ```
+
+  함께 `test_canonical_plan_sha_changes_when_resolved_database_path_changes`와 `test_database_path_requires_existing_regular_sqlite_file`을 추가한다.
+
+- [ ] **Step 2: RED 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "database_path" -q`
+
+  Expected: FAIL — Plan DB 바인딩 함수가 없다.
+
+- [ ] **Step 3: `expanduser().resolve(strict=True)` 계약 구현**
+
+  ```python
+  def resolve_database_path(db_path: str | Path) -> Path:
+      resolved = Path(db_path).expanduser().resolve(strict=True)
+      if not resolved.is_file():
+          raise PacketCheckpointRecoveryError("database path must be a regular file")
+      return resolved
+  ```
+
+  Execute는 `--db-path`와 Plan의 `database_path`를 문자열로 비교하기 전에 둘 다 resolved absolute Path로 만든다. 불일치는 Migration 검사, Lock, Artifact Directory, Backup보다 먼저 거부한다.
+
+- [ ] **Step 4: GREEN 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "database_path" -q`
+
+  Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+  ```powershell
+  git add edge/detection/packet_checkpoint_recovery.py tests/test_packet_checkpoint_recovery.py
+  git commit -m "feat: Gap Recovery DB 경로 바인딩 추가"
+  ```
+
+### Task 7: Capture Session Readiness와 전역 RUNNING Gate
+
+**Files:**
+- Create: `edge/detection/packet_checkpoint_recovery_repository.py`
+- Modify: `edge/detection/packet_checkpoint_recovery.py`
+- Modify: `tests/test_packet_checkpoint_recovery.py`
+
+**Interfaces:**
+- Repository produces: `get_checkpoint(connection: sqlite3.Connection, detector_name: str, source_table: str) -> sqlite3.Row | None`, `get_capture_session(connection: sqlite3.Connection, session_id: str) -> sqlite3.Row | None`, `list_capture_segments(connection: sqlite3.Connection, session_id: str) -> list[sqlite3.Row]`, `list_running_capture_sessions(connection: sqlite3.Connection) -> list[sqlite3.Row]`, `list_sessions_between(connection: sqlite3.Connection, *, after_window_end: str, before_window_start: str) -> list[sqlite3.Row]`, `get_existing_recovery(connection: sqlite3.Connection, *, detector_name: str, source_table: str, target_session_id: str) -> sqlite3.Row | None`.
+- Core produces: `build_recovery_plan(connection: sqlite3.Connection, *, repository_state: Mapping[str, object], database_path: Path, detector_name: str, current_session_id: str, target_session_id: str, approved_by: str, reason: str, resolved_locks: Sequence[ResolvedRecoveryLock]) -> dict[str, object]`.
+
+- [ ] **Step 1: Session Gate 테스트 작성**
+
+  테스트 이름:
+
+  - `test_plan_requires_supported_detector_and_source_table`
+  - `test_plan_requires_existing_completed_current_and_target_sessions`
+  - `test_plan_requires_current_checkpoint_at_current_ready_through`
+  - `test_plan_rejects_current_session_with_remaining_ready_prefix`
+  - `test_plan_requires_target_full_ready_processed_or_empty_range`
+  - `test_plan_rejects_missing_ready_failed_or_inconsistent_feature_segments`
+  - `test_plan_lists_all_running_sessions_and_blocks_execute`
+  - `test_running_session_gate_precedes_artifact_and_backup_creation`
+  - `test_plan_rejects_checkpoint_regression_same_session_and_duplicate_recovery`
+
+- [ ] **Step 2: RED 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "session or readiness or running" -q`
+
+  Expected: FAIL — 전용 Repository와 Plan Builder가 없다.
+
+- [ ] **Step 3: 고정 SQL Repository와 Readiness Digest 구현**
+
+  ```python
+  SUPPORTED_DETECTORS = {
+      "packet_rule": "packet_feature_logs",
+      "packet_if": "packet_feature_logs",
+  }
+
+  def list_running_capture_sessions(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+      return connection.execute(
+          """
+          SELECT session_id, started_at
+          FROM packet_capture_sessions
+          WHERE status = 'RUNNING'
+          ORDER BY started_at ASC, session_id ASC
+          """
+      ).fetchall()
+  ```
+
+  Session Readiness는 `packet_capture_segments`를 `window_start ASC`로 읽어 `first_window_start`부터 10초 연속인지 확인한다. `PROCESSED`에는 같은 Session·Window의 `packet_feature_logs`가 1건 이상, `EMPTY`에는 0건이어야 한다. Target은 `COMPLETED`이고 전체 Segment가 `PROCESSED/EMPTY`이며 Ready Through가 Session의 마지막 Window End와 일치해야 한다.
+
+- [ ] **Step 4: GREEN 확인과 기존 Repository 의미 회귀**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "session or readiness or running" -q`
+
+  Expected: PASS; RUNNING Summary는 `session_id`, `started_at`을 포함하고 어떤 Row도 수정하지 않는다.
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_repositories.py tests/test_packet_stage_readiness.py -q`
+
+  Expected: PASS; 기존 Readiness 계약과 충돌하지 않는다.
+
+- [ ] **Step 5: Commit**
+
+  ```powershell
+  git add edge/detection/packet_checkpoint_recovery_repository.py edge/detection/packet_checkpoint_recovery.py tests/test_packet_checkpoint_recovery.py
+  git commit -m "feat: Gap Recovery Session Readiness Gate 추가"
+  ```
+
+### Task 8: full-ready Session Skip 분류와 추가 확인 계약
+
+**Files:**
+- Modify: `edge/detection/packet_checkpoint_recovery.py`
+- Modify: `tests/test_packet_checkpoint_recovery.py`
+
+**Interfaces:**
+- Produces: `classify_skipped_sessions(connection: sqlite3.Connection, *, checkpoint_window_end: str, target_first_window_start: str) -> list[dict[str, object]]`, `require_execute_confirmations(plan: Mapping[str, object], *, confirm: str, confirm_skip_processable: str | None) -> None`.
+- 고정 분류: `EXHAUSTED_CURRENT`, `SKIPPED_FULL_READY_COMPLETED`, `SKIPPED_NOT_READY`, `SKIPPED_FAILED`, `BLOCKING_RUNNING`, `TARGET_FULL_READY_COMPLETED`.
+
+- [ ] **Step 1: Skip 분류와 확인 문자열 테스트 작성**
+
+  테스트 이름:
+
+  - `test_plan_classifies_full_ready_completed_session_as_processable_skip`
+  - `test_plan_classifies_failed_and_not_ready_sessions_separately`
+  - `test_processable_skip_requires_plan_sha_bound_confirmation`
+  - `test_processable_skip_rejects_missing_or_wrong_confirmation_before_backup`
+  - `test_nonprocessable_gap_does_not_require_processable_skip_confirmation`
+  - `test_confirmation_is_rejected_when_plan_has_no_processable_skip`
+
+- [ ] **Step 2: RED 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "processable_skip or classifies" -q`
+
+  Expected: FAIL — Skip 분류 또는 SHA-bound 확인 Gate가 없다.
+
+- [ ] **Step 3: 분류와 확인 계약 구현**
+
+  ```python
+  EXECUTE_CONFIRMATION = "APPLY-PACKET-CHECKPOINT-GAP-RECOVERY"
+  PROCESSABLE_SKIP_PREFIX = "SKIP-PROCESSABLE-SESSIONS:"
+
+  def require_execute_confirmations(plan, *, confirm, confirm_skip_processable):
+      if confirm != EXECUTE_CONFIRMATION:
+          raise PacketCheckpointRecoveryError("execute confirmation mismatch")
+      expected = f"{PROCESSABLE_SKIP_PREFIX}{plan['plan_sha256']}"
+      skips = bool(plan["summary"]["skips_processable_sessions"])
+      if skips and confirm_skip_processable != expected:
+          raise PacketCheckpointRecoveryError("processable-session confirmation mismatch")
+      if not skips and confirm_skip_processable is not None:
+          raise PacketCheckpointRecoveryError("processable-session confirmation not allowed")
+  ```
+
+  `SKIPPED_FULL_READY_COMPLETED` Summary에는 Session ID, Window 범위, Segment 수, Feature Row 수, `PROCESSABLE_SESSION_SKIP` Warning Code를 반드시 포함한다.
+
+- [ ] **Step 4: GREEN 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "processable_skip or classifies" -q`
+
+  Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+  ```powershell
+  git add edge/detection/packet_checkpoint_recovery.py tests/test_packet_checkpoint_recovery.py
+  git commit -m "feat: 처리 가능 Session Skip 승인 계약 추가"
+  ```
+
+### Task 9: 실제 Lock 경로 해석·중복 제거·정렬 획득
+
+**Files:**
+- Modify: `edge/detection/packet_checkpoint_recovery.py`
+- Modify: `tests/test_packet_checkpoint_recovery.py`
+
+**Interfaces:**
+- Consumes: `edge.orchestration.run_detection_orchestrator.resolve_lock_path`, `edge.detection.run_packet_rule_detector.DEFAULT_LOCK_PATH`, `edge.detection.run_packet_ai_detector.DEFAULT_LOCK_PATH`, `edge.features.run_packet_feature_extractor.DEFAULT_LOCK_PATH`, `edge.runtime_lock.single_instance_lock`.
+- Produces: `ResolvedRecoveryLock(path: Path, roles: tuple[str, ...])`, `resolve_recovery_locks(*, repository_root: Path, database_url: str, orchestrator_lock_path: Path | None, manual_lock_path: Path | None, extractor_lock_path: Path | None) -> tuple[ResolvedRecoveryLock, ...]`, `acquire_recovery_locks(locks: Sequence[ResolvedRecoveryLock]) -> ContextManager[None]`.
+
+- [ ] **Step 1: 실제 경로·중복·순서·충돌 테스트 작성**
+
+  테스트 이름:
+
+  - `test_lock_resolution_uses_orchestrator_manual_and_extractor_contracts`
+  - `test_relative_lock_paths_resolve_from_repository_root`
+  - `test_shared_rule_if_lock_is_acquired_once_with_both_roles`
+  - `test_duplicate_orchestrator_and_manual_path_is_acquired_once`
+  - `test_unique_locks_are_acquired_in_sorted_absolute_path_order`
+  - `test_any_lock_conflict_prevents_backup_database_and_artifact_changes`
+  - `test_locks_remain_held_through_post_commit_verification_and_result_write`
+
+- [ ] **Step 2: RED 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "lock_" -q`
+
+  Expected: FAIL — Recovery Lock 조정 함수가 없다.
+
+- [ ] **Step 3: 역할별 경로 계산과 `ExitStack` 획득 구현**
+
+  ```python
+  @dataclass(frozen=True)
+  class ResolvedRecoveryLock:
+      path: Path
+      roles: tuple[str, ...]
+
+  @contextmanager
+  def acquire_recovery_locks(locks: Sequence[ResolvedRecoveryLock]):
+      with ExitStack() as stack:
+          for lock in sorted(locks, key=lambda item: str(item.path)):
+              stack.enter_context(single_instance_lock(lock.path))
+          yield
+  ```
+
+  Orchestrator 경로는 실제 Settings/DB URL로 `resolve_lock_path()`를 호출한 결과를 사용한다. Manual Rule/IF와 Extractor의 상대 기본값 및 Override는 Repository Root 기준으로 절대경로화한다. `(resolved_path, roles[])`로 합친 후 같은 Path를 두 번 획득하지 않는다. Task 5 Gate가 모든 Lock Path를 먼저 승인한 뒤 획득한다.
+
+- [ ] **Step 4: GREEN 및 기존 Lock 회귀 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "lock_" -q`
+
+  Expected: PASS.
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_runtime_lock.py tests/test_detection_orchestrator_runner.py -q`
+
+  Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+  ```powershell
+  git add edge/detection/packet_checkpoint_recovery.py tests/test_packet_checkpoint_recovery.py
+  git commit -m "feat: Gap Recovery Runtime Lock 조정 추가"
+  ```
+
+### Task 10: Dry-run CLI
+
+**Files:**
+- Create: `edge/detection/run_packet_checkpoint_recovery.py`
+- Modify: `edge/detection/packet_checkpoint_recovery.py`
+- Modify: `tests/test_packet_checkpoint_recovery.py`
+
+**Interfaces:**
+- Produces: `inspect_packet_checkpoint_recovery(*, db_path: str | Path, repository_root: str | Path, detector_name: str, current_session_id: str, target_session_id: str, approved_by: str, reason: str, plan_output: str | Path, orchestrator_lock_path: Path | None = None, manual_lock_path: Path | None = None, extractor_lock_path: Path | None = None) -> dict[str, object]`, `build_parser() -> argparse.ArgumentParser`, `main(argv: Sequence[str] | None = None) -> int`.
+- Dry-run 필수 입력: `--db-path`, `--repository-root`, `--detector`, `--current-session-id`, `--target-session-id`, `--approved-by`, `--reason`, `--plan-output`; Lock Override는 역할별 선택 인자.
+
+- [ ] **Step 1: Dry-run 성공·실패 테스트 작성**
+
+  테스트 이름:
+
+  - `test_dry_run_writes_canonical_plan_atomically_after_all_gates_pass`
+  - `test_dry_run_is_query_only_and_does_not_create_artifact_directory`
+  - `test_dry_run_reports_checkpoint_before_after_running_gate_and_skip_summary`
+  - `test_dry_run_rejects_missing_005_row_or_table_before_plan_creation`
+  - `test_dry_run_cli_requires_all_identity_and_output_arguments`
+  - `test_dry_run_cli_returns_two_for_precommit_validation_error`
+
+- [ ] **Step 2: RED 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "dry_run" -q`
+
+  Expected: FAIL — Dry-run API/CLI가 없다.
+
+- [ ] **Step 3: Query-only Dry-run과 Atomic Plan write 구현**
+
+  ```python
+  def inspect_packet_checkpoint_recovery(
+      *, db_path, repository_root, detector_name, current_session_id,
+      target_session_id, approved_by, reason, plan_output,
+      orchestrator_lock_path=None, manual_lock_path=None, extractor_lock_path=None,
+  ) -> dict[str, object]:
+      database = resolve_database_path(db_path)
+      root = Path(repository_root).expanduser().resolve(strict=True)
+      locks = resolve_recovery_locks(
+          repository_root=root,
+          database_url=f"sqlite:///{database}",
+          orchestrator_lock_path=orchestrator_lock_path,
+          manual_lock_path=manual_lock_path,
+          extractor_lock_path=extractor_lock_path,
+      )
+      paths = validate_generated_paths(
+          repository_root=root,
+          plan_output=Path(plan_output),
+          lock_paths=tuple(lock.path for lock in locks),
+      )
+      repository_state = inspect_repository_state(repository_root)
+      with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+          connection.row_factory = sqlite3.Row
+          require_migration_005(connection)
+          payload = build_recovery_plan(
+              connection,
+              repository_state=repository_state,
+              database_path=database,
+              detector_name=detector_name,
+              current_session_id=current_session_id,
+              target_session_id=target_session_id,
+              approved_by=approved_by,
+              reason=reason,
+              resolved_locks=locks,
+          )
+      plan = attach_plan_sha256(payload, generated_at=_utc_now())
+      _write_json_atomically(paths["plan_output"], plan)
+      return plan
+  ```
+
+  같은 Task에서 `_utc_now() -> datetime`은 `datetime.now(timezone.utc)`를 반환하고, `_write_json_atomically(path: Path, payload: Mapping[str, object]) -> None`은 같은 Directory의 `NamedTemporaryFile(delete=False)`에 UTF-8 JSON과 끝 줄바꿈을 기록·`flush()`·`os.fsync()`한 뒤 `os.replace()`한다. 임시 경로도 Task 5의 Git ignore Gate가 승인한 Directory 안에서 만든다.
+
+  Migration 005 Row와 Table/Index Schema Digest 검증은 Repository/Git/Artifact Directory 생성보다 먼저 가능한 순서로 배치한다. `plan_output.parent`는 모든 Gate 통과 후에만 생성한다. 출력 JSON은 `can_execute`, Blocking reason, RUNNING Session, Checkpoint Before/After, Skip 분류, Lock 역할/경로, 재현 가능한 Execute 명령을 포함한다.
+
+- [ ] **Step 4: GREEN 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "dry_run" -q`
+
+  Expected: PASS; 성공 시 Plan 하나만 생성되고 DB Row·Journal·Artifact Directory는 변하지 않는다.
+
+- [ ] **Step 5: Commit**
+
+  ```powershell
+  git add edge/detection/run_packet_checkpoint_recovery.py edge/detection/packet_checkpoint_recovery.py tests/test_packet_checkpoint_recovery.py
+  git commit -m "feat: Packet Checkpoint Recovery Dry-run CLI 추가"
+  ```
+
+### Task 11: SQLite Backup·Transaction·조건부 Checkpoint Mutation·Audit
+
+**Files:**
+- Modify: `edge/detection/packet_checkpoint_recovery_repository.py`
+- Modify: `edge/detection/packet_checkpoint_recovery.py`
+- Modify: `tests/test_packet_checkpoint_recovery.py`
+
+**Interfaces:**
+- Consumes: `edge.scripts.phase4_cutover_storage.create_sqlite_backup()`와 `verify_database()`.
+- Repository produces: `update_checkpoint_conditionally(connection: sqlite3.Connection, *, before: Mapping[str, object], after: Mapping[str, object]) -> int`, `insert_recovery_audit(connection: sqlite3.Connection, *, audit: Mapping[str, object]) -> int`, `get_recovery_audit(connection: sqlite3.Connection, operation_id: str) -> sqlite3.Row | None`.
+- Core produces: `execute_packet_checkpoint_recovery(*, plan_file: str | Path, db_path: str | Path, artifact_dir: str | Path, confirm: str, confirm_skip_processable: str | None = None) -> dict[str, object]`.
+
+- [ ] **Step 1: Backup·TOCTOU·Mutation 테스트 작성**
+
+  테스트 이름:
+
+  - `test_execute_creates_verified_backup_before_begin_immediate`
+  - `test_execute_rechecks_full_canonical_plan_inside_begin_immediate`
+  - `test_execute_rejects_changed_checkpoint_updated_at_and_rolls_back`
+  - `test_execute_keeps_last_processed_id_and_advances_only_time_boundary`
+  - `test_execute_inserts_exactly_one_audit_row_in_same_transaction`
+  - `test_execute_requires_total_changes_delta_two`
+  - `test_backup_failure_leaves_live_database_and_artifacts_unchanged`
+  - `test_precommit_failure_preserves_verified_backup_and_rolls_back_database`
+  - `test_duplicate_operation_or_detector_target_is_rejected`
+
+- [ ] **Step 2: RED 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "backup or transaction or conditional or audit_row or total_changes" -q`
+
+  Expected: FAIL — Execute Workflow와 Mutation 함수가 없다.
+
+- [ ] **Step 3: 고정 SQL과 승인된 실행 순서 구현**
+
+  조건부 UPDATE는 다음 Predicate를 모두 사용한다.
+
+  ```sql
+  UPDATE detector_checkpoints
+  SET last_completed_window_end = ?, updated_at = ?
+  WHERE detector_name = ?
+    AND source_table = ?
+    AND last_processed_id IS ?
+    AND last_completed_window_end = ?
+    AND updated_at = ?
+  ```
+
+  Workflow를 다음 순서로 구현한다.
+
+  1. Plan JSON/SHA, DB Path, Migration, 확인 문자열, 생성 경로 검증
+  2. 고유 Lock 획득
+  3. Repository/Git/Canonical Plan 1차 재검증
+  4. Transaction 밖 live DB `integrity_check`/`foreign_key_check`
+  5. SQLite Backup API 실행과 Backup SHA/DB 검증
+  6. 같은 Connection의 `PRAGMA data_version`을 보조 신호로 비교
+  7. `BEGIN IMMEDIATE`
+  8. Canonical Plan 전체 재생성 및 Plan File Payload/SHA 비교
+  9. Mutation 직전 `connection.total_changes` 저장
+  10. 조건부 UPDATE 1건, Audit INSERT 1건
+  11. Checkpoint/Audit/다른 Checkpoint/FK와 `total_changes - before == 2` 검증
+  12. COMMIT
+  13. 별도 Connection에서 live DB 전체 검증과 Result JSON Atomic write
+
+  Transaction 내부에서는 전체 `integrity_check`를 실행하지 않고 변경 Row, Audit Row, 다른 Checkpoint Snapshot, FK만 검증한다.
+
+  `operation_id`는 `uuid.uuid4()`로 생성하고, 실제 `backup_path`, Backup `.sha256`, `result_path`를 `artifact_dir / operation_id` 아래에서 계산한다. `artifact_dir`와 세 실제 파일 경로를 Task 5의 Gate로 모두 검증한 뒤에만 Directory를 만들고 Backup을 시작한다.
+
+- [ ] **Step 4: GREEN 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "backup or transaction or conditional or audit_row or total_changes" -q`
+
+  Expected: PASS; 성공 Transaction의 `total_changes` Delta는 정확히 2다.
+
+- [ ] **Step 5: Commit**
+
+  ```powershell
+  git add edge/detection/packet_checkpoint_recovery_repository.py edge/detection/packet_checkpoint_recovery.py tests/test_packet_checkpoint_recovery.py
+  git commit -m "feat: Packet Checkpoint Recovery Transaction 추가"
+  ```
+
+### Task 12: Execute CLI와 Exit Code 2/3·HOLD
+
+**Files:**
+- Modify: `edge/detection/run_packet_checkpoint_recovery.py`
+- Modify: `edge/detection/packet_checkpoint_recovery.py`
+- Modify: `tests/test_packet_checkpoint_recovery.py`
+
+**Interfaces:**
+- Produces: `PacketCheckpointRecoveryError`, `PacketCheckpointRecoveryCommittedArtifactError(operation_id, backup_path)`, Execute JSON Output.
+- Execute 필수 입력: `--plan-file`, `--db-path`, `--artifact-dir`, `--confirm`; 처리 가능 Session Skip Plan에는 `--confirm-skip-processable` 추가 필수.
+
+- [ ] **Step 1: CLI Exit/HOLD 테스트 작성**
+
+  테스트 이름:
+
+  - `test_execute_cli_success_returns_zero_and_writes_result_json`
+  - `test_execute_cli_precommit_failure_returns_two_without_database_change`
+  - `test_execute_cli_postcommit_integrity_failure_returns_three_and_hold`
+  - `test_execute_cli_result_json_failure_returns_three_and_preserves_commit_audit_backup`
+  - `test_execute_cli_never_auto_restores_committed_database`
+  - `test_execute_cli_requires_plan_file_database_artifact_and_confirmation`
+
+- [ ] **Step 2: RED 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "execute_cli or postcommit or hold" -q`
+
+  Expected: FAIL — Exit Code 3/HOLD 예외 매핑이 없다.
+
+- [ ] **Step 3: CLI 예외 매핑과 Atomic Result 구현**
+
+  ```python
+  def _run_command(args: argparse.Namespace) -> dict[str, object]:
+      if args.command == "dry-run":
+          return inspect_packet_checkpoint_recovery(
+              db_path=args.db_path,
+              repository_root=args.repository_root,
+              detector_name=args.detector,
+              current_session_id=args.current_session_id,
+              target_session_id=args.target_session_id,
+              approved_by=args.approved_by,
+              reason=args.reason,
+              plan_output=args.plan_output,
+              orchestrator_lock_path=args.orchestrator_lock_path,
+              manual_lock_path=args.manual_lock_path,
+              extractor_lock_path=args.extractor_lock_path,
+          )
+      return execute_packet_checkpoint_recovery(
+          plan_file=args.plan_file,
+          db_path=args.db_path,
+          artifact_dir=args.artifact_dir,
+          confirm=args.confirm,
+          confirm_skip_processable=args.confirm_skip_processable,
+      )
+
+  def main(argv: Sequence[str] | None = None) -> int:
+      args = build_parser().parse_args(argv)
+      try:
+          payload = _run_command(args)
+      except PacketCheckpointRecoveryCommittedArtifactError as exc:
+          print(json.dumps({
+              "ok": False,
+              "database_committed": True,
+              "operation_status": "HOLD",
+              "operation_id": exc.operation_id,
+              "backup_path": str(exc.backup_path),
+              "error": str(exc),
+          }, sort_keys=True))
+          return 3
+      except PacketCheckpointRecoveryError as exc:
+          print(json.dumps({"ok": False, "database_committed": False, "error": str(exc)}, sort_keys=True))
+          return 2
+      print(json.dumps(payload, sort_keys=True))
+      return 0
+  ```
+
+  Commit 후 live DB 검증 또는 Result JSON 실패 시 Checkpoint/Audit/Backup을 유지하고 자동 Restore를 금지한다. Result에는 `database_committed=true`, `operation_status=HOLD`를 표시한다. Lock은 성공 또는 실패 출력 준비와 사후 검증이 끝날 때까지 유지한다.
+
+- [ ] **Step 4: GREEN 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "execute_cli or postcommit or hold" -q`
+
+  Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+  ```powershell
+  git add edge/detection/run_packet_checkpoint_recovery.py edge/detection/packet_checkpoint_recovery.py tests/test_packet_checkpoint_recovery.py
+  git commit -m "feat: Packet Checkpoint Recovery Execute CLI 추가"
+  ```
+
+### Task 13: Packet Rule Manual Runner의 `run_until_for_capture_session` 적용
+
+**Files:**
+- Modify: `edge/detection/run_packet_rule_detector.py`
+- Modify: `tests/test_packet_rule_runner.py`
+
+**Interfaces:**
+- Consumes: 기존 `PacketRuleDetectorStage.run_until_for_capture_session(db, *, cycle_range_start, cycle_cutoff, expected_capture_session_id)`.
+- Produces: Manual Runner의 `--session-id`와 실제 Source Selection이 동일 Session으로 바인딩되는 계약.
+
+- [ ] **Step 1: Session-bound 호출 테스트를 먼저 수정**
+
+  ```python
+  def test_manual_packet_rule_runner_binds_stage_to_requested_capture_session(monkeypatch) -> None:
+      stage = FakeStage()
+      monkeypatch.setattr(runner, "PacketRuleDetectorStage", lambda: stage)
+      argv = [
+          "--session-id", SESSION_ID,
+          "--range-start", "2026-08-06T10:00:00Z",
+          "--cutoff", "2026-08-06T10:01:00Z",
+      ]
+      assert runner.main(argv) == 0
+      assert stage.capture_session_calls == [{
+          "expected_capture_session_id": SESSION_ID,
+          "cycle_range_start": RANGE_START,
+          "cycle_cutoff": CUTOFF,
+      }]
+      assert stage.unbound_call_count == 0
+  ```
+
+- [ ] **Step 2: RED 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_rule_runner.py::test_manual_packet_rule_runner_binds_stage_to_requested_capture_session -q`
+
+  Expected: FAIL — Runner가 현재 `stage.run_until()`을 호출한다.
+
+- [ ] **Step 3: 호출부 한 곳만 최소 수정**
+
+  ```python
+  result = stage.run_until_for_capture_session(
+      db,
+      cycle_range_start=args.range_start,
+      cycle_cutoff=args.cutoff,
+      expected_capture_session_id=args.session_id,
+  )
+  ```
+
+  `_validate_manual_range`, Lock, Transaction, JSON Output 계약은 변경하지 않는다.
+
+- [ ] **Step 4: GREEN 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_rule_runner.py tests/test_packet_rule_detector.py -q`
+
+  Expected: PASS; Gap 거부와 단일 Transaction 회귀도 유지된다.
+
+- [ ] **Step 5: Commit**
+
+  ```powershell
+  git add edge/detection/run_packet_rule_detector.py tests/test_packet_rule_runner.py
+  git commit -m "fix: Packet Rule Manual Runner Session 바인딩"
+  ```
+
+### Task 14: Packet IF Manual Runner의 `run_until_for_capture_session` 적용
+
+**Files:**
+- Modify: `edge/detection/run_packet_ai_detector.py`
+- Modify: `tests/test_run_packet_ai_detector.py`
+
+**Interfaces:**
+- Consumes: 기존 `PacketIsolationForestStage.run_until_for_capture_session(db, *, cycle_range_start, cycle_cutoff, expected_capture_session_id)`.
+- Produces: Manual Packet IF Runner의 Session-bound Source Selection.
+
+- [ ] **Step 1: Session-bound 호출 테스트를 먼저 수정**
+
+  ```python
+  def test_manual_packet_if_runner_binds_stage_to_requested_capture_session(monkeypatch) -> None:
+      stage = FakeStage()
+      monkeypatch.setattr(runner.PacketIsolationForestStage, "from_settings", lambda **_: stage)
+      argv = [
+          "--session-id", SESSION_ID,
+          "--range-start", "2026-08-06T10:00:00Z",
+          "--cutoff", "2026-08-06T10:01:00Z",
+      ]
+      assert runner.main(argv) == 0
+      assert stage.capture_session_calls[0]["expected_capture_session_id"] == SESSION_ID
+      assert stage.unbound_call_count == 0
+  ```
+
+- [ ] **Step 2: RED 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_run_packet_ai_detector.py::test_manual_packet_if_runner_binds_stage_to_requested_capture_session -q`
+
+  Expected: FAIL — Runner가 현재 `stage.run_until()`을 호출한다.
+
+- [ ] **Step 3: 호출부 한 곳만 최소 수정**
+
+  ```python
+  result = stage.run_until_for_capture_session(
+      db,
+      cycle_range_start=args.range_start,
+      cycle_cutoff=args.cutoff,
+      expected_capture_session_id=args.session_id,
+  )
+  ```
+
+  Artifact/Model 검증, `_validate_manual_range`, Lock, Transaction, JSON Output은 유지한다.
+
+- [ ] **Step 4: GREEN 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_run_packet_ai_detector.py tests/test_packet_ai_detector.py -q`
+
+  Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+  ```powershell
+  git add edge/detection/run_packet_ai_detector.py tests/test_run_packet_ai_detector.py
+  git commit -m "fix: Packet IF Manual Runner Session 바인딩"
+  ```
+
+### Task 15: 보호 테이블·다른 Checkpoint 불변성 테스트
+
+**Files:**
+- Modify: `tests/test_packet_checkpoint_recovery.py`
+- Modify only if a test exposes a defect: `edge/detection/packet_checkpoint_recovery.py`
+- Modify only if a test exposes a defect: `edge/detection/packet_checkpoint_recovery_repository.py`
+
+**Interfaces:**
+- Consumes: Task 11의 Execute API.
+- Produces: 허용된 두 Row 외 DB와 PCAP이 불변이라는 실행 증거.
+
+- [ ] **Step 1: 보호 대상의 실제 Row/파일 Snapshot 테스트 작성**
+
+  ```python
+  PROTECTED_TABLES = (
+      "detection_events", "trust_score_history", "devices", "isolation_history",
+      "firewall_rules", "mqtt_logs", "feature_logs", "packet_capture_sessions",
+      "packet_capture_segments", "packet_feature_logs",
+  )
+
+  def test_execute_changes_only_requested_checkpoint_and_one_audit_row(tmp_path: Path):
+      fixture = create_recovery_fixture(tmp_path)
+      inspect_packet_checkpoint_recovery(**valid_dry_run_kwargs(fixture))
+      before = database_snapshot(fixture.db_path, PROTECTED_TABLES)
+      checkpoints_before = checkpoint_snapshot(fixture.db_path)
+      pcap_hashes = file_hash_snapshot(fixture.pcap_dir)
+      execute_packet_checkpoint_recovery(
+          **valid_execute_kwargs(fixture, fixture.plan_output)
+      )
+      assert database_snapshot(fixture.db_path, PROTECTED_TABLES) == before
+      assert unchanged_checkpoint_rows(
+          checkpoints_before,
+          checkpoint_snapshot(fixture.db_path),
+          requested_key=(fixture.detector_name, "packet_feature_logs"),
+      )
+      assert file_hash_snapshot(fixture.pcap_dir) == pcap_hashes
+  ```
+
+  추가 테스트:
+
+  - `test_packet_rule_recovery_does_not_change_packet_if_or_trust_checkpoint`
+  - `test_packet_if_recovery_does_not_change_packet_rule_or_trust_checkpoint`
+  - `test_failed_execute_keeps_all_protected_tables_and_checkpoint_rows_unchanged`
+  - `test_execute_does_not_modify_untracked_file_zero_or_pcap_files`
+
+- [ ] **Step 2: RED 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "changes_only or does_not_change or protected or untracked_file_zero" -q`
+
+  Expected: 새 테스트 중 최소 하나 FAIL이면 변경 범위 누출 또는 Snapshot 누락이 드러난다. 전부 즉시 PASS하면 현재 최소 SQL이 이미 불변성 계약을 만족한 것이므로 Production Code를 바꾸지 않는다.
+
+- [ ] **Step 3: 실패가 있을 때만 고정 SQL/검증 순서를 최소 보정**
+
+  변경 허용 SQL은 요청 Detector Checkpoint의 조건부 UPDATE와 Audit INSERT뿐이다. 테스트 Fixture나 Assertion을 약화하지 않는다.
+
+- [ ] **Step 4: GREEN 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -q`
+
+  Expected: PASS; 성공 시 Target Checkpoint 1건과 Audit 1건 외 Row/파일 Digest가 동일하다.
+
+- [ ] **Step 5: Commit**
+
+  ```powershell
+  git add tests/test_packet_checkpoint_recovery.py edge/detection/packet_checkpoint_recovery.py edge/detection/packet_checkpoint_recovery_repository.py
+  git commit -m "test: Gap Recovery 보호 데이터 불변성 검증"
+  ```
+
+  Production 파일에 변경이 없다면 `git add` 결과에서 해당 파일이 Stage되지 않는지 확인하고 테스트 파일만 커밋한다.
+
+### Task 16: 인접·전체 회귀 테스트
+
+**Files:**
+- Verify only; 신규 변경 파일 없음.
+
+**Interfaces:**
+- Consumes: Tasks 1~15 전체 구현.
+- Produces: Migration, Packet Repository/Readiness, Manual Runner, Orchestrator Gap 차단, Runtime Lock, Cutover, Trust 안전 계약의 회귀 결과.
+
+- [ ] **Step 1: 집중·인접 테스트 실행**
+
+  Run:
+
+  ```powershell
+  C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py tests/test_migrations.py tests/test_packet_repositories.py tests/test_packet_stage_readiness.py tests/test_packet_rule_detector.py tests/test_packet_rule_runner.py tests/test_packet_ai_detector.py tests/test_run_packet_ai_detector.py tests/test_detection_orchestrator_runner.py tests/test_runtime_lock.py tests/test_phase4_cutover.py tests/test_baseline_recovery.py tests/test_trust_compensation.py -q
+  ```
+
+  Expected: PASS; Orchestrator의 자동 Gap 차단 테스트가 그대로 통과한다.
+
+- [ ] **Step 2: Windows Bash Wrapper 제외 전체 회귀 실행**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest -q --ignore=tests/test_firewall_rule_wrapper.py`
+
+  Expected: PASS with no new failures.
+
+- [ ] **Step 3: 전체 pytest를 별도로 실행해 기존 Windows 환경 실패 구분**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest -q`
+
+  Expected: `tests/test_firewall_rule_wrapper.py`의 기존 Windows Bash/CP949 계열 실패 외 신규 실패 0. 실패 수와 이름은 실제 출력 그대로 기록한다.
+
+- [ ] **Step 4: 정적·Diff 검증**
+
+  Run:
+
+  ```powershell
+  C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m compileall -q backend edge tests
+  git diff --check origin/develop...HEAD
+  git status --short
+  ```
+
+  Expected: compileall과 diff check PASS; Status에는 의도한 구현 파일만 나타난다.
+
+- [ ] **Step 5: 회귀 실패 처리 Gate**
+
+  신규 실패가 있으면 커밋·Push를 중단하고 최초 실패부터 원인을 수정한 뒤 Task 16의 모든 명령을 처음부터 재실행한다. 검증만으로 변경이 없다면 빈 Commit을 만들지 않는다.
+
+### Task 17: Runbook·DB Schema·Detection Core 문서 갱신
+
+**Files:**
+- Create: `docs/packet-checkpoint-gap-recovery-runbook.md`
+- Modify: `docs/db-schema.md`
+- Modify: `docs/phase4-detection-core.md`
+
+**Interfaces:**
+- Consumes: 최종 CLI 인자, Exit Code, Migration 005, Lock/Transaction/Session 계약.
+- Produces: 병합 후 운영자가 별도로 수행할 Migration·Dry-run·Execute·Manual Detector 검증 절차.
+
+- [ ] **Step 1: 문서 계약 검증 테스트를 먼저 정의**
+
+  `tests/test_packet_checkpoint_recovery.py`에 다음 이름의 문서 Smoke Test를 추가한다.
+
+  - `test_gap_recovery_runbook_separates_migration_dry_run_and_execute`
+  - `test_gap_recovery_runbook_documents_service_process_and_running_session_gates`
+  - `test_gap_recovery_runbook_documents_exit_three_hold_and_no_auto_restore`
+  - `test_gap_recovery_docs_preserve_orchestrator_gap_block_and_holdout_e2e_scope`
+
+  각 테스트는 필수 명령 토큰과 정책 문구를 UTF-8로 읽어 확인한다. 실제 DB·Pi 명령을 실행하지 않는다.
+
+- [ ] **Step 2: RED 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "runbook or recovery_docs" -q`
+
+  Expected: FAIL — Runbook이 아직 없거나 필수 계약이 없다.
+
+- [ ] **Step 3: 세 문서에 확정된 운영 계약 기록**
+
+  `docs/packet-checkpoint-gap-recovery-runbook.md`에는 순서대로 다음을 작성한다.
+
+  1. Migration 005 Backup·검증·별도 적용 단계
+  2. Repository Root에서 tracked/staged clean 확인과 untracked inventory 보존
+  3. 관련 systemd enabled/active 기록, active Writer 중지, Packet Capture/공격/Extractor/Manual Runner 미실행 확인
+  4. 전역 RUNNING Session 0, 현재 Session 소진, Target COMPLETED/full-ready SQL
+  5. Dry-run 명령과 Plan SHA/DB Path/Lock/Skip/RUNNING Summary 검토
+  6. 처리 가능 Session Skip 시 SHA-bound 두 번째 확인
+  7. Execute, Exit 2 사전 실패, Exit 3 HOLD, 자동 Restore 금지
+  8. 사후 Checkpoint/Audit/Backup SHA/integrity/FK/보호 Table 확인
+  9. 승인된 Target Session으로 Packet Rule 또는 Packet IF Manual Runner 실행
+  10. Recovery 전에 active였던 서비스만 복구
+  11. 공식 Trust/Firewall E2E는 병합 후 새 Holdout Session에서 별도 수행
+
+  `docs/db-schema.md`에는 Migration `(5, packet_checkpoint_recovery)`와 `packet_checkpoint_recoveries` Column/Unique/FK/불변 Check를 추가한다. `docs/phase4-detection-core.md`에는 Orchestrator 자동 Gap 차단 유지, Recovery의 Detector별 독립 승인, Manual Runner의 `run_until_for_capture_session()` 사용을 추가한다.
+
+- [ ] **Step 4: GREEN과 문서 검색 확인**
+
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py -k "runbook or recovery_docs" -q`
+
+  Expected: PASS.
+
+  Run: `rg -n "Migration 005|RUNNING|SKIP-PROCESSABLE-SESSIONS|Exit Code 3|HOLD|run_until_for_capture_session|Holdout" docs/packet-checkpoint-gap-recovery-runbook.md docs/db-schema.md docs/phase4-detection-core.md`
+
+  Expected: 각 계약이 지정 문서에 존재하며 자동 Gap 통과나 운영 DB 실행 완료 표현이 없다.
+
+- [ ] **Step 5: 최종 전체 검증과 Commit**
+
+  Run:
+
+  ```powershell
+  C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest -q --ignore=tests/test_firewall_rule_wrapper.py
+  C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m compileall -q backend edge tests
+  git diff --check origin/develop...HEAD
+  ```
+
+  Expected: 모든 명령 PASS.
+
+  ```powershell
+  git add docs/packet-checkpoint-gap-recovery-runbook.md docs/db-schema.md docs/phase4-detection-core.md tests/test_packet_checkpoint_recovery.py
+  git commit -m "docs: Packet Checkpoint Gap Recovery 운영 계약 추가"
+  ```
+
+## 설계 요구사항 추적표
+
+| 설계 요구사항 | 구현 Task |
+|---|---|
+| Migration 005 별도 적용과 Audit | 1, 2, 10, 17 |
+| Canonical Plan·결정적 SHA·Plan JSON 입력 | 3, 10, 11, 12 |
+| tracked/staged 거부·untracked inventory 보존 | 4, 10, 11 |
+| Repository 내부 생성 경로 Git ignore Gate | 5, 9, 10, 11 |
+| resolved absolute DB Path 바인딩 | 6, 10, 11 |
+| Session Readiness·전역 RUNNING Gate | 7, 10, 11 |
+| full-ready Session Skip 분류·추가 승인 | 8, 10, 12 |
+| 실제 Lock 경로·중복 제거·정렬 획득 | 9, 11 |
+| Backup·TOCTOU·조건부 UPDATE·Audit·Delta 2 | 11 |
+| Exit 2/3·Commit 후 HOLD | 12 |
+| Rule/IF Session-bound Manual Runner | 13, 14 |
+| Trust/보호 Table/다른 Checkpoint 불변 | 15 |
+| 인접·전체 회귀 | 16 |
+| 운영 Runbook·Schema·Detection 문서 | 17 |
+| Orchestrator 자동 Gap 통과 제외 | 16, 17 |
+| 공식 E2E를 새 Holdout Session으로 분리 | 17 |
+
+## 구현 완료 판정
+
+- 요청 Detector의 `last_processed_id`는 유지되고 시간 경계만 Target `first_window_start`로 전진한다.
+- Checkpoint 1건과 Audit 1건 외 DB Row, PCAP, untracked 파일은 불변이다.
+- Dry-run Plan과 Execute 재생성 Plan의 Canonical Payload/SHA가 동일하고 다른 DB Path에서는 재사용되지 않는다.
+- 처리 가능 Session Skip은 Plan SHA에 바인딩된 추가 확인 없이는 실행되지 않는다.
+- 모든 실제 고유 Lock은 Repository Root 기준 절대경로로 계산해 정렬·단일 획득하고 사후 검증까지 유지한다.
+- Migration 미적용, RUNNING Session, Git 상태/Inventory/경로/Checkpoint/Readiness/TOCTOU 불일치는 Backup 또는 Mutation 전에 차단된다.
+- Commit 전 실패는 Exit 2와 Rollback, Commit 후 검증·Artifact 실패는 Exit 3/HOLD로 구분된다.
+- Manual Rule/IF Runner는 요청 Session에 바인딩되며 Orchestrator의 자동 Gap 차단은 유지된다.
+- 운영 DB Migration·Recovery와 Raspberry Pi Holdout E2E는 병합 후 별도 운영 승인 단계로 남는다.
