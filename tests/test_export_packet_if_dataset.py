@@ -3,7 +3,9 @@ from __future__ import annotations
 import csv
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -15,7 +17,18 @@ from ai.export_packet_if_dataset import (
     export_packet_if_dataset,
 )
 from ai.packet_if_dataset import DATASET_REQUIRED_COLUMNS, file_sha256
+from ai.packet_if_phase5_manifest import PacketIFRunManifestReference
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
+from edge.phase5.contracts import (
+    RUN_MANIFEST_SCHEMA_VERSION,
+    EvaluationScope,
+    ExecutionNode,
+    ExpectedOutcome,
+    RunManifest,
+    RunStageStatuses,
+    ScenarioReference,
+    run_manifest_sha256,
+)
 from edge.packet.capture_policy import CapturePolicy
 
 
@@ -31,16 +44,43 @@ def _export(
     target_device_ids: dict[str, str] | None = None,
 ):
     targets = target_device_ids or {}
-    annotations = [
-        PacketIFSessionAnnotation(
+    annotations: list[PacketIFSessionAnnotation] = []
+    for session_id in session_ids:
+        target_device_id = targets.get(session_id)
+        target_source_ip = {
+            "esp32_01": "192.168.0.4",
+            "esp32_02": "192.168.0.5",
+        }.get(target_device_id or "")
+        scenario = "packet_flood" if target_device_id else "normal_stable"
+        run_target_device_id = target_device_id or "esp32_01"
+        run_source_ip = target_source_ip or "192.168.0.4"
+        run_path, run_reference = _write_run_manifest(
+            output_path.parent,
             session_id=session_id,
-            split="test" if session_id in targets else "train",
-            traffic_label="attack" if session_id in targets else "normal",
-            scenario="packet_flood" if session_id in targets else "normal_stable",
-            target_device_id=targets.get(session_id),
+            scenario=scenario,
+            target_device_id=run_target_device_id,
+            source_ip=run_source_ip,
+            is_attack=target_device_id is not None,
         )
-        for session_id in session_ids
-    ]
+        annotations.append(
+            PacketIFSessionAnnotation(
+                session_id=session_id,
+                split="test" if target_device_id else "train",
+                traffic_label="attack" if target_device_id else "normal",
+                scenario=scenario,
+                target_device_id=target_device_id,
+                collection_slot_id=f"slot-{session_id}",
+                source_capture_group_id=session_id,
+                run_manifest_ref=run_reference,
+                run_manifest_path=run_path,
+                normal_policy_version="phase5-normal-policy-v1.1",
+                firmware_version="phase5-normal-pilot-v1",
+                payload_schema_version="phase5-normal-payload-v1",
+                target_source_ip=target_source_ip,
+                included_device_ids=("esp32_01", "esp32_02"),
+                background_traffic_present=target_device_id is not None,
+            )
+        )
     return export_packet_if_dataset(
         db,
         output_path=output_path,
@@ -49,6 +89,47 @@ def _export(
         capture_filter="tcp or udp",
         source_commit_sha="a" * 40,
         capture_policy=CapturePolicy(),
+    )
+
+
+def _write_run_manifest(
+    root: Path,
+    *,
+    session_id: str,
+    scenario: str,
+    target_device_id: str,
+    source_ip: str,
+    is_attack: bool,
+) -> tuple[Path, PacketIFRunManifestReference]:
+    run_id = f"run-{session_id}"
+    relative_path = f"runs/{run_id}/run-manifest.json"
+    path = root / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    started_at = datetime(2026, 7, 26, 10, tzinfo=timezone.utc)
+    scope = EvaluationScope.FULL_E2E if is_attack else EvaluationScope.DATA_ONLY
+    manifest = RunManifest(
+        run_id=run_id,
+        session_id=session_id,
+        scenario=ScenarioReference(scenario_id=scenario),
+        target_device_id=target_device_id,
+        source_ip=source_ip,
+        execution_node=ExecutionNode(node_id="test-node", registered=True),
+        evaluation_scope=scope,
+        is_active=False,
+        started_at=started_at,
+        observation_deadline_at=started_at + timedelta(minutes=5),
+        ended_at=started_at + timedelta(minutes=1),
+        expected_outcome=ExpectedOutcome(evaluation_scope=scope),
+        statuses=RunStageStatuses(),
+    )
+    path.write_text(manifest.to_json(), encoding="utf-8")
+    digest = run_manifest_sha256(manifest)
+    Path(f"{path}.sha256").write_text(f"{digest}\n", encoding="ascii")
+    return path, PacketIFRunManifestReference(
+        run_id=run_id,
+        relative_path=relative_path,
+        schema_version=RUN_MANIFEST_SCHEMA_VERSION,
+        sha256=digest,
     )
 
 
@@ -220,6 +301,7 @@ def test_export_records_session_and_capture_policy_provenance(
         )
 
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["dataset_version"] == "packet-if-dataset-v2"
     assert manifest["capture_policy"] == {
         "epsilon_seconds": 0.01,
         "max_start_delay_seconds": 1.0,
@@ -229,6 +311,14 @@ def test_export_records_session_and_capture_policy_provenance(
         "version": "packet-capture-policy-v1",
     }
     session = manifest["sessions"][0]
+    assert session["collection_slot_id"] == f"slot-{SESSION_ID}"
+    assert session["source_capture_group_id"] == SESSION_ID
+    assert session["normal_policy_version"] == "phase5-normal-policy-v1.1"
+    assert session["firmware_version"] == "phase5-normal-pilot-v1"
+    assert session["payload_schema_version"] == "phase5-normal-payload-v1"
+    assert session["included_device_ids"] == ["esp32_01", "esp32_02"]
+    assert session["background_traffic_present"] is False
+    assert session["run_manifest_ref"]["run_id"] == f"run-{SESSION_ID}"
     assert session["status"] == "COMPLETED"
     assert session["capture_interface"] == "eth0"
     assert session["capture_filter"] == "tcp or udp"
@@ -239,6 +329,100 @@ def test_export_records_session_and_capture_policy_provenance(
         {"device_id": "esp32_01", "peer_ip": "192.168.0.4"}
     ]
     assert len(session["data_sha256"]) == 64
+
+
+def test_load_export_spec_parses_dataset_v2_session_contract(
+    tmp_path: Path,
+) -> None:
+    run_path, run_reference = _write_run_manifest(
+        tmp_path,
+        session_id=SESSION_ID,
+        scenario="normal_stable",
+        target_device_id="esp32_01",
+        source_ip="192.168.0.4",
+        is_attack=False,
+    )
+    spec_path = tmp_path / "packet-if-export-spec-v2.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "capture_filter": "tcp or udp",
+                "source_commit_sha": "a" * 40,
+                "sessions": [
+                    {
+                        "session_id": SESSION_ID,
+                        "split": "train",
+                        "traffic_label": "normal",
+                        "scenario": "normal_stable",
+                        "target_device_id": None,
+                        "target_source_ip": None,
+                        "collection_slot_id": "normal-stable-train-01",
+                        "source_capture_group_id": SESSION_ID,
+                        "run_manifest_path": str(run_path.relative_to(tmp_path)),
+                        "run_manifest_ref": run_reference.to_dict(),
+                        "normal_policy_version": "phase5-normal-policy-v1.1",
+                        "firmware_version": "phase5-normal-pilot-v1",
+                        "payload_schema_version": "phase5-normal-payload-v1",
+                        "included_device_ids": ["esp32_01", "esp32_02"],
+                        "background_traffic_present": False,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    capture_filter, source_sha, annotations = exporter._load_export_spec(
+        spec_path
+    )
+
+    assert capture_filter == "tcp or udp"
+    assert source_sha == "a" * 40
+    assert len(annotations) == 1
+    assert annotations[0].run_manifest_path == run_path.resolve()
+    assert annotations[0].run_manifest_ref == run_reference
+    assert annotations[0].included_device_ids == ("esp32_01", "esp32_02")
+
+
+def test_load_export_spec_rejects_non_string_version(tmp_path: Path) -> None:
+    run_path, run_reference = _write_run_manifest(
+        tmp_path,
+        session_id=SESSION_ID,
+        scenario="normal_stable",
+        target_device_id="esp32_01",
+        source_ip="192.168.0.4",
+        is_attack=False,
+    )
+    spec_path = tmp_path / "invalid-export-spec.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "capture_filter": "tcp or udp",
+                "source_commit_sha": "a" * 40,
+                "sessions": [
+                    {
+                        "session_id": SESSION_ID,
+                        "split": "train",
+                        "traffic_label": "normal",
+                        "scenario": "normal_stable",
+                        "collection_slot_id": "normal-stable-train-01",
+                        "source_capture_group_id": SESSION_ID,
+                        "run_manifest_path": str(run_path.relative_to(tmp_path)),
+                        "run_manifest_ref": run_reference.to_dict(),
+                        "normal_policy_version": 1,
+                        "firmware_version": "phase5-normal-pilot-v1",
+                        "payload_schema_version": "phase5-normal-payload-v1",
+                        "included_device_ids": ["esp32_01"],
+                        "background_traffic_present": False,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="normal_policy_version"):
+        exporter._load_export_spec(spec_path)
 
 
 def test_export_rejects_feature_and_segment_window_mismatch(
@@ -408,6 +592,30 @@ def test_export_filters_attack_session_to_target_device(
     assert row["device_id"] == "esp32_02"
 
 
+def test_export_filters_device_not_in_included_device_ids() -> None:
+    reason = exporter._exclusion_reason(
+        _eligible_source_row(device_id="esp32_02", peer_ip="192.168.0.5"),
+        CapturePolicy(),
+        target_device_ids={},
+        target_source_ips={},
+        included_device_ids={SESSION_ID: frozenset({"esp32_01"})},
+    )
+
+    assert reason == "session_device_not_included"
+
+
+def test_export_filters_attack_row_with_wrong_source_ip() -> None:
+    reason = exporter._exclusion_reason(
+        _eligible_source_row(device_id="esp32_01", peer_ip="192.168.0.4"),
+        CapturePolicy(),
+        target_device_ids={SESSION_ID: "esp32_01"},
+        target_source_ips={SESSION_ID: "192.168.0.5"},
+        included_device_ids={SESSION_ID: frozenset({"esp32_01"})},
+    )
+
+    assert reason == "session_target_source_ip_mismatch"
+
+
 def test_export_requires_an_eligible_row_for_every_requested_session(
     SessionLocal,
     tmp_path: Path,
@@ -469,6 +677,18 @@ def test_export_rejects_invalid_session_annotations(
     annotation: PacketIFSessionAnnotation,
 ) -> None:
     with pytest.raises(ValueError):
+        exporter._normalize_session_annotations([annotation])
+
+
+def test_export_rejects_holdout_split() -> None:
+    annotation = PacketIFSessionAnnotation(
+        SESSION_ID,
+        "holdout",
+        "normal",
+        "normal_stable",
+    )
+
+    with pytest.raises(ValueError, match="invalid packet dataset split"):
         exporter._normalize_session_annotations([annotation])
 
 
@@ -649,6 +869,25 @@ def _insert_capture_session(
         },
     )
     return int(result.lastrowid)
+
+
+def _eligible_source_row(
+    *,
+    device_id: str,
+    peer_ip: str,
+) -> dict[str, Any]:
+    return {
+        "session_id": SESSION_ID,
+        "direction": "INBOUND",
+        "device_id": device_id,
+        "registered_device_id": device_id,
+        "peer_ip": peer_ip,
+        "registered_ip_address": peer_ip,
+        "segment_status": "PROCESSED",
+        "segment_error_code": None,
+        "start_delay_seconds": 0.1,
+        "captured_duration_seconds": 9.9,
+    }
 
 
 def _insert_segment(

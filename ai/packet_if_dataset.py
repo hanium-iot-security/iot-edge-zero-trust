@@ -23,6 +23,19 @@ from ai.packet_if_contract import (
     PACKET_IF_RAW_FEATURES,
     packet_feature_matrix,
 )
+from ai.packet_if_phase5_manifest import (
+    PACKET_IF_DATASET_VERSION_V2,
+    SUPPORTED_PACKET_IF_DATASET_VERSIONS,
+    PacketIFRunManifestReference,
+    load_verified_run_manifest,
+    normalize_device_ids,
+    normalize_optional_ipv4,
+    require_bool,
+    require_canonical_uuid4,
+    require_identifier,
+    require_non_empty_string,
+    validate_run_manifest_identity,
+)
 from edge.packet.capture_policy import (
     CaptureEligibilitySegment,
     CapturePolicy,
@@ -32,7 +45,7 @@ from edge.packet.capture_policy import (
 _UTC_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
-PACKET_IF_DATASET_VERSION = "packet-if-dataset-v1"
+PACKET_IF_DATASET_VERSION = PACKET_IF_DATASET_VERSION_V2
 
 TRAIN_SPLIT = "train"
 VALIDATION_SPLIT = "validation"
@@ -86,6 +99,15 @@ class PacketIFSessionSpec:
     capture_gap_end: datetime | None = None
     devices: tuple[PacketIFSessionDevice, ...] = ()
     data_sha256: str = ""
+    collection_slot_id: str | None = None
+    source_capture_group_id: str | None = None
+    run_manifest_ref: PacketIFRunManifestReference | None = None
+    normal_policy_version: str | None = None
+    firmware_version: str | None = None
+    payload_schema_version: str | None = None
+    target_source_ip: str | None = None
+    included_device_ids: tuple[str, ...] = ()
+    background_traffic_present: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +120,27 @@ class PacketIFDatasetManifest:
     @property
     def capture_policy_version(self) -> str:
         return self.capture_policy.version
+
+    @property
+    def normal_policy_version(self) -> str | None:
+        versions = {
+            session.normal_policy_version
+            for session in self.sessions
+            if session.normal_policy_version is not None
+        }
+        if self.dataset_version == PACKET_IF_DATASET_VERSION_V2:
+            if len(versions) != 1:
+                raise ValueError(
+                    "Packet IF Dataset v2 must contain exactly one "
+                    "normal_policy_version"
+                )
+            return next(iter(versions))
+        if len(versions) > 1:
+            raise ValueError(
+                "Packet IF Dataset must not contain multiple "
+                "normal_policy_version values"
+            )
+        return next(iter(versions), None)
 
 
 @dataclass(frozen=True)
@@ -163,7 +206,9 @@ def load_packet_if_dataset(
     )
 
 
-def load_packet_if_manifest(path: Path) -> PacketIFDatasetManifest:
+def load_packet_if_manifest(
+    path: Path,
+) -> PacketIFDatasetManifest:
     if not path.exists():
         raise FileNotFoundError(f"packet dataset manifest not found: {path}")
 
@@ -175,10 +220,11 @@ def load_packet_if_manifest(path: Path) -> PacketIFDatasetManifest:
         raise ValueError("packet dataset manifest must be a JSON object")
 
     dataset_version = _required_non_empty_string(payload, "dataset_version")
-    if dataset_version != PACKET_IF_DATASET_VERSION:
+    if dataset_version not in SUPPORTED_PACKET_IF_DATASET_VERSIONS:
         raise ValueError(
             "unsupported packet dataset version: "
-            f"expected={PACKET_IF_DATASET_VERSION!r}, actual={dataset_version!r}"
+            f"supported={sorted(SUPPORTED_PACKET_IF_DATASET_VERSIONS)!r}, "
+            f"actual={dataset_version!r}"
         )
 
     capture_policy = _parse_capture_policy(payload)
@@ -191,14 +237,20 @@ def load_packet_if_manifest(path: Path) -> PacketIFDatasetManifest:
     if not isinstance(raw_sessions, list) or not raw_sessions:
         raise ValueError("packet dataset manifest sessions must be a non-empty list")
 
-    sessions = tuple(_parse_session_spec(item) for item in raw_sessions)
-    _validate_manifest_sessions(sessions)
-    return PacketIFDatasetManifest(
+    sessions = tuple(
+        _parse_session_spec(item, dataset_version=dataset_version)
+        for item in raw_sessions
+    )
+    _validate_manifest_sessions(sessions, dataset_version=dataset_version)
+    manifest = PacketIFDatasetManifest(
         dataset_version=dataset_version,
         capture_policy=capture_policy,
         dataset_sha256=dataset_sha256,
         sessions=sessions,
     )
+    if dataset_version == PACKET_IF_DATASET_VERSION_V2:
+        _validate_run_manifest_references(path, manifest)
+    return manifest
 
 
 def file_sha256(path: Path) -> str:
@@ -330,7 +382,11 @@ def _parse_session_device(payload: Any) -> PacketIFSessionDevice:
     return PacketIFSessionDevice(device_id=device_id, peer_ip=peer_ip)
 
 
-def _parse_session_spec(payload: Any) -> PacketIFSessionSpec:
+def _parse_session_spec(
+    payload: Any,
+    *,
+    dataset_version: str,
+) -> PacketIFSessionSpec:
     if not isinstance(payload, dict):
         raise ValueError("each packet dataset session must be a JSON object")
 
@@ -417,6 +473,49 @@ def _parse_session_spec(payload: Any) -> PacketIFSessionSpec:
         "data_sha256",
     )
 
+    phase5_fields: dict[str, Any] = {}
+    if dataset_version == PACKET_IF_DATASET_VERSION_V2:
+        run_manifest_payload = payload.get("run_manifest_ref")
+        if not isinstance(run_manifest_payload, dict):
+            raise ValueError("run_manifest_ref must be a JSON object")
+        phase5_fields = {
+            "collection_slot_id": require_identifier(
+                payload.get("collection_slot_id"),
+                "collection_slot_id",
+            ),
+            "source_capture_group_id": require_canonical_uuid4(
+                payload.get("source_capture_group_id"),
+                "source_capture_group_id",
+            ),
+            "run_manifest_ref": PacketIFRunManifestReference.from_dict(
+                run_manifest_payload
+            ),
+            "normal_policy_version": require_non_empty_string(
+                payload.get("normal_policy_version"),
+                "normal_policy_version",
+            ),
+            "firmware_version": require_non_empty_string(
+                payload.get("firmware_version"),
+                "firmware_version",
+            ),
+            "payload_schema_version": require_non_empty_string(
+                payload.get("payload_schema_version"),
+                "payload_schema_version",
+            ),
+            "target_source_ip": normalize_optional_ipv4(
+                payload.get("target_source_ip"),
+                "target_source_ip",
+            ),
+            "included_device_ids": normalize_device_ids(
+                payload.get("included_device_ids"),
+                "included_device_ids",
+            ),
+            "background_traffic_present": require_bool(
+                payload.get("background_traffic_present"),
+                "background_traffic_present",
+            ),
+        }
+
     return PacketIFSessionSpec(
         session_id=session_id,
         split=split,
@@ -434,15 +533,21 @@ def _parse_session_spec(payload: Any) -> PacketIFSessionSpec:
         capture_gap_end=capture_gap_end,
         devices=devices,
         data_sha256=data_sha256,
+        **phase5_fields,
     )
 
 
 def _validate_manifest_sessions(
     sessions: tuple[PacketIFSessionSpec, ...],
+    *,
+    dataset_version: str,
 ) -> None:
     session_ids = [spec.session_id for spec in sessions]
     if len(set(session_ids)) != len(session_ids):
         raise ValueError("packet dataset manifest contains duplicate session_id values")
+
+    if dataset_version == PACKET_IF_DATASET_VERSION_V2:
+        _validate_phase5_manifest_sessions(sessions)
 
     split_values = {spec.split for spec in sessions}
     missing_splits = VALID_SPLITS - split_values
@@ -484,6 +589,20 @@ def _validate_manifest_sessions(
             raise ValueError(
                 f"normal session must not have target_device_id: {spec.session_id}"
             )
+        if dataset_version == PACKET_IF_DATASET_VERSION_V2:
+            if spec.traffic_label == ATTACK_LABEL and not spec.target_source_ip:
+                raise ValueError(
+                    "attack session must specify target_source_ip: "
+                    f"{spec.session_id}"
+                )
+            if (
+                spec.traffic_label == NORMAL_LABEL
+                and spec.target_source_ip is not None
+            ):
+                raise ValueError(
+                    "normal session must not have target_source_ip: "
+                    f"{spec.session_id}"
+                )
         device_ids = [device.device_id for device in spec.devices]
         peer_ips = [device.peer_ip for device in spec.devices]
         if len(set(device_ids)) != len(device_ids):
@@ -502,6 +621,108 @@ def _validate_manifest_sessions(
                 "attack target_device_id is missing from session devices: "
                 f"{spec.session_id}"
             )
+        if dataset_version == PACKET_IF_DATASET_VERSION_V2:
+            _validate_phase5_session_devices(spec)
+
+
+def _validate_phase5_manifest_sessions(
+    sessions: tuple[PacketIFSessionSpec, ...],
+) -> None:
+    collection_slot_ids = [spec.collection_slot_id for spec in sessions]
+    if len(set(collection_slot_ids)) != len(collection_slot_ids):
+        raise ValueError(
+            "packet dataset manifest contains duplicate "
+            "collection_slot_id values"
+        )
+
+    run_ids = [
+        spec.run_manifest_ref.run_id
+        for spec in sessions
+        if spec.run_manifest_ref is not None
+    ]
+    if len(set(run_ids)) != len(run_ids):
+        raise ValueError("packet dataset manifest contains duplicate run_id values")
+
+    group_splits: dict[str, str] = {}
+    for spec in sessions:
+        group_id = spec.source_capture_group_id
+        if group_id is None:
+            raise ValueError("source_capture_group_id is required for Dataset v2")
+        previous_split = group_splits.setdefault(group_id, spec.split)
+        if previous_split != spec.split:
+            raise ValueError(
+                "source_capture_group_id must not cross Dataset splits: "
+                f"group={group_id}, splits={sorted({previous_split, spec.split})}"
+            )
+
+    policy_versions = {spec.normal_policy_version for spec in sessions}
+    if len(policy_versions) != 1:
+        raise ValueError(
+            "Packet IF Dataset v2 must use one normal_policy_version: "
+            f"{sorted(str(value) for value in policy_versions)}"
+        )
+
+
+def _validate_phase5_session_devices(spec: PacketIFSessionSpec) -> None:
+    included = set(spec.included_device_ids)
+    exported = {device.device_id for device in spec.devices}
+    if not exported.issubset(included):
+        raise ValueError(
+            "packet dataset devices must be included in included_device_ids: "
+            f"session_id={spec.session_id}, missing={sorted(exported - included)}"
+        )
+    if spec.target_device_id is None:
+        return
+    if spec.target_device_id not in included:
+        raise ValueError(
+            "attack target_device_id is missing from included_device_ids: "
+            f"{spec.session_id}"
+        )
+    target_devices = [
+        device
+        for device in spec.devices
+        if device.device_id == spec.target_device_id
+    ]
+    if (
+        len(target_devices) != 1
+        or target_devices[0].peer_ip != spec.target_source_ip
+    ):
+        raise ValueError(
+            "attack target_source_ip must match the exported target device: "
+            f"{spec.session_id}"
+        )
+
+
+def _validate_run_manifest_references(
+    manifest_path: Path,
+    manifest: PacketIFDatasetManifest,
+) -> None:
+    base_directory = manifest_path.parent.resolve()
+    for spec in manifest.sessions:
+        reference = spec.run_manifest_ref
+        if reference is None:
+            raise ValueError("run_manifest_ref is required for Dataset v2")
+        run_manifest_path = (base_directory / reference.relative_path).resolve()
+        if base_directory not in run_manifest_path.parents:
+            raise ValueError(
+                "run_manifest_ref escapes the Dataset Manifest directory"
+            )
+        run_manifest = load_verified_run_manifest(
+            run_manifest_path,
+            expected_sha256=reference.sha256,
+        )
+        validate_run_manifest_identity(
+            run_manifest,
+            reference,
+            session_id=spec.session_id,
+            scenario=spec.scenario,
+            target_device_id=spec.target_device_id,
+            target_source_ip=spec.target_source_ip,
+            included_device_ips={
+                device.device_id: device.peer_ip
+                for device in spec.devices
+            },
+        )
 
 
 def _validate_dataset_columns(frame: pd.DataFrame) -> None:

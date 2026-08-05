@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -18,6 +19,18 @@ from ai.packet_if_dataset import (
     load_packet_if_manifest,
     session_data_sha256s,
 )
+from ai.packet_if_phase5_manifest import PACKET_IF_DATASET_VERSION_V1
+from edge.phase5.contracts import (
+    RUN_MANIFEST_SCHEMA_VERSION,
+    EvaluationScope,
+    ExecutionNode,
+    ExpectedOutcome,
+    RunManifest,
+    RunStageStatuses,
+    ScenarioReference,
+    run_manifest_sha256,
+)
+from edge.scenarios.run_scenario import ScenarioRunner
 
 
 SESSION_IDS = {
@@ -104,6 +117,12 @@ def _write_dataset_bundle(
     session_payloads = (
         sessions if sessions is not None else _manifest_sessions()
     )
+    dataset_version = str(
+        (manifest_overrides or {}).get(
+            "dataset_version",
+            PACKET_IF_DATASET_VERSION,
+        )
+    )
     try:
         per_session_sha256 = session_data_sha256s(dataset_path)
     except ValueError:
@@ -127,9 +146,42 @@ def _write_dataset_bundle(
             "data_sha256",
             per_session_sha256.get(session_id, "0" * 64),
         )
+        if dataset_version == PACKET_IF_DATASET_VERSION:
+            session.setdefault("collection_slot_id", f"slot-{session_id}")
+            session.setdefault("source_capture_group_id", session_id)
+            session.setdefault("normal_policy_version", "phase5-normal-policy-v1.1")
+            session.setdefault("firmware_version", "phase5-normal-pilot-v1")
+            session.setdefault("payload_schema_version", "phase5-normal-payload-v1")
+            devices = session.get("devices", [])
+            session.setdefault(
+                "included_device_ids",
+                sorted(
+                    {
+                        str(device["device_id"])
+                        for device in devices
+                        if isinstance(device, dict) and "device_id" in device
+                    }
+                ),
+            )
+            session.setdefault("background_traffic_present", False)
+            target_device_id = session.get("target_device_id")
+            target_source_ip = None
+            if target_device_id is not None:
+                for device in devices:
+                    if (
+                        isinstance(device, dict)
+                        and device.get("device_id") == target_device_id
+                    ):
+                        target_source_ip = str(device.get("peer_ip"))
+                        break
+            session.setdefault("target_source_ip", target_source_ip)
+            session.setdefault(
+                "run_manifest_ref",
+                _write_run_manifest(tmp_path, session),
+            )
 
     manifest: dict[str, object] = {
-        "dataset_version": PACKET_IF_DATASET_VERSION,
+        "dataset_version": dataset_version,
         "capture_policy_version": "packet-capture-policy-v1",
         "capture_policy": {
             "version": "packet-capture-policy-v1",
@@ -150,6 +202,54 @@ def _write_dataset_bundle(
         encoding="utf-8",
     )
     return dataset_path, manifest_path
+
+
+def _write_run_manifest(
+    root: Path,
+    session: dict[str, object],
+) -> dict[str, str]:
+    session_id = str(session["session_id"])
+    run_id = f"run-{session_id}"
+    relative_path = f"runs/{run_id}/run-manifest.json"
+    path = root / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    is_attack = session.get("traffic_label") == ATTACK_LABEL
+    scope = EvaluationScope.FULL_E2E if is_attack else EvaluationScope.DATA_ONLY
+    started_at = datetime(2026, 7, 23, tzinfo=timezone.utc)
+    devices = [
+        device
+        for device in session.get("devices", [])
+        if isinstance(device, dict)
+    ]
+    run_target_device_id = session.get("target_device_id")
+    run_source_ip = session.get("target_source_ip")
+    if run_target_device_id is None and devices:
+        run_target_device_id = devices[0].get("device_id")
+        run_source_ip = devices[0].get("peer_ip")
+    manifest = RunManifest(
+        run_id=run_id,
+        session_id=session_id,
+        scenario=ScenarioReference(scenario_id=str(session["scenario"])),
+        target_device_id=run_target_device_id,
+        source_ip=run_source_ip,
+        execution_node=ExecutionNode(node_id="test-node", registered=True),
+        evaluation_scope=scope,
+        is_active=False,
+        started_at=started_at,
+        observation_deadline_at=started_at + timedelta(minutes=5),
+        ended_at=started_at + timedelta(minutes=1),
+        expected_outcome=ExpectedOutcome(evaluation_scope=scope),
+        statuses=RunStageStatuses(),
+    )
+    path.write_text(manifest.to_json(), encoding="utf-8")
+    digest = run_manifest_sha256(manifest)
+    Path(f"{path}.sha256").write_text(f"{digest}\n", encoding="ascii")
+    return {
+        "run_id": run_id,
+        "relative_path": relative_path,
+        "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+        "sha256": digest,
+    }
 
 
 def test_load_dataset_assigns_splits_and_labels_by_session(tmp_path: Path) -> None:
@@ -544,3 +644,188 @@ def test_load_dataset_rejects_attack_row_with_wrong_device_id(tmp_path: Path) ->
 
     with pytest.raises(ValueError, match="not matching target_device_id"):
         load_packet_if_dataset(dataset_path, manifest_path)
+
+
+def test_manifest_v2_records_phase5_session_provenance(tmp_path: Path) -> None:
+    _, manifest_path = _write_dataset_bundle(tmp_path)
+
+    manifest = load_packet_if_manifest(manifest_path)
+    attack = next(
+        session
+        for session in manifest.sessions
+        if session.traffic_label == ATTACK_LABEL
+    )
+
+    assert manifest.dataset_version == PACKET_IF_DATASET_VERSION
+    assert manifest.normal_policy_version == "phase5-normal-policy-v1.1"
+    assert attack.collection_slot_id == f"slot-{SESSION_IDS['test_attack']}"
+    assert attack.source_capture_group_id == SESSION_IDS["test_attack"]
+    assert attack.run_manifest_ref is not None
+    assert attack.run_manifest_ref.schema_version == RUN_MANIFEST_SCHEMA_VERSION
+    assert attack.target_source_ip == "192.168.1.100"
+    assert attack.included_device_ids == ("esp32_01",)
+
+
+def test_manifest_v2_accepts_scenario_runner_artifact_under_dataset_root(
+    tmp_path: Path,
+) -> None:
+    sessions = _manifest_sessions()
+    attack = next(
+        session
+        for session in sessions
+        if session["session_id"] == SESSION_IDS["test_attack"]
+    )
+    attack["scenario"] = "mqtt_abnormal_publish_rate"
+    dataset_path, manifest_path = _write_dataset_bundle(tmp_path, sessions=sessions)
+
+    run_id = "run-packet-if-test-attack"
+    runner = ScenarioRunner(
+        execution_node="unit-test-node",
+        execution_node_registered=True,
+        runs_root=tmp_path / "runs",
+    )
+    _, run_manifest = runner.run(
+        "mqtt_abnormal_publish_rate",
+        run_id=run_id,
+        target_device_id="esp32_01",
+        source_ip="192.168.1.100",
+        session_id=SESSION_IDS["test_attack"],
+        dry_run=True,
+    )
+
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    attack_payload = next(
+        session
+        for session in payload["sessions"]
+        if session["session_id"] == SESSION_IDS["test_attack"]
+    )
+    attack_payload["run_manifest_ref"] = {
+        "run_id": run_id,
+        "relative_path": f"runs/{run_id}/run-manifest.json",
+        "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+        "sha256": run_manifest_sha256(run_manifest),
+    }
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    dataset = load_packet_if_dataset(dataset_path, manifest_path)
+
+    assert SESSION_IDS["test_attack"] in set(dataset.test["session_id"])
+
+
+def test_manifest_v2_rejects_source_capture_group_across_splits(
+    tmp_path: Path,
+) -> None:
+    sessions = _manifest_sessions()
+    shared_group = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    sessions[0]["source_capture_group_id"] = shared_group
+    sessions[1]["source_capture_group_id"] = shared_group
+    _, manifest_path = _write_dataset_bundle(tmp_path, sessions=sessions)
+
+    with pytest.raises(ValueError, match="must not cross Dataset splits"):
+        load_packet_if_manifest(manifest_path)
+
+
+def test_manifest_v2_rejects_duplicate_collection_slot(tmp_path: Path) -> None:
+    sessions = _manifest_sessions()
+    sessions[0]["collection_slot_id"] = "normal-slot-01"
+    sessions[1]["collection_slot_id"] = "normal-slot-01"
+    _, manifest_path = _write_dataset_bundle(tmp_path, sessions=sessions)
+
+    with pytest.raises(ValueError, match="duplicate collection_slot_id"):
+        load_packet_if_manifest(manifest_path)
+
+
+def test_manifest_v2_rejects_run_manifest_identity_mismatch(tmp_path: Path) -> None:
+    _, manifest_path = _write_dataset_bundle(tmp_path)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["sessions"][0]["run_manifest_ref"]["run_id"] = "different-run-id"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Run Manifest run_id mismatch"):
+        load_packet_if_manifest(manifest_path)
+
+
+def test_manifest_v2_rejects_run_manifest_sidecar_mismatch(tmp_path: Path) -> None:
+    _, manifest_path = _write_dataset_bundle(tmp_path)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    relative_path = payload["sessions"][0]["run_manifest_ref"]["relative_path"]
+    Path(f"{tmp_path / relative_path}.sha256").write_text(
+        f"{'0' * 64}\n",
+        encoding="ascii",
+    )
+
+    with pytest.raises(ValueError, match="sidecar SHA256 mismatch"):
+        load_packet_if_manifest(manifest_path)
+
+
+def test_manifest_v2_rejects_exported_device_missing_from_collection(
+    tmp_path: Path,
+) -> None:
+    sessions = _manifest_sessions()
+    sessions[0]["included_device_ids"] = ["esp32_02"]
+    _, manifest_path = _write_dataset_bundle(tmp_path, sessions=sessions)
+
+    with pytest.raises(ValueError, match="included_device_ids"):
+        load_packet_if_manifest(manifest_path)
+
+
+def test_manifest_v2_rejects_mixed_normal_policy_versions(tmp_path: Path) -> None:
+    sessions = _manifest_sessions()
+    sessions[0]["normal_policy_version"] = "phase5-normal-policy-v1.0"
+    sessions[1]["normal_policy_version"] = "phase5-normal-policy-v1.1"
+    _, manifest_path = _write_dataset_bundle(tmp_path, sessions=sessions)
+
+    with pytest.raises(ValueError, match="one normal_policy_version"):
+        load_packet_if_manifest(manifest_path)
+
+
+def test_manifest_v2_rejects_awaiting_session_correlation_run_manifest(
+    tmp_path: Path,
+) -> None:
+    _, manifest_path = _write_dataset_bundle(tmp_path)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    session = payload["sessions"][0]
+    ref = session["run_manifest_ref"]
+    run_manifest_path = tmp_path / ref["relative_path"]
+
+    original = RunManifest.from_json(run_manifest_path.read_text(encoding="utf-8"))
+    provisional = RunManifest(
+        run_id=original.run_id,
+        session_id=None,
+        scenario=original.scenario,
+        target_device_id=original.target_device_id,
+        source_ip=original.source_ip,
+        execution_node=original.execution_node,
+        evaluation_scope=original.evaluation_scope,
+        is_active=original.is_active,
+        started_at=original.started_at,
+        observation_deadline_at=original.observation_deadline_at,
+        ended_at=original.ended_at,
+        expected_outcome=original.expected_outcome,
+        statuses=original.statuses,
+        failure_stage="session_correlation",
+        failure_reason_code="AWAITING_SESSION_CORRELATION",
+        failure_reason="session_id not yet confirmed",
+    )
+    provisional_json = provisional.to_json()
+    run_manifest_path.write_text(provisional_json, encoding="utf-8")
+    new_digest = run_manifest_sha256(provisional)
+    Path(f"{run_manifest_path}.sha256").write_text(f"{new_digest}\n", encoding="ascii")
+    ref["sha256"] = new_digest
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="session_id mismatch"):
+        load_packet_if_manifest(manifest_path)
+
+
+def test_manifest_v1_remains_readable_for_local_fixtures(tmp_path: Path) -> None:
+    _, manifest_path = _write_dataset_bundle(
+        tmp_path,
+        manifest_overrides={"dataset_version": PACKET_IF_DATASET_VERSION_V1},
+    )
+
+    manifest = load_packet_if_manifest(manifest_path)
+
+    assert manifest.dataset_version == PACKET_IF_DATASET_VERSION_V1
+    assert manifest.normal_policy_version is None
+    assert all(session.run_manifest_ref is None for session in manifest.sessions)
