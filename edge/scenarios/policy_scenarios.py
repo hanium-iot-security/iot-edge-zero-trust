@@ -8,7 +8,8 @@
 
 .. note:: device_id_mismatch_attack.py는 ``--topic-device-id``/``--payload-device-id``를
    지정하지 않으면 REGISTERED_DEVICES의 앞 두 값을 결정적으로 사용한다.
-   Manifest의 대상 Device와 실제 감점 대상이 어긋나지 않도록, 반복 실행 시 항상 같은 기기 쌍이 검증 대상이 된다.
+   Manifest의 대상 Device와 실제 감점 대상이 어긋나지 않도록, 반복 실행 시 항상 같은
+   기기 쌍이 검증 대상이 된다.
 """
 
 from __future__ import annotations
@@ -40,6 +41,8 @@ register(
         duration_seconds=4 * 2.0,
         intensity="medium",
         requires_target_device_id=True,
+        target_device_id_arg_names=("topic-device-id",),
+        secondary_device_id_arg_name="payload-device-id",
         min_functional_runs=3,  # 대표 항목 최소 3회
         target_baseline_runs=10,
         expected_event_types=(DEVICE_ID_MISMATCH,),

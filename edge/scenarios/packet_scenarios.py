@@ -10,7 +10,7 @@
 이 Gate 확인은 DB/Orchestrator 상태를 실제로 조회해야 하므로 Raspberry Pi 쪽에서 최종 확정한다. 이 모듈은 그 결과를 코드에 반영할 수 있는 단일 지점(``is_packet_rule_gate_confirmed``)만 제공하며, 안전 기본값은 **미확인
 (False → HOLD)** 이다.
 
-.. note:: FULL_E2E 격리 도달 가능성 (실측 필요)
+.. note:: FULL_E2E 격리 도달 가능성 (미해결 — 실측 필요)
    packet_rate_flood(duration=12초)는 Capture Window(10초) 기준 최대 2개 Window에서만
    감점이 발생할 수 있어, 현재 Trust 격리 임계값(30점 미만)까지 도달하는지는 실측으로
    확인해야 한다. 이 카드에서는 duration을 임의로 늘리지 않았다 — Threshold·Trust 정책
@@ -54,6 +54,8 @@ register(
         duration_seconds=12.0,
         intensity="high",
         requires_target_source_ip=True,
+        target_device_id_arg_names=(),  # Packet 계열은 target_device_id를 command에 전달하지 않음
+        target_host_arg_name="target-host",  # packet_rate_flood_attack.py의 --target-host
         target_baseline_runs=10,
         expected_event_types=(PACKET_RATE_ANOMALY,),
         expected_incident_families=("FLOODING",),
@@ -85,6 +87,8 @@ register(
         duration_seconds=12.0,
         intensity="medium",
         requires_target_source_ip=True,
+        target_device_id_arg_names=(),  # Packet 계열은 target_device_id를 command에 전달하지 않음
+        target_host_arg_name="target-host",  # packet_rate_flood_attack.py의 --target-host
         min_functional_runs=1,  # 하위 항목별 기능 검증 1회 이상
         target_baseline_runs=3,
         expected_event_types=(BYTE_RATE_ANOMALY,),
@@ -120,6 +124,8 @@ register(
         duration_seconds=0.0,  # port 수에 따라 가변 — volume_strategy로 별도 계산
         intensity="medium",
         requires_target_source_ip=True,
+        target_device_id_arg_names=(),  # Packet 계열은 target_device_id를 command에 전달하지 않음
+        target_host_arg_name="target",  # port_scan_attack.py는 --target-host가 아니라 --target을 씀
         min_functional_runs=1,  # 하위 항목별 기능 검증 1회 이상
         target_baseline_runs=3,  # 다른 보조 시나리오와 동일 기준 (대표 항목만 10회 목표)
         expected_event_types=(PORT_SCAN,),

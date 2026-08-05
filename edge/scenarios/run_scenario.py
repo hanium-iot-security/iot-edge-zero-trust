@@ -123,6 +123,31 @@ def _validate_run_id(run_id: str) -> str:
     return run_id
 
 
+class SecondaryDeviceIdUnavailableError(ValueError):
+    """target_device_id와 다른 두 번째 등록 기기를 REGISTERED_DEVICES에서
+    찾을 수 없는 경우 (예: 등록 기기가 1개뿐이거나 설정이 비어있음)."""
+
+
+def _pick_secondary_device_id(target_device_id: str) -> str:
+    """``target_device_id``와 다른 등록 기기를 결정적으로 하나 고른다.
+
+    ``mqtt_device_id_mismatch``처럼 topic/payload에 서로 다른 두 등록 기기가
+    필요한 시나리오에서 사용한다. ``REGISTERED_DEVICES``를 정렬한 뒤
+    ``target_device_id``와 다른 첫 값을 고정 순서로 반환해, 반복 실행해도
+    항상 같은 두 번째 기기가 선택되도록 한다 (무작위 선택 금지).
+    """
+    from attacks.config import REGISTERED_DEVICES
+
+    candidates = sorted(d for d in REGISTERED_DEVICES if d != target_device_id)
+    if not candidates:
+        raise SecondaryDeviceIdUnavailableError(
+            f"target_device_id={target_device_id!r}와 다른 등록 기기를 "
+            f"REGISTERED_DEVICES={REGISTERED_DEVICES!r}에서 찾을 수 없습니다. "
+            "등록 기기가 최소 2개 이상 필요합니다."
+        )
+    return candidates[0]
+
+
 def compare_event_types(
     expected_event_types: list[str] | tuple[str, ...],
     actual_event_types: list[str] | tuple[str, ...],
@@ -204,6 +229,7 @@ class ScenarioResultRow:
     scenario_version: str = ""
     target_device_id: str | None = None
     source_ip: str | None = None
+    target_host: str | None = None
     execution_node: str = ""
     command: list[str] = field(default_factory=list)
     started_at: str | None = None
@@ -265,8 +291,7 @@ class ScenarioRunner:
         self.python_executable = python_executable
         # non-dry-run(``dry_run=False``) 실행을 허용할지 여부. 기본값 False —
         # 실제 DB·iptables·Device·MQTT 상태를 확인하는 훅이 연결되기 전까지
-        # 실공격 실행을 거부한다. Pi에서 실제 훅을 연결한
-        # 뒤 CLI의 ``--execute`` 플래그로만 True가 된다.
+        # 실공격 실행을 거부한다. Pi에서 실제 훅을 연결한 뒤 CLI의 ``--execute`` 플래그로만 True가 된다.
         self.allow_execute = allow_execute
 
     def run(
@@ -276,10 +301,20 @@ class ScenarioRunner:
         run_id: str | None = None,
         target_device_id: str | None = None,
         source_ip: str | None = None,
+        target_host: str | None = None,
         session_id: str | None = None,
         extra_args: dict[str, str] | None = None,
         dry_run: bool = True,
     ) -> tuple[ScenarioResultRow, RunManifest]:
+        """단일 시나리오를 1회 실행한다.
+
+        target_host: PACKET_ANOMALY 계열에서 공격 패킷을 실제로 받는 목적지
+        (Raspberry Pi/Broker) IP. source_ip(Attack Node 자신의 IP, Manifest
+        관찰용)와 의미가 다르므로 별도 인자로 분리했다.
+        RunManifest 스키마에는 없고 scenario-result.jsonl과 실행 command에만
+        기록된다. 지정하지 않으면 attack 스크립트 자체 기본값(BROKER_HOST)이
+        사용된다.
+        """
         defn = get_scenario(scenario_id)
 
         if defn.requires_target_device_id and not target_device_id:
@@ -295,6 +330,18 @@ class ScenarioRunner:
                 "allow_execute=False(기본값)입니다. 실제 DB·iptables·Device·MQTT "
                 "상태를 확인하는 Baseline/Cleanup 훅이 연결된 뒤에만 "
                 "allow_execute=True로 생성하세요 (CLI에서는 --execute)."
+            )
+
+        if not dry_run and (
+            self.baseline_check is default_baseline_check
+            or self.cleanup_hook is default_cleanup_hook
+        ):
+            raise UnsafeExecutionRefusedError(
+                f"{scenario_id}의 실공격 실행이 거부되었습니다: baseline_check/"
+                "cleanup_hook이 아직 기본 no-op 구현(default_baseline_check/"
+                "default_cleanup_hook)입니다. Pi에서 실제 DB·iptables·Device·"
+                "MQTT 상태를 확인·복구하는 훅으로 교체한 뒤 ScenarioRunner에 "
+                "전달하세요 (edge/scenarios/cleanup.py의 예시 뼈대 참고)."
             )
 
         run_id = run_id if run_id is not None else str(uuid.uuid4())
@@ -318,7 +365,10 @@ class ScenarioRunner:
                 source_ip=source_ip,
                 run_dir=run_dir,
                 exec_status=ScenarioExecStatus.DRY_RUN,
-                command=self._build_command(defn, dict(defn.default_args)),
+                command=self._build_command(
+                    defn,
+                    self._build_args(defn, target_device_id=target_device_id, target_host=target_host, extra_args=extra_args),
+                ),
                 exit_code=None,
                 started_at=_utc_now(),
                 attack_started_at=None,
@@ -330,6 +380,7 @@ class ScenarioRunner:
                 cleanup_ok=True,
                 cleanup_failure_reason=None,
                 is_dry_run=True,
+                target_host=target_host,
             )
 
         if defn.requires_packet_rule_gate and not is_packet_rule_gate_confirmed():
@@ -341,7 +392,10 @@ class ScenarioRunner:
                 source_ip=source_ip,
                 run_dir=run_dir,
                 exec_status=ScenarioExecStatus.HOLD,
-                command=self._build_command(defn, dict(defn.default_args)),
+                command=self._build_command(
+                    defn,
+                    self._build_args(defn, target_device_id=target_device_id, target_host=target_host, extra_args=extra_args),
+                ),
                 exit_code=None,
                 started_at=_utc_now(),
                 attack_started_at=None,
@@ -356,27 +410,33 @@ class ScenarioRunner:
                 cleanup_attempted=False,
                 cleanup_ok=True,
                 cleanup_failure_reason=None,
+                target_host=target_host,
             )
 
         evaluation_scope = EvaluationScope(defn.evaluation_scope)
         if not self.execution_node_registered and evaluation_scope == EvaluationScope.FULL_E2E:
             evaluation_scope = EvaluationScope.DETECTION_ONLY
 
-        if evaluation_scope == EvaluationScope.FULL_E2E and session_id is None:
-            raise MissingRequiredInputError(
-                f"{scenario_id}는 FULL_E2E 공식 실행이므로 session_id를 실행 전에 "
-                "확정해야 합니다 (Exporter는 Manifest를 사후에 재작성하지 않습니다). "
-                "상관관계가 아직 없다면 별도 Session 상관분석 단계를 먼저 수행하거나 "
-                "dry_run=True로 Local 검증만 수행하세요."
-            )
+        if evaluation_scope == EvaluationScope.FULL_E2E:
+            missing_fields = []
+            if session_id is None:
+                missing_fields.append("session_id")
+            if defn.requires_target_device_id and target_device_id is None:
+                missing_fields.append("target_device_id")
+            if defn.requires_target_source_ip and source_ip is None:
+                missing_fields.append("source_ip")
+            if missing_fields:
+                raise MissingRequiredInputError(
+                    f"{scenario_id}는 FULL_E2E 공식 실행이므로 {', '.join(missing_fields)}를 "
+                    "실행 전에 모두 확정해야 합니다 (Exporter는 Manifest를 사후에 "
+                    "재작성하지 않습니다). 상관관계가 아직 없다면 별도 Session "
+                    "상관분석 단계를 먼저 수행하거나 dry_run=True로 Local 검증만 "
+                    "수행하세요."
+                )
 
-        args = dict(defn.default_args)
-        if extra_args:
-            args.update(extra_args)
-        if target_device_id and defn.series != "PACKET_ANOMALY":
-            args["device_id"] = target_device_id
-        if source_ip and defn.series == "PACKET_ANOMALY":
-            pass
+        args = self._build_args(
+            defn, target_device_id=target_device_id, target_host=target_host, extra_args=extra_args
+        )
 
         command = self._build_command(defn, args)
         started_at = _utc_now()
@@ -403,6 +463,7 @@ class ScenarioRunner:
                 cleanup_ok=True,
                 cleanup_failure_reason=None,
                 evaluation_scope=evaluation_scope,
+                target_host=target_host,
             )
 
         attack_started_at = _utc_now()
@@ -456,6 +517,7 @@ class ScenarioRunner:
                 cleanup_ok=True,
                 cleanup_failure_reason=None,
                 evaluation_scope=evaluation_scope,
+                target_host=target_host,
             )
 
         ended_at = _utc_now()
@@ -486,6 +548,7 @@ class ScenarioRunner:
             cleanup_failure_reason=cleanup_reason,
             execution_volume=execution_volume,
             evaluation_scope=evaluation_scope,
+            target_host=target_host,
         )
 
     # ------------------------------------------------------------------
@@ -513,6 +576,7 @@ class ScenarioRunner:
         execution_volume: dict[str, Any] | None = None,
         evaluation_scope: EvaluationScope | None = None,
         is_dry_run: bool = False,
+        target_host: str | None = None,
     ) -> tuple[ScenarioResultRow, RunManifest]:
         execution_volume = execution_volume or _compute_execution_volume(
             defn, dict(defn.default_args)
@@ -540,6 +604,7 @@ class ScenarioRunner:
             scenario_version=defn.scenario_version,
             target_device_id=target_device_id,
             source_ip=source_ip,
+            target_host=target_host,
             execution_node=self.execution_node,
             command=command,
             started_at=_iso(started_at),
@@ -686,6 +751,35 @@ class ScenarioRunner:
             run_manifest_sha256(manifest) + "\n", encoding="utf-8"
         )
 
+    def _build_args(
+        self,
+        defn: ScenarioDefinition,
+        *,
+        target_device_id: str | None,
+        target_host: str | None = None,
+        extra_args: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        """attack 스크립트에 전달할 최종 인자 dict를 조립한다.
+
+        Dry-run·HOLD·실제 실행이 모두 이 메서드를 거쳐야 한다.
+        """
+        args = dict(defn.default_args)
+        if extra_args:
+            args.update(extra_args)
+
+        if target_device_id:
+            for arg_name in defn.target_device_id_arg_names:
+                args[arg_name] = target_device_id
+
+        if target_device_id and defn.secondary_device_id_arg_name:
+            args[defn.secondary_device_id_arg_name] = _pick_secondary_device_id(
+                target_device_id
+            )
+
+        if target_host and defn.target_host_arg_name:
+            args[defn.target_host_arg_name] = target_host
+        return args
+
     def _build_command(
         self, defn: ScenarioDefinition, args: dict[str, str]
     ) -> list[str]:
@@ -717,8 +811,7 @@ class BatchSummary:
         """SCENARIO_FAILED를 포함해 SUCCESS/DRY_RUN이 아닌 결과가 하나라도 있으면 True.
 
         기존에는 RESET_FAILED/HOLD만 조기 중단시키고 SCENARIO_FAILED는 배치
-        전체의 성공 여부에 반영하지 않아, 실패 Run이 있어도 CLI가 0을 반환할 수
-        있었다.
+        전체의 성공 여부에 반영하지 않아, 실패 Run이 있어도 CLI가 0을 반환할 수 있었다.
         """
         ok_statuses = {ScenarioExecStatus.SUCCESS, ScenarioExecStatus.DRY_RUN}
         return any(result.scenario_runner_status not in ok_statuses for result in self.results)
@@ -731,6 +824,7 @@ def run_repeated(
     *,
     target_device_id: str | None = None,
     source_ip: str | None = None,
+    target_host: str | None = None,
     session_id: str | None = None,
     dry_run: bool = True,
 ) -> BatchSummary:
@@ -741,6 +835,7 @@ def run_repeated(
             scenario_id,
             target_device_id=target_device_id,
             source_ip=source_ip,
+            target_host=target_host,
             session_id=session_id,
             dry_run=dry_run,
         )
@@ -771,7 +866,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--scenario")
     p.add_argument("--list", action="store_true")
     p.add_argument("--target-device-id", default=None)
-    p.add_argument("--source-ip", default=None, help="Packet 계열 시나리오의 대상 IP")
+    p.add_argument("--source-ip", default=None, help="Packet 계열 시나리오의 대상 IP (Attack Node 자신의 IP, Manifest 관찰용)")
+    p.add_argument(
+        "--target-host",
+        default=None,
+        help="Packet 계열 시나리오의 공격 목적지(Raspberry Pi/Broker) IP. "
+        "--source-ip(Attack Node 자신의 IP)와 다른 값이다. "
+        "지정하지 않으면 attack 스크립트 자체 기본값(BROKER_HOST)이 사용된다.",
+    )
     p.add_argument(
         "--execution-node-registered",
         action="store_true",
@@ -790,7 +892,42 @@ def _parse_args() -> argparse.Namespace:
         "(기본값). 실기기에서 실제 DB·iptables·Device·MQTT 상태를 확인하는 "
         "Baseline/Cleanup 훅이 연결된 뒤에만 사용해야 한다.",
     )
+    p.add_argument(
+        "--baseline-check-module",
+        default=None,
+        help="--execute와 함께 사용. 실제 Baseline 확인 함수를 "
+        "'module.submodule:function_name' 형식으로 지정한다 "
+        "(예: 'edge.scenarios.cleanup:pi_baseline_check'). 지정하지 않으면 "
+        "기본 no-op 훅이 남아있는 것으로 간주해 --execute가 거부된다.",
+    )
+    p.add_argument(
+        "--cleanup-hook-module",
+        default=None,
+        help="--execute와 함께 사용. 실제 Cleanup 함수를 "
+        "'module.submodule:function_name' 형식으로 지정한다 "
+        "(예: 'edge.scenarios.cleanup:pi_cleanup_hook'). 지정하지 않으면 "
+        "기본 no-op 훅이 남아있는 것으로 간주해 --execute가 거부된다.",
+    )
     return p.parse_args()
+
+
+def _load_hook_from_module_path(module_path: str) -> Any:
+    """'module.submodule:function_name' 형식 문자열을 실제 함수 객체로 로드한다."""
+    if ":" not in module_path:
+        raise MissingRequiredInputError(
+            f"모듈 경로 형식이 올바르지 않습니다: {module_path!r} "
+            "('module.submodule:function_name' 형식이어야 합니다)"
+        )
+    module_name, func_name = module_path.rsplit(":", 1)
+    import importlib
+
+    module = importlib.import_module(module_name)
+    try:
+        return getattr(module, func_name)
+    except AttributeError as exc:
+        raise MissingRequiredInputError(
+            f"{module_name!r} 모듈에 {func_name!r} 함수가 없습니다."
+        ) from exc
 
 
 def main() -> int:
@@ -809,12 +946,30 @@ def main() -> int:
 
     dry_run = not args.execute
 
-    runner = ScenarioRunner(
+    runner_kwargs: dict[str, Any] = dict(
         execution_node=args.execution_node,
         execution_node_registered=args.execution_node_registered,
         runs_root=Path(args.runs_root),
         allow_execute=args.execute,
     )
+    if args.baseline_check_module:
+        try:
+            runner_kwargs["baseline_check"] = _load_hook_from_module_path(
+                args.baseline_check_module
+            )
+        except MissingRequiredInputError as exc:
+            print(f"[ScenarioRunner] 실행 거부: {exc}", file=sys.stderr)
+            return 2
+    if args.cleanup_hook_module:
+        try:
+            runner_kwargs["cleanup_hook"] = _load_hook_from_module_path(
+                args.cleanup_hook_module
+            )
+        except MissingRequiredInputError as exc:
+            print(f"[ScenarioRunner] 실행 거부: {exc}", file=sys.stderr)
+            return 2
+
+    runner = ScenarioRunner(**runner_kwargs)
 
     try:
         if args.times == 1 and args.run_id:
@@ -823,6 +978,7 @@ def main() -> int:
                 run_id=args.run_id,
                 target_device_id=args.target_device_id,
                 source_ip=args.source_ip,
+                target_host=args.target_host,
                 session_id=args.session_id,
                 dry_run=dry_run,
             )
@@ -840,6 +996,7 @@ def main() -> int:
             args.times,
             target_device_id=args.target_device_id,
             source_ip=args.source_ip,
+            target_host=args.target_host,
             session_id=args.session_id,
             dry_run=dry_run,
         )

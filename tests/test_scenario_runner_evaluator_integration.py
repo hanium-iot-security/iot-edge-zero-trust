@@ -3,8 +3,9 @@
 
 이 테스트는 실제로 재현했던 버그(마이크로초 포함 attack_started_at 때문에 같은 초에 기록된 Detection Event가 "공격 시작 이전"으로 잘못 배제되는 문제)의 회귀를 막기 위한 것이다.
 
-.. important:: Dry-run은 attack_started_at을 남기지 않으므로, 공식 TP/FN 지표 검증에는 사용할 수 없다.
-    여기서는 mocked subprocess로 실제 실행 경로(dry_run=False + allow_execute=True)를 태워 공식 지표를 생성한다.
+.. important:: Dry-run은 attack_started_at을 남기지 않으므로,
+   공식 TP/FN 지표 검증에는 사용할 수 없다. 여기서는 mocked subprocess로 실제
+   실행 경로(dry_run=False + allow_execute=True)를 태워 공식 지표를 생성한다.
 """
 
 from __future__ import annotations
@@ -22,6 +23,19 @@ from edge.scenarios.run_scenario import ScenarioRunner
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "db" / "migrations"
 FAKE_SOURCE_COMMIT = "a" * 40
+
+
+def _noop_but_real_baseline_check() -> tuple[bool, str | None]:
+    """``default_baseline_check``와 identity가 다른, 테스트 전용 더미 훅.
+
+    ``ScenarioRunner``는 non-dry-run 실행 시 ``baseline_check``/``cleanup_hook``이 여전히 기본 no-op 함수와 동일 객체이면 실행을 거부한다.
+    """
+    return True, None
+
+
+def _noop_but_real_cleanup_hook() -> tuple[bool, str | None]:
+    """``default_cleanup_hook``와 identity가 다른, 테스트 전용 더미 훅."""
+    return True, None
 
 
 def _build_test_db(db_path: Path, *, device_id: str, ip_address: str) -> None:
@@ -80,6 +94,8 @@ def test_matched_detection_produces_true_positive(tmp_path: Path):
         execution_node_registered=True,
         runs_root=tmp_path / "runs",
         allow_execute=True,
+        baseline_check=_noop_but_real_baseline_check,
+        cleanup_hook=_noop_but_real_cleanup_hook,
     )
     result, manifest = _run_real(
         runner,
@@ -125,6 +141,8 @@ def test_missing_detection_produces_false_negative(tmp_path: Path):
         execution_node_registered=True,
         runs_root=tmp_path / "runs",
         allow_execute=True,
+        baseline_check=_noop_but_real_baseline_check,
+        cleanup_hook=_noop_but_real_cleanup_hook,
     )
     result, _manifest = _run_real(
         runner,

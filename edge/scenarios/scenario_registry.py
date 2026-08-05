@@ -25,11 +25,13 @@ class ScenarioDefinition:
     ``module``은 ``python -m <module>`` 형태로 실행할 attacks/ 스크립트다.
     ``default_args``의 key는 해당 스크립트 argparse 옵션 이름(언더스코어 표기, 예: ``device_id``)과 정확히 같아야 한다.
     """
+
     scenario_id: str
     series: str
     scenario_version: str
     description: str
     module: str
+
     default_args: dict[str, str] = field(default_factory=dict)
 
     # 입력 계약
@@ -39,9 +41,14 @@ class ScenarioDefinition:
     requires_target_device_id: bool = False
     requires_target_source_ip: bool = False
 
+    target_device_id_arg_names: tuple[str, ...] = ("device_id",)
+
+    secondary_device_id_arg_name: str | None = None
+
     # 반복 실행 기준
     min_functional_runs: int = 3
     target_baseline_runs: int = 10
+
     detection_expected: bool = True
     expected_event_types: tuple[str, ...] = ()
     expected_incident_families: tuple[str, ...] = ()  # 문서화 전용
@@ -65,6 +72,7 @@ class ScenarioDefinition:
     volume_arg_name: str = "count"
     volume_unit: str = "messages"
 
+    target_host_arg_name: str | None = None
 
 SCENARIOS: dict[str, ScenarioDefinition] = {}
 

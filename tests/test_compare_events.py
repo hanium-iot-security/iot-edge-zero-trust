@@ -22,6 +22,20 @@ from edge.scenarios.run_scenario import ScenarioRunner
 MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "db" / "migrations"
 
 
+def _noop_but_real_baseline_check() -> tuple[bool, str | None]:
+    """``default_baseline_check``와 identity가 다른, 테스트 전용 더미 훅.
+
+    ``ScenarioRunner``는 non-dry-run 실행 시 ``baseline_check``/``cleanup_hook``이 여전히 기본 no-op 함수와 동일 객체이면
+    실행을 거부한다. 이 파일은 실제 실행 경로(dry_run=False)로 Manifest의 attack_started_at을 채워야 하므로, identity가 다른 더미 훅을 명시적으로 넘긴다.
+    """
+    return True, None
+
+
+def _noop_but_real_cleanup_hook() -> tuple[bool, str | None]:
+    """``default_cleanup_hook``와 identity가 다른, 테스트 전용 더미 훅."""
+    return True, None
+
+
 def _build_test_db(db_path: Path) -> None:
     with sqlite3.connect(db_path) as conn:
         for name in ("001_init.sql", "002_packet_gateway.sql", "003_phase4_detection.sql"):
@@ -88,7 +102,11 @@ def _run_real(runner: ScenarioRunner, scenario_id: str, **kwargs):
 def test_matched_event_is_detected(tmp_path: Path, db_session):
     session, db_path = db_session
     runner = ScenarioRunner(
-        execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
+        execution_node="unit-test-node",
+        runs_root=tmp_path,
+        allow_execute=True,
+        baseline_check=_noop_but_real_baseline_check,
+        cleanup_hook=_noop_but_real_cleanup_hook,
     )
     result, manifest = _run_real(
         runner, "mqtt_abnormal_publish_rate", target_device_id="esp32_02"
@@ -112,7 +130,11 @@ def test_matched_event_is_detected(tmp_path: Path, db_session):
 def test_missing_when_no_event_recorded(tmp_path: Path, db_session):
     session, _db_path = db_session
     runner = ScenarioRunner(
-        execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
+        execution_node="unit-test-node",
+        runs_root=tmp_path,
+        allow_execute=True,
+        baseline_check=_noop_but_real_baseline_check,
+        cleanup_hook=_noop_but_real_cleanup_hook,
     )
     result, _manifest = _run_real(
         runner, "mqtt_abnormal_publish_rate", target_device_id="esp32_02"
@@ -126,7 +148,11 @@ def test_missing_when_no_event_recorded(tmp_path: Path, db_session):
 def test_unexpected_event_is_flagged(tmp_path: Path, db_session):
     session, db_path = db_session
     runner = ScenarioRunner(
-        execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
+        execution_node="unit-test-node",
+        runs_root=tmp_path,
+        allow_execute=True,
+        baseline_check=_noop_but_real_baseline_check,
+        cleanup_hook=_noop_but_real_cleanup_hook,
     )
     result, manifest = _run_real(
         runner, "mqtt_abnormal_publish_rate", target_device_id="esp32_02"
@@ -154,7 +180,11 @@ def test_packet_scenario_falls_back_to_subject_ip(tmp_path: Path, db_session):
         "edge.scenarios.run_scenario.is_packet_rule_gate_confirmed", return_value=True
     ):
         runner = ScenarioRunner(
-            execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
+            execution_node="unit-test-node",
+            runs_root=tmp_path,
+            allow_execute=True,
+            baseline_check=_noop_but_real_baseline_check,
+            cleanup_hook=_noop_but_real_cleanup_hook,
         )
         result, manifest = _run_real(
             runner, "packet_rate_flood", source_ip="192.168.0.10"
@@ -179,7 +209,11 @@ def test_event_detected_mid_window_is_still_matched(tmp_path: Path, db_session):
     시작된 경우) detected_at이 관찰 구간 안에 있으면 matched로 잡혀야 한다."""
     session, db_path = db_session
     runner = ScenarioRunner(
-        execution_node="unit-test-node", runs_root=tmp_path, allow_execute=True
+        execution_node="unit-test-node",
+        runs_root=tmp_path,
+        allow_execute=True,
+        baseline_check=_noop_but_real_baseline_check,
+        cleanup_hook=_noop_but_real_cleanup_hook,
     )
     result, manifest = _run_real(
         runner, "mqtt_abnormal_publish_rate", target_device_id="esp32_02"

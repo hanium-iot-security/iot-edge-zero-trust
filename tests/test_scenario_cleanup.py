@@ -50,6 +50,9 @@ def test_baseline_failure_marks_environment_error_and_skips_execution(tmp_path: 
 def test_cleanup_is_attempted_after_execution(tmp_path: Path):
     calls = {"cleanup": 0}
 
+    def baseline() -> tuple[bool, str | None]:
+        return True, None
+
     def cleanup() -> tuple[bool, str | None]:
         calls["cleanup"] += 1
         return True, None
@@ -57,6 +60,7 @@ def test_cleanup_is_attempted_after_execution(tmp_path: Path):
     runner = ScenarioRunner(
         execution_node="unit-test-node",
         runs_root=tmp_path,
+        baseline_check=baseline,
         cleanup_hook=cleanup,
         allow_execute=True,
     )
@@ -70,11 +74,21 @@ def test_cleanup_is_attempted_after_execution(tmp_path: Path):
 
 
 def test_three_failure_modes_are_distinguishable_in_scenario_runner_status(tmp_path: Path):
+    def real_baseline() -> tuple[bool, str | None]:
+        return True, None
+
+    def real_cleanup() -> tuple[bool, str | None]:
+        return True, None
+
     with patch("subprocess.run") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
 
         runner_ok = ScenarioRunner(
-            execution_node="unit-test-node", runs_root=tmp_path / "a", allow_execute=True
+            execution_node="unit-test-node",
+            runs_root=tmp_path / "a",
+            allow_execute=True,
+            baseline_check=real_baseline,
+            cleanup_hook=real_cleanup,
         )
         result_ok, _ = runner_ok.run("mqtt_unknown_device", dry_run=False)
         assert result_ok.scenario_runner_status == ScenarioExecStatus.SUCCESS
@@ -82,6 +96,7 @@ def test_three_failure_modes_are_distinguishable_in_scenario_runner_status(tmp_p
         runner_reset_failed = ScenarioRunner(
             execution_node="unit-test-node",
             runs_root=tmp_path / "b",
+            baseline_check=real_baseline,
             cleanup_hook=lambda: (False, "정리 실패"),
             allow_execute=True,
         )
@@ -92,6 +107,7 @@ def test_three_failure_modes_are_distinguishable_in_scenario_runner_status(tmp_p
             execution_node="unit-test-node",
             runs_root=tmp_path / "c",
             baseline_check=lambda: (False, "환경 오류"),
+            cleanup_hook=real_cleanup,
             allow_execute=True,
         )
         result_env_error, _ = runner_env_error.run("mqtt_unknown_device", dry_run=False)

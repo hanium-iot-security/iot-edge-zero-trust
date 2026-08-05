@@ -24,13 +24,17 @@ Protocol과 안전한 기본값(no-op=항상 성공)만 제공한다. Pi #2에�
    ``approved_by``·``reason``·``--confirm``을 입력하도록 설계된 운영자 도구이므로,
    Scenario Runner가 매 반복 실행 뒤 자동으로 호출하는 ``CleanupHook``에 그대로
    결합하지 않는다 — 자동 Cleanup은 "정상 상태로 복귀했는지 확인"까지만 담당하고,
-   이미 반영된 Trust Score를 되돌려야 하는 예외 상황은 운영자가 별도로 위 도구를 사용해 처리한다.
+   이미 반영된 Trust Score를 되돌려야 하는 예외 상황은 운영자가 별도로 위 도구를
+   사용해 처리한다.
 
    또한 ``default_baseline_check``/``default_cleanup_hook``(no-op)은 Local
    개발·Dry-run 전용이다. ``ScenarioRunner``는 ``allow_execute=True``(CLI
-   ``--execute``)로 실공격을 실행하기 전에 이 훅들이 실제 구현으로 교체되었는지
-   여부까지는 자동으로 검증하지 않으므로, Pi에서 non-dry-run 실행을 준비할 때는
-   반드시 아래 예시 뼈대를 실제 DB/iptables 확인 로직으로 교체한 뒤 전달해야 한다.
+   ``--execute``)로 실공격을 실행하려 할 때, ``baseline_check``/``cleanup_hook``이
+   이 no-op 기본값과 동일한 객체인지 identity 비교로 확인하고, 그렇다면
+   ``UnsafeExecutionRefusedError``로 실행 자체를 거부한다.
+   Pi에서 non-dry-run 실행을 준비할 때는 반드시 아래 예시 뼈대를 실제
+   DB/iptables 확인 로직으로 교체한 뒤 ``ScenarioRunner``에 전달해야 하며,
+   교체하지 않으면 ``allow_execute=True``를 줘도 실행이 거부된다.
 """
 
 from __future__ import annotations

@@ -7,10 +7,7 @@ evaluation exporter(Trust/Firewall까지 포함하는 정식 산출물)와 달�
 이 스크립트는 **Event Type 일치 여부만** 빠르게 확인하는 스팟체크 도구다.
 
 매칭 기준은 ``detected_at``이 Run의 관찰 구간(``[started_at, observation_deadline_at]``)
-안에 있는지로 판정한다. 이전에는 조회 자체를 ``analysis_window_start >= started_at``
-조건으로 필터링했는데, 공격이 10초 집계 Window 중간에 시작되면 정상적으로 탐지된 Event도 Window *시작* 시각이 공격 시작보다 앞선다는 이유로 조회에서
-누락(false missing)될 수 있었다. 공식 Evaluator와 동일하게 ``detected_at`` 자체를 기준으로 매칭한다.
-"""
+안에 있는지로 판정한다. 공식 Evaluator와 동일하게 ``detected_at`` 자체를 기준으로 매칭한다."""
 
 from __future__ import annotations
 
