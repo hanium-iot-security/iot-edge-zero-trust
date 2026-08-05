@@ -47,6 +47,31 @@ def test_baseline_failure_marks_environment_error_and_skips_execution(tmp_path: 
     assert "baseline_check_failed" in (manifest.failure_reason or "")
 
 
+def test_baseline_exception_is_recorded_and_attack_is_not_started(tmp_path: Path):
+    def baseline() -> tuple[bool, str | None]:
+        raise RuntimeError("baseline hook crashed")
+
+    runner = ScenarioRunner(
+        execution_node="unit-test-node",
+        runs_root=tmp_path,
+        baseline_check=baseline,
+        cleanup_hook=lambda: (True, None),
+        allow_execute=True,
+    )
+    with patch("subprocess.run") as mock_run:
+        result, manifest = runner.run("mqtt_unknown_device", dry_run=False)
+
+    mock_run.assert_not_called()
+    assert result.scenario_runner_status == ScenarioExecStatus.ENVIRONMENT_ERROR
+    assert result.cleanup_attempted is False
+    assert result.capture_eligible is False
+    assert result.error_reason == "baseline_check_exception: baseline hook crashed"
+    assert manifest.statuses.scenario_status == ManifestStatus.ENVIRONMENT_ERROR
+    run_dir = tmp_path / result.run_id
+    assert (run_dir / "scenario-result.jsonl").is_file()
+    assert (run_dir / "run-manifest.json").is_file()
+
+
 def test_cleanup_is_attempted_after_execution(tmp_path: Path):
     calls = {"cleanup": 0}
 
@@ -71,6 +96,34 @@ def test_cleanup_is_attempted_after_execution(tmp_path: Path):
     assert calls["cleanup"] == 1
     assert result.cleanup_attempted is True
     assert result.cleanup_ok is True
+
+
+def test_cleanup_exception_is_recorded_as_reset_failed_after_execution(tmp_path: Path):
+    def baseline() -> tuple[bool, str | None]:
+        return True, None
+
+    def cleanup() -> tuple[bool, str | None]:
+        raise RuntimeError("cleanup hook crashed")
+
+    runner = ScenarioRunner(
+        execution_node="unit-test-node",
+        runs_root=tmp_path,
+        baseline_check=baseline,
+        cleanup_hook=cleanup,
+        allow_execute=True,
+    )
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+        result, manifest = runner.run("mqtt_unknown_device", dry_run=False)
+
+    assert result.scenario_runner_status == ScenarioExecStatus.RESET_FAILED
+    assert result.cleanup_attempted is True
+    assert result.cleanup_ok is False
+    assert result.cleanup_failure_reason == "cleanup_hook_exception: cleanup hook crashed"
+    assert manifest.statuses.scenario_status == ManifestStatus.ENVIRONMENT_ERROR
+    run_dir = tmp_path / result.run_id
+    assert (run_dir / "scenario-result.jsonl").is_file()
+    assert (run_dir / "run-manifest.json").is_file()
 
 
 def test_three_failure_modes_are_distinguishable_in_scenario_runner_status(tmp_path: Path):

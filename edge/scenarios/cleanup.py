@@ -1,6 +1,6 @@
 """실행 전 Baseline 확인 / 실행 후 Cleanup 훅.
 
-  - Baseline: Device ``active`` 상태, 시작 Trust Score, 활성 Firewall/
+  - Baseline: Device ``normal`` 상태, 시작 Trust Score, 활성 Firewall/
     iptables Rule 없음, 정상 MQTT 연결 가능 상태를 확인한다.
   - Cleanup: 공격 Process·MQTT Client·Firewall Rule·iptables를 정리하고
     다음 Run 실행 가능 상태를 확인한다. 실패하면 새 Run을 시작하지 않고
@@ -45,7 +45,7 @@ from typing import Protocol
 class BaselineCheck(Protocol):
     """실행 전 Baseline 확인.
 
-    Device ``active`` 상태, 시작 Trust Score, 활성 Firewall·iptables Rule
+    Device ``normal`` 상태, 시작 Trust Score, 활성 Firewall·iptables Rule
     없음, 정상 MQTT 연결 가능 상태를 확인하고 실패 시 ``(False, 사유)``를 반환한다.
     """
 
@@ -87,7 +87,7 @@ def default_cleanup_hook() -> tuple[bool, str | None]:
 # --- Pi #2에서 연결할 훅의 예시 뼈대 ---
 #
 # def pi_baseline_check() -> tuple[bool, str | None]:
-#     # TODO: devices.status == 'active' 확인
+#     # TODO: devices.status == 'normal' 확인
 #     # TODO: 시작 Trust Score 기록
 #     # TODO: 활성 firewall_rules / iptables Rule 없음 확인
 #     # TODO: 정상 MQTT 연결·Publish 가능 확인

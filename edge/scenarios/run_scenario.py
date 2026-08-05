@@ -383,6 +383,30 @@ class ScenarioRunner:
                 target_host=target_host,
             )
 
+        evaluation_scope = EvaluationScope(defn.evaluation_scope)
+        if not self.execution_node_registered and evaluation_scope == EvaluationScope.FULL_E2E:
+            evaluation_scope = EvaluationScope.DETECTION_ONLY
+
+        if evaluation_scope == EvaluationScope.FULL_E2E:
+            required_identity = {
+                "session_id": session_id,
+                "target_device_id": target_device_id,
+                "source_ip": source_ip,
+            }
+            missing_fields = [
+                field_name
+                for field_name, value in required_identity.items()
+                if value is None
+            ]
+            if missing_fields:
+                raise MissingRequiredInputError(
+                    f"{scenario_id}는 FULL_E2E 공식 실행이므로 {', '.join(missing_fields)}를 "
+                    "실행 전에 모두 확정해야 합니다 (Exporter는 Manifest를 사후에 "
+                    "재작성하지 않습니다). 상관관계가 아직 없다면 별도 Session "
+                    "상관분석 단계를 먼저 수행하거나 dry_run=True로 Local 검증만 "
+                    "수행하세요."
+                )
+
         if defn.requires_packet_rule_gate and not is_packet_rule_gate_confirmed():
             return self._finalize(
                 defn=defn,
@@ -410,29 +434,9 @@ class ScenarioRunner:
                 cleanup_attempted=False,
                 cleanup_ok=True,
                 cleanup_failure_reason=None,
+                evaluation_scope=evaluation_scope,
                 target_host=target_host,
             )
-
-        evaluation_scope = EvaluationScope(defn.evaluation_scope)
-        if not self.execution_node_registered and evaluation_scope == EvaluationScope.FULL_E2E:
-            evaluation_scope = EvaluationScope.DETECTION_ONLY
-
-        if evaluation_scope == EvaluationScope.FULL_E2E:
-            missing_fields = []
-            if session_id is None:
-                missing_fields.append("session_id")
-            if defn.requires_target_device_id and target_device_id is None:
-                missing_fields.append("target_device_id")
-            if defn.requires_target_source_ip and source_ip is None:
-                missing_fields.append("source_ip")
-            if missing_fields:
-                raise MissingRequiredInputError(
-                    f"{scenario_id}는 FULL_E2E 공식 실행이므로 {', '.join(missing_fields)}를 "
-                    "실행 전에 모두 확정해야 합니다 (Exporter는 Manifest를 사후에 "
-                    "재작성하지 않습니다). 상관관계가 아직 없다면 별도 Session "
-                    "상관분석 단계를 먼저 수행하거나 dry_run=True로 Local 검증만 "
-                    "수행하세요."
-                )
 
         args = self._build_args(
             defn, target_device_id=target_device_id, target_host=target_host, extra_args=extra_args
@@ -441,8 +445,17 @@ class ScenarioRunner:
         command = self._build_command(defn, args)
         started_at = _utc_now()
 
-        baseline_ok, baseline_reason = self.baseline_check()
+        try:
+            baseline_ok, baseline_reason = self.baseline_check()
+        except Exception as exc:
+            baseline_ok = False
+            baseline_reason = f"baseline_check_exception: {exc}"
         if not baseline_ok:
+            baseline_error_reason = (
+                baseline_reason
+                if baseline_reason and baseline_reason.startswith("baseline_check_exception:")
+                else f"baseline_check_failed: {baseline_reason}"
+            )
             return self._finalize(
                 defn=defn,
                 run_id=run_id,
@@ -458,7 +471,7 @@ class ScenarioRunner:
                 ended_at=None,
                 stdout_path=None,
                 stderr_path=None,
-                error_reason=f"baseline_check_failed: {baseline_reason}",
+                error_reason=baseline_error_reason,
                 cleanup_attempted=False,
                 cleanup_ok=True,
                 cleanup_failure_reason=None,
@@ -521,7 +534,11 @@ class ScenarioRunner:
             )
 
         ended_at = _utc_now()
-        cleanup_ok, cleanup_reason = self.cleanup_hook()
+        try:
+            cleanup_ok, cleanup_reason = self.cleanup_hook()
+        except Exception as exc:
+            cleanup_ok = False
+            cleanup_reason = f"cleanup_hook_exception: {exc}"
         if not cleanup_ok:
             exec_status = ScenarioExecStatus.RESET_FAILED
 
@@ -921,13 +938,23 @@ def _load_hook_from_module_path(module_path: str) -> Any:
     module_name, func_name = module_path.rsplit(":", 1)
     import importlib
 
-    module = importlib.import_module(module_name)
     try:
-        return getattr(module, func_name)
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise MissingRequiredInputError(
+            f"{module_name!r} 모듈을 로드할 수 없습니다: {exc}"
+        ) from exc
+    try:
+        hook = getattr(module, func_name)
     except AttributeError as exc:
         raise MissingRequiredInputError(
             f"{module_name!r} 모듈에 {func_name!r} 함수가 없습니다."
         ) from exc
+    if not callable(hook):
+        raise MissingRequiredInputError(
+            f"{module_name!r} 모듈의 {func_name!r} 속성은 호출 가능한 함수가 아닙니다."
+        )
+    return hook
 
 
 def main() -> int:

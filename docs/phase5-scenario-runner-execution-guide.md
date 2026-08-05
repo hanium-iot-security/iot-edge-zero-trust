@@ -29,6 +29,8 @@ python -m edge.scenarios.run_scenario \
 
 > `[TODO: 실기기 검증 필요]` `edge/scenarios/cleanup.py` 하단에 주석으로만 남아있는 `pi_baseline_check`/`pi_cleanup_hook` 예시 뼈대를 실제 구현으로 채우고 주석을 해제해야 위 명령이 동작한다. 뼈대를 채우지 않은 상태에서 위 두 옵션에 존재하지 않는 함수를 지정하면 `모듈 경로 형식이 올바르지 않습니다` 또는 `함수가 없습니다` 에러로 명확히 거부된다.
 
+Hook 경로는 저장소에서 검토한 신뢰 가능한 모듈만 지정한다. 모듈을 불러올 수 없거나 지정한 속성이 호출 가능한 함수가 아니면 실행 전에 종료 코드 2로 거부된다. Baseline Hook 예외는 공격 시작 전 `ENVIRONMENT_ERROR`로, 공격 후 Cleanup Hook 예외는 `RESET_FAILED`로 기록하며 결과 Manifest를 보존한다.
+
 이 게이트가 뚫리지 않았는데 `--execute`를 줬을 때 나오는 에러 메시지:
 
 ```
@@ -79,9 +81,13 @@ Packet 계열 3개는 전부 `requires_packet_rule_gate=True`다. Phase 4 Packet
 
 ### FULL_E2E 공식 실행 시 추가로 필요한 것
 
-`--execute`를 붙여 FULL_E2E 시나리오(`mqtt_abnormal_publish_rate`, `mqtt_device_id_mismatch`, `packet_rate_flood`)를 공식 실행하려면, 위 시나리오별 필수 인자에 더해 `--session-id`가 항상 필요하다. 세 가지(session_id + 그 시나리오가 요구하는 target_device_id 또는 source_ip) 중 하나라도 없으면 `MissingRequiredInputError`로 실행 전에 거부된다 — Exporter는 Manifest를 사후에 재작성하지 않으므로, 상관관계 없는 Run을 만든 뒤 나중에 채우는 흐름은 성립하지 않는다.
+`--execute`를 붙여 FULL_E2E 시나리오(`mqtt_abnormal_publish_rate`, `mqtt_device_id_mismatch`, `packet_rate_flood`)를 공식 실행하려면 `--session-id`, `--target-device-id`, `--source-ip` 세 값을 모두 실행 전에 확정해야 한다. 하나라도 없으면 `MissingRequiredInputError`로 공격 시작 전에 거부된다 — Exporter는 Manifest를 사후에 재작성하지 않으므로, 상관관계 없는 Run을 만든 뒤 나중에 채우는 흐름은 성립하지 않는다.
 
 `--execution-node-registered`를 지정하지 않으면(기본값 False), Attack Node가 DB에 등록되지 않은 것으로 간주되어 FULL_E2E가 자동으로 DETECTION_ONLY로 하향된다 — 이 경우 `--session-id` 요구도 함께 해제된다.
+
+### 격리·Firewall 도달 가능성 확인 전 운영 Gate
+
+Registry의 `firewall_rule_expected=true`, `block_expected=true`는 대표 시나리오가 최종적으로 검증해야 할 **후보 계약**이지, 현재 실기기에서 달성됐다는 결과가 아니다. 현재 실행량이 독립된 10초 Window를 충분히 만들고 Trust Score를 30점 미만까지 낮추는지는 아직 실측되지 않았다. Pi 증적으로 Trust 감점→`isolated`→Firewall `APPLIED`→실제 차단이 확인되기 전까지 공식 FULL_E2E 반복 실행과 완료 판정은 운영상 `HOLD`한다. 이 PR의 병합만으로 FULL_E2E 격리 검증이 완료된 것으로 기록하지 않는다.
 
 ---
 
@@ -106,6 +112,7 @@ Dry-run 결과는 `scenario_status=NOT_EVALUATED`, `scenario_runner_status=DRY_R
 python -m edge.scenarios.run_scenario \
   --scenario mqtt_abnormal_publish_rate \
   --target-device-id esp32_02 \
+  --source-ip <Attack Node IP> \
   --session-id <실제 Capture Session ID> \
   --execution-node <Pi 식별자> \
   --execution-node-registered \
@@ -125,6 +132,7 @@ python -m edge.scenarios.run_scenario \
 python -m edge.scenarios.run_scenario \
   --scenario mqtt_abnormal_publish_rate \
   --target-device-id esp32_02 \
+  --source-ip <Attack Node IP> \
   --session-id <실제 Capture Session ID> \
   --execution-node <Pi 식별자> \
   --execution-node-registered \
@@ -141,6 +149,7 @@ python -m edge.scenarios.run_scenario \
 ```bash
 python -m edge.scenarios.run_scenario \
   --scenario packet_rate_flood \
+  --target-device-id <Attack Node에 귀속된 Device ID> \
   --source-ip <Attack Node 자신의 IP> \
   --target-host <Raspberry Pi/Broker IP> \
   --session-id <실제 Capture Session ID> \
@@ -238,9 +247,10 @@ Pi에서 실제 `cleanup_hook`을 구현할 때 다음은 절대 하지 않는�
 
 ## 6. 빠른 체크리스트 (매 실행 전)
 
-- [ ] Device 상태 `active`, 시작 Trust Score 기록, 활성 Firewall/iptables Rule 없음, 정상 MQTT 연결 가능 확인 (Baseline)
+- [ ] Device 상태 `normal`, 시작 Trust Score 기록, 활성 Firewall/iptables Rule 없음, 정상 MQTT 연결 가능 확인 (Baseline)
 - [ ] `--execute` 없이 Dry-run으로 먼저 명령·인자가 올바른지 확인
-- [ ] FULL_E2E 공식 실행이면 `--session-id`를 미리 확정
+- [ ] FULL_E2E 공식 실행이면 `--session-id`, `--target-device-id`, `--source-ip`를 모두 미리 확정
+- [ ] 격리 도달 실기기 증적이 없으면 Firewall·Block 완료를 선언하지 않고 공식 FULL_E2E 실행을 `HOLD`
 - [ ] Packet 계열이면 Packet Rule Gate 확인 상태 점검 (`PHASE5_PACKET_RULE_GATE_CONFIRMED` 환경변수 또는 담당자 확인)
 - [ ] 실행 후 `scenario-result.jsonl`의 `scenario_runner_status` 확인, `RESET_FAILED`면 수동 정리 후 재개
 - [ ] `RESET_FAILED`/이상 상황 시 Trust Score를 임의로 되돌리지 않고 승인된 보상 절차 사용

@@ -19,6 +19,7 @@ from edge.scenarios.run_scenario import (
     ScenarioExecStatus,
     ScenarioRunner,
     UnsafeExecutionRefusedError,
+    _load_hook_from_module_path,
     compare_event_types,
     run_repeated,
 )
@@ -173,6 +174,59 @@ def test_full_e2e_non_dry_run_requires_session_id(tmp_path: Path):
             )
 
 
+def test_full_e2e_non_dry_run_requires_source_ip_before_attack(tmp_path: Path):
+    runner = ScenarioRunner(
+        execution_node="unit-test-node",
+        execution_node_registered=True,
+        runs_root=tmp_path,
+        allow_execute=True,
+        baseline_check=_noop_but_real_baseline_check,
+        cleanup_hook=_noop_but_real_cleanup_hook,
+    )
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+        with pytest.raises(MissingRequiredInputError, match="source_ip"):
+            runner.run(
+                "mqtt_abnormal_publish_rate",
+                target_device_id="esp32_02",
+                session_id="sess-source-required",
+                source_ip=None,
+                dry_run=False,
+            )
+    mock_run.assert_not_called()
+
+
+def test_packet_full_e2e_non_dry_run_requires_target_device_id_before_attack(
+    tmp_path: Path,
+):
+    runner = ScenarioRunner(
+        execution_node="unit-test-node",
+        execution_node_registered=True,
+        runs_root=tmp_path,
+        allow_execute=True,
+        baseline_check=_noop_but_real_baseline_check,
+        cleanup_hook=_noop_but_real_cleanup_hook,
+    )
+    with (
+        patch(
+            "edge.scenarios.run_scenario.is_packet_rule_gate_confirmed",
+            return_value=True,
+        ),
+        patch("subprocess.run") as mock_run,
+    ):
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+        with pytest.raises(MissingRequiredInputError, match="target_device_id"):
+            runner.run(
+                "packet_rate_flood",
+                target_device_id=None,
+                source_ip="192.168.0.10",
+                target_host="192.168.0.5",
+                session_id="sess-target-required",
+                dry_run=False,
+            )
+    mock_run.assert_not_called()
+
+
 def test_full_e2e_non_dry_run_succeeds_with_session_id(tmp_path: Path):
     runner = ScenarioRunner(
         execution_node="unit-test-node",
@@ -186,6 +240,7 @@ def test_full_e2e_non_dry_run_succeeds_with_session_id(tmp_path: Path):
         result, _manifest = runner.run(
             "mqtt_abnormal_publish_rate",
             target_device_id="esp32_02",
+            source_ip="192.168.0.10",
             session_id="sess-1",
             dry_run=False,
         )
@@ -206,6 +261,18 @@ def test_detection_only_non_dry_run_does_not_require_session_id(tmp_path: Path):
             "mqtt_unknown_device", session_id=None, dry_run=False
         )
     assert result.scenario_runner_status == ScenarioExecStatus.SUCCESS
+
+
+def test_hook_loader_rejects_missing_module_with_input_error():
+    with pytest.raises(MissingRequiredInputError, match="로드할 수 없습니다"):
+        _load_hook_from_module_path("does.not.exist:baseline")
+
+
+def test_hook_loader_rejects_non_callable_attribute():
+    with pytest.raises(MissingRequiredInputError, match="호출 가능한 함수가 아닙니다"):
+        _load_hook_from_module_path(
+            "edge.scenarios.run_scenario:DEFAULT_COMMAND_TIMEOUT_SECONDS"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +380,7 @@ def test_registered_node_keeps_full_e2e(tmp_path: Path):
             mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
             _result, manifest = runner.run(
                 "packet_rate_flood",
+                target_device_id="esp32_01",
                 source_ip="192.168.0.10",
                 session_id="sess-registered-full-e2e",
                 dry_run=False,
