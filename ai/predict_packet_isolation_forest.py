@@ -40,9 +40,10 @@ from ai.packet_if_artifact import (
     bytes_sha256,
     packet_if_bundle_sha256_bytes,
 )
-from ai.packet_if_dataset import (
-    PACKET_IF_DATASET_VERSION,
-    load_packet_if_dataset,
+from ai.packet_if_dataset import load_packet_if_dataset
+from ai.packet_if_phase5_manifest import (
+    PACKET_IF_DATASET_VERSION_V2,
+    SUPPORTED_PACKET_IF_DATASET_VERSIONS,
 )
 from edge.packet.capture_policy import CapturePolicy
 
@@ -364,11 +365,8 @@ def _validate_metadata(
 
     capture_policy = _validate_capture_policy_metadata(metadata)
     _validate_normalization_metadata(metadata.get("normalization"))
-    _require_exact_string(
-        metadata,
-        "dataset_version",
-        PACKET_IF_DATASET_VERSION,
-    )
+    dataset_version = _require_supported_dataset_version(metadata)
+    _validate_normal_policy_version(metadata, dataset_version=dataset_version)
     _require_sha256(metadata, "dataset_sha256")
     _require_sha256(metadata, "manifest_sha256")
     _validate_training_parameters(metadata.get("training_parameters"))
@@ -378,6 +376,30 @@ def _validate_metadata(
     _require_git_commit_sha(metadata, "git_commit_sha")
     _require_utc_timestamp(metadata, "created_at")
     return model_version, threshold, capture_policy
+
+
+def _require_supported_dataset_version(metadata: dict[str, Any]) -> str:
+    value = _require_non_empty_string(metadata, "dataset_version")
+    if value not in SUPPORTED_PACKET_IF_DATASET_VERSIONS:
+        raise ValueError(
+            "Packet IF metadata dataset_version mismatch: "
+            f"supported={sorted(SUPPORTED_PACKET_IF_DATASET_VERSIONS)!r}, "
+            f"actual={value!r}"
+        )
+    return value
+
+
+def _validate_normal_policy_version(
+    metadata: dict[str, Any],
+    *,
+    dataset_version: str,
+) -> str | None:
+    value = metadata.get("normal_policy_version")
+    if dataset_version == PACKET_IF_DATASET_VERSION_V2:
+        return _require_non_empty_string(metadata, "normal_policy_version")
+    if value is None:
+        return None
+    return _require_non_empty_string(metadata, "normal_policy_version")
 
 
 def _validate_capture_policy_metadata(

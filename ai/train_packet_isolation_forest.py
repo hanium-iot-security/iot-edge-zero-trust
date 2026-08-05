@@ -173,6 +173,7 @@ def train_packet_isolation_forest(
                 "total_bytes_formula": PACKET_IF_TOTAL_BYTES_FORMULA,
             },
             "dataset_version": dataset.manifest.dataset_version,
+            "normal_policy_version": dataset.manifest.normal_policy_version,
             "dataset_sha256": dataset.manifest.dataset_sha256,
             "manifest_sha256": manifest_sha256,
             "sessions": {
@@ -272,6 +273,8 @@ def _build_training_report(
 ) -> dict[str, Any]:
     test_labels = dataset.test["traffic_label"].astype(str).to_numpy()
     return {
+        "dataset_version": dataset.manifest.dataset_version,
+        "normal_policy_version": dataset.manifest.normal_policy_version,
         "threshold": threshold,
         "threshold_percentile": float(threshold_percentile),
         "threshold_operator": PACKET_IF_THRESHOLD_OPERATOR,

@@ -126,9 +126,26 @@ Row만 변경 불가능한 새 CSV로 저장합니다.
 CSV는 덮어쓰지 않으며 같은 Directory의 임시 파일을 `fsync()`한 뒤 원자적
 hard-link로 게시하여 완성된 파일만 노출합니다. 동시 Export가 같은 경로를
 선점해도 먼저 생성된 파일을 보존하고 후속 실행은 실패합니다.
+따라서 Export Directory는 운영체제와 관계없이 하드링크를 지원하는 로컬
+파일시스템이어야 하며, 지원하지 않는 Drive·Mount에서는 게시 전에 실패합니다.
 
-Export Spec에는 Split·Label·Scenario, 공격 대상, 실제 Capture Filter와 Capture
-실행 Source Commit SHA를 기록합니다.
+Export Spec에는 Split·Label·Scenario, 수집 Slot·Source Capture Group, Run Manifest
+참조, 정상 정책·Firmware·Payload Schema Version, 공격 대상, 실제 Capture Filter와
+Capture 실행 Source Commit SHA를 기록합니다.
+
+`run_manifest_ref.relative_path`는 Dataset Manifest Directory 하위만 허용합니다.
+따라서 아래처럼 Dataset을 `data/exports/`에 둘 경우 Scenario Runner도
+`--runs-root data/exports/runs`로 실행해 Run Manifest와 Sidecar를 같은 하위
+Directory에 생성합니다. 기본 `data/phase5/runs/` 경로는 이 Export Spec에서
+`../` 참조가 필요하므로 사용할 수 없습니다.
+
+```bash
+python -m edge.scenarios.run_scenario --runs-root data/exports/runs --help
+```
+
+Capture Runtime이 생성한 소문자 Canonical UUIDv4 `session_id`를 확인한 뒤, 공격
+FULL_E2E Run에는 같은 값을 `--session-id`로 전달합니다. Capture 시작 전에는
+`session_id`를 임의로 생성하거나 Run Manifest에 추정값을 기록하지 않습니다.
 
 ```json
 {
@@ -139,14 +156,45 @@ Export Spec에는 Split·Label·Scenario, 공격 대상, 실제 Capture Filter�
       "session_id": "11111111-1111-4111-8111-111111111111",
       "split": "train",
       "traffic_label": "normal",
-      "scenario": "normal_stable"
+      "scenario": "normal_stable",
+      "target_device_id": null,
+      "target_source_ip": null,
+      "collection_slot_id": "normal-stable-train-01",
+      "source_capture_group_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "run_manifest_path": "runs/run-normal-stable-train-01/run-manifest.json",
+      "run_manifest_ref": {
+        "run_id": "run-normal-stable-train-01",
+        "relative_path": "runs/run-normal-stable-train-01/run-manifest.json",
+        "schema_version": "phase5-run-manifest-v1",
+        "sha256": "<Run Manifest Canonical JSON SHA256>"
+      },
+      "normal_policy_version": "phase5-normal-policy-v1.0",
+      "firmware_version": "phase5-normal-firmware-v1",
+      "payload_schema_version": "phase5-normal-payload-v1",
+      "included_device_ids": ["esp32_01", "esp32_02"],
+      "background_traffic_present": false
     },
     {
       "session_id": "44444444-4444-4444-8444-444444444444",
       "split": "test",
       "traffic_label": "attack",
       "scenario": "packet_flood",
-      "target_device_id": "esp32_02"
+      "target_device_id": "esp32_02",
+      "target_source_ip": "192.168.0.5",
+      "collection_slot_id": "packet-flood-test-01",
+      "source_capture_group_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      "run_manifest_path": "runs/run-packet-flood-test-01/run-manifest.json",
+      "run_manifest_ref": {
+        "run_id": "run-packet-flood-test-01",
+        "relative_path": "runs/run-packet-flood-test-01/run-manifest.json",
+        "schema_version": "phase5-run-manifest-v1",
+        "sha256": "<Run Manifest Canonical JSON SHA256>"
+      },
+      "normal_policy_version": "phase5-normal-policy-v1.0",
+      "firmware_version": "phase4-attack-sender-v1",
+      "payload_schema_version": "phase5-attack-payload-v1",
+      "included_device_ids": ["esp32_01", "esp32_02"],
+      "background_traffic_present": true
     }
   ]
 }
@@ -154,15 +202,17 @@ Export Spec에는 Split·Label·Scenario, 공격 대상, 실제 Capture Filter�
 
 ```bash
 python -m ai.export_packet_if_dataset \
-  --output data/exports/packet_if_dataset-v1.csv \
-  --manifest-output data/exports/packet_if_manifest-v1.json \
-  --spec data/exports/packet_if_export_spec-v1.json
+  --output data/exports/packet_if_dataset-v2.csv \
+  --manifest-output data/exports/packet_if_manifest-v2.json \
+  --spec data/exports/packet_if_export_spec-v2.json
 ```
 
 Exporter는 CSV와 Session Manifest를 함께 생성합니다. Manifest에는 전체 CSV
 SHA256, Session별 데이터 SHA256, Capture Policy 전체 수치, Session 시간·Gap,
 Interface·Filter·Commit SHA와 Device/IP 매핑을 기록합니다. 공격 Session은
-`target_device_id`와 다른 기기의 혼합 트래픽을 제외합니다. 요청한 Session 중
+`target_device_id`·`target_source_ip`와 다른 기기의 혼합 트래픽을 제외합니다.
+Run Manifest와 Sidecar의 SHA256·Run·Session·Scenario·대상 식별자가 일치하지
+않으면 게시 전에 실패합니다. 요청한 Session 중
 적격 Row가 하나도 없거나 아직 Feature 변환이 끝나지 않은 Session이 있으면
 Dataset을 게시하지 않고 실패합니다.
 
@@ -172,7 +222,7 @@ Dataset을 게시하지 않고 실패합니다.
 
 ```json
 {
-  "dataset_version": "packet-if-dataset-v1",
+  "dataset_version": "packet-if-dataset-v2",
   "capture_policy_version": "packet-capture-policy-v1",
   "capture_policy": {
     "version": "packet-capture-policy-v1",
@@ -190,6 +240,20 @@ Dataset을 게시하지 않고 실패합니다.
       "traffic_label": "normal",
       "scenario": "normal_stable",
       "target_device_id": null,
+      "target_source_ip": null,
+      "collection_slot_id": "normal-stable-train-01",
+      "source_capture_group_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "run_manifest_ref": {
+        "run_id": "run-normal-stable-train-01",
+        "relative_path": "runs/run-normal-stable-train-01/run-manifest.json",
+        "schema_version": "phase5-run-manifest-v1",
+        "sha256": "<Run Manifest Canonical JSON SHA256>"
+      },
+      "normal_policy_version": "phase5-normal-policy-v1.0",
+      "firmware_version": "phase5-normal-firmware-v1",
+      "payload_schema_version": "phase5-normal-payload-v1",
+      "included_device_ids": ["esp32_01", "esp32_02"],
+      "background_traffic_present": false,
       "status": "COMPLETED",
       "capture_interface": "eth0",
       "capture_filter": "tcp or udp",
@@ -223,13 +287,27 @@ Session 항목에 같은 Provenance 필드를 기록합니다.
 - Test에는 서로 다른 정상·공격 Session이 모두 필요
 - 공격 Session은 `target_device_id`를 필수로 지정하고 해당 Device Row만 포함
 - 정상 Session에는 `target_device_id`를 지정하지 않음
+- 공격 Session에는 `target_source_ip`를 필수로 지정하고 정상 Session에는 지정하지 않음
 - 하나의 Session을 여러 Split에 배치하는 것 금지
+- 같은 `source_capture_group_id`에서 파생된 Session을 여러 Split에 배치하는 것 금지
+- `collection_slot_id`와 Run Manifest `run_id`는 Dataset 안에서 중복 금지
+- Dataset 전체에 하나의 `normal_policy_version`만 사용
+- Export Row의 Device는 `included_device_ids`에 포함되어야 함
+- Run Manifest Canonical JSON SHA256과 `.sha256` Sidecar를 모두 검증
+- `run_manifest_ref.relative_path`는 Dataset Manifest Directory 하위의 상대 경로만 허용
+- 경로 파일명은 `run-manifest.json`으로 고정하고 Windows 예약 이름·`:` 등
+  Platform별로 다르게 해석되는 경로 문자 금지
 - 모든 Manifest Session에 CSV Row가 한 개 이상 존재해야 함
 - 모든 CSV Session이 Manifest에 선언되어야 함
 - Session ID는 소문자 Canonical UUID4 형식 사용
 - 전체 CSV SHA256이 `dataset_sha256`과 일치해야 함
 - 각 Session Row SHA256이 `data_sha256`과 일치해야 함
 - Manifest Capture Policy 전체 수치가 학습 환경과 정확히 일치해야 함
+
+`packet-if-dataset-v1`은 기존 Local Fixture를 읽기 위한 호환 경로로만 유지합니다.
+Phase 5 공식 Export·학습·평가는 v2를 사용합니다. Holdout Session은 공식
+Train·Validation·Test Dataset에 넣지 않고 별도 Run·Split 계획에서 보존합니다.
+전체 v2 계약은 `docs/packet-if-dataset-v2.md`를 따릅니다.
 
 ## 학습
 
@@ -243,8 +321,8 @@ test -z "$(git status --porcelain)" || {
 export SOURCE_COMMIT_SHA="$(git rev-parse HEAD)"
 
 python -m ai.train_packet_isolation_forest \
-  --dataset data/exports/packet_if_dataset-v1.csv \
-  --manifest data/exports/packet_if_manifest-v1.json \
+  --dataset data/exports/packet_if_dataset-v2.csv \
+  --manifest data/exports/packet_if_manifest-v2.json \
   --artifact-dir ai/models/packet_if/packet-if-v1 \
   --threshold-percentile 99.0 \
   --git-commit-sha "$SOURCE_COMMIT_SHA"
@@ -305,6 +383,7 @@ Model을 역직렬화하기 전에 아래 항목을 검증합니다.
 - 운영 설정에 고정된 외부 Bundle SHA256
 - Artifact Schema와 Model Type
 - Feature·Transform·Dataset Version의 정확한 일치
+- Dataset v2의 정상 정책 Version
 - Model Version과 Capture Policy Version·수치의 정확한 일치
 - 명목 10초 Window, 최소 Coverage와 Count·Bytes 정규화식
 - 정확한 Feature 순서
@@ -334,8 +413,8 @@ Session Manifest를 함께 검증합니다.
 ```bash
 python -m ai.predict_packet_isolation_forest \
   --artifact-dir ai/models/packet_if/packet-if-v1 \
-  --csv data/exports/packet_if_dataset-v1.csv \
-  --manifest data/exports/packet_if_manifest-v1.json \
+  --csv data/exports/packet_if_dataset-v2.csv \
+  --manifest data/exports/packet_if_manifest-v2.json \
   --expected-model-version packet-if-v1 \
   --expected-bundle-sha256 "$PACKET_IF_EXPECTED_BUNDLE_SHA256"
 ```
@@ -347,18 +426,12 @@ Core의 Local 검증은 Test Split만 사용하는 아래 평가 명령을 실�
 
 ## Phase 5 Offline 평가
 
-현재 `packet-if-dataset-v1` 명령은 평가 Core와 Local Fixture를 검증하기 위한
-선행 경로입니다. 아래 조건이 모두 충족되기 전에는 출력 Bundle을 공식 Phase 5
-평가 결과로 사용하지 않습니다.
+Dataset Manifest v2와 Source Capture Group 검증은 구현되어 있습니다. 아래 운영
+조건이 모두 충족된 고정 Dataset만 공식 Phase 5 평가에 사용합니다.
 
 - 공통 Phase 5 Run Manifest Schema가 병합되고 동결됨
-- Packet IF Dataset Manifest v2가 병합되고 동결됨
-- Dataset Exporter와 Loader가 v2 및 `source_capture_group_id` 계약을 검증함
 - 공식 Session·Split과 Source Capture Group이 사전에 동결됨
-
-현재 Core는 Session ID 기준 누수만 차단합니다. P5-JM-01 완료를 위해서는 v2
-병합 시 동일 Source Capture Group이 Train·Validation·Test·Holdout 사이에
-나뉘지 않는 검증을 추가해야 합니다.
+- Holdout은 Train·Validation·Test Dataset 밖에서 별도로 동결됨
 
 `packet-if-evaluation-v1`은 평가 출력의 Schema Version이며 공통 Run Manifest
 Schema Version과 별개입니다. 이 평가 Core는 `run_id` 등 공통 Run Manifest
@@ -372,8 +445,8 @@ test -z "$(git status --porcelain)" || {
 export SOURCE_COMMIT_SHA="$(git rev-parse HEAD)"
 
 python -m ai.evaluate_packet_isolation_forest \
-  --dataset data/exports/packet_if_dataset-v1.csv \
-  --manifest data/exports/packet_if_manifest-v1.json \
+  --dataset data/exports/packet_if_dataset-v2.csv \
+  --manifest data/exports/packet_if_manifest-v2.json \
   --artifact-dir ai/models/packet_if/packet-if-v1 \
   --expected-model-version packet-if-v1 \
   --expected-bundle-sha256 "$PACKET_IF_EXPECTED_BUNDLE_SHA256" \

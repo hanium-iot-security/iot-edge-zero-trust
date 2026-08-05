@@ -422,6 +422,7 @@ def _build_evaluation_summary(
         },
         "dataset": {
             "dataset_version": dataset.manifest.dataset_version,
+            "normal_policy_version": dataset.manifest.normal_policy_version,
             "dataset_sha256": dataset_sha256,
             "manifest_sha256": dataset_manifest_sha256,
             "capture_policy_version": dataset.manifest.capture_policy_version,
@@ -434,6 +435,9 @@ def _build_evaluation_summary(
             "threshold_percentile": artifact.metadata["threshold_percentile"],
             "training_dataset_sha256": artifact.metadata["dataset_sha256"],
             "training_manifest_sha256": artifact.metadata["manifest_sha256"],
+            "training_normal_policy_version": artifact.metadata.get(
+                "normal_policy_version"
+            ),
             "training_git_commit_sha": artifact.metadata["git_commit_sha"],
             "training_sessions": {
                 split: list(artifact.metadata["sessions"][split])

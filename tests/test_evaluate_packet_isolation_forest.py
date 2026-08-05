@@ -39,6 +39,7 @@ from ai.packet_if_dataset import (
     load_packet_if_dataset,
     session_data_sha256s,
 )
+from ai.packet_if_phase5_manifest import PACKET_IF_DATASET_VERSION_V1
 from ai.predict_packet_isolation_forest import (
     PacketIFArtifact,
     PacketIFPrediction,
@@ -74,7 +75,7 @@ def _dataset(
 ) -> PacketIFDataset:
     policy = capture_policy or CapturePolicy()
     manifest = PacketIFDatasetManifest(
-        dataset_version=PACKET_IF_DATASET_VERSION,
+        dataset_version=PACKET_IF_DATASET_VERSION_V1,
         capture_policy=policy,
         dataset_sha256="d" * 64,
         sessions=(
@@ -369,7 +370,7 @@ def _write_real_dataset_bundle(tmp_path: Path) -> tuple[Path, Path]:
     manifest_path.write_text(
         json.dumps(
             {
-                "dataset_version": PACKET_IF_DATASET_VERSION,
+                "dataset_version": PACKET_IF_DATASET_VERSION_V1,
                 "capture_policy_version": policy.version,
                 "capture_policy": {
                     "version": policy.version,

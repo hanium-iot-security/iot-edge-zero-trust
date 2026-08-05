@@ -115,6 +115,7 @@ def _write_artifact(
             "total_bytes_formula": PACKET_IF_TOTAL_BYTES_FORMULA,
         },
         "dataset_version": PACKET_IF_DATASET_VERSION,
+        "normal_policy_version": "phase5-normal-policy-v1.1",
         "dataset_sha256": "a" * 64,
         "manifest_sha256": "b" * 64,
         "sessions": {
@@ -377,7 +378,7 @@ def test_load_rejects_python_major_minor_mismatch(tmp_path: Path) -> None:
         ("transform_version", "other-transform", "transform_version mismatch"),
         ("score_direction", "lower_is_more_anomalous", "score_direction mismatch"),
         ("threshold_operator", ">=", "threshold_operator mismatch"),
-        ("dataset_version", "packet-if-dataset-v2", "dataset_version mismatch"),
+        ("dataset_version", "packet-if-dataset-v999", "dataset_version mismatch"),
     ],
 )
 def test_load_rejects_metadata_contract_mismatch(
@@ -403,6 +404,32 @@ def test_load_rejects_feature_order_mismatch(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="feature order mismatch"):
         _load_artifact(artifact_dir)
+
+
+def test_load_rejects_v2_artifact_without_normal_policy_version(
+    tmp_path: Path,
+) -> None:
+    artifact_dir = tmp_path / "artifact"
+    metadata = _write_artifact(artifact_dir)
+    metadata.pop("normal_policy_version")
+    _write_metadata(artifact_dir, metadata)
+
+    with pytest.raises(ValueError, match="normal_policy_version"):
+        _load_artifact(artifact_dir)
+
+
+def test_load_accepts_v1_artifact_without_normal_policy_version(
+    tmp_path: Path,
+) -> None:
+    artifact_dir = tmp_path / "artifact"
+    metadata = _write_artifact(artifact_dir)
+    metadata["dataset_version"] = "packet-if-dataset-v1"
+    metadata.pop("normal_policy_version")
+    _write_metadata(artifact_dir, metadata)
+
+    artifact = _load_artifact(artifact_dir)
+
+    assert artifact.model_version == "packet-if-test-v1"
 
 
 @pytest.mark.parametrize(
