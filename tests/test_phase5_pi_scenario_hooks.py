@@ -12,6 +12,7 @@ import pytest
 
 from edge.scenarios.cleanup import (
     ScenarioHookContext,
+    _find_conflicting_processes,
     pi_baseline_check,
     pi_cleanup_hook,
 )
@@ -240,6 +241,41 @@ def test_pi_baseline_fails_closed_when_firewall_inventory_cannot_be_read(tmp_pat
 
     assert ok is False
     assert reason == "firewall_inventory_error: sudo denied"
+
+
+def test_conflict_detection_finds_packet_ai_runner_command():
+    command = (
+        "4242 python -m edge.detection.run_packet_ai_detector "
+        "--session-id session-001 --range-start 2026-08-06T00:00:00Z "
+        "--cutoff 2026-08-06T00:00:10Z"
+    )
+    with patch(
+        "edge.scenarios.cleanup.subprocess.run",
+        return_value=subprocess.CompletedProcess(
+            args=["ps", "-eo", "pid=,args="],
+            returncode=0,
+            stdout=command + "\n",
+            stderr="",
+        ),
+    ):
+        assert _find_conflicting_processes() == [command]
+
+
+def test_conflict_detection_finds_packet_feature_extractor_command():
+    command = (
+        "4243 python -m edge.features.run_packet_feature_extractor "
+        "--session-id session-001"
+    )
+    with patch(
+        "edge.scenarios.cleanup.subprocess.run",
+        return_value=subprocess.CompletedProcess(
+            args=["ps", "-eo", "pid=,args="],
+            returncode=0,
+            stdout=command + "\n",
+            stderr="",
+        ),
+    ):
+        assert _find_conflicting_processes() == [command]
 
 
 def test_pi_cleanup_reports_residual_attack_process():
