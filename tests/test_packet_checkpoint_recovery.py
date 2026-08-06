@@ -2805,3 +2805,54 @@ def test_execute_holds_all_locks_through_post_commit_verification_and_result_wri
     assert postcommit_verifications == 1
     assert result_writes == 1
     assert lock_exit_exception == "PacketCheckpointRecoveryCommittedArtifactError"
+
+
+def _recovery_docs() -> tuple[str, str, str]:
+    root = Path(__file__).parents[1]
+    return tuple(
+        (root / path).read_text(encoding="utf-8")
+        for path in (
+            "docs/packet-checkpoint-gap-recovery-runbook.md",
+            "docs/db-schema.md",
+            "docs/phase4-detection-core.md",
+        )
+    )
+
+
+def test_gap_recovery_runbook_separates_migration_dry_run_and_execute() -> None:
+    runbook, _, _ = _recovery_docs()
+    assert "Migration 005" in runbook
+    assert "dry-run" in runbook
+    assert "execute" in runbook
+
+
+def test_gap_recovery_runbook_documents_service_process_and_running_session_gates() -> None:
+    runbook, _, _ = _recovery_docs()
+    assert "RUNNING" in runbook
+    assert "packet-capture.service" in runbook
+
+
+def test_gap_recovery_runbook_documents_exit_three_hold_and_no_auto_restore() -> None:
+    runbook, _, _ = _recovery_docs()
+    assert "Exit Code 3" in runbook
+    assert "HOLD" in runbook
+    assert "자동 Restore하지" in runbook
+
+
+def test_gap_recovery_runbook_documents_cross_platform_dry_run_and_posix_only_execute() -> None:
+    runbook, _, _ = _recovery_docs()
+    assert "Windows와 POSIX" in runbook
+    assert "Execute는 POSIX" in runbook
+
+
+def test_gap_recovery_runbook_requires_existing_plan_parent_and_artifact_directory() -> None:
+    runbook, _, _ = _recovery_docs()
+    assert "plan_output.parent" in runbook
+    assert "artifact_dir" in runbook
+
+
+def test_gap_recovery_docs_preserve_orchestrator_gap_block_and_holdout_e2e_scope() -> None:
+    _, schema, core = _recovery_docs()
+    assert "packet_checkpoint_recoveries" in schema
+    assert "run_until_for_capture_session" in core
+    assert "Holdout" in core

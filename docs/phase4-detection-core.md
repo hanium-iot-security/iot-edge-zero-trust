@@ -121,6 +121,8 @@ metadata, and invalid model artifacts remain fail-fast integrity errors.
 Raspberry Pi deployment verification, final Packet IF model training, and
 operator-driven Session Gap recovery remain operational follow-up work.
 
+승인형 Packet Checkpoint Gap Recovery를 사용해도 Orchestrator의 자동 Gap 차단은 유지된다. Recovery는 `packet_rule`과 `packet_if`를 독립 승인하고 `last_processed_id`는 유지한 채 `last_completed_window_end`만 Target Session의 `first_window_start`로 전진시킨다. 이후 Manual Runner는 `run_until_for_capture_session()`으로 승인된 Session에 Source Selection을 바인딩한다. 공식 Trust/Firewall E2E는 새 Holdout Session에서 별도로 검증한다.
+
 ## Detection Orchestrator Runtime
 
 The runtime fixes one `cycle_range_start` and `cycle_cutoff` per cycle and gives
