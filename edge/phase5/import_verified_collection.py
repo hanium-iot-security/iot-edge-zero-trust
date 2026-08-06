@@ -12,12 +12,18 @@ database and no PCAP is touched.
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import logging
+import os
 from pathlib import Path
+import shutil
 import sqlite3
+import sys
+import tempfile
 from typing import Any
 
 from edge.packet.capture_policy import (
@@ -26,6 +32,20 @@ from edge.packet.capture_policy import (
     is_capture_eligible,
 )
 from edge.packet.pcap_naming import parse_pcap_filename
+from edge.phase5.contracts import (
+    RUN_MANIFEST_SCHEMA_VERSION,
+    RUN_MANIFEST_SHA256_SIDECAR_SUFFIX,
+    EvaluationScope,
+    ExecutionNode,
+    ExpectedOutcome,
+    ManifestReference,
+    ManifestStatus,
+    RunArtifact,
+    RunManifest,
+    RunStageStatuses,
+    ScenarioReference,
+    run_manifest_sha256,
+)
 from edge.phase5.verified_collection_contract import (
     ALLOWED_COLLECTION_SCENARIOS,
     ATTACK_COLLECTION_SCENARIOS,
@@ -34,14 +54,26 @@ from edge.phase5.verified_collection_contract import (
     NORMAL_LABEL,
     VALID_SPLITS,
     VALID_TRAFFIC_LABELS,
+    VERIFIED_COLLECTION_MANIFEST_FILENAME,
+    VERIFIED_COLLECTION_SCHEMA_VERSION,
+    VERIFIED_COLLECTION_SHA256_SIDECAR_SUFFIX,
     PayloadSchemaProvenance,
+    VerifiedCollectionArtifact,
+    VerifiedCollectionManifest,
+    VerifiedCollectionObservation,
     file_sha256,
+    format_utc,
+    load_verified_collection_manifest,
     normalize_optional_ipv4,
     normalize_sha1,
     require_canonical_uuid4,
     require_identifier,
     require_non_empty_string,
+    verified_collection_sha256,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 IMPORT_SPEC_SCHEMA_VERSION = "phase5-verified-collection-import-spec-v1"
@@ -84,6 +116,12 @@ class VerifiedCollectionSessionSpec:
     target_device_id: str | None
     target_source_ip: str | None
     source_capture_group_id: str
+    # DB에서 유도할 수 없어 운영자가 인계 자료에서 확정해야 하는 값들이다.
+    # sender_reported_packets는 ESP32 Serial 로그, gateway_first_attack_packet_at은
+    # Gateway 관측 기록에서 온다. 둘 다 없으면 null로 남긴다.
+    sender_reported_packets: int | None
+    observation_gap_cause: str | None
+    gateway_first_attack_packet_at: datetime | None
 
     _ALLOWED = frozenset(
         {
@@ -100,6 +138,9 @@ class VerifiedCollectionSessionSpec:
             "target_device_id",
             "target_source_ip",
             "source_capture_group_id",
+            "sender_reported_packets",
+            "observation_gap_cause",
+            "gateway_first_attack_packet_at",
         }
     )
     _REQUIRED = frozenset(
@@ -197,6 +238,28 @@ class VerifiedCollectionSessionSpec:
             if raw_group is None
             else require_canonical_uuid4(raw_group, "source_capture_group_id")
         )
+        sender_reported_packets = payload.get("sender_reported_packets")
+        if sender_reported_packets is not None:
+            if (
+                isinstance(sender_reported_packets, bool)
+                or not isinstance(sender_reported_packets, int)
+                or sender_reported_packets < 0
+            ):
+                raise ValueError(
+                    "sender_reported_packets must be a non-negative integer"
+                )
+        observation_gap_cause = payload.get("observation_gap_cause")
+        if observation_gap_cause is not None:
+            observation_gap_cause = require_identifier(
+                observation_gap_cause,
+                "observation_gap_cause",
+            )
+        gateway_first_attack_packet_at = payload.get("gateway_first_attack_packet_at")
+        if gateway_first_attack_packet_at is not None:
+            gateway_first_attack_packet_at = _parse_utc(
+                gateway_first_attack_packet_at,
+                "gateway_first_attack_packet_at",
+            )
 
         spec = cls(
             session_id=session_id,
@@ -215,6 +278,9 @@ class VerifiedCollectionSessionSpec:
             target_device_id=target_device_id,
             target_source_ip=target_source_ip,
             source_capture_group_id=source_capture_group_id,
+            sender_reported_packets=sender_reported_packets,
+            observation_gap_cause=observation_gap_cause,
+            gateway_first_attack_packet_at=gateway_first_attack_packet_at,
         )
         spec._validate_profile()
         return spec
@@ -937,3 +1003,676 @@ def _parse_utc(value: Any, field_name: str) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+# --- Package publication -----------------------------------------------------
+
+DEFAULT_OBSERVATION_GAP_CAUSE = "UNRESOLVED"
+_EVIDENCE_DIRNAME = "evidence"
+_RUNS_DIRNAME = "runs"
+_DB_SNAPSHOT_FILENAME = "db-snapshot.db"
+_DB_SNAPSHOT_METADATA_FILENAME = "db-snapshot-metadata.json"
+_EXPORT_SPEC_FILENAME = "packet-if-export-spec-v2.json"
+_IMPORT_SUMMARY_FILENAME = "import-summary.json"
+_RUN_MANIFEST_FILENAME = "run-manifest.json"
+_EVIDENCE_FILES = (
+    ("session_snapshot", "session-snapshot.json"),
+    ("feature_qc", "feature-qc.json"),
+    ("pcap_inventory", "pcap-inventory.json"),
+    ("source_evidence", "source-evidence.json"),
+)
+
+
+def write_verified_collection_package(
+    plan: VerifiedCollectionBatchPlan,
+    *,
+    db_snapshot: Path,
+    processed_pcap_dir: Path,
+    output_root: Path,
+    verified_at: datetime,
+) -> Path:
+    """Publish the whole batch atomically, or publish nothing at all.
+
+    Every file is written into a temporary directory on the same filesystem and
+    only renamed into place once all 17 Sessions succeeded and every hash chain
+    reloaded. A partially verified batch must never become a Dataset input.
+    """
+    output_root = output_root.resolve()
+    final_path = output_root / plan.spec.dataset_package_id
+    if os.path.lexists(final_path):
+        raise FileExistsError(
+            f"Verified Collection package already exists: {final_path}"
+        )
+    output_root.mkdir(parents=True, exist_ok=True)
+    snapshot_path = db_snapshot.resolve()
+    pcap_dir = processed_pcap_dir.resolve()
+
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{plan.spec.dataset_package_id}.",
+            suffix=".tmp",
+            dir=output_root,
+        )
+    )
+    try:
+        _copy_snapshot(plan, snapshot_path, staging)
+        export_sessions: list[dict[str, Any]] = []
+        for session_plan in plan.sessions:
+            export_sessions.append(
+                _write_run_directory(
+                    plan,
+                    session_plan,
+                    staging=staging,
+                    pcap_dir=pcap_dir,
+                    verified_at=verified_at,
+                )
+            )
+        _write_export_spec(plan, staging, export_sessions)
+        _write_import_summary(plan, staging, verified_at, export_sessions)
+        _reverify_package(staging, export_sessions)
+        _fsync_tree(staging)
+        if os.path.lexists(final_path):
+            raise FileExistsError(
+                "Verified Collection package appeared during publication; "
+                f"refusing to replace it: {final_path}"
+            )
+        os.rename(staging, final_path)
+        staging = None  # type: ignore[assignment]
+        _fsync_directory(output_root)
+    finally:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+    return final_path
+
+
+def _copy_snapshot(
+    plan: VerifiedCollectionBatchPlan,
+    snapshot_path: Path,
+    staging: Path,
+) -> None:
+    destination = staging / _DB_SNAPSHOT_FILENAME
+    shutil.copyfile(snapshot_path, destination)
+    copied_sha256 = file_sha256(destination)
+    if copied_sha256 != plan.db_snapshot_sha256:
+        raise VerifiedCollectionImportError(
+            "copied DB snapshot SHA256 does not match the verified source: "
+            f"expected={plan.db_snapshot_sha256}, actual={copied_sha256}"
+        )
+    connection = connect_snapshot_read_only(destination.resolve())
+    try:
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+    finally:
+        connection.close()
+    _write_json(
+        staging / _DB_SNAPSHOT_METADATA_FILENAME,
+        {
+            "source_path_name": snapshot_path.name,
+            "sha256": copied_sha256,
+            "size_bytes": destination.stat().st_size,
+            "integrity_check": str(integrity[0]) if integrity else "unknown",
+            "foreign_key_violations": len(violations),
+            "opened_with": "mode=ro, PRAGMA query_only=ON",
+        },
+    )
+
+
+def _write_run_directory(
+    plan: VerifiedCollectionBatchPlan,
+    session_plan: VerifiedCollectionSessionPlan,
+    *,
+    staging: Path,
+    pcap_dir: Path,
+    verified_at: datetime,
+) -> dict[str, Any]:
+    spec = session_plan.spec
+    run_dir = staging / _RUNS_DIRNAME / spec.run_id
+    (run_dir / _EVIDENCE_DIRNAME).mkdir(parents=True, exist_ok=True)
+
+    evidence_payloads = {
+        "session-snapshot.json": _session_snapshot_evidence(plan, session_plan),
+        "feature-qc.json": _feature_qc_evidence(plan, session_plan),
+        "pcap-inventory.json": _pcap_inventory_evidence(session_plan, pcap_dir),
+        "source-evidence.json": _source_evidence(plan, session_plan),
+    }
+    for filename, payload in evidence_payloads.items():
+        _write_json(run_dir / _EVIDENCE_DIRNAME / filename, payload)
+
+    artifacts = tuple(
+        VerifiedCollectionArtifact(
+            relative_path=f"{_EVIDENCE_DIRNAME}/{filename}",
+            artifact_type=artifact_type,
+            size_bytes=(run_dir / _EVIDENCE_DIRNAME / filename).stat().st_size,
+            sha256=file_sha256(run_dir / _EVIDENCE_DIRNAME / filename),
+        )
+        for artifact_type, filename in _EVIDENCE_FILES
+    )
+
+    collection = VerifiedCollectionManifest(
+        run_id=spec.run_id,
+        session_id=spec.session_id,
+        collection_slot_id=spec.collection_slot_id,
+        source_capture_group_id=spec.source_capture_group_id,
+        split=spec.split,
+        traffic_label=spec.traffic_label,
+        scenario=spec.scenario,
+        collection_device_id=spec.collection_device_id,
+        target_device_id=spec.target_device_id,
+        target_source_ip=spec.target_source_ip,
+        included_device_ids=session_plan.included_device_ids,
+        background_traffic_present=session_plan.background_traffic_present,
+        firmware_version=spec.firmware_version,
+        payload_schema_version=spec.payload_schema_version,
+        payload_schema_provenance=spec.payload_schema_provenance,
+        firmware_reported_payload_schema_version=(
+            spec.firmware_reported_payload_schema_version
+        ),
+        normal_policy_version=plan.spec.normal_policy_version,
+        capture_source_commit_sha=spec.capture_source_commit_sha,
+        verification_commit_sha=plan.verification_commit_sha,
+        capture_interface=session_plan.capture_interface,
+        capture_filter=plan.spec.capture_filter,
+        started_at=session_plan.started_at,
+        first_window_start=session_plan.first_window_start,
+        ended_at=session_plan.ended_at,
+        verified_at=verified_at,
+        segment_count=session_plan.segment_count,
+        processed_segment_count=session_plan.processed_segment_count,
+        empty_segment_count=session_plan.empty_segment_count,
+        eligible_feature_row_count=session_plan.eligible_row_count,
+        db_snapshot_sha256=plan.db_snapshot_sha256,
+        observation=_build_observation(session_plan),
+        artifacts=artifacts,
+    )
+    collection_path = run_dir / VERIFIED_COLLECTION_MANIFEST_FILENAME
+    collection_path.write_text(collection.to_json(), encoding="utf-8")
+    collection_sha256 = verified_collection_sha256(collection)
+    _write_sidecar(
+        Path(f"{collection_path}{VERIFIED_COLLECTION_SHA256_SIDECAR_SUFFIX}"),
+        collection_sha256,
+    )
+
+    run_manifest = _build_run_manifest(
+        plan,
+        session_plan,
+        collection_sha256=collection_sha256,
+        collection_artifacts=artifacts,
+        collection_path=collection_path,
+    )
+    run_path = run_dir / _RUN_MANIFEST_FILENAME
+    run_path.write_text(run_manifest.to_json(), encoding="utf-8")
+    run_sha256 = run_manifest_sha256(run_manifest)
+    _write_sidecar(
+        Path(f"{run_path}{RUN_MANIFEST_SHA256_SIDECAR_SUFFIX}"),
+        run_sha256,
+    )
+
+    run_relative_path = f"{_RUNS_DIRNAME}/{spec.run_id}/{_RUN_MANIFEST_FILENAME}"
+    return {
+        "session_id": spec.session_id,
+        "split": spec.split,
+        "traffic_label": spec.traffic_label,
+        "scenario": spec.scenario,
+        "target_device_id": spec.target_device_id,
+        "target_source_ip": spec.target_source_ip,
+        "collection_slot_id": spec.collection_slot_id,
+        "source_capture_group_id": spec.source_capture_group_id,
+        "run_manifest_path": run_relative_path,
+        "run_manifest_ref": {
+            "run_id": spec.run_id,
+            "relative_path": run_relative_path,
+            "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+            "sha256": run_sha256,
+        },
+        "normal_policy_version": plan.spec.normal_policy_version,
+        "firmware_version": spec.firmware_version,
+        "payload_schema_version": spec.payload_schema_version,
+        "included_device_ids": list(session_plan.included_device_ids),
+        "background_traffic_present": session_plan.background_traffic_present,
+        "source_commit_sha": spec.capture_source_commit_sha,
+        "device_ips": dict(session_plan.device_ips),
+    }
+
+
+def _build_observation(
+    session_plan: VerifiedCollectionSessionPlan,
+) -> VerifiedCollectionObservation:
+    spec = session_plan.spec
+    sender = spec.sender_reported_packets
+    gateway = session_plan.gateway_observed_packets
+    gap = None if sender is None else sender - gateway
+    cause = spec.observation_gap_cause
+    if gap:
+        # 원인을 단정하지 않는다. ESP32의 endPacket()==1은 수신 ACK가 아니므로
+        # Wi-Fi 손실·ESP32 실패·Pi Drop 중 무엇인지 확정할 수 없다.
+        cause = cause or DEFAULT_OBSERVATION_GAP_CAUSE
+    return VerifiedCollectionObservation(
+        feature_packet_count=session_plan.feature_packet_count,
+        gateway_observed_packets=gateway,
+        sender_reported_packets=sender,
+        observation_gap_packets=gap,
+        observation_gap_cause=cause if gap else None,
+        gateway_first_attack_packet_at=spec.gateway_first_attack_packet_at,
+    )
+
+
+def _build_run_manifest(
+    plan: VerifiedCollectionBatchPlan,
+    session_plan: VerifiedCollectionSessionPlan,
+    *,
+    collection_sha256: str,
+    collection_artifacts: Sequence[VerifiedCollectionArtifact],
+    collection_path: Path,
+) -> RunManifest:
+    """Build the DATA_ONLY Run Manifest for one retrospective Session.
+
+    The Run describes the original Capture, not this import: `started_at` and
+    `ended_at` come from `packet_capture_sessions`. Detection, Trust, Firewall,
+    and Block are NOT_APPLICABLE because no such evaluation ever ran.
+    """
+    spec = session_plan.spec
+    # Dataset v2는 정상 Run도 실제 Export된 등록 Device를 식별하도록 요구한다.
+    run_device_id = spec.target_device_id or spec.collection_device_id
+    run_source_ip = spec.target_source_ip or session_plan.device_ips[run_device_id]
+
+    external_observations: dict[str, datetime] = {}
+    if spec.gateway_first_attack_packet_at is not None:
+        external_observations["gateway_first_attack_packet_at"] = (
+            spec.gateway_first_attack_packet_at
+        )
+
+    artifacts = [
+        RunArtifact(
+            artifact_type="verified_collection_manifest",
+            relative_path=collection_path.name,
+            size_bytes=collection_path.stat().st_size,
+            sha256=file_sha256(collection_path),
+        )
+    ]
+    artifacts.extend(
+        RunArtifact(
+            artifact_type=artifact.artifact_type,
+            relative_path=artifact.relative_path,
+            size_bytes=artifact.size_bytes,
+            sha256=artifact.sha256,
+        )
+        for artifact in collection_artifacts
+    )
+
+    return RunManifest(
+        run_id=spec.run_id,
+        session_id=spec.session_id,
+        scenario=ScenarioReference(scenario_id=spec.scenario),
+        target_device_id=run_device_id,
+        source_ip=run_source_ip,
+        execution_node=ExecutionNode(node_id=spec.collection_device_id, registered=True),
+        evaluation_scope=EvaluationScope.DATA_ONLY,
+        is_active=False,
+        started_at=session_plan.started_at,
+        # 절대 UTC 공격 시작 증거가 확정되지 않았으므로 null로 둔다. ESP32의
+        # started_at_ms는 부팅 후 경과시간이라 UTC로 변환하지 않는다.
+        attack_started_at=None,
+        observation_deadline_at=session_plan.ended_at,
+        ended_at=session_plan.ended_at,
+        expected_outcome=ExpectedOutcome(
+            expected_event_types=(),
+            detection_expected=False,
+            trust_score_change_expected=False,
+            firewall_expected=False,
+            block_expected=False,
+            evaluation_scope=EvaluationScope.DATA_ONLY,
+        ),
+        statuses=RunStageStatuses(
+            scenario_status=ManifestStatus.SUCCESS,
+            detection_status=ManifestStatus.NOT_APPLICABLE,
+            trust_status=ManifestStatus.NOT_APPLICABLE,
+            firewall_status=ManifestStatus.NOT_APPLICABLE,
+            block_status=ManifestStatus.NOT_APPLICABLE,
+            data_status=ManifestStatus.SUCCESS,
+            final_status=ManifestStatus.SUCCESS,
+        ),
+        external_observations=external_observations,
+        artifacts=tuple(artifacts),
+        session_manifest_ref=ManifestReference(
+            relative_path=VERIFIED_COLLECTION_MANIFEST_FILENAME,
+            schema_version=VERIFIED_COLLECTION_SCHEMA_VERSION,
+            sha256=collection_sha256,
+        ),
+    )
+
+
+def _session_snapshot_evidence(
+    plan: VerifiedCollectionBatchPlan,
+    session_plan: VerifiedCollectionSessionPlan,
+) -> dict[str, Any]:
+    return {
+        "session_id": session_plan.session_id,
+        "capture_interface": session_plan.capture_interface,
+        "status": "COMPLETED",
+        "started_at": format_utc(session_plan.started_at),
+        "first_window_start": format_utc(session_plan.first_window_start),
+        "ended_at": format_utc(session_plan.ended_at),
+        "feature_ready_through": format_utc(session_plan.feature_ready_through),
+        "db_snapshot_sha256": plan.db_snapshot_sha256,
+        "segments": [
+            {
+                "segment_id": segment.segment_id,
+                "status": segment.status,
+                "window_start": format_utc(segment.window_start),
+                "window_end": format_utc(segment.window_end),
+                "packet_count": segment.packet_count,
+                "start_delay_seconds": segment.start_delay_seconds,
+                "captured_duration_seconds": segment.captured_duration_seconds,
+            }
+            for segment in session_plan.segments
+        ],
+    }
+
+
+def _feature_qc_evidence(
+    plan: VerifiedCollectionBatchPlan,
+    session_plan: VerifiedCollectionSessionPlan,
+) -> dict[str, Any]:
+    return {
+        "session_id": session_plan.session_id,
+        "segment_count": session_plan.segment_count,
+        "processed_segment_count": session_plan.processed_segment_count,
+        "empty_segment_count": session_plan.empty_segment_count,
+        "eligible_feature_row_count": session_plan.eligible_row_count,
+        "feature_packet_count": session_plan.feature_packet_count,
+        "included_device_ids": list(session_plan.included_device_ids),
+        "device_ips": dict(session_plan.device_ips),
+        "background_traffic_present": session_plan.background_traffic_present,
+        "capture_policy_version": plan.capture_policy.version,
+        "feature_ready_through": format_utc(session_plan.feature_ready_through),
+    }
+
+
+def _pcap_inventory_evidence(
+    session_plan: VerifiedCollectionSessionPlan,
+    pcap_dir: Path,
+) -> dict[str, Any]:
+    return {
+        "session_id": session_plan.session_id,
+        "processed_pcap_dir_name": pcap_dir.name,
+        "file_count": len(session_plan.pcap_files),
+        "total_size_bytes": sum(item.size_bytes for item in session_plan.pcap_files),
+        "note": (
+            "PCAP originals are verified in place and never copied, moved, or "
+            "deleted by this importer."
+        ),
+        "files": [
+            {
+                "file_name": item.file_name,
+                "segment_id": item.segment_id,
+                "window_start": format_utc(item.window_start),
+                "window_end": format_utc(item.window_end),
+                "size_bytes": item.size_bytes,
+                "sha256": item.sha256,
+            }
+            for item in session_plan.pcap_files
+        ],
+    }
+
+
+def _source_evidence(
+    plan: VerifiedCollectionBatchPlan,
+    session_plan: VerifiedCollectionSessionPlan,
+) -> dict[str, Any]:
+    spec = session_plan.spec
+    return {
+        "session_id": spec.session_id,
+        "provenance_mode": "VERIFIED_RETROSPECTIVE_IMPORT",
+        "collection_method": "MANUAL_HARDWARE",
+        "collection_device_id": spec.collection_device_id,
+        "firmware_version": spec.firmware_version,
+        "payload_schema_version": spec.payload_schema_version,
+        "payload_schema_provenance": spec.payload_schema_provenance.value,
+        "firmware_reported_payload_schema_version": (
+            spec.firmware_reported_payload_schema_version
+        ),
+        "capture_source_commit_sha": spec.capture_source_commit_sha,
+        "verification_commit_sha": plan.verification_commit_sha,
+        "normal_policy_version": plan.spec.normal_policy_version,
+        "capture_policy": {
+            "version": plan.capture_policy.version,
+            "max_start_delay_seconds": plan.capture_policy.max_start_delay_seconds,
+            "minimum_duration_seconds": plan.capture_policy.minimum_duration_seconds,
+            "epsilon_seconds": plan.capture_policy.epsilon_seconds,
+        },
+        "scenario_runner_executed": False,
+        "note": (
+            "This Session was collected manually with ESP32 hardware before the "
+            "Dataset v2 Run Manifest contract existed. No Scenario Runner ran and "
+            "no Run Manifest was generated at capture time; the preserved DB "
+            "snapshot, PCAP, and Packet Features were verified afterwards."
+        ),
+    }
+
+
+def _write_export_spec(
+    plan: VerifiedCollectionBatchPlan,
+    staging: Path,
+    export_sessions: Sequence[Mapping[str, Any]],
+) -> None:
+    """Emit the Dataset v2 Export Spec so nobody retypes verified values."""
+    _write_json(
+        staging / _EXPORT_SPEC_FILENAME,
+        {
+            "capture_filter": plan.spec.capture_filter,
+            # 최상위 값은 기존 호출자 호환용 fallback이다. 공식 Session은 모두
+            # 자기 Capture Commit을 갖는다.
+            "source_commit_sha": plan.verification_commit_sha,
+            "sessions": [dict(entry) for entry in export_sessions],
+        },
+    )
+
+
+def _write_import_summary(
+    plan: VerifiedCollectionBatchPlan,
+    staging: Path,
+    verified_at: datetime,
+    export_sessions: Sequence[Mapping[str, Any]],
+) -> None:
+    summary_path = staging / _IMPORT_SUMMARY_FILENAME
+    _write_json(
+        summary_path,
+        {
+            "dataset_package_id": plan.spec.dataset_package_id,
+            "import_spec_schema_version": plan.spec.schema_version,
+            "collection_manifest_schema_version": VERIFIED_COLLECTION_SCHEMA_VERSION,
+            "run_manifest_schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+            "verified_at": format_utc(verified_at),
+            "verification_commit_sha": plan.verification_commit_sha,
+            "normal_policy_version": plan.spec.normal_policy_version,
+            "db_snapshot_sha256": plan.db_snapshot_sha256,
+            "capture_policy_version": plan.capture_policy.version,
+            "session_count": len(plan.sessions),
+            "split_counts": _split_counts(plan),
+            "sessions": [
+                {
+                    "session_id": session.session_id,
+                    "run_id": session.spec.run_id,
+                    "split": session.spec.split,
+                    "traffic_label": session.spec.traffic_label,
+                    "scenario": session.spec.scenario,
+                    "eligible_feature_row_count": session.eligible_row_count,
+                    "segment_count": session.segment_count,
+                    "pcap_file_count": len(session.pcap_files),
+                    "capture_source_commit_sha": (
+                        session.spec.capture_source_commit_sha
+                    ),
+                }
+                for session in plan.sessions
+            ],
+            "export_spec_session_count": len(export_sessions),
+        },
+    )
+    _write_sidecar(
+        Path(f"{summary_path}.sha256"),
+        file_sha256(summary_path),
+    )
+
+
+def _split_counts(plan: VerifiedCollectionBatchPlan) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for session in plan.sessions:
+        counts[session.spec.split] = counts.get(session.spec.split, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _reverify_package(
+    staging: Path,
+    export_sessions: Sequence[Mapping[str, Any]],
+) -> None:
+    """Reload every manifest from disk before the batch is published."""
+    for entry in export_sessions:
+        run_path = staging / entry["run_manifest_path"]
+        raw_run = run_path.read_text(encoding="utf-8")
+        run_manifest = RunManifest.from_json(raw_run)
+        actual_run_sha256 = run_manifest_sha256(run_manifest)
+        if actual_run_sha256 != entry["run_manifest_ref"]["sha256"]:
+            raise VerifiedCollectionImportError(
+                "Run Manifest SHA256 changed during packaging: "
+                f"{entry['run_manifest_path']}"
+            )
+        reference = run_manifest.session_manifest_ref
+        if reference is None:
+            raise VerifiedCollectionImportError(
+                "Verified Collection Run Manifest lost its session_manifest_ref: "
+                f"{entry['run_manifest_path']}"
+            )
+        load_verified_collection_manifest(
+            run_path.parent / reference.relative_path,
+            expected_sha256=reference.sha256,
+        )
+
+
+def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_sidecar(path: Path, digest: str) -> None:
+    path.write_text(f"{digest}\n", encoding="ascii")
+
+
+def _fsync_tree(root: Path) -> None:
+    if os.name != "posix":  # pragma: no cover - platform dependent
+        return
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            with path.open("rb") as handle:
+                os.fsync(handle.fileno())
+    for path in sorted(root.rglob("*")):
+        if path.is_dir():
+            _fsync_directory(path)
+    _fsync_directory(root)
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name != "posix":  # pragma: no cover - platform dependent
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+# --- CLI ---------------------------------------------------------------------
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "이미 수집·QC가 끝난 Phase 5 Capture Session을 읽기 전용으로 검증해 "
+            "Dataset v2 입력 Package로 이관합니다."
+        )
+    )
+    parser.add_argument("--project-root", type=Path, required=True)
+    parser.add_argument("--db-snapshot", type=Path, required=True)
+    parser.add_argument("--processed-pcap-dir", type=Path, required=True)
+    parser.add_argument("--spec", type=Path, required=True)
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--verification-commit-sha", required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--check-only", action="store_true")
+    mode.add_argument("--write", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    try:
+        spec = VerifiedCollectionImportSpec.from_json(
+            args.spec.read_text(encoding="utf-8")
+        )
+        plan = preflight_verified_collection(
+            db_snapshot=args.db_snapshot,
+            processed_pcap_dir=args.processed_pcap_dir,
+            spec=spec,
+            verification_commit_sha=args.verification_commit_sha,
+        )
+        summary: dict[str, Any] = {
+            "status": "PASS",
+            "mode": "check-only" if args.check_only else "write",
+            "dataset_package_id": spec.dataset_package_id,
+            "session_count": len(plan.sessions),
+            "split_counts": _split_counts(plan),
+            "db_snapshot_sha256": plan.db_snapshot_sha256,
+            "capture_policy_version": plan.capture_policy.version,
+            "sessions": [
+                {
+                    "session_id": session.session_id,
+                    "run_id": session.spec.run_id,
+                    "split": session.spec.split,
+                    "traffic_label": session.spec.traffic_label,
+                    "scenario": session.spec.scenario,
+                    "eligible_feature_row_count": session.eligible_row_count,
+                    "segment_count": session.segment_count,
+                    "pcap_file_count": len(session.pcap_files),
+                    "included_device_ids": list(session.included_device_ids),
+                    "background_traffic_present": session.background_traffic_present,
+                    "capture_source_commit_sha": (
+                        session.spec.capture_source_commit_sha
+                    ),
+                }
+                for session in plan.sessions
+            ],
+        }
+        if args.write:
+            package_path = write_verified_collection_package(
+                plan,
+                db_snapshot=args.db_snapshot,
+                processed_pcap_dir=args.processed_pcap_dir,
+                output_root=args.output_root,
+                verified_at=datetime.now(timezone.utc).replace(microsecond=0),
+            )
+            summary["package_path_name"] = package_path.name
+        print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    except (
+        VerifiedCollectionImportError,
+        FileExistsError,
+        FileNotFoundError,
+        ValueError,
+    ) as exc:
+        print(
+            json.dumps(
+                {"status": "FAIL", "error": str(exc)},
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    raise SystemExit(main())

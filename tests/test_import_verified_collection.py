@@ -11,16 +11,31 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from ai.packet_if_phase5_manifest import (
+    load_verified_run_manifest,
+    load_verified_session_manifest,
+)
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
 from edge.packet.capture_policy import CapturePolicy
 from edge.packet.pcap_naming import build_pcap_filename
+from edge.phase5 import import_verified_collection as importer
+from edge.phase5.contracts import (
+    EvaluationScope,
+    ManifestStatus,
+    RunManifest,
+)
 from edge.phase5.import_verified_collection import (
     VerifiedCollectionImportError,
     VerifiedCollectionImportSpec,
     connect_snapshot_read_only,
+    main,
     preflight_verified_collection,
+    write_verified_collection_package,
 )
-from edge.phase5.verified_collection_contract import file_sha256
+from edge.phase5.verified_collection_contract import (
+    VerifiedCollectionManifest,
+    file_sha256,
+)
 
 
 NORMAL_TRAIN_SESSION = "11111111-1111-4111-8111-111111111111"
@@ -955,3 +970,480 @@ def test_spec_rejects_attack_session_other_than_the_verified_one() -> None:
 
     with pytest.raises(ValueError, match="attack session"):
         VerifiedCollectionImportSpec.from_json(json.dumps(payload))
+
+
+# --- Package writing ---------------------------------------------------------
+
+
+def _write_package(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+    spec_payload: dict | None = None,
+    *,
+    output_root: Path | None = None,
+    verified_at: datetime | None = None,
+):
+    plan = _preflight(snapshot, spec_payload or _full_spec())
+    return write_verified_collection_package(
+        plan,
+        db_snapshot=snapshot.db_path,
+        processed_pcap_dir=snapshot.pcap_dir,
+        output_root=output_root or (tmp_path / "exports"),
+        verified_at=verified_at or (BASE_TIME + timedelta(days=3)),
+    )
+
+
+def _read_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_package_writes_expected_tree(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+
+    package = _write_package(snapshot, tmp_path)
+
+    assert package.name == "packet-if-v2-verified-001"
+    assert (package / "import-summary.json").is_file()
+    assert (package / "import-summary.json.sha256").is_file()
+    assert (package / "db-snapshot.db").is_file()
+    assert (package / "db-snapshot-metadata.json").is_file()
+    assert (package / "packet-if-export-spec-v2.json").is_file()
+
+    run_dir = package / "runs" / "verified-normal-stable-train-01"
+    for name in (
+        "verified-collection-manifest.json",
+        "verified-collection-manifest.json.sha256",
+        "run-manifest.json",
+        "run-manifest.json.sha256",
+    ):
+        assert (run_dir / name).is_file(), name
+    for name in (
+        "session-snapshot.json",
+        "feature-qc.json",
+        "pcap-inventory.json",
+        "source-evidence.json",
+    ):
+        assert (run_dir / "evidence" / name).is_file(), name
+
+
+def test_package_copies_snapshot_with_matching_hash(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+    source_sha256 = file_sha256(snapshot.db_path)
+
+    package = _write_package(snapshot, tmp_path)
+
+    assert file_sha256(package / "db-snapshot.db") == source_sha256
+    metadata = _read_json(package / "db-snapshot-metadata.json")
+    assert metadata["sha256"] == source_sha256
+    assert metadata["integrity_check"] == "ok"
+    assert metadata["foreign_key_violations"] == 0
+
+
+def test_package_run_manifest_is_data_only(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+
+    package = _write_package(snapshot, tmp_path)
+    run_path = (
+        package / "runs" / "verified-normal-stable-train-01" / "run-manifest.json"
+    )
+    run_manifest = RunManifest.from_json(run_path.read_text(encoding="utf-8"))
+
+    assert run_manifest.session_manifest_ref.relative_path == (
+        "verified-collection-manifest.json"
+    )
+    assert run_manifest.evaluation_scope is EvaluationScope.DATA_ONLY
+    assert run_manifest.is_active is False
+    assert run_manifest.statuses.scenario_status is ManifestStatus.SUCCESS
+    assert run_manifest.statuses.data_status is ManifestStatus.SUCCESS
+    assert run_manifest.statuses.detection_status is ManifestStatus.NOT_APPLICABLE
+    assert run_manifest.statuses.trust_status is ManifestStatus.NOT_APPLICABLE
+    assert run_manifest.statuses.firewall_status is ManifestStatus.NOT_APPLICABLE
+    assert run_manifest.statuses.block_status is ManifestStatus.NOT_APPLICABLE
+    assert run_manifest.statuses.final_status is ManifestStatus.SUCCESS
+    assert run_manifest.expected_outcome.expected_event_types == ()
+    assert run_manifest.expected_outcome.detection_expected is False
+    assert run_manifest.expected_outcome.block_expected is False
+    # 정상 Session의 Run Manifest는 실제 Export된 등록 Device를 식별한다.
+    assert run_manifest.target_device_id == "esp32_01"
+    assert run_manifest.source_ip == "192.168.0.4"
+
+
+def test_package_run_times_describe_original_capture(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+
+    package = _write_package(snapshot, tmp_path)
+    run_path = (
+        package / "runs" / "verified-normal-stable-train-01" / "run-manifest.json"
+    )
+    run_manifest = RunManifest.from_json(run_path.read_text(encoding="utf-8"))
+
+    assert run_manifest.started_at == BASE_TIME
+    assert run_manifest.ended_at == BASE_TIME + timedelta(seconds=20)
+    assert run_manifest.observation_deadline_at == run_manifest.ended_at
+    # 정상 Session에는 공격 시작 시각이 없다.
+    assert run_manifest.attack_started_at is None
+
+
+def test_attack_run_leaves_attack_started_at_null_without_absolute_evidence(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+
+    package = _write_package(snapshot, tmp_path)
+    run_path = (
+        package / "runs" / "verified-packet-rate-flood-test-01" / "run-manifest.json"
+    )
+    run_manifest = RunManifest.from_json(run_path.read_text(encoding="utf-8"))
+
+    assert run_manifest.attack_started_at is None
+    assert run_manifest.target_device_id == "esp32_02"
+    assert run_manifest.source_ip == "192.168.0.5"
+
+
+def test_attack_gateway_first_packet_goes_to_external_observations(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+    observed_at = BASE_TIME + timedelta(seconds=61)
+    payload = _full_spec()
+    payload["sessions"][-1]["gateway_first_attack_packet_at"] = _iso(observed_at)
+
+    package = _write_package(snapshot, tmp_path, payload)
+    run_path = (
+        package / "runs" / "verified-packet-rate-flood-test-01" / "run-manifest.json"
+    )
+    run_manifest = RunManifest.from_json(run_path.read_text(encoding="utf-8"))
+
+    assert run_manifest.attack_started_at is None
+    assert (
+        run_manifest.external_observations["gateway_first_attack_packet_at"]
+        == observed_at
+    )
+
+
+def test_session_53_observation_is_recorded_without_claiming_a_cause(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    snapshot.add_session(NORMAL_TRAIN_SESSION)
+    snapshot.add_session(NORMAL_VALIDATION_SESSION)
+    snapshot.add_session(NORMAL_TEST_SESSION)
+    snapshot.add_session(
+        ATTACK_TEST_SESSION,
+        device_id="esp32_02",
+        peer_ip="192.168.0.5",
+        segments=2,
+        packet_count=440,
+    )
+    payload = _full_spec()
+    payload["sessions"][-1]["sender_reported_packets"] = 960
+
+    package = _write_package(snapshot, tmp_path, payload)
+    collection_path = (
+        package
+        / "runs"
+        / "verified-packet-rate-flood-test-01"
+        / "verified-collection-manifest.json"
+    )
+    collection = VerifiedCollectionManifest.from_json(
+        collection_path.read_text(encoding="utf-8")
+    )
+    observation = collection.observation
+
+    assert observation.sender_reported_packets == 960
+    assert observation.gateway_observed_packets == 880
+    assert observation.feature_packet_count == 880
+    assert observation.observation_gap_packets == 80
+    assert observation.observation_gap_cause == "UNRESOLVED"
+
+
+def test_collection_manifest_records_retrospective_payload_provenance(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+
+    package = _write_package(snapshot, tmp_path)
+    collection_path = (
+        package
+        / "runs"
+        / "verified-packet-rate-flood-test-01"
+        / "verified-collection-manifest.json"
+    )
+    collection = VerifiedCollectionManifest.from_json(
+        collection_path.read_text(encoding="utf-8")
+    )
+
+    assert collection.payload_schema_provenance.value == (
+        "RETROSPECTIVE_SOURCE_AND_PCAP_VERIFICATION"
+    )
+    assert collection.firmware_reported_payload_schema_version is None
+    assert collection.provenance_mode.value == "VERIFIED_RETROSPECTIVE_IMPORT"
+    assert collection.collection_method.value == "MANUAL_HARDWARE"
+
+
+def test_package_manifests_reload_after_publication(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+
+    package = _write_package(snapshot, tmp_path)
+    export_spec = _read_json(package / "packet-if-export-spec-v2.json")
+
+    for entry in export_spec["sessions"]:
+        run_path = package / entry["run_manifest_path"]
+        run_manifest = load_verified_run_manifest(
+            run_path,
+            expected_sha256=entry["run_manifest_ref"]["sha256"],
+        )
+        collection = load_verified_session_manifest(
+            run_path,
+            run_manifest,
+            session_id=entry["session_id"],
+            scenario=entry["scenario"],
+            target_device_id=entry["target_device_id"],
+            target_source_ip=entry["target_source_ip"],
+            included_device_ips={
+                device_id: ip
+                for device_id, ip in entry["device_ips"].items()
+            },
+            required=True,
+        )
+        assert collection is not None
+
+
+def test_export_spec_carries_per_session_capture_commits(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+
+    package = _write_package(snapshot, tmp_path)
+    export_spec = _read_json(package / "packet-if-export-spec-v2.json")
+    commits = {
+        entry["session_id"]: entry["source_commit_sha"]
+        for entry in export_spec["sessions"]
+    }
+
+    assert commits[NORMAL_TRAIN_SESSION] == CAPTURE_COMMIT
+    assert commits[ATTACK_TEST_SESSION] == ATTACK_COMMIT
+    # 최상위 값은 호환용 검증 Commit이며 Session별 값이 우선한다.
+    assert export_spec["source_commit_sha"] == VERIFICATION_COMMIT
+
+
+def test_export_spec_uses_package_relative_run_manifest_paths(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+
+    package = _write_package(snapshot, tmp_path)
+    export_spec = _read_json(package / "packet-if-export-spec-v2.json")
+    entry = next(
+        item
+        for item in export_spec["sessions"]
+        if item["session_id"] == NORMAL_TRAIN_SESSION
+    )
+
+    assert entry["run_manifest_path"] == (
+        "runs/verified-normal-stable-train-01/run-manifest.json"
+    )
+    assert entry["run_manifest_ref"]["relative_path"] == entry["run_manifest_path"]
+    assert entry["source_capture_group_id"] == NORMAL_TRAIN_SESSION
+    assert entry["included_device_ids"] == ["esp32_01"]
+    assert entry["background_traffic_present"] is False
+
+
+def test_pcap_inventory_records_hashes_without_copying_pcap(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+
+    package = _write_package(snapshot, tmp_path)
+    inventory = _read_json(
+        package
+        / "runs"
+        / "verified-normal-stable-train-01"
+        / "evidence"
+        / "pcap-inventory.json"
+    )
+
+    assert inventory["file_count"] == 2
+    for item in inventory["files"]:
+        source = snapshot.pcap_dir / item["file_name"]
+        assert source.is_file()
+        assert item["sha256"] == file_sha256(source)
+        assert not (package / item["file_name"]).exists()
+
+
+def test_check_only_leaves_no_output(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+    spec_path = tmp_path / "import-spec.json"
+    spec_path.write_text(json.dumps(_full_spec()), encoding="utf-8")
+    output_root = tmp_path / "exports"
+
+    exit_code = main(
+        [
+            "--project-root",
+            str(tmp_path),
+            "--db-snapshot",
+            str(snapshot.db_path),
+            "--processed-pcap-dir",
+            str(snapshot.pcap_dir),
+            "--spec",
+            str(spec_path),
+            "--output-root",
+            str(output_root),
+            "--verification-commit-sha",
+            VERIFICATION_COMMIT,
+            "--check-only",
+        ]
+    )
+
+    assert exit_code == 0
+    assert not (output_root / "packet-if-v2-verified-001").exists()
+
+
+def test_cli_write_publishes_package(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    _seed_full_batch(snapshot)
+    spec_path = tmp_path / "import-spec.json"
+    spec_path.write_text(json.dumps(_full_spec()), encoding="utf-8")
+    output_root = tmp_path / "exports"
+
+    exit_code = main(
+        [
+            "--project-root",
+            str(tmp_path),
+            "--db-snapshot",
+            str(snapshot.db_path),
+            "--processed-pcap-dir",
+            str(snapshot.pcap_dir),
+            "--spec",
+            str(spec_path),
+            "--output-root",
+            str(output_root),
+            "--verification-commit-sha",
+            VERIFICATION_COMMIT,
+            "--write",
+        ]
+    )
+
+    assert exit_code == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["status"] == "PASS"
+    assert summary["session_count"] == 4
+    assert (output_root / "packet-if-v2-verified-001").is_dir()
+
+
+def test_cli_requires_exactly_one_mode(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    spec_path = tmp_path / "import-spec.json"
+    spec_path.write_text(json.dumps(_full_spec()), encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--project-root",
+                str(tmp_path),
+                "--db-snapshot",
+                str(snapshot.db_path),
+                "--processed-pcap-dir",
+                str(snapshot.pcap_dir),
+                "--spec",
+                str(spec_path),
+                "--output-root",
+                str(tmp_path / "exports"),
+                "--verification-commit-sha",
+                VERIFICATION_COMMIT,
+            ]
+        )
+
+
+def test_package_refuses_to_overwrite_existing_directory(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+    output_root = tmp_path / "exports"
+    _write_package(snapshot, tmp_path, output_root=output_root)
+
+    with pytest.raises(FileExistsError):
+        _write_package(snapshot, tmp_path, output_root=output_root)
+
+
+def test_failed_batch_leaves_no_final_package(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _seed_full_batch(snapshot)
+    output_root = tmp_path / "exports"
+    plan = _preflight(snapshot, _full_spec())
+
+    calls = {"count": 0}
+    real_writer = importer._write_run_directory
+
+    def failing_writer(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 3:
+            raise RuntimeError("simulated failure on the third Session")
+        return real_writer(*args, **kwargs)
+
+    monkeypatch.setattr(importer, "_write_run_directory", failing_writer)
+
+    with pytest.raises(RuntimeError, match="third Session"):
+        write_verified_collection_package(
+            plan,
+            db_snapshot=snapshot.db_path,
+            processed_pcap_dir=snapshot.pcap_dir,
+            output_root=output_root,
+            verified_at=BASE_TIME + timedelta(days=3),
+        )
+
+    assert not (output_root / "packet-if-v2-verified-001").exists()
+    assert list(output_root.glob("*")) == []
+
+
+def test_package_does_not_modify_snapshot_or_pcap(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+    snapshot_before = file_sha256(snapshot.db_path)
+    pcap_before = {
+        path.name: file_sha256(path)
+        for path in sorted(snapshot.pcap_dir.iterdir())
+    }
+
+    _write_package(snapshot, tmp_path)
+
+    assert file_sha256(snapshot.db_path) == snapshot_before
+    assert {
+        path.name: file_sha256(path)
+        for path in sorted(snapshot.pcap_dir.iterdir())
+    } == pcap_before
