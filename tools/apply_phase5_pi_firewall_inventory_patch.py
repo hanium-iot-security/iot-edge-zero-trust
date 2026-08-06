@@ -74,8 +74,15 @@ def main() -> int:
         label="firewall inventory helper insertion",
     )
 
-    baseline_anchor = """    conflicts = _find_conflicting_processes()\n"""
-    baseline_replacement = """    actual_firewall_rules = _list_project_firewall_rules(context.source_ip)
+    baseline_anchor = """    finally:
+        connection.close()
+
+    conflicts = _find_conflicting_processes()
+"""
+    baseline_replacement = """    finally:
+        connection.close()
+
+    actual_firewall_rules = _list_project_firewall_rules(context.source_ip)
     inventory_errors = [
         item for item in actual_firewall_rules if item.startswith("firewall_inventory_error:")
     ]
