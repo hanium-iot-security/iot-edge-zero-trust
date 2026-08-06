@@ -101,18 +101,20 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
 
 **Interfaces:**
 - Consumes: `db.migration_runner.apply_migrations(db_path, migrations_dir)`와 기존 `schema_migrations(version, name, applied_at)` 계약.
-- Produces: `packet_checkpoint_recoveries` Table, `uq_packet_checkpoint_recovery_detector_target` Unique Index, `(5, 'packet_checkpoint_recovery')` Migration metadata.
+- Produces: `packet_checkpoint_recoveries` base table and `(5, 'packet_checkpoint_recovery')` migration metadata. Task 2 owns every UNIQUE, CHECK, FOREIGN KEY, and index constraint.
 
 - [ ] **Step 1: 신규 DB의 Migration 005 생성 실패 테스트 작성**
 
   `tests/test_migrations.py`에 다음 테스트를 추가한다.
 
   ```python
-  def test_packet_checkpoint_recovery_schema_and_constraints(tmp_path: Path) -> None:
+  def test_packet_checkpoint_recovery_base_schema(tmp_path: Path) -> None:
       db_path = tmp_path / "recovery.db"
       apply_migrations(db_path, MIGRATIONS_DIR)
-      with sqlite3.connect(db_path) as connection:
-          assert 5 in _migration_versions(connection)
+      with connect_database(db_path) as connection:
+          assert connection.execute(
+              "SELECT version, name FROM schema_migrations WHERE version = 5"
+          ).fetchone() == (5, "packet_checkpoint_recovery")
           assert _table_exists(connection, "packet_checkpoint_recoveries")
           columns = _column_names(connection, "packet_checkpoint_recoveries")
           assert {
@@ -128,7 +130,7 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
 
 - [ ] **Step 2: RED 확인**
 
-  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_migrations.py::test_packet_checkpoint_recovery_schema_and_constraints -q`
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_migrations.py::test_packet_checkpoint_recovery_base_schema -q`
 
   Expected: FAIL — Migration 005가 없어 `packet_checkpoint_recoveries`가 존재하지 않는다.
 
@@ -139,9 +141,9 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
   ```sql
   CREATE TABLE packet_checkpoint_recoveries (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      operation_id TEXT NOT NULL UNIQUE,
-      detector_name TEXT NOT NULL CHECK (detector_name IN ('packet_rule', 'packet_if')),
-      source_table TEXT NOT NULL CHECK (source_table = 'packet_feature_logs'),
+      operation_id TEXT NOT NULL,
+      detector_name TEXT NOT NULL,
+      source_table TEXT NOT NULL,
       current_capture_session_id TEXT NOT NULL,
       target_capture_session_id TEXT NOT NULL,
       last_processed_id_before INTEGER,
@@ -150,37 +152,25 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
       last_completed_window_end_after TEXT NOT NULL,
       updated_at_before TEXT NOT NULL,
       updated_at_after TEXT NOT NULL,
-      plan_sha256 TEXT NOT NULL CHECK (length(plan_sha256) = 64),
+      plan_sha256 TEXT NOT NULL,
       plan_json TEXT NOT NULL,
-      skipped_session_count INTEGER NOT NULL CHECK (skipped_session_count >= 0),
-      skipped_processable_session_count INTEGER NOT NULL CHECK (skipped_processable_session_count >= 0),
+      skipped_session_count INTEGER NOT NULL,
+      skipped_processable_session_count INTEGER NOT NULL,
       approved_by TEXT NOT NULL,
       reason TEXT NOT NULL,
-      repository_commit TEXT NOT NULL CHECK (length(repository_commit) = 40),
+      repository_commit TEXT NOT NULL,
       database_path TEXT NOT NULL,
       backup_path TEXT NOT NULL,
-      backup_sha256 TEXT NOT NULL CHECK (length(backup_sha256) = 64),
-      created_at TEXT NOT NULL,
-      CHECK (last_processed_id_before IS last_processed_id_after),
-      FOREIGN KEY (detector_name, source_table)
-          REFERENCES detector_checkpoints(detector_name, source_table) ON DELETE RESTRICT,
-      FOREIGN KEY (current_capture_session_id)
-          REFERENCES packet_capture_sessions(session_id) ON DELETE RESTRICT,
-      FOREIGN KEY (target_capture_session_id)
-          REFERENCES packet_capture_sessions(session_id) ON DELETE RESTRICT
+      backup_sha256 TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
-
-  CREATE UNIQUE INDEX uq_packet_checkpoint_recovery_detector_target
-      ON packet_checkpoint_recoveries(
-          detector_name, source_table, target_capture_session_id
-      );
   ```
 
   SHA와 UTC 문자열의 세부 형식은 Core에서도 검증하며, Migration 테스트에서는 잘못된 Detector, Source, 중복 operation/target, `last_processed_id` 변경, 음수 Skip count를 각각 거부하도록 확인한다.
 
 - [ ] **Step 4: GREEN 확인**
 
-  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_migrations.py::test_packet_checkpoint_recovery_schema_and_constraints -q`
+  Run: `C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_migrations.py::test_packet_checkpoint_recovery_base_schema -q`
 
   Expected: PASS.
 
@@ -194,11 +184,12 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
 ### Task 2: Migration 계약·회귀 테스트
 
 **Files:**
+- Modify: `db/migrations/005_packet_checkpoint_recovery.sql`
 - Modify: `tests/test_migrations.py`
 
 **Interfaces:**
 - Consumes: Task 1의 Migration 005와 기존 `_write_project_migrations_subset()`.
-- Produces: 004→005 Upgrade, Row 보존, Constraint, 실패 Rollback의 회귀 증거.
+- Produces: constrained Migration 005 DDL plus 004→005 upgrade, row-preservation, constraint DML, and failed-005 rollback evidence.
 
 - [ ] **Step 1: 004 DB Upgrade와 Row 보존 테스트 작성**
 
@@ -247,7 +238,10 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
 
   - `test_packet_checkpoint_recovery_rejects_duplicate_operation_id`
   - `test_packet_checkpoint_recovery_rejects_duplicate_detector_target`
+  - `test_packet_checkpoint_recovery_rejects_invalid_detector_or_source`
   - `test_packet_checkpoint_recovery_rejects_changed_last_processed_id`
+  - `test_packet_checkpoint_recovery_rejects_negative_skip_counts`
+  - `test_packet_checkpoint_recovery_foreign_keys_restrict_referenced_rows`
   - `test_failed_005_migration_rolls_back_schema_and_version_record`
 
 - [ ] **Step 2: RED 확인**
@@ -256,9 +250,51 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
 
   Expected: 최소 한 테스트 FAIL — 005 Upgrade/Constraint 또는 Rollback 계약이 아직 충족되지 않는다.
 
-- [ ] **Step 3: Migration DDL을 테스트가 요구하는 최소 범위로 보정**
+- [ ] **Step 3: Add all constrained DDL required by the Task 2 tests**
 
-  `005_packet_checkpoint_recovery.sql`의 Index, FK, CHECK만 수정하고 기존 Table은 재구성하지 않는다. Migration Runner는 변경하지 않는다.
+  Update `005_packet_checkpoint_recovery.sql` from the Task 1 base table to this constrained DDL. Task 2 owns all UNIQUE, CHECK, FOREIGN KEY, and index constraints; the migration runner remains unchanged.
+
+  ```sql
+  CREATE TABLE packet_checkpoint_recoveries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      operation_id TEXT NOT NULL UNIQUE,
+      detector_name TEXT NOT NULL CHECK (detector_name IN ('packet_rule', 'packet_if')),
+      source_table TEXT NOT NULL CHECK (source_table = 'packet_feature_logs'),
+      current_capture_session_id TEXT NOT NULL,
+      target_capture_session_id TEXT NOT NULL,
+      last_processed_id_before INTEGER,
+      last_processed_id_after INTEGER,
+      last_completed_window_end_before TEXT NOT NULL,
+      last_completed_window_end_after TEXT NOT NULL,
+      updated_at_before TEXT NOT NULL,
+      updated_at_after TEXT NOT NULL,
+      plan_sha256 TEXT NOT NULL CHECK (length(plan_sha256) = 64),
+      plan_json TEXT NOT NULL,
+      skipped_session_count INTEGER NOT NULL CHECK (skipped_session_count >= 0),
+      skipped_processable_session_count INTEGER NOT NULL CHECK (skipped_processable_session_count >= 0),
+      approved_by TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      repository_commit TEXT NOT NULL CHECK (length(repository_commit) = 40),
+      database_path TEXT NOT NULL,
+      backup_path TEXT NOT NULL,
+      backup_sha256 TEXT NOT NULL CHECK (length(backup_sha256) = 64),
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CHECK (last_processed_id_before IS last_processed_id_after),
+      FOREIGN KEY (detector_name, source_table)
+          REFERENCES detector_checkpoints(detector_name, source_table) ON DELETE RESTRICT,
+      FOREIGN KEY (current_capture_session_id)
+          REFERENCES packet_capture_sessions(session_id) ON DELETE RESTRICT,
+      FOREIGN KEY (target_capture_session_id)
+          REFERENCES packet_capture_sessions(session_id) ON DELETE RESTRICT
+  );
+
+  CREATE UNIQUE INDEX uq_packet_checkpoint_recovery_detector_target
+      ON packet_checkpoint_recoveries(
+          detector_name, source_table, target_capture_session_id
+      );
+  ```
+
+  The Task 2 DML tests explicitly cover duplicate `operation_id`, duplicate `(detector_name, source_table, target_capture_session_id)`, detector/source checks, unchanged `last_processed_id`, both nonnegative skip counts, and `ON DELETE RESTRICT` foreign keys. Its 004→005 upgrade test preserves existing rows, and its failed-005 test proves schema/version rollback.
 
 - [ ] **Step 4: GREEN 및 기존 Migration 회귀 확인**
 

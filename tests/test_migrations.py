@@ -248,22 +248,43 @@ def test_runner_applies_new_database_in_order(tmp_path: Path) -> None:
         assert _table_exists(connection, "trust_score_history")
 
 
-def test_packet_checkpoint_recovery_schema_and_constraints(tmp_path: Path) -> None:
+def test_packet_checkpoint_recovery_base_schema(tmp_path: Path) -> None:
     db_path = tmp_path / "recovery.db"
     apply_migrations(db_path, MIGRATIONS_DIR)
     with connect_database(db_path) as connection:
-        assert 5 in _migration_versions(connection)
+        migration = connection.execute(
+            "SELECT version, name FROM schema_migrations WHERE version = 5"
+        ).fetchone()
+        assert migration is not None
+        assert migration["version"] == 5
+        assert migration["name"] == "packet_checkpoint_recovery"
         assert _table_exists(connection, "packet_checkpoint_recoveries")
         columns = _column_names(connection, "packet_checkpoint_recoveries")
-        assert {
-            "operation_id", "detector_name", "source_table",
+        assert columns == {
+            "id", "operation_id", "detector_name", "source_table",
             "current_capture_session_id", "target_capture_session_id",
             "last_processed_id_before", "last_processed_id_after",
             "last_completed_window_end_before", "last_completed_window_end_after",
             "updated_at_before", "updated_at_after", "plan_sha256", "plan_json",
+            "skipped_session_count", "skipped_processable_session_count",
             "approved_by", "reason", "repository_commit", "database_path",
             "backup_path", "backup_sha256", "created_at",
-        } <= columns
+        }
+        column_info = {
+            row["name"]: (row["type"], row["notnull"], row["pk"], row["dflt_value"])
+            for row in connection.execute("PRAGMA table_info(packet_checkpoint_recoveries)")
+        }
+        assert column_info["id"] == ("INTEGER", 0, 1, None)
+        assert column_info["last_processed_id_before"] == ("INTEGER", 0, 0, None)
+        assert column_info["last_processed_id_after"] == ("INTEGER", 0, 0, None)
+        assert column_info["skipped_session_count"] == ("INTEGER", 1, 0, None)
+        assert column_info["skipped_processable_session_count"] == ("INTEGER", 1, 0, None)
+        for column_name in columns - {
+            "id", "last_processed_id_before", "last_processed_id_after",
+            "skipped_session_count", "skipped_processable_session_count", "created_at",
+        }:
+            assert column_info[column_name] == ("TEXT", 1, 0, None)
+        assert column_info["created_at"] == ("TEXT", 1, 0, "CURRENT_TIMESTAMP")
 
 
 def test_missing_migration_directory_fails_before_touching_db(tmp_path: Path) -> None:
