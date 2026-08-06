@@ -86,7 +86,7 @@ def valid_dry_run_kwargs(fixture: RecoveryFixture) -> dict[str, object]:
     """inspect_packet_checkpoint_recovery()의 완전한 성공 인자를 반환한다."""
 
 def valid_execute_kwargs(fixture: RecoveryFixture, plan_file: Path) -> dict[str, object]:
-    """독립 DB와 Task 9 Fake Lock을 포함하되 플랫폼 Override는 포함하지 않는다."""
+    """독립 DB의 성공 Execute 입력을 반환하며 플랫폼·Lock Override는 포함하지 않는다."""
 ```
 
 Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 뒤 Initial Commit을 만들고, 제품 Repository나 실제 DB 경로를 참조하지 않는다. UUID는 `uuid.UUID(..., version=4)` 검증을 통과하는 고정 Test ID를 사용한다.
@@ -1114,9 +1114,11 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
 **Interfaces:**
 - Consumes: `edge.scripts.phase4_cutover_storage.create_sqlite_backup()`와 `verify_database()`.
 - Repository produces: `update_checkpoint_conditionally(connection: sqlite3.Connection, *, before: Mapping[str, object], after: Mapping[str, object]) -> int`, `insert_recovery_audit(connection: sqlite3.Connection, *, audit: Mapping[str, object]) -> int`, `get_recovery_audit(connection: sqlite3.Connection, operation_id: str) -> sqlite3.Row | None`.
-- Core produces: `_current_platform_name() -> str`, `require_execute_platform(platform_name: str) -> None`, `execute_packet_checkpoint_recovery(*, plan_file: str | Path, db_path: str | Path, artifact_dir: str | Path, confirm: str, confirm_skip_processable: str | None = None, lock_factory: Callable[[Path], ContextManager[None]] = single_instance_lock) -> dict[str, object]`.
+- Core produces: `_current_platform_name() -> str`, `require_execute_platform(platform_name: str) -> None`, `execute_packet_checkpoint_recovery(*, plan_file: str | Path, db_path: str | Path, artifact_dir: str | Path, confirm: str, confirm_skip_processable: str | None = None) -> dict[str, object]`.
 
 - [ ] **Step 1: Backup·TOCTOU·Mutation 테스트 작성**
+
+  `tests/test_packet_checkpoint_recovery.py`에 공개 Signature 검사용 `import inspect`와 Lock Context Manager Test Double용 `from contextlib import nullcontext`를 추가한다.
 
   테스트 이름:
 
@@ -1138,16 +1140,37 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
   - `test_execute_rejects_windows_before_lock_backup_artifact_and_database_changes`
   - `test_execute_public_signature_has_no_platform_override`
   - `test_execute_rejects_platform_name_keyword_in_general_python_call`
+  - `test_execute_public_signature_has_no_lock_factory_override`
+  - `test_execute_rejects_lock_factory_keyword_in_general_python_call`
 
   Windows에서 실행되는 성공 Workflow 테스트는 공개 인자 없이 다음 패턴을 사용한다.
 
   ```python
   def test_execute_creates_verified_backup_before_begin_immediate(monkeypatch, fixture):
       monkeypatch.setattr(recovery, "_current_platform_name", lambda: "posix")
+      monkeypatch.setattr(
+          recovery,
+          "acquire_recovery_locks",
+          lambda locks: nullcontext(),
+      )
       kwargs = valid_execute_kwargs(fixture, fixture.plan_output)
       assert "platform_name" not in kwargs
+      assert "lock_factory" not in kwargs
       result = execute_packet_checkpoint_recovery(**kwargs)
       assert result["database_committed"] is True
+
+  def test_execute_public_signature_has_no_lock_factory_override():
+      assert "lock_factory" not in inspect.signature(
+          execute_packet_checkpoint_recovery
+      ).parameters
+
+  def test_execute_rejects_lock_factory_keyword_in_general_python_call(fixture):
+      kwargs = valid_execute_kwargs(fixture, fixture.plan_output)
+      with pytest.raises(TypeError):
+          execute_packet_checkpoint_recovery(
+              **kwargs,
+              lock_factory=lambda path: nullcontext(),
+          )
   ```
 
 - [ ] **Step 2: RED 확인**
@@ -1185,14 +1208,14 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
 
   Windows에서는 Manual Runner가 `msvcrt`, 공용 Runtime Lock이 `O_EXCL`, Packet Feature Extractor가 무잠금 경로를 사용하므로 같은 Path만으로 상호배제를 보장하지 못한다. `execute_packet_checkpoint_recovery()`는 공개 인자를 읽거나 파일에 접근하기 전에 `require_execute_platform(_current_platform_name())`을 가장 먼저 호출한다. 공개 Signature와 CLI에는 `platform_name`을 두지 않으므로 일반 Python 호출과 CLI 모두 `platform_name="posix"` 같은 값으로 Gate를 우회할 수 없다.
 
-  Windows에서 Task 11의 성공·Rollback Workflow를 검증할 때는 공개 Execute 인자를 바꾸지 않고 `_current_platform_name()`만 `lambda: "posix"`로 Monkeypatch하며 기록 가능한 Fake Lock Factory를 전달한다. Windows 거부 테스트는 `_current_platform_name()`을 `lambda: "nt"`로 Monkeypatch하고 모든 Mutation Spy의 호출 수가 0인지 확인한다. `inspect.signature()`로 공개 플랫폼 인자가 없음을 확인하고, `platform_name="posix"` Keyword 호출은 Python `TypeError`로 거부되는지 별도 테스트한다.
+  Windows에서 Task 11의 성공·Rollback Workflow를 검증할 때는 공개 Execute 인자를 바꾸지 않고 `_current_platform_name()`만 `lambda: "posix"`로 Monkeypatch한다. Lock Test Double이 필요하면 공개 인자로 전달하지 않고 `recovery.acquire_recovery_locks`를 기록 가능한 Context Manager로 Monkeypatch한다. Windows 거부 테스트는 `_current_platform_name()`을 `lambda: "nt"`로 Monkeypatch하고 모든 Mutation Spy의 호출 수가 0인지 확인한다. `inspect.signature()`로 공개 플랫폼·`lock_factory` 인자가 없음을 확인한다. `platform_name="posix"` 또는 `lock_factory=fake_lock_factory` Keyword를 일반 Python 호출에 전달하면 Python `TypeError`로 거부되는지 각각 테스트한다. `valid_execute_kwargs()`에도 두 Override를 포함하지 않는다.
 
   Workflow를 다음 순서로 구현한다.
 
   1. POSIX Execute Gate
   2. Plan JSON/SHA와 resolved DB Path 비교
   3. Migration, 확인 문자열, existing `artifact_dir`, 생성 경로 Git ignore 검증
-  4. 고유 Lock 획득
+  4. `with acquire_recovery_locks(locks):`로 실제 고유 Lock 획득
   5. Repository/Git/Untracked Inventory/Canonical Plan 1차 재검증과 전역 RUNNING Gate
   6. Transaction 밖 live DB `integrity_check`/`foreign_key_check`
   7. SQLite Backup API 실행과 Backup SHA/DB 검증
@@ -1204,6 +1227,15 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
   13. Checkpoint/Audit/다른 Checkpoint/FK와 `total_changes - before == 2` 검증
   14. COMMIT
   15. 별도 Connection에서 live DB 전체 검증과 Result JSON Atomic write
+
+  Production Execute는 Task 9의 저수준 `lock_factory` 주입점을 외부로 전달하지 않고 항상 다음 구조로 실제 Lock 구현을 사용한다.
+
+  ```python
+  with acquire_recovery_locks(locks):
+      return _execute_locked_recovery(...)
+  ```
+
+  Task 9의 `acquire_recovery_locks(..., lock_factory=...)`는 Lock 순서·충돌 단위 테스트에만 유지한다. Task 11·12의 Execute 통합 테스트는 이 저수준 인자를 공개 Execute 호출로 전달하지 않는다.
 
   Transaction 내부에서는 전체 `integrity_check`를 실행하지 않고 변경 Row, Audit Row, 다른 Checkpoint Snapshot, FK만 검증한다.
 
@@ -1300,7 +1332,7 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
       return 0
   ```
 
-  Commit 후 live DB 검증 또는 Result JSON 실패 시 Checkpoint/Audit/Backup을 유지하고 자동 Restore를 금지한다. Result에는 `database_committed=true`, `operation_status=HOLD`를 표시한다. CLI의 성공·Exit 3 Mapping 테스트는 Core 함수를 Monkeypatch해 플랫폼과 무관한 출력 계약만 확인한다. Lock 수명 통합 테스트는 `_current_platform_name()`을 `lambda: "posix"`로 Monkeypatch하고 Injected Lock의 해제 시점을 기록하는 Test Double을 사용해 모든 Lock이 성공 Result write와 Commit 후 HOLD 처리까지 유지되는지 검증한다. Windows Execute 거부는 Exit 2이며 Lock Factory, Backup Factory, Artifact Writer, DB Mutation Spy의 호출 수가 모두 0이어야 한다.
+  Commit 후 live DB 검증 또는 Result JSON 실패 시 Checkpoint/Audit/Backup을 유지하고 자동 Restore를 금지한다. Result에는 `database_committed=true`, `operation_status=HOLD`를 표시한다. CLI의 성공·Exit 3 Mapping 테스트는 Core 함수를 Monkeypatch해 플랫폼과 무관한 출력 계약만 확인한다. Lock 수명 통합 테스트는 `_current_platform_name()`을 `lambda: "posix"`로 Monkeypatch하고 `recovery.acquire_recovery_locks`를 해제 시점을 기록하는 Context Manager Test Double로 Monkeypatch해 모든 Lock이 성공 Result write와 Commit 후 HOLD 처리까지 유지되는지 검증한다. 공개 Execute 호출에는 `lock_factory`를 전달하지 않는다. Windows Execute 거부는 Exit 2이며 Lock 획득 함수, Backup Factory, Artifact Writer, DB Mutation Spy의 호출 수가 모두 0이어야 한다.
 
 - [ ] **Step 4: GREEN 확인**
 
@@ -1468,8 +1500,17 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
           for row in snapshot["detector_checkpoints"]
       )
 
-  def test_execute_changes_only_requested_checkpoint_and_one_audit_row(tmp_path: Path):
+  def test_execute_changes_only_requested_checkpoint_and_one_audit_row(
+      tmp_path: Path,
+      monkeypatch,
+  ):
       fixture = create_recovery_fixture(tmp_path)
+      monkeypatch.setattr(recovery, "_current_platform_name", lambda: "posix")
+      monkeypatch.setattr(
+          recovery,
+          "acquire_recovery_locks",
+          lambda locks: nullcontext(),
+      )
       inspect_packet_checkpoint_recovery(**valid_dry_run_kwargs(fixture))
       before = database_snapshot(fixture.db_path, PROTECTED_TABLES)
       checkpoints_before = checkpoint_snapshot(fixture.db_path)
@@ -1556,7 +1597,7 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
   C:\Users\woomin\Desktop\iot-edge-zero-trust\venv\Scripts\python.exe -m pytest tests/test_packet_checkpoint_recovery.py tests/test_migrations.py tests/test_packet_repositories.py tests/test_packet_stage_readiness.py tests/test_packet_rule_detector.py tests/test_packet_rule_runner.py tests/test_packet_ai_detector.py tests/test_run_packet_ai_detector.py tests/test_detection_orchestrator_runner.py tests/test_runtime_lock.py tests/test_phase4_cutover.py tests/test_baseline_recovery.py tests/test_trust_compensation.py -q
   ```
 
-  Expected: PASS; Orchestrator의 자동 Gap 차단 테스트가 그대로 통과한다. Windows에서는 Fake/Injected Lock으로 함수·Workflow 계약만 검증하며 실제 POSIX Lock 상호운용 통과로 보고하지 않는다.
+  Expected: PASS; Orchestrator의 자동 Gap 차단 테스트가 그대로 통과한다. Windows에서는 Task 9 저수준 Lock Factory 주입과 `recovery.acquire_recovery_locks` Workflow Monkeypatch로 함수·Workflow 계약만 검증하며 실제 POSIX Lock 상호운용 통과로 보고하지 않는다.
 
 - [ ] **Step 2: Windows Bash Wrapper 제외 전체 회귀 실행**
 
@@ -1682,6 +1723,7 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
 | 실제 Lock 경로·중복 제거·정렬 획득 | 9, 11 |
 | Windows/POSIX Dry-run·POSIX 전용 Execute | 10, 11, 12, 17 |
 | 공개 플랫폼 Override 없는 실제 OS Gate | 11, 12, 17 |
+| 공개 Lock Factory Override 없는 실제 Lock 획득 | 9, 11, 12 |
 | 실제 POSIX Lock 상호운용은 병합 후 Pi 복사 DB Smoke | 9, 17 |
 | Backup·TOCTOU·조건부 UPDATE·Audit·Delta 2 | 11 |
 | Exit 2/3·Commit 후 HOLD | 12 |
@@ -1701,6 +1743,7 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
 - Target full-ready는 모든 Segment가 정확히 한 번 연속 Prefix에 소비되고 `segment_count == len(rows)`일 때만 성립한다.
 - 처리 가능 Session Skip은 Plan SHA에 바인딩된 추가 확인 없이는 실행되지 않는다.
 - 모든 실제 고유 Lock은 Repository Root 기준 절대경로로 계산해 정렬·단일 획득하고 사후 검증까지 유지한다.
+- 공개 Execute API에는 `lock_factory` Override가 없으며 Production Execute는 항상 `acquire_recovery_locks(locks)`로 실제 Lock을 획득한다.
 - Dry-run은 Windows와 POSIX에서 동작하고, Execute는 공개 Override 없이 실제 `os.name`을 검사하여 POSIX가 아니면 어떤 Lock·Backup·Artifact·DB 변경 전에도 Exit 2로 거부된다.
 - Plan 상위 Directory와 최상위 Artifact Directory는 미리 존재하며, CLI는 Plan 상위를 만들지 않고 Execute는 Artifact 아래 operation Directory만 만든다.
 - Migration 미적용, RUNNING Session, Git 상태/Inventory/경로/Checkpoint/Readiness/TOCTOU 불일치는 Backup 또는 Mutation 전에 차단된다.
