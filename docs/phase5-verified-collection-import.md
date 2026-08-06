@@ -38,11 +38,41 @@ Runner 반복 평가는 Phase 6 선택 고도화로 이관한다.
 
 ## 3. 대상 Session
 
-**포함**
+**포함 — 총 17 Session (이번 공식 배치의 운영 계획)**
 
-- `esp32_01` 정상 Train 8 / Validation 4 / Test 4
-- `esp32_02` 공격 Offline Test Session 53
-  (`23d5dc5b-1e73-44e4-80ed-1d0c12bda7f9`, `192.168.0.5`, `packet_rate_flood`)
+정상 Profile 4종을 각각 **Train 2 / Validation 1 / Test 1**로 맞춘다.
+
+| 정상 Profile | Train | Validation | Test |
+| --- | --- | --- | --- |
+| `normal_stable` | 2 | 1 | 1 |
+| `normal_interval_jitter` | 2 | 1 | 1 |
+| `normal_payload_variation` | 2 | 1 | 1 |
+| `normal_combined_variation` | 2 | 1 | 1 |
+| **정상 합계** | **8** | **4** | **4** |
+
+여기에 `esp32_02` 공격 Offline Test Session 53
+(`23d5dc5b-1e73-44e4-80ed-1d0c12bda7f9`, `192.168.0.5`, `packet_rate_flood`) **1개**를
+더해 **17 Session**이다.
+
+Profile별 개수를 맞추는 이유는, 총 Train 8개만 채우면 한 Profile이 Train을
+독차지할 수 있기 때문이다. 그러면 모델은 그 Profile을 "정상"의 기준으로 학습하고
+나머지 3종을 이상으로 판정할 수 있다.
+
+> **이 구성은 Importer가 강제하지 않는다.** Verified Collection의 일반 계약이
+> 아니라 이번 공식 배치의 운영 계획이기 때문이다. Phase 6 재수집이나 Profile
+> 구성이 달라지면 코드 수정 없이 새 구성을 그대로 Import할 수 있어야 한다.
+>
+> 대신 **운영자가 `--check-only` 출력의 `scenario_split_counts`로 직접 확인한다**
+> (아래 6.1 절). 공식 배치에서 이 표와 다르면 Import를 진행하지 않는다.
+
+Importer가 실제로 강제하는 것은 아래 안전 규칙이며, 구성과 무관하게 항상 적용된다.
+
+- Session·`collection_slot_id`·Run ID 중복 금지
+- 같은 `source_capture_group_id`가 여러 Split에 걸치는 것 금지
+- Train·Validation은 정상 Session만
+- Test에는 정상과 공격이 모두 존재
+- 승인된 공격 Session(Session 53)만 허용
+- 세 Split이 모두 존재
 
 **제외 (Dataset 외부 보존)**
 
@@ -183,6 +213,28 @@ python -m edge.phase5.import_verified_collection \
 Commit·`included_device_ids`·`background_traffic_present`를 노션 인계 자료와
 대조한다.
 
+#### 공식 구성 확인 (필수 검토 항목)
+
+Importer는 구성을 강제하지 않으므로 **이 확인은 운영자 책임이다.** 출력의
+`scenario_split_counts`가 3절 표와 정확히 일치해야 공식 배치로 진행한다.
+
+```json
+{
+  "session_count": 17,
+  "split_counts": { "train": 8, "validation": 4, "test": 5 },
+  "scenario_split_counts": {
+    "normal_stable":             { "train": 2, "validation": 1, "test": 1 },
+    "normal_interval_jitter":    { "train": 2, "validation": 1, "test": 1 },
+    "normal_payload_variation":  { "train": 2, "validation": 1, "test": 1 },
+    "normal_combined_variation": { "train": 2, "validation": 1, "test": 1 },
+    "packet_rate_flood":         { "test": 1 }
+  }
+}
+```
+
+하나라도 다르면 `--write`를 실행하지 않고 Import Spec을 먼저 고친다. 같은 값이
+게시된 Package의 `import-summary.json`에도 남으므로 사후에도 확인할 수 있다.
+
 ### 6.2 게시 (`--write`)
 
 `--check-only` 결과를 승인한 뒤에만 실행한다.
@@ -255,6 +307,19 @@ Manifest Directory 기준 상대경로이므로 다른 위치에 쓰면 참조�
 Export Spec에 `db_snapshot_sha256`이 있는데 `--db-snapshot`을 생략하면 Export가
 거부된다. 어떤 DB를 읽었는지 증명하지 못한 Dataset은 만들지 않는다.
 
+### Dataset Manifest의 `db_snapshot_sha256`
+
+Export 결과 Dataset Manifest 최상위에 `db_snapshot_sha256`이 남는다. 이 값의 유무가
+Dataset의 등급을 가른다.
+
+| Manifest | 의미 | Load 시 요구사항 |
+| --- | --- | --- |
+| `db_snapshot_sha256` 있음 | 공식 Verified Collection Dataset | **모든 Session에 Collection Manifest 필수**, 각 Collection의 `db_snapshot_sha256`이 Dataset 값과 일치해야 함 |
+| `db_snapshot_sha256` 없음 | 기존 Dataset | 종전과 동일. Collection 참조가 있을 때만 검증 |
+
+즉 공식 Dataset은 Session 하나라도 Collection Manifest가 빠지면 Load가 실패한다.
+`db_snapshot_sha256`이 없는 기존 Dataset은 하위 호환으로 그대로 동작한다.
+
 Dataset Load 시 `Dataset → Run Manifest → Collection Manifest → Evidence` SHA256
 연쇄와 아래 Session 필드 일치가 자동 검증된다. 어느 한 단계라도 어긋나면 Load가
 실패한다.
@@ -269,13 +334,17 @@ background_traffic_present, source_commit_sha, capture_filter
 
 | 결과 | 의미 | 조치 |
 | --- | --- | --- |
-| PASS | 17개 전부 검증 통과 | `--write` 진행 |
+| PASS | 선언한 Session 전부 검증 통과 | **구성 확인 후** `--write` 진행 |
 | HOLD | 필수 Provenance 값 미확인 | 노션·소스에서 값 확정 후 재실행. 추정값 입력 금지 |
 | FAIL | Session·PCAP·Split 검증 실패 | 원인 해소 전 진행 금지 |
 
 FAIL 사유 예: Session 미완료, `READY`·`FAILED` Segment 존재, Window Gap·중복,
 Feature와 Segment Window 불일치, 적격 INBOUND Row 없음, PCAP 누락·이름 불일치,
-Slot·Run ID 중복, Split 누수, 기존 Package 존재.
+Slot·Run ID 중복, Split 누수, Train/Validation에 공격 Session, Test에 공격 부재,
+승인되지 않은 공격 Session, 기존 Package 존재.
+
+**PASS는 "안전 규칙을 통과했다"는 뜻이지 "공식 구성이 맞다"는 뜻이 아니다.**
+6.1 절의 `scenario_split_counts` 확인을 반드시 함께 수행한다.
 
 ## 10. Session 53 한계
 

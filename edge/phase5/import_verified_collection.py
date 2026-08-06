@@ -1647,6 +1647,7 @@ def _write_import_summary(
             "capture_policy_version": plan.capture_policy.version,
             "session_count": len(plan.sessions),
             "split_counts": _split_counts(plan),
+            "scenario_split_counts": _scenario_split_counts(plan),
             "sessions": [
                 {
                     "session_id": session.session_id,
@@ -1677,6 +1678,26 @@ def _split_counts(plan: VerifiedCollectionBatchPlan) -> dict[str, int]:
     for session in plan.sessions:
         counts[session.spec.split] = counts.get(session.spec.split, 0) + 1
     return dict(sorted(counts.items()))
+
+
+def _scenario_split_counts(
+    plan: VerifiedCollectionBatchPlan,
+) -> dict[str, dict[str, int]]:
+    """Break the batch down by Scenario and Split for operator review.
+
+    The importer deliberately does not enforce a particular Dataset composition
+    — that is an operating plan for one batch, not a property of Verified
+    Collection. This breakdown lets `--check-only` show the actual shape so the
+    operator can compare it against the composition the Runbook records.
+    """
+    counts: dict[str, dict[str, int]] = {}
+    for session in plan.sessions:
+        by_split = counts.setdefault(session.spec.scenario, {})
+        by_split[session.spec.split] = by_split.get(session.spec.split, 0) + 1
+    return {
+        scenario: dict(sorted(by_split.items()))
+        for scenario, by_split in sorted(counts.items())
+    }
 
 
 def _reverify_package(
@@ -1782,6 +1803,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "dataset_package_id": spec.dataset_package_id,
             "session_count": len(plan.sessions),
             "split_counts": _split_counts(plan),
+            "scenario_split_counts": _scenario_split_counts(plan),
             "db_snapshot_sha256": plan.db_snapshot_sha256,
             "capture_policy_version": plan.capture_policy.version,
             "sessions": [

@@ -119,6 +119,14 @@ class PacketIFDatasetManifest:
     capture_policy: CapturePolicy
     dataset_sha256: str
     sessions: tuple[PacketIFSessionSpec, ...]
+    # Verified Collection Package에서 Export한 공식 Dataset만 값을 갖는다.
+    # 값이 있으면 그 Snapshot을 읽었다는 뜻이고, Session마다 Verified Collection
+    # Manifest가 반드시 있어야 한다.
+    db_snapshot_sha256: str | None = None
+
+    @property
+    def is_verified_collection_dataset(self) -> bool:
+        return self.db_snapshot_sha256 is not None
 
     @property
     def capture_policy_version(self) -> str:
@@ -236,6 +244,13 @@ def load_packet_if_manifest(
         "dataset_sha256",
     )
 
+    raw_snapshot_sha256 = payload.get("db_snapshot_sha256")
+    db_snapshot_sha256 = (
+        None
+        if raw_snapshot_sha256 is None
+        else _validate_sha256(raw_snapshot_sha256, "db_snapshot_sha256")
+    )
+
     raw_sessions = payload.get("sessions")
     if not isinstance(raw_sessions, list) or not raw_sessions:
         raise ValueError("packet dataset manifest sessions must be a non-empty list")
@@ -250,6 +265,7 @@ def load_packet_if_manifest(
         capture_policy=capture_policy,
         dataset_sha256=dataset_sha256,
         sessions=sessions,
+        db_snapshot_sha256=db_snapshot_sha256,
     )
     if dataset_version == PACKET_IF_DATASET_VERSION_V2:
         _validate_run_manifest_references(path, manifest)
@@ -743,9 +759,10 @@ def _validate_run_manifest_references(
             target_source_ip=spec.target_source_ip,
             included_device_ips=included_device_ips,
         )
-        # Verified Collection Run은 session_manifest_ref까지 연쇄 검증한다.
-        # 기존 Scenario Runner Run은 참조가 없으므로 그대로 통과한다.
-        load_verified_session_manifest(
+        # db_snapshot_sha256이 있는 공식 Verified Collection Dataset은 Session마다
+        # Collection Manifest가 반드시 있어야 한다. 없는 기존 Dataset은 참조가
+        # 있을 때만 검증하고 그대로 통과한다.
+        collection = load_verified_session_manifest(
             run_manifest_path,
             run_manifest,
             session_id=spec.session_id,
@@ -754,8 +771,17 @@ def _validate_run_manifest_references(
             target_source_ip=spec.target_source_ip,
             included_device_ips=included_device_ips,
             dataset_identity=_dataset_session_identity(spec),
-            required=False,
+            required=manifest.is_verified_collection_dataset,
         )
+        if collection is not None and manifest.db_snapshot_sha256 is not None:
+            if collection.db_snapshot_sha256 != manifest.db_snapshot_sha256:
+                raise ValueError(
+                    "Collection Manifest db_snapshot_sha256 does not match the "
+                    "Dataset Manifest: "
+                    f"session_id={spec.session_id}, "
+                    f"collection={collection.db_snapshot_sha256}, "
+                    f"dataset={manifest.db_snapshot_sha256}"
+                )
         assert_run_manifest_complete(run_manifest, reference.run_id)
 
 

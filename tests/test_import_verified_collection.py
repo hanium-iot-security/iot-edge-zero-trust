@@ -16,7 +16,7 @@ from ai.export_packet_if_dataset import (
     PacketIFSessionAnnotation,
     export_packet_if_dataset,
 )
-from ai.packet_if_dataset import load_packet_if_dataset
+from ai.packet_if_dataset import load_packet_if_dataset, load_packet_if_manifest
 from ai.packet_if_phase5_manifest import (
     PacketIFRunManifestReference,
     load_verified_run_manifest,
@@ -45,11 +45,57 @@ from edge.phase5.verified_collection_contract import (
 )
 
 
-NORMAL_TRAIN_SESSION = "11111111-1111-4111-8111-111111111111"
-NORMAL_VALIDATION_SESSION = "22222222-2222-4222-8222-222222222222"
-NORMAL_TEST_SESSION = "33333333-3333-4333-8333-333333333333"
 ATTACK_TEST_SESSION = "23d5dc5b-1e73-44e4-80ed-1d0c12bda7f9"
 HOLDOUT_SESSION = "44444444-4444-4444-8444-444444444444"
+
+NORMAL_PROFILES = (
+    "normal_stable",
+    "normal_interval_jitter",
+    "normal_payload_variation",
+    "normal_combined_variation",
+)
+# 공식 구성: Profile 4종 × (Train 2 / Validation 1 / Test 1) + 공격 Test 1 = 17
+PROFILE_SPLIT_LAYOUT = (("train", 2), ("validation", 1), ("test", 1))
+
+
+def _normal_session_id(index: int) -> str:
+    """Build a canonical UUID4 that is stable and readable in failures."""
+    return f"{index:08x}-1111-4111-8111-111111111111"
+
+
+def _official_normal_sessions() -> tuple[dict, ...]:
+    """Enumerate the 16 normal Sessions of the official composition."""
+    sessions: list[dict] = []
+    index = 0x11111111
+    for profile in NORMAL_PROFILES:
+        for split, count in PROFILE_SPLIT_LAYOUT:
+            for ordinal in range(1, count + 1):
+                sessions.append(
+                    {
+                        "session_id": _normal_session_id(index),
+                        "scenario": profile,
+                        "split": split,
+                        "slot": f"{profile.replace('_', '-')}-{split}-{ordinal:02d}",
+                    }
+                )
+                index += 1
+    return tuple(sessions)
+
+
+OFFICIAL_NORMAL_SESSIONS = _official_normal_sessions()
+
+# 대표 Session 3개. 기존 테스트가 이 이름으로 특정 Session을 가리킨다.
+NORMAL_TRAIN_SESSION = OFFICIAL_NORMAL_SESSIONS[0]["session_id"]
+NORMAL_VALIDATION_SESSION = next(
+    item["session_id"]
+    for item in OFFICIAL_NORMAL_SESSIONS
+    if item["scenario"] == "normal_stable" and item["split"] == "validation"
+)
+NORMAL_TEST_SESSION = next(
+    item["session_id"]
+    for item in OFFICIAL_NORMAL_SESSIONS
+    if item["scenario"] == "normal_stable" and item["split"] == "test"
+)
 
 CAPTURE_COMMIT = "a" * 40
 ATTACK_COMMIT = "a4b0be29a8353f3b516808e2ed945b6cb251ac61"
@@ -405,7 +451,30 @@ def _spec_payload(sessions: list[dict], **overrides) -> dict:
     return payload
 
 
-def _full_spec() -> dict:
+def _official_normal_entries(
+    *,
+    skip_session_ids: frozenset[str] = frozenset(),
+) -> list[dict]:
+    return [
+        _session_entry(
+            item["session_id"],
+            slot=item["slot"],
+            split=item["split"],
+            scenario=item["scenario"],
+        )
+        for item in OFFICIAL_NORMAL_SESSIONS
+        if item["session_id"] not in skip_session_ids
+    ]
+
+
+def _full_spec(**overrides) -> dict:
+    """Build the smallest Import Spec that satisfies every safety rule.
+
+    The importer does not require a particular Dataset composition, so the
+    default fixture is the minimum valid batch: one normal Session per Split
+    plus the attack Test Session. The real 17-Session operating composition is
+    exercised separately in the official-composition end-to-end test.
+    """
     return _spec_payload(
         [
             _session_entry(
@@ -424,15 +493,36 @@ def _full_spec() -> dict:
                 split="test",
             ),
             _attack_entry(),
-        ]
+        ],
+        **overrides,
     )
 
 
-def _seed_full_batch(snapshot: SnapshotBuilder) -> None:
-    snapshot.add_session(NORMAL_TRAIN_SESSION)
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot)
+def _seed_full_batch(
+    snapshot: SnapshotBuilder,
+    *,
+    skip_session_ids: frozenset[str] = frozenset(),
+    attack_overrides: dict | None = None,
+    **first_session_overrides,
+) -> None:
+    """Seed the minimum valid batch that `_full_spec()` declares.
+
+    `first_session_overrides` apply to the first normal Session only, which is
+    how the negative tests inject a single malformed Session into an otherwise
+    valid batch. `attack_overrides` does the same for Session 53.
+    """
+    minimal = (
+        NORMAL_TRAIN_SESSION,
+        NORMAL_VALIDATION_SESSION,
+        NORMAL_TEST_SESSION,
+    )
+    for index, session_id in enumerate(minimal):
+        if session_id in skip_session_ids:
+            continue
+        overrides = first_session_overrides if index == 0 else {}
+        snapshot.add_session(session_id, **overrides)
+    if ATTACK_TEST_SESSION not in skip_session_ids:
+        _add_attack_session(snapshot, **(attack_overrides or {}))
 
 
 def _preflight(snapshot: SnapshotBuilder, spec_payload: dict):
@@ -677,12 +767,9 @@ def test_preflight_records_attack_session_target_rows_only(
 
 
 def test_preflight_detects_background_traffic(snapshot: SnapshotBuilder) -> None:
-    snapshot.add_session(NORMAL_TRAIN_SESSION)
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(
+    _seed_full_batch(
         snapshot,
-        extra_device=("esp32_01", "192.168.0.4"),
+        attack_overrides={"extra_device": ("esp32_01", "192.168.0.4")},
     )
 
     plan = _preflight(snapshot, _full_spec())
@@ -705,36 +792,27 @@ def test_preflight_rejects_missing_session(snapshot: SnapshotBuilder) -> None:
 
 
 def test_preflight_rejects_non_completed_session(snapshot: SnapshotBuilder) -> None:
-    snapshot.add_session(NORMAL_TRAIN_SESSION, status="RUNNING")
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot)
+    _seed_full_batch(snapshot, status="RUNNING")
 
     with pytest.raises(VerifiedCollectionImportError, match="COMPLETED"):
         _preflight(snapshot, _full_spec())
 
 
 def test_preflight_rejects_ready_segment(snapshot: SnapshotBuilder) -> None:
-    snapshot.add_session(
-        NORMAL_TRAIN_SESSION,
+    _seed_full_batch(
+        snapshot,
         segment_statuses=("PROCESSED", "READY"),
     )
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot)
 
     with pytest.raises(VerifiedCollectionImportError, match="READY"):
         _preflight(snapshot, _full_spec())
 
 
 def test_preflight_rejects_failed_segment(snapshot: SnapshotBuilder) -> None:
-    snapshot.add_session(
-        NORMAL_TRAIN_SESSION,
+    _seed_full_batch(
+        snapshot,
         segment_statuses=("PROCESSED", "FAILED"),
     )
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot)
 
     with pytest.raises(VerifiedCollectionImportError, match="FAILED"):
         _preflight(snapshot, _full_spec())
@@ -743,10 +821,7 @@ def test_preflight_rejects_failed_segment(snapshot: SnapshotBuilder) -> None:
 def test_preflight_rejects_processed_segment_without_feature(
     snapshot: SnapshotBuilder,
 ) -> None:
-    snapshot.add_session(NORMAL_TRAIN_SESSION, omit_feature_for_processed=True)
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot)
+    _seed_full_batch(snapshot, omit_feature_for_processed=True)
 
     with pytest.raises(VerifiedCollectionImportError, match="PROCESSED"):
         _preflight(snapshot, _full_spec())
@@ -755,14 +830,11 @@ def test_preflight_rejects_processed_segment_without_feature(
 def test_preflight_rejects_empty_segment_with_feature(
     snapshot: SnapshotBuilder,
 ) -> None:
-    snapshot.add_session(
-        NORMAL_TRAIN_SESSION,
+    _seed_full_batch(
+        snapshot,
         segment_statuses=("PROCESSED", "EMPTY"),
         feature_for_empty=True,
     )
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot)
 
     with pytest.raises(VerifiedCollectionImportError, match="EMPTY"):
         _preflight(snapshot, _full_spec())
@@ -771,13 +843,10 @@ def test_preflight_rejects_empty_segment_with_feature(
 def test_preflight_accepts_empty_segment_without_feature(
     snapshot: SnapshotBuilder,
 ) -> None:
-    snapshot.add_session(
-        NORMAL_TRAIN_SESSION,
+    _seed_full_batch(
+        snapshot,
         segment_statuses=("PROCESSED", "EMPTY"),
     )
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot)
 
     plan = _preflight(snapshot, _full_spec())
     train = plan.session_by_id(NORMAL_TRAIN_SESSION)
@@ -788,15 +857,12 @@ def test_preflight_accepts_empty_segment_without_feature(
 
 
 def test_preflight_rejects_window_gap(snapshot: SnapshotBuilder) -> None:
-    snapshot.add_session(
-        NORMAL_TRAIN_SESSION,
+    _seed_full_batch(
+        snapshot,
         segments=3,
         segment_statuses=("PROCESSED", "PROCESSED", "PROCESSED"),
         window_gap_after=1,
     )
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot)
 
     with pytest.raises(VerifiedCollectionImportError, match="contiguous"):
         _preflight(snapshot, _full_spec())
@@ -805,20 +871,14 @@ def test_preflight_rejects_window_gap(snapshot: SnapshotBuilder) -> None:
 def test_preflight_rejects_feature_segment_window_mismatch(
     snapshot: SnapshotBuilder,
 ) -> None:
-    snapshot.add_session(NORMAL_TRAIN_SESSION, feature_window_shift_seconds=10)
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot)
+    _seed_full_batch(snapshot, feature_window_shift_seconds=10)
 
     with pytest.raises(VerifiedCollectionImportError, match="window"):
         _preflight(snapshot, _full_spec())
 
 
 def test_preflight_rejects_no_eligible_rows(snapshot: SnapshotBuilder) -> None:
-    snapshot.add_session(NORMAL_TRAIN_SESSION, feature_direction="OUTBOUND")
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot)
+    _seed_full_batch(snapshot, feature_direction="OUTBOUND")
 
     with pytest.raises(VerifiedCollectionImportError, match="eligible"):
         _preflight(snapshot, _full_spec())
@@ -827,20 +887,14 @@ def test_preflight_rejects_no_eligible_rows(snapshot: SnapshotBuilder) -> None:
 def test_preflight_rejects_ineligible_capture_timing(
     snapshot: SnapshotBuilder,
 ) -> None:
-    snapshot.add_session(NORMAL_TRAIN_SESSION, duration=7.5)
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot)
+    _seed_full_batch(snapshot, duration=7.5)
 
     with pytest.raises(VerifiedCollectionImportError, match="eligible"):
         _preflight(snapshot, _full_spec())
 
 
 def test_preflight_rejects_device_ip_mismatch(snapshot: SnapshotBuilder) -> None:
-    snapshot.add_session(NORMAL_TRAIN_SESSION, feature_peer_ip="192.168.0.99")
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot)
+    _seed_full_batch(snapshot, feature_peer_ip="192.168.0.99")
 
     with pytest.raises(VerifiedCollectionImportError, match="eligible"):
         _preflight(snapshot, _full_spec())
@@ -849,14 +903,11 @@ def test_preflight_rejects_device_ip_mismatch(snapshot: SnapshotBuilder) -> None
 def test_preflight_rejects_collection_device_not_matching_rows(
     snapshot: SnapshotBuilder,
 ) -> None:
-    snapshot.add_session(
-        NORMAL_TRAIN_SESSION,
+    _seed_full_batch(
+        snapshot,
         device_id="esp32_02",
         peer_ip="192.168.0.5",
     )
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot)
 
     with pytest.raises(
         VerifiedCollectionImportError,
@@ -869,10 +920,7 @@ def test_preflight_rejects_collection_device_not_matching_rows(
 
 
 def test_preflight_rejects_missing_pcap(snapshot: SnapshotBuilder) -> None:
-    snapshot.add_session(NORMAL_TRAIN_SESSION, write_pcap=False)
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot)
+    _seed_full_batch(snapshot, write_pcap=False)
 
     with pytest.raises(VerifiedCollectionImportError, match="PCAP"):
         _preflight(snapshot, _full_spec())
@@ -889,10 +937,7 @@ def test_preflight_rejects_pcap_filename_metadata_mismatch(
         window_end=other_window + timedelta(seconds=10),
         tmp=False,
     )
-    snapshot.add_session(NORMAL_TRAIN_SESSION, pcap_filename_override=bogus)
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot)
+    _seed_full_batch(snapshot, pcap_filename_override=bogus)
 
     with pytest.raises(VerifiedCollectionImportError, match="PCAP"):
         _preflight(snapshot, _full_spec())
@@ -1129,10 +1174,7 @@ def test_session_53_observation_is_recorded_without_claiming_a_cause(
     snapshot: SnapshotBuilder,
     tmp_path: Path,
 ) -> None:
-    snapshot.add_session(NORMAL_TRAIN_SESSION)
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot)
+    _seed_full_batch(snapshot)
     payload = _full_spec()
     payload["sessions"][-1]["sender_reported_packets"] = 960
 
@@ -1436,8 +1478,18 @@ def test_package_does_not_modify_snapshot_or_pcap(
 # --- Dataset v2 integration --------------------------------------------------
 
 
-def _export_from_package(package: Path, snapshot: SnapshotBuilder, tmp_path: Path):
-    """Run the real Dataset v2 exporter against the Package snapshot."""
+def _export_from_package(
+    package: Path,
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+    *,
+    bind_snapshot: bool = True,
+):
+    """Run the real Dataset v2 exporter against the Package snapshot.
+
+    `bind_snapshot=False` omits db_snapshot_sha256 so the resulting Dataset
+    exercises the pre-Verified-Collection contract that has no snapshot hash.
+    """
     spec_payload = _read_json(package / "packet-if-export-spec-v2.json")
     annotations = []
     for entry in spec_payload["sessions"]:
@@ -1476,7 +1528,9 @@ def _export_from_package(package: Path, snapshot: SnapshotBuilder, tmp_path: Pat
                 capture_filter=spec_payload["capture_filter"],
                 source_commit_sha=spec_payload["source_commit_sha"],
                 capture_policy=CapturePolicy(),
-                db_snapshot_sha256=spec_payload["db_snapshot_sha256"],
+                db_snapshot_sha256=(
+                    spec_payload["db_snapshot_sha256"] if bind_snapshot else None
+                ),
             )
     finally:
         engine.dispose()
@@ -1629,13 +1683,10 @@ def test_normal_session_background_traffic_is_detected_and_excluded(
     The extra Device's rows must stay out of the export while still marking
     background_traffic_present, exactly like the attack case.
     """
-    snapshot.add_session(
-        NORMAL_TRAIN_SESSION,
+    _seed_full_batch(
+        snapshot,
         extra_device=("esp32_02", "192.168.0.5"),
     )
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot)
 
     plan = _preflight(snapshot, _full_spec())
     train = plan.session_by_id(NORMAL_TRAIN_SESSION)
@@ -1656,10 +1707,10 @@ def test_attack_session_without_rows_for_the_declared_target_ip_is_rejected(
     the declared esp32_02/192.168.0.5 target has nothing to export and the
     Session must not be silently published with someone else's traffic.
     """
-    snapshot.add_session(NORMAL_TRAIN_SESSION)
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot, device_id="esp32_01", peer_ip="192.168.0.4")
+    _seed_full_batch(
+        snapshot,
+        attack_overrides={"device_id": "esp32_01", "peer_ip": "192.168.0.4"},
+    )
 
     with pytest.raises(
         VerifiedCollectionImportError,
@@ -1672,10 +1723,10 @@ def test_attack_export_excludes_background_rows_from_other_devices(
     snapshot: SnapshotBuilder,
 ) -> None:
     """Background esp32_01 rows are counted for the flag but never exported."""
-    snapshot.add_session(NORMAL_TRAIN_SESSION)
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot, extra_device=("esp32_01", "192.168.0.4"))
+    _seed_full_batch(
+        snapshot,
+        attack_overrides={"extra_device": ("esp32_01", "192.168.0.4")},
+    )
 
     plan = _preflight(snapshot, _full_spec())
     attack = plan.session_by_id(ATTACK_TEST_SESSION)
@@ -1788,10 +1839,7 @@ def test_preflight_rejects_attack_gateway_count_other_than_880(
     snapshot: SnapshotBuilder,
     tmp_path: Path,
 ) -> None:
-    snapshot.add_session(NORMAL_TRAIN_SESSION)
-    snapshot.add_session(NORMAL_VALIDATION_SESSION)
-    snapshot.add_session(NORMAL_TEST_SESSION)
-    _add_attack_session(snapshot, packet_count=100)
+    _seed_full_batch(snapshot, attack_overrides={"packet_count": 100})
 
     plan = _preflight(snapshot, _full_spec())
 
@@ -2216,3 +2264,243 @@ def test_export_cli_exports_from_package_snapshot(
     assert manifest["db_snapshot_sha256"] == file_sha256(package / "db-snapshot.db")
     dataset = load_packet_if_dataset(output, manifest_output)
     assert len(dataset.manifest.sessions) == 4
+
+
+# --- Dataset Manifest db_snapshot_sha256 contract ----------------------------
+
+
+def test_dataset_manifest_without_snapshot_hash_stays_backward_compatible(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    """A Dataset with no db_snapshot_sha256 keeps the old, looser contract."""
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+    result = _export_from_package(package, snapshot, tmp_path, bind_snapshot=False)
+
+    manifest = load_packet_if_manifest(result.manifest_path)
+
+    assert manifest.db_snapshot_sha256 is None
+    assert manifest.is_verified_collection_dataset is False
+    dataset = load_packet_if_dataset(result.output_path, result.manifest_path)
+    assert len(dataset.manifest.sessions) == 4
+
+
+def test_official_dataset_requires_session_manifest_ref(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    """With a snapshot hash present, a missing Collection reference is fatal."""
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+    result = _export_from_package(package, snapshot, tmp_path)
+
+    # Collection 참조만 지우고 Hash 연쇄는 그대로 맞춰 둔다.
+    run_path = (
+        package / "runs" / "verified-normal-stable-train-01" / "run-manifest.json"
+    )
+    run_payload = json.loads(run_path.read_text(encoding="utf-8"))
+    run_payload["session_manifest_ref"] = None
+    run_manifest = RunManifest.from_json(json.dumps(run_payload))
+    run_path.write_text(run_manifest.to_json(), encoding="utf-8")
+    run_digest = importer.run_manifest_sha256(run_manifest)
+    Path(f"{run_path}.sha256").write_text(f"{run_digest}\n", encoding="ascii")
+
+    dataset_payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    for entry in dataset_payload["sessions"]:
+        if entry["session_id"] == NORMAL_TRAIN_SESSION:
+            entry["run_manifest_ref"]["sha256"] = run_digest
+    result.manifest_path.write_text(
+        json.dumps(dataset_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must declare session_manifest_ref"):
+        load_packet_if_dataset(result.output_path, result.manifest_path)
+
+
+def test_dataset_load_rejects_snapshot_hash_mismatch(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    """The Dataset's snapshot hash must equal every Collection Manifest's."""
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+    result = _export_from_package(package, snapshot, tmp_path)
+
+    dataset_payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    dataset_payload["db_snapshot_sha256"] = "f" * 64
+    result.manifest_path.write_text(
+        json.dumps(dataset_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="db_snapshot_sha256 does not match the Dataset Manifest",
+    ):
+        load_packet_if_dataset(result.output_path, result.manifest_path)
+
+
+def test_dataset_load_accepts_matching_snapshot_hash(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+    result = _export_from_package(package, snapshot, tmp_path)
+
+    dataset = load_packet_if_dataset(result.output_path, result.manifest_path)
+
+    assert dataset.manifest.is_verified_collection_dataset is True
+    assert dataset.manifest.db_snapshot_sha256 == file_sha256(
+        package / "db-snapshot.db"
+    )
+
+
+def test_dataset_manifest_rejects_invalid_snapshot_hash(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+    result = _export_from_package(package, snapshot, tmp_path)
+
+    dataset_payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    dataset_payload["db_snapshot_sha256"] = "not-a-hash"
+    result.manifest_path.write_text(
+        json.dumps(dataset_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="db_snapshot_sha256"):
+        load_packet_if_manifest(result.manifest_path)
+
+
+
+
+
+
+
+
+# --- Official operating composition (accepted, not enforced) -----------------
+
+
+def test_importer_accepts_the_official_17_session_composition(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    """The real operating shape must import cleanly end to end.
+
+    The importer does not require this composition — it is the Phase 5 operating
+    plan, not a property of Verified Collection — but the official batch has to
+    work, so it is exercised here in full.
+    """
+    for item in OFFICIAL_NORMAL_SESSIONS:
+        snapshot.add_session(item["session_id"])
+    _add_attack_session(snapshot)
+    spec_payload = _spec_payload([*_official_normal_entries(), _attack_entry()])
+
+    package = _write_package(snapshot, tmp_path, spec_payload)
+    result = _export_from_package(package, snapshot, tmp_path)
+    dataset = load_packet_if_dataset(result.output_path, result.manifest_path)
+
+    assert len(dataset.manifest.sessions) == 17
+    assert len(dataset.session_ids("train")) == 8
+    assert len(dataset.session_ids("validation")) == 4
+    assert len(dataset.session_ids("test")) == 5
+    for split in ("train", "validation", "test"):
+        scenarios = {
+            spec.scenario
+            for spec in dataset.manifest.sessions
+            if spec.split == split and spec.traffic_label == "normal"
+        }
+        assert scenarios == set(NORMAL_PROFILES), split
+
+
+def test_check_only_reports_scenario_split_breakdown_for_review(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """`--check-only` must surface the composition so an operator can verify it."""
+    for item in OFFICIAL_NORMAL_SESSIONS:
+        snapshot.add_session(item["session_id"])
+    _add_attack_session(snapshot)
+    spec_path = tmp_path / "import-spec.json"
+    spec_path.write_text(
+        json.dumps(_spec_payload([*_official_normal_entries(), _attack_entry()])),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "--project-root",
+            str(tmp_path),
+            "--db-snapshot",
+            str(snapshot.db_path),
+            "--processed-pcap-dir",
+            str(snapshot.pcap_dir),
+            "--spec",
+            str(spec_path),
+            "--output-root",
+            str(tmp_path / "exports"),
+            "--verification-commit-sha",
+            VERIFICATION_COMMIT,
+            "--check-only",
+        ]
+    )
+
+    assert exit_code == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["session_count"] == 17
+    assert summary["split_counts"] == {"test": 5, "train": 8, "validation": 4}
+    assert summary["scenario_split_counts"] == {
+        "normal_combined_variation": {"test": 1, "train": 2, "validation": 1},
+        "normal_interval_jitter": {"test": 1, "train": 2, "validation": 1},
+        "normal_payload_variation": {"test": 1, "train": 2, "validation": 1},
+        "normal_stable": {"test": 1, "train": 2, "validation": 1},
+        "packet_rate_flood": {"test": 1},
+    }
+
+
+def test_importer_accepts_a_different_valid_composition(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    """A batch that satisfies the safety rules but not the 17-Session plan works.
+
+    This is the point of not hardcoding the composition: a future re-collection
+    with a different Profile mix must not require code changes.
+    """
+    snapshot.add_session(NORMAL_TRAIN_SESSION)
+    snapshot.add_session(NORMAL_VALIDATION_SESSION)
+    snapshot.add_session(NORMAL_TEST_SESSION)
+    _add_attack_session(snapshot)
+    spec_payload = _spec_payload(
+        [
+            _session_entry(
+                NORMAL_TRAIN_SESSION,
+                slot="normal-jitter-train-01",
+                split="train",
+                scenario="normal_interval_jitter",
+            ),
+            _session_entry(
+                NORMAL_VALIDATION_SESSION,
+                slot="normal-jitter-validation-01",
+                split="validation",
+                scenario="normal_interval_jitter",
+            ),
+            _session_entry(
+                NORMAL_TEST_SESSION,
+                slot="normal-jitter-test-01",
+                split="test",
+                scenario="normal_interval_jitter",
+            ),
+            _attack_entry(),
+        ]
+    )
+
+    plan = _preflight(snapshot, spec_payload)
+
+    assert len(plan.sessions) == 4
