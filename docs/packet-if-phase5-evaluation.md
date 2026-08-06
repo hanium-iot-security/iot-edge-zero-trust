@@ -5,23 +5,20 @@ Offline Test 평가 Core를 재현하는 절차를 설명합니다.
 
 ## 공식 평가 진입 Gate
 
-이 PR의 평가 모듈과 `packet-if-dataset-v1` 예시는 Local Fixture·평가 Core
-선행 검증 범위입니다. 아래 조건이 모두 충족된 이후에만 같은 평가 절차의
-출력을 공식 Phase 5 결과로 사용합니다.
+Dataset Manifest v2와 Source Capture Group 검증은 구현되어 있습니다. 아래
+운영 조건이 모두 충족된 이후에만 평가 출력을 공식 Phase 5 결과로 사용합니다.
 
 - 공통 Phase 5 Run Manifest Schema 병합·동결
-- Packet IF Dataset Manifest v2 병합·동결
-- Dataset Exporter·Loader의 v2 계약과 `source_capture_group_id` 검증
 - 공식 Session·Split·Source Capture Group 사전 동결
+- Holdout Session의 Dataset 외부 분리·동결
 
-현재 Core는 Session ID 기준 누수만 차단합니다. P5-JM-01 완료로 판정하려면
-Dataset Manifest v2 병합 시 동일 `source_capture_group_id`가 Train·Validation·
-Test·Holdout 사이에 나뉘지 않는 검증을 추가해야 합니다.
+Dataset v2 Loader는 동일 `source_capture_group_id`가 Train·Validation·Test
+사이에 나뉘면 거부합니다. Holdout은 Dataset에 포함하지 않으므로 수집 계획과
+Run Manifest 목록에서 별도로 분리되었는지 확인합니다.
 
 `packet-if-evaluation-v1`은 평가 출력 Bundle의 Schema Version이며 공통 Run
 Manifest Schema Version과 별개입니다. 본 모듈은 `run_id`를 비롯한 공통 Run
-Manifest 필드를 정의하지 않고, 후속 v2 Dataset Manifest가 참조한 입력만
-소비합니다.
+Manifest 필드를 재정의하지 않고 Dataset Manifest v2가 참조한 입력만 소비합니다.
 
 ## 평가 경계
 
@@ -79,8 +76,8 @@ test -z "$(git status --porcelain)" || {
 export SOURCE_COMMIT_SHA="$(git rev-parse HEAD)"
 
 python -m ai.evaluate_packet_isolation_forest \
-  --dataset data/exports/packet_if_dataset-v1.csv \
-  --manifest data/exports/packet_if_manifest-v1.json \
+  --dataset data/exports/packet_if_dataset-v2.csv \
+  --manifest data/exports/packet_if_manifest-v2.json \
   --artifact-dir ai/models/packet_if/packet-if-v1 \
   --expected-model-version packet-if-v1 \
   --expected-bundle-sha256 "$PACKET_IF_EXPECTED_BUNDLE_SHA256" \
@@ -154,6 +151,7 @@ Pi 배포 담당자에게 아래 값을 함께 전달합니다.
 - Model Version·Artifact Directory·Bundle SHA256
 - Threshold·Percentile·비교 연산자
 - Capture Policy Version
+- Normal Policy Version
 - Artifact Metadata의 학습 Source Commit SHA
 - 평가 실행 Source Commit SHA
 - Evaluation Manifest와 `evaluation-manifest.json.sha256` Sidecar

@@ -11,11 +11,11 @@ import pytest
 
 from ai.packet_if_contract import PACKET_IF_FEATURES, packet_feature_matrix
 from ai.packet_if_dataset import (
-    PACKET_IF_DATASET_VERSION,
     file_sha256,
     load_packet_if_dataset,
     session_data_sha256s,
 )
+from ai.packet_if_phase5_manifest import PACKET_IF_DATASET_VERSION_V1
 from ai.predict_packet_isolation_forest import (
     load_packet_if_artifact,
     predict_packet_feature_row,
@@ -167,7 +167,7 @@ def _write_training_bundle(
     manifest_path.write_text(
         json.dumps(
             {
-                "dataset_version": PACKET_IF_DATASET_VERSION,
+                "dataset_version": PACKET_IF_DATASET_VERSION_V1,
                 "capture_policy_version": "packet-capture-policy-v1",
                 "capture_policy": {
                     "version": "packet-capture-policy-v1",
@@ -216,6 +216,7 @@ def test_train_writes_reproducible_artifact_contract(tmp_path: Path) -> None:
     assert metadata["scaler_type"] is None
     assert metadata["dataset_sha256"] == file_sha256(dataset_path)
     assert metadata["manifest_sha256"] == file_sha256(manifest_path)
+    assert metadata["normal_policy_version"] is None
     assert metadata["model_sha256"] == file_sha256(artifacts.model_path)
     assert metadata["training_report_filename"] == "training_report.json"
     assert metadata["training_report_sha256"] == file_sha256(
@@ -251,6 +252,8 @@ def test_train_writes_reproducible_artifact_contract(tmp_path: Path) -> None:
     report = json.loads(
         artifacts.training_report_path.read_text(encoding="utf-8")
     )
+    assert report["dataset_version"] == PACKET_IF_DATASET_VERSION_V1
+    assert report["normal_policy_version"] is None
     assert report["test_by_label"]["normal"]["row_count"] == 20
     assert report["test_by_label"]["attack"]["row_count"] == 20
 

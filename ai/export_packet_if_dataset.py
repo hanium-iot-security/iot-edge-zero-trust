@@ -25,6 +25,18 @@ from ai.packet_if_dataset import (
     file_sha256,
     session_data_sha256s,
 )
+from ai.packet_if_phase5_manifest import (
+    PacketIFRunManifestReference,
+    assert_run_manifest_complete,
+    load_verified_run_manifest,
+    normalize_device_ids,
+    normalize_optional_ipv4,
+    require_bool,
+    require_canonical_uuid4,
+    require_identifier,
+    require_non_empty_string,
+    validate_run_manifest_identity,
+)
 from backend.app.database import SessionLocal
 from edge.detection.phase4_time import format_db_utc, parse_db_utc
 from edge.packet.capture_session_repository import (
@@ -56,6 +68,16 @@ class PacketIFSessionAnnotation:
     traffic_label: str
     scenario: str
     target_device_id: str | None = None
+    collection_slot_id: str = ""
+    source_capture_group_id: str = ""
+    run_manifest_ref: PacketIFRunManifestReference | None = None
+    run_manifest_path: Path | None = None
+    normal_policy_version: str = ""
+    firmware_version: str = ""
+    payload_schema_version: str = ""
+    target_source_ip: str | None = None
+    included_device_ids: tuple[str, ...] = ()
+    background_traffic_present: bool | None = None
 
 
 def export_packet_if_dataset(
@@ -83,6 +105,15 @@ def export_packet_if_dataset(
         annotation.session_id: annotation.target_device_id
         for annotation in annotations
         if annotation.target_device_id is not None
+    }
+    normalized_target_ips = {
+        annotation.session_id: annotation.target_source_ip
+        for annotation in annotations
+        if annotation.target_source_ip is not None
+    }
+    included_device_ids = {
+        annotation.session_id: frozenset(annotation.included_device_ids)
+        for annotation in annotations
     }
     if not isinstance(capture_filter, str):
         raise ValueError("capture_filter must be a string")
@@ -118,6 +149,8 @@ def export_packet_if_dataset(
             row,
             capture_policy,
             target_device_ids=normalized_targets,
+            target_source_ips=normalized_target_ips,
+            included_device_ids=included_device_ids,
         )
         if reason is not None:
             exclusion_reasons[reason] += 1
@@ -141,6 +174,12 @@ def export_packet_if_dataset(
             "no eligible Packet IF rows for requested sessions: "
             + ", ".join(missing_session_ids)
         )
+
+    _validate_run_manifests_for_export(
+        annotations,
+        exported_rows=exported_rows,
+        manifest_path=manifest_path,
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -371,6 +410,8 @@ def _exclusion_reason(
     capture_policy: CapturePolicy,
     *,
     target_device_ids: Mapping[str, str],
+    target_source_ips: Mapping[str, str],
+    included_device_ids: Mapping[str, frozenset[str]],
 ) -> str | None:
     if row["direction"] != "INBOUND":
         return "direction_not_inbound"
@@ -381,9 +422,15 @@ def _exclusion_reason(
         or str(row["registered_ip_address"]) != str(row["peer_ip"])
     ):
         return "device_ip_mapping_changed"
-    target_device_id = target_device_ids.get(str(row["session_id"]))
+    session_id = str(row["session_id"])
+    if str(row["device_id"]) not in included_device_ids.get(session_id, frozenset()):
+        return "session_device_not_included"
+    target_device_id = target_device_ids.get(session_id)
     if target_device_id is not None and str(row["device_id"]) != target_device_id:
         return "session_target_device_mismatch"
+    target_source_ip = target_source_ips.get(session_id)
+    if target_source_ip is not None and str(row["peer_ip"]) != target_source_ip:
+        return "session_target_source_ip_mismatch"
 
     eligibility = is_capture_eligible(
         CaptureEligibilitySegment(
@@ -410,17 +457,28 @@ def _normalize_session_annotations(
             raise ValueError(
                 "session_annotations must contain PacketIFSessionAnnotation values"
             )
-        session_id = annotation.session_id.strip()
-        split = annotation.split.strip()
-        traffic_label = annotation.traffic_label.strip()
-        scenario = annotation.scenario.strip()
-        target_device_id = (
-            annotation.target_device_id.strip()
-            if isinstance(annotation.target_device_id, str)
-            else None
+        session_id = require_canonical_uuid4(
+            annotation.session_id,
+            "session_id",
         )
-        if not session_id:
-            raise ValueError("session_id must be a non-empty string")
+        split = require_non_empty_string(annotation.split, "split")
+        traffic_label = require_non_empty_string(
+            annotation.traffic_label,
+            "traffic_label",
+        )
+        scenario = require_identifier(annotation.scenario, "scenario")
+        target_device_id = (
+            None
+            if annotation.target_device_id is None
+            else require_identifier(
+                annotation.target_device_id,
+                "target_device_id",
+            )
+        )
+        target_source_ip = normalize_optional_ipv4(
+            annotation.target_source_ip,
+            "target_source_ip",
+        )
         if session_id in seen_session_ids:
             raise ValueError(f"duplicate Session annotation: {session_id}")
         if split not in VALID_SPLITS:
@@ -429,8 +487,6 @@ def _normalize_session_annotations(
             raise ValueError(
                 f"invalid packet traffic label: {traffic_label!r}"
             )
-        if not scenario:
-            raise ValueError("scenario must be a non-empty string")
         if traffic_label == ATTACK_LABEL and not target_device_id:
             raise ValueError(
                 f"attack session must specify target_device_id: {session_id}"
@@ -439,6 +495,40 @@ def _normalize_session_annotations(
             raise ValueError(
                 f"normal session must not have target_device_id: {session_id}"
             )
+        if traffic_label == ATTACK_LABEL and target_source_ip is None:
+            raise ValueError(
+                f"attack session must specify target_source_ip: {session_id}"
+            )
+        if traffic_label == NORMAL_LABEL and target_source_ip is not None:
+            raise ValueError(
+                f"normal session must not have target_source_ip: {session_id}"
+            )
+        run_manifest_ref = annotation.run_manifest_ref
+        if not isinstance(run_manifest_ref, PacketIFRunManifestReference):
+            raise ValueError(f"run_manifest_ref is required: {session_id}")
+        if not isinstance(annotation.run_manifest_path, Path):
+            raise ValueError(f"run_manifest_path is required: {session_id}")
+        collection_slot_id = require_identifier(
+            annotation.collection_slot_id,
+            "collection_slot_id",
+        )
+        source_capture_group_id = require_canonical_uuid4(
+            annotation.source_capture_group_id,
+            "source_capture_group_id",
+        )
+        included_ids = normalize_device_ids(
+            annotation.included_device_ids,
+            "included_device_ids",
+        )
+        if target_device_id is not None and target_device_id not in included_ids:
+            raise ValueError(
+                "attack target_device_id must be included in included_device_ids: "
+                f"{session_id}"
+            )
+        background_traffic_present = require_bool(
+            annotation.background_traffic_present,
+            "background_traffic_present",
+        )
         seen_session_ids.add(session_id)
         normalized.append(
             PacketIFSessionAnnotation(
@@ -447,9 +537,103 @@ def _normalize_session_annotations(
                 traffic_label=traffic_label,
                 scenario=scenario,
                 target_device_id=target_device_id,
+                collection_slot_id=collection_slot_id,
+                source_capture_group_id=source_capture_group_id,
+                run_manifest_ref=run_manifest_ref,
+                run_manifest_path=annotation.run_manifest_path.resolve(),
+                normal_policy_version=require_non_empty_string(
+                    annotation.normal_policy_version,
+                    "normal_policy_version",
+                ),
+                firmware_version=require_non_empty_string(
+                    annotation.firmware_version,
+                    "firmware_version",
+                ),
+                payload_schema_version=require_non_empty_string(
+                    annotation.payload_schema_version,
+                    "payload_schema_version",
+                ),
+                target_source_ip=target_source_ip,
+                included_device_ids=included_ids,
+                background_traffic_present=background_traffic_present,
             )
         )
-    return tuple(normalized)
+    normalized_annotations = tuple(normalized)
+    _validate_phase5_annotation_set(normalized_annotations)
+    return normalized_annotations
+
+
+def _validate_phase5_annotation_set(
+    annotations: tuple[PacketIFSessionAnnotation, ...],
+) -> None:
+    slot_ids = [annotation.collection_slot_id for annotation in annotations]
+    if len(set(slot_ids)) != len(slot_ids):
+        raise ValueError("duplicate collection_slot_id in Packet IF export spec")
+    run_ids = [
+        annotation.run_manifest_ref.run_id
+        for annotation in annotations
+        if annotation.run_manifest_ref is not None
+    ]
+    if len(set(run_ids)) != len(run_ids):
+        raise ValueError("duplicate run_id in Packet IF export spec")
+
+    group_splits: dict[str, str] = {}
+    for annotation in annotations:
+        previous = group_splits.setdefault(
+            annotation.source_capture_group_id,
+            annotation.split,
+        )
+        if previous != annotation.split:
+            raise ValueError(
+                "source_capture_group_id must not cross Dataset splits"
+            )
+    policy_versions = {
+        annotation.normal_policy_version for annotation in annotations
+    }
+    if len(policy_versions) != 1:
+        raise ValueError("Packet IF export must use one normal_policy_version")
+
+
+def _validate_run_manifests_for_export(
+    annotations: tuple[PacketIFSessionAnnotation, ...],
+    *,
+    exported_rows: list[dict[str, Any]],
+    manifest_path: Path,
+) -> None:
+    devices_by_session: dict[str, dict[str, str]] = {}
+    for row in exported_rows:
+        devices_by_session.setdefault(str(row["session_id"]), {})[
+            str(row["device_id"])
+        ] = str(row["peer_ip"])
+
+    manifest_base = manifest_path.parent.resolve()
+    for annotation in annotations:
+        reference = annotation.run_manifest_ref
+        run_manifest_path = annotation.run_manifest_path
+        if reference is None or run_manifest_path is None:
+            raise ValueError("Run Manifest provenance is required for Dataset v2")
+        archived_path = (manifest_base / reference.relative_path).resolve()
+        if manifest_base not in archived_path.parents:
+            raise ValueError("run_manifest_ref escapes the Dataset Manifest directory")
+        if archived_path != run_manifest_path:
+            raise ValueError(
+                "run_manifest_path must match run_manifest_ref.relative_path "
+                "under the Dataset Manifest directory"
+            )
+        run_manifest = load_verified_run_manifest(
+            run_manifest_path,
+            expected_sha256=reference.sha256,
+        )
+        validate_run_manifest_identity(
+            run_manifest,
+            reference,
+            session_id=annotation.session_id,
+            scenario=annotation.scenario,
+            target_device_id=annotation.target_device_id,
+            target_source_ip=annotation.target_source_ip,
+            included_device_ips=devices_by_session.get(annotation.session_id, {}),
+        )
+        assert_run_manifest_complete(run_manifest, reference.run_id)
 
 
 def _build_manifest_payload(
@@ -487,6 +671,17 @@ def _build_manifest_payload(
                 "traffic_label": annotation.traffic_label,
                 "scenario": annotation.scenario,
                 "target_device_id": annotation.target_device_id,
+                "target_source_ip": annotation.target_source_ip,
+                "collection_slot_id": annotation.collection_slot_id,
+                "source_capture_group_id": annotation.source_capture_group_id,
+                "run_manifest_ref": annotation.run_manifest_ref.to_dict(),
+                "normal_policy_version": annotation.normal_policy_version,
+                "firmware_version": annotation.firmware_version,
+                "payload_schema_version": annotation.payload_schema_version,
+                "included_device_ids": list(annotation.included_device_ids),
+                "background_traffic_present": (
+                    annotation.background_traffic_present
+                ),
                 "status": str(session["status"]),
                 "capture_interface": str(session["capture_interface"]),
                 "capture_filter": capture_filter,
@@ -584,6 +779,7 @@ def _write_json_atomically(
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
+            newline="\n",
             dir=output_path.parent,
             prefix=f".{output_path.name}.",
             suffix=".tmp",
@@ -633,11 +829,47 @@ def _load_export_spec(
             raise ValueError("each export Session must be a JSON object")
         annotations.append(
             PacketIFSessionAnnotation(
-                session_id=str(raw_session.get("session_id", "")),
-                split=str(raw_session.get("split", "")),
-                traffic_label=str(raw_session.get("traffic_label", "")),
-                scenario=str(raw_session.get("scenario", "")),
+                session_id=raw_session.get("session_id", ""),
+                split=raw_session.get("split", ""),
+                traffic_label=raw_session.get("traffic_label", ""),
+                scenario=raw_session.get("scenario", ""),
                 target_device_id=raw_session.get("target_device_id"),
+                collection_slot_id=raw_session.get("collection_slot_id", ""),
+                source_capture_group_id=raw_session.get(
+                    "source_capture_group_id",
+                    "",
+                ),
+                run_manifest_ref=(
+                    PacketIFRunManifestReference.from_dict(
+                        raw_session["run_manifest_ref"]
+                    )
+                    if isinstance(raw_session.get("run_manifest_ref"), dict)
+                    else None
+                ),
+                run_manifest_path=(
+                    (path.parent / raw_session["run_manifest_path"]).resolve()
+                    if isinstance(raw_session.get("run_manifest_path"), str)
+                    and raw_session["run_manifest_path"].strip()
+                    else None
+                ),
+                normal_policy_version=raw_session.get(
+                    "normal_policy_version",
+                    "",
+                ),
+                firmware_version=raw_session.get("firmware_version", ""),
+                payload_schema_version=raw_session.get(
+                    "payload_schema_version",
+                    "",
+                ),
+                target_source_ip=raw_session.get("target_source_ip"),
+                included_device_ids=tuple(
+                    raw_session.get("included_device_ids", ())
+                    if isinstance(raw_session.get("included_device_ids"), list)
+                    else ()
+                ),
+                background_traffic_present=raw_session.get(
+                    "background_traffic_present"
+                ),
             )
         )
     return (
