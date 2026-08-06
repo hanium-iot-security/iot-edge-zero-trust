@@ -29,6 +29,7 @@ from ai.packet_if_phase5_manifest import (
     PacketIFRunManifestReference,
     assert_run_manifest_complete,
     load_verified_run_manifest,
+    load_verified_session_manifest,
     normalize_device_ids,
     normalize_optional_ipv4,
     require_bool,
@@ -712,6 +713,10 @@ def _validate_run_manifest_references(
             run_manifest_path,
             expected_sha256=reference.sha256,
         )
+        included_device_ips = {
+            device.device_id: device.peer_ip
+            for device in spec.devices
+        }
         validate_run_manifest_identity(
             run_manifest,
             reference,
@@ -719,10 +724,19 @@ def _validate_run_manifest_references(
             scenario=spec.scenario,
             target_device_id=spec.target_device_id,
             target_source_ip=spec.target_source_ip,
-            included_device_ips={
-                device.device_id: device.peer_ip
-                for device in spec.devices
-            },
+            included_device_ips=included_device_ips,
+        )
+        # Verified Collection Run은 session_manifest_ref까지 연쇄 검증한다.
+        # 기존 Scenario Runner Run은 참조가 없으므로 그대로 통과한다.
+        load_verified_session_manifest(
+            run_manifest_path,
+            run_manifest,
+            session_id=spec.session_id,
+            scenario=spec.scenario,
+            target_device_id=spec.target_device_id,
+            target_source_ip=spec.target_source_ip,
+            included_device_ips=included_device_ips,
+            required=False,
         )
         assert_run_manifest_complete(run_manifest, reference.run_id)
 
