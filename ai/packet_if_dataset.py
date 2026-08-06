@@ -27,6 +27,7 @@ from ai.packet_if_phase5_manifest import (
     PACKET_IF_DATASET_VERSION_V2,
     SUPPORTED_PACKET_IF_DATASET_VERSIONS,
     PacketIFRunManifestReference,
+    assert_run_manifest_complete,
     load_verified_run_manifest,
     normalize_device_ids,
     normalize_optional_ipv4,
@@ -723,6 +724,7 @@ def _validate_run_manifest_references(
                 for device in spec.devices
             },
         )
+        assert_run_manifest_complete(run_manifest, reference.run_id)
 
 
 def _validate_dataset_columns(frame: pd.DataFrame) -> None:

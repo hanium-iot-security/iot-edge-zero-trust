@@ -27,6 +27,7 @@ from ai.packet_if_dataset import (
 )
 from ai.packet_if_phase5_manifest import (
     PacketIFRunManifestReference,
+    assert_run_manifest_complete,
     load_verified_run_manifest,
     normalize_device_ids,
     normalize_optional_ipv4,
@@ -632,6 +633,7 @@ def _validate_run_manifests_for_export(
             target_source_ip=annotation.target_source_ip,
             included_device_ips=devices_by_session.get(annotation.session_id, {}),
         )
+        assert_run_manifest_complete(run_manifest, reference.run_id)
 
 
 def _build_manifest_payload(

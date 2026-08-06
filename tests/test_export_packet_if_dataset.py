@@ -24,6 +24,7 @@ from edge.phase5.contracts import (
     EvaluationScope,
     ExecutionNode,
     ExpectedOutcome,
+    ManifestStatus,
     RunManifest,
     RunStageStatuses,
     ScenarioReference,
@@ -120,7 +121,7 @@ def _write_run_manifest(
         observation_deadline_at=started_at + timedelta(minutes=5),
         ended_at=started_at + timedelta(minutes=1),
         expected_outcome=ExpectedOutcome(evaluation_scope=scope),
-        statuses=RunStageStatuses(),
+        statuses=RunStageStatuses(scenario_status=ManifestStatus.SUCCESS),
     )
     path.write_text(manifest.to_json(), encoding="utf-8")
     digest = run_manifest_sha256(manifest)
@@ -807,6 +808,151 @@ def test_export_requires_non_empty_session_ids(
                 output_path=tmp_path / "dataset.csv",
                 session_ids=session_ids,
             )
+
+
+def _make_annotation_with_manifest(
+    tmp_path: Path,
+    run_manifest: RunManifest,
+) -> "PacketIFSessionAnnotation":
+    """Write run_manifest to disk and return a matching annotation for direct validation."""
+    run_id = run_manifest.run_id
+    relative_path = f"runs/{run_id}/run-manifest.json"
+    run_manifest_path = tmp_path / relative_path
+    run_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    run_manifest_path.write_text(run_manifest.to_json(), encoding="utf-8")
+    digest = run_manifest_sha256(run_manifest)
+    Path(f"{run_manifest_path}.sha256").write_text(f"{digest}\n", encoding="ascii")
+    reference = PacketIFRunManifestReference(
+        run_id=run_id,
+        relative_path=relative_path,
+        schema_version=RUN_MANIFEST_SCHEMA_VERSION,
+        sha256=digest,
+    )
+    return PacketIFSessionAnnotation(
+        session_id=SESSION_ID,
+        split="test",
+        traffic_label="attack",
+        scenario="packet_flood",
+        target_device_id="esp32_01",
+        collection_slot_id=f"slot-{SESSION_ID}",
+        source_capture_group_id=SESSION_ID,
+        run_manifest_ref=reference,
+        run_manifest_path=run_manifest_path,
+        normal_policy_version="phase5-normal-policy-v1.1",
+        firmware_version="phase5-normal-pilot-v1",
+        payload_schema_version="phase5-normal-payload-v1",
+        target_source_ip="192.168.1.100",
+        included_device_ids=("esp32_01",),
+        background_traffic_present=True,
+    )
+
+
+def _base_run_manifest() -> RunManifest:
+    started_at = datetime(2026, 7, 26, 10, tzinfo=timezone.utc)
+    return RunManifest(
+        run_id=f"run-{SESSION_ID}",
+        session_id=SESSION_ID,
+        scenario=ScenarioReference(scenario_id="packet_flood"),
+        target_device_id="esp32_01",
+        source_ip="192.168.1.100",
+        execution_node=ExecutionNode(node_id="test-node", registered=True),
+        evaluation_scope=EvaluationScope.FULL_E2E,
+        is_active=False,
+        started_at=started_at,
+        observation_deadline_at=started_at + timedelta(minutes=5),
+        ended_at=started_at + timedelta(minutes=1),
+        expected_outcome=ExpectedOutcome(evaluation_scope=EvaluationScope.FULL_E2E),
+        statuses=RunStageStatuses(scenario_status=ManifestStatus.SUCCESS),
+    )
+
+
+def _call_validate_run_manifests(
+    tmp_path: Path,
+    run_manifest: RunManifest,
+) -> None:
+    from ai import export_packet_if_dataset as exporter
+
+    annotation = _make_annotation_with_manifest(tmp_path, run_manifest)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+    exporter._validate_run_manifests_for_export(
+        (annotation,),
+        exported_rows=[
+            {
+                "session_id": SESSION_ID,
+                "device_id": "esp32_01",
+                "peer_ip": "192.168.1.100",
+            }
+        ],
+        manifest_path=manifest_path,
+    )
+
+
+def test_export_rejects_active_run_manifest(tmp_path: Path) -> None:
+    started_at = datetime(2026, 7, 26, 10, tzinfo=timezone.utc)
+    active = RunManifest(
+        run_id=f"run-{SESSION_ID}",
+        session_id=SESSION_ID,
+        scenario=ScenarioReference(scenario_id="packet_flood"),
+        target_device_id="esp32_01",
+        source_ip="192.168.1.100",
+        execution_node=ExecutionNode(node_id="test-node", registered=True),
+        evaluation_scope=EvaluationScope.FULL_E2E,
+        is_active=True,
+        started_at=started_at,
+        observation_deadline_at=started_at + timedelta(minutes=5),
+        ended_at=None,
+        expected_outcome=ExpectedOutcome(evaluation_scope=EvaluationScope.FULL_E2E),
+        statuses=RunStageStatuses(),
+    )
+    with pytest.raises(ValueError, match="is_active=True"):
+        _call_validate_run_manifests(tmp_path, active)
+
+
+def test_export_rejects_incomplete_run_manifest(tmp_path: Path) -> None:
+    started_at = datetime(2026, 7, 26, 10, tzinfo=timezone.utc)
+    incomplete = RunManifest(
+        run_id=f"run-{SESSION_ID}",
+        session_id=SESSION_ID,
+        scenario=ScenarioReference(scenario_id="packet_flood"),
+        target_device_id="esp32_01",
+        source_ip="192.168.1.100",
+        execution_node=ExecutionNode(node_id="test-node", registered=True),
+        evaluation_scope=EvaluationScope.FULL_E2E,
+        is_active=False,
+        started_at=started_at,
+        observation_deadline_at=started_at + timedelta(minutes=5),
+        ended_at=None,
+        expected_outcome=ExpectedOutcome(evaluation_scope=EvaluationScope.FULL_E2E),
+        statuses=RunStageStatuses(),
+    )
+    with pytest.raises(ValueError, match="ended_at"):
+        _call_validate_run_manifests(tmp_path, incomplete)
+
+
+def test_export_rejects_not_evaluated_scenario_status(tmp_path: Path) -> None:
+    started_at = datetime(2026, 7, 26, 10, tzinfo=timezone.utc)
+    not_evaluated = RunManifest(
+        run_id=f"run-{SESSION_ID}",
+        session_id=SESSION_ID,
+        scenario=ScenarioReference(scenario_id="packet_flood"),
+        target_device_id="esp32_01",
+        source_ip="192.168.1.100",
+        execution_node=ExecutionNode(node_id="test-node", registered=True),
+        evaluation_scope=EvaluationScope.FULL_E2E,
+        is_active=False,
+        started_at=started_at,
+        observation_deadline_at=started_at + timedelta(minutes=5),
+        ended_at=started_at + timedelta(minutes=1),
+        expected_outcome=ExpectedOutcome(evaluation_scope=EvaluationScope.FULL_E2E),
+        statuses=RunStageStatuses(),
+    )
+    with pytest.raises(ValueError, match="scenario_status"):
+        _call_validate_run_manifests(tmp_path, not_evaluated)
+
+
+def test_export_accepts_completed_success_run_manifest(tmp_path: Path) -> None:
+    _call_validate_run_manifests(tmp_path, _base_run_manifest())
 
 
 def _insert_device(db, device_id: str, ip_address: str) -> None:

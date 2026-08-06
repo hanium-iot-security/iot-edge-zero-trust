@@ -25,6 +25,7 @@ from edge.phase5.contracts import (
     EvaluationScope,
     ExecutionNode,
     ExpectedOutcome,
+    ManifestStatus,
     RunManifest,
     RunStageStatuses,
     ScenarioReference,
@@ -226,6 +227,7 @@ def _write_run_manifest(
     if run_target_device_id is None and devices:
         run_target_device_id = devices[0].get("device_id")
         run_source_ip = devices[0].get("peer_ip")
+    statuses = RunStageStatuses(scenario_status=ManifestStatus.SUCCESS)
     manifest = RunManifest(
         run_id=run_id,
         session_id=session_id,
@@ -239,7 +241,7 @@ def _write_run_manifest(
         observation_deadline_at=started_at + timedelta(minutes=5),
         ended_at=started_at + timedelta(minutes=1),
         expected_outcome=ExpectedOutcome(evaluation_scope=scope),
-        statuses=RunStageStatuses(),
+        statuses=statuses,
     )
     path.write_text(manifest.to_json(), encoding="utf-8")
     digest = run_manifest_sha256(manifest)
@@ -666,7 +668,7 @@ def test_manifest_v2_records_phase5_session_provenance(tmp_path: Path) -> None:
     assert attack.included_device_ids == ("esp32_01",)
 
 
-def test_manifest_v2_accepts_scenario_runner_artifact_under_dataset_root(
+def test_manifest_v2_accepts_completed_success_run_manifest_under_dataset_root(
     tmp_path: Path,
 ) -> None:
     sessions = _manifest_sessions()
@@ -679,12 +681,65 @@ def test_manifest_v2_accepts_scenario_runner_artifact_under_dataset_root(
     dataset_path, manifest_path = _write_dataset_bundle(tmp_path, sessions=sessions)
 
     run_id = "run-packet-if-test-attack"
+    run_manifest_rel = f"runs/{run_id}/run-manifest.json"
+    run_manifest_path = tmp_path / run_manifest_rel
+    run_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    started_at = datetime(2026, 7, 23, tzinfo=timezone.utc)
+    run_manifest = RunManifest(
+        run_id=run_id,
+        session_id=SESSION_IDS["test_attack"],
+        scenario=ScenarioReference(scenario_id="mqtt_abnormal_publish_rate"),
+        target_device_id="esp32_01",
+        source_ip="192.168.1.100",
+        execution_node=ExecutionNode(node_id="unit-test-node", registered=True),
+        evaluation_scope=EvaluationScope.FULL_E2E,
+        is_active=False,
+        started_at=started_at,
+        observation_deadline_at=started_at + timedelta(minutes=5),
+        ended_at=started_at + timedelta(minutes=1),
+        expected_outcome=ExpectedOutcome(evaluation_scope=EvaluationScope.FULL_E2E),
+        statuses=RunStageStatuses(scenario_status=ManifestStatus.SUCCESS),
+    )
+    run_manifest_path.write_text(run_manifest.to_json(), encoding="utf-8")
+    digest = run_manifest_sha256(run_manifest)
+    Path(f"{run_manifest_path}.sha256").write_text(f"{digest}\n", encoding="ascii")
+
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    attack_payload = next(
+        session
+        for session in payload["sessions"]
+        if session["session_id"] == SESSION_IDS["test_attack"]
+    )
+    attack_payload["run_manifest_ref"] = {
+        "run_id": run_id,
+        "relative_path": run_manifest_rel,
+        "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+        "sha256": digest,
+    }
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    dataset = load_packet_if_dataset(dataset_path, manifest_path)
+
+    assert SESSION_IDS["test_attack"] in set(dataset.test["session_id"])
+
+
+def test_manifest_v2_rejects_dry_run_run_manifest(tmp_path: Path) -> None:
+    sessions = _manifest_sessions()
+    attack = next(
+        session
+        for session in sessions
+        if session["session_id"] == SESSION_IDS["test_attack"]
+    )
+    attack["scenario"] = "mqtt_abnormal_publish_rate"
+    _, manifest_path = _write_dataset_bundle(tmp_path, sessions=sessions)
+
+    run_id = "run-packet-if-test-attack"
     runner = ScenarioRunner(
         execution_node="unit-test-node",
         execution_node_registered=True,
         runs_root=tmp_path / "runs",
     )
-    _, run_manifest = runner.run(
+    _, dry_run_manifest = runner.run(
         "mqtt_abnormal_publish_rate",
         run_id=run_id,
         target_device_id="esp32_01",
@@ -703,13 +758,127 @@ def test_manifest_v2_accepts_scenario_runner_artifact_under_dataset_root(
         "run_id": run_id,
         "relative_path": f"runs/{run_id}/run-manifest.json",
         "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
-        "sha256": run_manifest_sha256(run_manifest),
+        "sha256": run_manifest_sha256(dry_run_manifest),
     }
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    dataset = load_packet_if_dataset(dataset_path, manifest_path)
+    # dry_run sets ended_at=None (끝나지 않은 실행) AND scenario_status=NOT_EVALUATED.
+    # 두 조건 모두 Dataset v2에서 거부 사유이며, ended_at 체크가 먼저 발화한다.
+    with pytest.raises(ValueError, match=r"ended_at|scenario_status"):
+        load_packet_if_manifest(manifest_path)
 
-    assert SESSION_IDS["test_attack"] in set(dataset.test["session_id"])
+
+def test_manifest_v2_rejects_active_run_manifest(tmp_path: Path) -> None:
+    _, manifest_path = _write_dataset_bundle(tmp_path)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    attack_session = next(
+        session
+        for session in payload["sessions"]
+        if session["session_id"] == SESSION_IDS["test_attack"]
+    )
+    ref = attack_session["run_manifest_ref"]
+    run_manifest_path = tmp_path / ref["relative_path"]
+
+    original = RunManifest.from_json(run_manifest_path.read_text(encoding="utf-8"))
+    active_manifest = RunManifest(
+        run_id=original.run_id,
+        session_id=original.session_id,
+        scenario=original.scenario,
+        target_device_id=original.target_device_id,
+        source_ip=original.source_ip,
+        execution_node=original.execution_node,
+        evaluation_scope=original.evaluation_scope,
+        is_active=True,
+        started_at=original.started_at,
+        observation_deadline_at=original.observation_deadline_at,
+        ended_at=None,
+        expected_outcome=original.expected_outcome,
+        statuses=RunStageStatuses(),
+    )
+    run_manifest_path.write_text(active_manifest.to_json(), encoding="utf-8")
+    new_digest = run_manifest_sha256(active_manifest)
+    Path(f"{run_manifest_path}.sha256").write_text(f"{new_digest}\n", encoding="ascii")
+    ref["sha256"] = new_digest
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="is_active=True"):
+        load_packet_if_manifest(manifest_path)
+
+
+def test_manifest_v2_rejects_incomplete_run_manifest(tmp_path: Path) -> None:
+    _, manifest_path = _write_dataset_bundle(tmp_path)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    attack_session = next(
+        session
+        for session in payload["sessions"]
+        if session["session_id"] == SESSION_IDS["test_attack"]
+    )
+    ref = attack_session["run_manifest_ref"]
+    run_manifest_path = tmp_path / ref["relative_path"]
+
+    original = RunManifest.from_json(run_manifest_path.read_text(encoding="utf-8"))
+    incomplete_manifest = RunManifest(
+        run_id=original.run_id,
+        session_id=original.session_id,
+        scenario=original.scenario,
+        target_device_id=original.target_device_id,
+        source_ip=original.source_ip,
+        execution_node=original.execution_node,
+        evaluation_scope=original.evaluation_scope,
+        is_active=False,
+        started_at=original.started_at,
+        observation_deadline_at=original.observation_deadline_at,
+        ended_at=None,
+        expected_outcome=original.expected_outcome,
+        statuses=RunStageStatuses(),
+    )
+    run_manifest_path.write_text(incomplete_manifest.to_json(), encoding="utf-8")
+    new_digest = run_manifest_sha256(incomplete_manifest)
+    Path(f"{run_manifest_path}.sha256").write_text(f"{new_digest}\n", encoding="ascii")
+    ref["sha256"] = new_digest
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="ended_at"):
+        load_packet_if_manifest(manifest_path)
+
+
+def test_manifest_v2_rejects_not_evaluated_scenario_status(tmp_path: Path) -> None:
+    _, manifest_path = _write_dataset_bundle(tmp_path)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    attack_session = next(
+        session
+        for session in payload["sessions"]
+        if session["session_id"] == SESSION_IDS["test_attack"]
+    )
+    ref = attack_session["run_manifest_ref"]
+    run_manifest_path = tmp_path / ref["relative_path"]
+
+    original = RunManifest.from_json(run_manifest_path.read_text(encoding="utf-8"))
+    # completed (is_active=False, ended_at set) but NOT_EVALUATED — simulates dry-run or
+    # a run that finished without a successful scenario outcome
+    not_evaluated_manifest = RunManifest(
+        run_id=original.run_id,
+        session_id=original.session_id,
+        scenario=original.scenario,
+        target_device_id=original.target_device_id,
+        source_ip=original.source_ip,
+        execution_node=original.execution_node,
+        evaluation_scope=original.evaluation_scope,
+        is_active=False,
+        started_at=original.started_at,
+        observation_deadline_at=original.observation_deadline_at,
+        ended_at=original.ended_at,
+        expected_outcome=original.expected_outcome,
+        statuses=RunStageStatuses(),
+    )
+    run_manifest_path.write_text(not_evaluated_manifest.to_json(), encoding="utf-8")
+    new_digest = run_manifest_sha256(not_evaluated_manifest)
+    Path(f"{run_manifest_path}.sha256").write_text(f"{new_digest}\n", encoding="ascii")
+    ref["sha256"] = new_digest
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="scenario_status"):
+        load_packet_if_manifest(manifest_path)
 
 
 def test_manifest_v2_rejects_source_capture_group_across_splits(

@@ -11,6 +11,7 @@ from typing import Any
 from uuid import UUID
 
 from edge.phase5.contracts import (
+    ManifestStatus,
     RUN_MANIFEST_SHA256_SIDECAR_SUFFIX,
     RunManifest,
     is_supported_run_manifest_schema_version,
@@ -103,6 +104,25 @@ class PacketIFRunManifestReference:
             "schema_version": self.schema_version,
             "sha256": self.sha256,
         }
+
+
+def assert_run_manifest_complete(manifest: RunManifest, run_id: str) -> None:
+    """Raise ValueError if the Run Manifest is not a completed SUCCESS run."""
+    if manifest.is_active:
+        raise ValueError(
+            f"Run Manifest {run_id!r} is still active (is_active=True); "
+            "only completed Runs may be referenced in a Dataset Manifest"
+        )
+    if manifest.ended_at is None:
+        raise ValueError(
+            f"Run Manifest {run_id!r} has no ended_at; "
+            "only completed Runs may be referenced in a Dataset Manifest"
+        )
+    if manifest.statuses.scenario_status != ManifestStatus.SUCCESS:
+        raise ValueError(
+            f"Run Manifest {run_id!r} scenario_status must be ManifestStatus.SUCCESS; "
+            f"got {manifest.statuses.scenario_status!r}"
+        )
 
 
 def load_verified_run_manifest(
