@@ -162,6 +162,7 @@ def test_pi_baseline_accepts_read_only_normal_running_session(tmp_path: Path):
             },
         ),
         patch("edge.scenarios.cleanup._find_conflicting_processes", return_value=[]),
+        patch("edge.scenarios.cleanup._list_project_firewall_rules", return_value=[]),
     ):
         assert pi_baseline_check(_context()) == (True, None)
 
@@ -201,6 +202,44 @@ def test_pi_baseline_rejects_active_firewall_rule(tmp_path: Path):
 
     assert ok is False
     assert reason and "active_firewall_rule" in reason
+
+
+def test_pi_baseline_rejects_actual_iptables_rule_without_db_row(tmp_path: Path):
+    db_path = tmp_path / "iot_security.db"
+    _create_baseline_db(db_path)
+
+    with (
+        patch("edge.scenarios.cleanup.settings.database_url", f"sqlite:///{db_path}"),
+        patch(
+            "edge.scenarios.cleanup._list_project_firewall_rules",
+            return_value=[
+                '-A INPUT -p tcp -s 192.168.0.30/32 --dport 1883 '
+                '-m comment --comment "hanium-firewall:91" -j DROP'
+            ],
+        ),
+    ):
+        ok, reason = pi_baseline_check(_context())
+
+    assert ok is False
+    assert reason and "active_iptables_rule" in reason
+    assert "hanium-firewall:91" in reason
+
+
+def test_pi_baseline_fails_closed_when_firewall_inventory_cannot_be_read(tmp_path: Path):
+    db_path = tmp_path / "iot_security.db"
+    _create_baseline_db(db_path)
+
+    with (
+        patch("edge.scenarios.cleanup.settings.database_url", f"sqlite:///{db_path}"),
+        patch(
+            "edge.scenarios.cleanup._list_project_firewall_rules",
+            return_value=["firewall_inventory_error: sudo denied"],
+        ),
+    ):
+        ok, reason = pi_baseline_check(_context())
+
+    assert ok is False
+    assert reason == "firewall_inventory_error: sudo denied"
 
 
 def test_pi_cleanup_reports_residual_attack_process():
