@@ -50,6 +50,18 @@ class PacketCheckpointRecoveryError(Exception):
     """Raised when a packet checkpoint recovery plan is invalid."""
 
 
+class PacketCheckpointRecoveryCommittedArtifactError(PacketCheckpointRecoveryError):
+    """Raised when post-commit verification or artifact creation fails."""
+
+    def __init__(self, operation_id: str, backup_path: str | Path) -> None:
+        self.operation_id = operation_id
+        self.backup_path = Path(backup_path)
+        super().__init__(
+            "database committed but post-commit verification or result artifact "
+            "creation failed; manual HOLD required"
+        )
+
+
 @dataclass(frozen=True)
 class ResolvedRecoveryLock:
     path: Path
@@ -841,28 +853,33 @@ def _execute_locked_recovery(
                 connection.execute("ROLLBACK")
             raise
 
-    post_commit = verify_database(database)
-    if post_commit.integrity_check != "ok" or post_commit.foreign_key_violations:
-        raise PacketCheckpointRecoveryError(
-            "post-commit database failed integrity or foreign-key checks"
-        )
-    result: dict[str, object] = {
-        "operation_id": operation_id,
-        "database_committed": True,
-        "database_path": str(database),
-        "artifact_dir": str(artifact_root),
-        "backup_path": str(backup_path),
-        "backup_sha256_path": str(backup_sha256_path),
-        "backup_sha256": backup.sha256,
-        "result_path": str(result_path),
-        "plan_sha256": plan["plan_sha256"],
-        "transaction_total_changes_delta": delta,
-        "post_commit_verified_at": format_db_utc(
-            _utc_now().replace(microsecond=0)
-        ),
-    }
-    _write_json_atomically(result_path, result)
-    return result
+    try:
+        post_commit = verify_database(database)
+        if post_commit.integrity_check != "ok" or post_commit.foreign_key_violations:
+            raise PacketCheckpointRecoveryError(
+                "post-commit database failed integrity or foreign-key checks"
+            )
+        result: dict[str, object] = {
+            "operation_id": operation_id,
+            "database_committed": True,
+            "database_path": str(database),
+            "artifact_dir": str(artifact_root),
+            "backup_path": str(backup_path),
+            "backup_sha256_path": str(backup_sha256_path),
+            "backup_sha256": backup.sha256,
+            "result_path": str(result_path),
+            "plan_sha256": plan["plan_sha256"],
+            "transaction_total_changes_delta": delta,
+            "post_commit_verified_at": format_db_utc(
+                _utc_now().replace(microsecond=0)
+            ),
+        }
+        _write_json_atomically(result_path, result)
+        return result
+    except Exception as exc:
+        raise PacketCheckpointRecoveryCommittedArtifactError(
+            operation_id, backup_path
+        ) from exc
 
 
 def execute_packet_checkpoint_recovery(

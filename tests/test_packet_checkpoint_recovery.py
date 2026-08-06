@@ -1876,7 +1876,10 @@ def test_dry_run_cli_requires_all_identity_and_output_arguments(
         "--reason": "recover capture-session gap",
         "--plan-output": str(tmp_path / "plan.json"),
     }
-    argv = [item for flag, value in values.items() for item in (flag, value)]
+    argv = [
+        "dry-run",
+        *[item for flag, value in values.items() for item in (flag, value)],
+    ]
     missing_index = argv.index(missing_flag)
     del argv[missing_index : missing_index + 2]
 
@@ -1897,6 +1900,7 @@ def test_dry_run_cli_returns_two_for_precommit_validation_error(
 
     exit_code = cli.main(
         [
+            "dry-run",
             "--db-path",
             str(missing_database),
             "--repository-root",
@@ -1918,8 +1922,11 @@ def test_dry_run_cli_returns_two_for_precommit_validation_error(
 
     captured = capsys.readouterr()
     assert exit_code == 2
-    assert "error:" in captured.err
-    assert captured.out == ""
+    assert captured.err == ""
+    error_payload = json.loads(captured.out)
+    assert error_payload["database_committed"] is False
+    assert error_payload["ok"] is False
+    assert error_payload["error"]
     assert not plan_output.exists()
 
 
@@ -2372,3 +2379,391 @@ def test_execute_rejects_lock_factory_keyword_in_general_python_call(
             **kwargs,
             lock_factory=lambda path: nullcontext(),
         )
+
+
+def test_execute_cli_success_returns_zero_and_writes_result_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = importlib.import_module("edge.detection.run_packet_checkpoint_recovery")
+    expected = {
+        "operation_id": "operation-success",
+        "database_committed": True,
+        "result_path": str(tmp_path / "result.json"),
+    }
+    monkeypatch.setattr(
+        cli, "execute_packet_checkpoint_recovery", lambda **kwargs: expected, raising=False
+    )
+
+    exit_code = cli.main(
+        [
+            "execute",
+            "--plan-file",
+            str(tmp_path / "plan.json"),
+            "--db-path",
+            str(tmp_path / "iot.db"),
+            "--artifact-dir",
+            str(tmp_path / "artifacts"),
+            "--confirm",
+            packet_checkpoint_recovery.EXECUTE_CONFIRMATION,
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.err == ""
+    assert json.loads(captured.out) == expected
+
+
+def test_execute_cli_precommit_failure_returns_two_without_database_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = importlib.import_module("edge.detection.run_packet_checkpoint_recovery")
+    database = tmp_path / "iot.db"
+    database.write_bytes(b"unchanged")
+
+    def fail_execute(**kwargs: object) -> dict[str, object]:
+        raise PacketCheckpointRecoveryError("precommit rejected")
+
+    monkeypatch.setattr(
+        cli, "execute_packet_checkpoint_recovery", fail_execute, raising=False
+    )
+
+    exit_code = cli.main(
+        [
+            "execute",
+            "--plan-file",
+            str(tmp_path / "plan.json"),
+            "--db-path",
+            str(database),
+            "--artifact-dir",
+            str(tmp_path / "artifacts"),
+            "--confirm",
+            packet_checkpoint_recovery.EXECUTE_CONFIRMATION,
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.err == ""
+    assert json.loads(captured.out) == {
+        "database_committed": False,
+        "error": "precommit rejected",
+        "ok": False,
+    }
+    assert database.read_bytes() == b"unchanged"
+
+
+def test_execute_cli_postcommit_integrity_failure_returns_three_and_hold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = importlib.import_module("edge.detection.run_packet_checkpoint_recovery")
+
+    class FakeCommittedArtifactError(PacketCheckpointRecoveryError):
+        def __init__(self) -> None:
+            self.operation_id = "operation-hold"
+            self.backup_path = tmp_path / "database.backup.db"
+            super().__init__("post-commit integrity failure")
+
+    def fail_execute(**kwargs: object) -> dict[str, object]:
+        raise FakeCommittedArtifactError()
+
+    monkeypatch.setattr(
+        cli,
+        "PacketCheckpointRecoveryCommittedArtifactError",
+        FakeCommittedArtifactError,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli, "execute_packet_checkpoint_recovery", fail_execute, raising=False
+    )
+
+    exit_code = cli.main(
+        [
+            "execute",
+            "--plan-file",
+            str(tmp_path / "plan.json"),
+            "--db-path",
+            str(tmp_path / "iot.db"),
+            "--artifact-dir",
+            str(tmp_path / "artifacts"),
+            "--confirm",
+            packet_checkpoint_recovery.EXECUTE_CONFIRMATION,
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 3
+    assert captured.err == ""
+    assert json.loads(captured.out) == {
+        "backup_path": str(tmp_path / "database.backup.db"),
+        "database_committed": True,
+        "error": "post-commit integrity failure",
+        "ok": False,
+        "operation_id": "operation-hold",
+        "operation_status": "HOLD",
+    }
+
+
+def test_execute_cli_result_json_failure_returns_three_and_preserves_commit_audit_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = importlib.import_module("edge.detection.run_packet_checkpoint_recovery")
+    fixture = _execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    monkeypatch.setattr(
+        packet_checkpoint_recovery,
+        "_write_json_atomically",
+        lambda path, payload: (_ for _ in ()).throw(OSError("result write failed")),
+    )
+
+    exit_code = cli.main(
+        [
+            "execute",
+            "--plan-file",
+            str(fixture["plan_output"]),
+            "--db-path",
+            str(fixture["database"]),
+            "--artifact-dir",
+            str(fixture["artifact_dir"]),
+            "--confirm",
+            packet_checkpoint_recovery.EXECUTE_CONFIRMATION,
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 3
+    assert payload["database_committed"] is True
+    assert payload["operation_status"] == "HOLD"
+    assert Path(payload["backup_path"]).is_file()
+    assert dict(_checkpoint(fixture["database"]))["last_completed_window_end"] == _db_utc(
+        TARGET_FIRST
+    )
+    with sqlite3.connect(fixture["database"]) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM packet_checkpoint_recoveries"
+        ).fetchone()[0] == 1
+
+
+def test_execute_cli_never_auto_restores_committed_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = importlib.import_module("edge.detection.run_packet_checkpoint_recovery")
+    fixture = _execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    real_verify = packet_checkpoint_recovery.verify_database
+    live_verification_count = 0
+
+    def fail_postcommit_verification(path: Path):
+        nonlocal live_verification_count
+        verification = real_verify(path)
+        if Path(path) == fixture["database"]:
+            live_verification_count += 1
+            if live_verification_count == 2:
+                return type(verification)("failed", ())
+        return verification
+
+    monkeypatch.setattr(
+        packet_checkpoint_recovery, "verify_database", fail_postcommit_verification
+    )
+
+    exit_code = cli.main(
+        [
+            "execute",
+            "--plan-file",
+            str(fixture["plan_output"]),
+            "--db-path",
+            str(fixture["database"]),
+            "--artifact-dir",
+            str(fixture["artifact_dir"]),
+            "--confirm",
+            packet_checkpoint_recovery.EXECUTE_CONFIRMATION,
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 3
+    assert payload["operation_status"] == "HOLD"
+    assert dict(_checkpoint(fixture["database"]))["last_completed_window_end"] == _db_utc(
+        TARGET_FIRST
+    )
+    with sqlite3.connect(fixture["database"]) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM packet_checkpoint_recoveries"
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    "missing_flag", ("--plan-file", "--db-path", "--artifact-dir", "--confirm")
+)
+def test_execute_cli_requires_plan_file_database_artifact_and_confirmation(
+    tmp_path: Path, missing_flag: str
+) -> None:
+    cli = importlib.import_module("edge.detection.run_packet_checkpoint_recovery")
+    values = {
+        "--plan-file": str(tmp_path / "plan.json"),
+        "--db-path": str(tmp_path / "iot.db"),
+        "--artifact-dir": str(tmp_path / "artifacts"),
+        "--confirm": packet_checkpoint_recovery.EXECUTE_CONFIRMATION,
+    }
+    argv = [
+        "execute",
+        *[item for flag, value in values.items() for item in (flag, value)],
+    ]
+    parsed = cli.build_parser().parse_args(argv)
+    assert parsed.command == "execute"
+    parsed_with_skip = cli.build_parser().parse_args(
+        [*argv, "--confirm-skip-processable", "SKIP-PROCESSABLE-SESSIONS:digest"]
+    )
+    assert (
+        parsed_with_skip.confirm_skip_processable
+        == "SKIP-PROCESSABLE-SESSIONS:digest"
+    )
+    missing_index = argv.index(missing_flag)
+    del argv[missing_index : missing_index + 2]
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.build_parser().parse_args(argv)
+
+    assert exc_info.value.code == 2
+
+
+def test_execute_cli_returns_two_for_windows_platform_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = importlib.import_module("edge.detection.run_packet_checkpoint_recovery")
+    database = tmp_path / "untouched.db"
+    database.write_bytes(b"not sqlite")
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    monkeypatch.setattr(
+        packet_checkpoint_recovery, "_current_platform_name", lambda: "nt"
+    )
+    monkeypatch.setattr(
+        packet_checkpoint_recovery,
+        "acquire_recovery_locks",
+        lambda locks: pytest.fail("locks must not be acquired"),
+    )
+    monkeypatch.setattr(
+        packet_checkpoint_recovery,
+        "create_sqlite_backup",
+        lambda *args, **kwargs: pytest.fail("backup must not be created"),
+    )
+
+    exit_code = cli.main(
+        [
+            "execute",
+            "--plan-file",
+            str(tmp_path / "missing-plan.json"),
+            "--db-path",
+            str(database),
+            "--artifact-dir",
+            str(artifact_dir),
+            "--confirm",
+            packet_checkpoint_recovery.EXECUTE_CONFIRMATION,
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.err == ""
+    assert json.loads(captured.out)["database_committed"] is False
+    assert database.read_bytes() == b"not sqlite"
+    assert list(artifact_dir.iterdir()) == []
+
+
+def test_execute_cli_rejects_platform_name_option(tmp_path: Path) -> None:
+    cli = importlib.import_module("edge.detection.run_packet_checkpoint_recovery")
+    argv = [
+        "execute",
+        "--plan-file",
+        str(tmp_path / "plan.json"),
+        "--db-path",
+        str(tmp_path / "iot.db"),
+        "--artifact-dir",
+        str(tmp_path / "artifacts"),
+        "--confirm",
+        packet_checkpoint_recovery.EXECUTE_CONFIRMATION,
+    ]
+    parsed = cli.build_parser().parse_args(argv)
+    assert not hasattr(parsed, "platform_name")
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.build_parser().parse_args(
+            [
+                *argv,
+                "--platform-name",
+                "posix",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+
+
+def test_execute_holds_all_locks_through_post_commit_verification_and_result_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    monkeypatch.setattr(
+        packet_checkpoint_recovery, "_current_platform_name", lambda: "posix"
+    )
+    lock_held = False
+    real_verify = packet_checkpoint_recovery.verify_database
+    real_write = packet_checkpoint_recovery._write_json_atomically
+    postcommit_verifications = 0
+    result_writes = 0
+    lock_exit_exception = ""
+
+    @contextmanager
+    def recording_locks(locks: object):
+        nonlocal lock_held, lock_exit_exception
+        lock_held = True
+        try:
+            yield
+        except BaseException as exc:
+            lock_exit_exception = type(exc).__name__
+            raise
+        finally:
+            lock_held = False
+
+    def recording_verify(path: Path):
+        nonlocal postcommit_verifications
+        verification = real_verify(path)
+        if Path(path) == fixture["database"] and dict(_checkpoint(path))[
+            "last_completed_window_end"
+        ] == _db_utc(TARGET_FIRST):
+            assert lock_held is True
+            postcommit_verifications += 1
+        return verification
+
+    def recording_write(path: Path, payload: object) -> None:
+        nonlocal result_writes
+        assert lock_held is True
+        result_writes += 1
+        real_write(path, payload)
+        raise OSError("hold after result write")
+
+    monkeypatch.setattr(
+        packet_checkpoint_recovery, "acquire_recovery_locks", recording_locks
+    )
+    monkeypatch.setattr(packet_checkpoint_recovery, "verify_database", recording_verify)
+    monkeypatch.setattr(packet_checkpoint_recovery, "_write_json_atomically", recording_write)
+
+    with pytest.raises(PacketCheckpointRecoveryError):
+        execute_packet_checkpoint_recovery(**_valid_execute_kwargs(fixture))
+
+    assert lock_held is False
+    assert postcommit_verifications == 1
+    assert result_writes == 1
+    assert lock_exit_exception == "PacketCheckpointRecoveryCommittedArtifactError"
