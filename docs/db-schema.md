@@ -19,6 +19,12 @@ PRAGMA busy_timeout = 5000;
 
 ## schema_migrations
 
+Migration 005 (`packet_checkpoint_recovery`)는 운영 적용과 Recovery Execute를 분리한다.
+
+## packet_checkpoint_recoveries
+
+Detector별 Packet Checkpoint Gap Recovery 감사 Row를 저장한다. `operation_id`와 `(detector_name, source_table, target_capture_session_id)`는 각각 UNIQUE이며 Detector는 `packet_rule`/`packet_if`, Source는 `packet_feature_logs`만 허용한다. 현재·대상 Capture Session과 Detector Checkpoint는 `ON DELETE RESTRICT` FK로 연결되고 `last_processed_id_before IS last_processed_id_after`, Skip count 비음수, SHA256 길이를 검사한다.
+
 `db/migration_runner.py`가 적용한 migration을 기록합니다.
 
 | 컬럼 | 타입 | 설명 |

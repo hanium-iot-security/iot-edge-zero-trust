@@ -205,6 +205,80 @@ def _insert_packet_feature_log(
     return int(cursor.lastrowid)
 
 
+def _insert_packet_checkpoint_recovery(
+    connection: sqlite3.Connection,
+    **overrides,
+) -> int:
+    values = {
+        "operation_id": "20260806T010000Z-111111111111",
+        "detector_name": "packet_rule",
+        "source_table": "packet_feature_logs",
+        "current_capture_session_id": "11111111-1111-4111-8111-111111111111",
+        "target_capture_session_id": "22222222-2222-4222-8222-222222222222",
+        "last_processed_id_before": 42,
+        "last_processed_id_after": 42,
+        "last_completed_window_end_before": "2026-08-06T01:00:00Z",
+        "last_completed_window_end_after": "2026-08-06T01:00:00Z",
+        "updated_at_before": "2026-08-06T01:00:01Z",
+        "updated_at_after": "2026-08-06T01:00:01Z",
+        "plan_sha256": "a" * 64,
+        "plan_json": "{}",
+        "skipped_session_count": 0,
+        "skipped_processable_session_count": 0,
+        "approved_by": "operator@example.com",
+        "reason": "checkpoint gap recovery",
+        "repository_commit": "b" * 40,
+        "database_path": "/var/lib/iot-security.db",
+        "backup_path": "/var/backups/iot-security.db",
+        "backup_sha256": "c" * 64,
+    }
+    values.update(overrides)
+    cursor = connection.execute(
+        """
+        INSERT INTO packet_checkpoint_recoveries (
+            operation_id, detector_name, source_table,
+            current_capture_session_id, target_capture_session_id,
+            last_processed_id_before, last_processed_id_after,
+            last_completed_window_end_before, last_completed_window_end_after,
+            updated_at_before, updated_at_after, plan_sha256, plan_json,
+            skipped_session_count, skipped_processable_session_count,
+            approved_by, reason, repository_commit, database_path,
+            backup_path, backup_sha256
+        )
+        VALUES (
+            :operation_id, :detector_name, :source_table,
+            :current_capture_session_id, :target_capture_session_id,
+            :last_processed_id_before, :last_processed_id_after,
+            :last_completed_window_end_before, :last_completed_window_end_after,
+            :updated_at_before, :updated_at_after, :plan_sha256, :plan_json,
+            :skipped_session_count, :skipped_processable_session_count,
+            :approved_by, :reason, :repository_commit, :database_path,
+            :backup_path, :backup_sha256
+        )
+        """,
+        values,
+    )
+    return int(cursor.lastrowid)
+
+
+def _seed_packet_checkpoint_recovery_references(
+    connection: sqlite3.Connection,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO detector_checkpoints (
+            detector_name, source_table, last_processed_id, last_completed_window_end
+        )
+        VALUES ('packet_rule', 'packet_feature_logs', 42, '2026-08-06T01:00:00Z')
+        """
+    )
+    _insert_packet_capture_session(connection)
+    _insert_packet_capture_session(
+        connection,
+        session_id="22222222-2222-4222-8222-222222222222",
+    )
+
+
 def _interface_metrics(
     *,
     internal_rate: float | None = None,
@@ -241,11 +315,227 @@ def test_runner_applies_new_database_in_order(tmp_path: Path) -> None:
     result = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [1, 2, 3, 4]
+        assert result.applied_versions == [1, 2, 3, 4, 5]
         assert result.baselined_versions == []
-        assert _migration_versions(connection) == [1, 2, 3, 4]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5]
         assert _table_exists(connection, "packet_capture_sessions")
         assert _table_exists(connection, "trust_score_history")
+
+
+def test_packet_checkpoint_recovery_base_schema(tmp_path: Path) -> None:
+    db_path = tmp_path / "recovery.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    with connect_database(db_path) as connection:
+        migration = connection.execute(
+            "SELECT version, name FROM schema_migrations WHERE version = 5"
+        ).fetchone()
+        assert migration is not None
+        assert migration["version"] == 5
+        assert migration["name"] == "packet_checkpoint_recovery"
+        assert _table_exists(connection, "packet_checkpoint_recoveries")
+        columns = _column_names(connection, "packet_checkpoint_recoveries")
+        assert columns == {
+            "id", "operation_id", "detector_name", "source_table",
+            "current_capture_session_id", "target_capture_session_id",
+            "last_processed_id_before", "last_processed_id_after",
+            "last_completed_window_end_before", "last_completed_window_end_after",
+            "updated_at_before", "updated_at_after", "plan_sha256", "plan_json",
+            "skipped_session_count", "skipped_processable_session_count",
+            "approved_by", "reason", "repository_commit", "database_path",
+            "backup_path", "backup_sha256", "created_at",
+        }
+        column_info = {
+            row["name"]: (row["type"], row["notnull"], row["pk"], row["dflt_value"])
+            for row in connection.execute("PRAGMA table_info(packet_checkpoint_recoveries)")
+        }
+        assert column_info["id"] == ("INTEGER", 0, 1, None)
+        assert column_info["last_processed_id_before"] == ("INTEGER", 0, 0, None)
+        assert column_info["last_processed_id_after"] == ("INTEGER", 0, 0, None)
+        assert column_info["skipped_session_count"] == ("INTEGER", 1, 0, None)
+        assert column_info["skipped_processable_session_count"] == ("INTEGER", 1, 0, None)
+        for column_name in columns - {
+            "id", "last_processed_id_before", "last_processed_id_after",
+            "skipped_session_count", "skipped_processable_session_count", "created_at",
+        }:
+            assert column_info[column_name] == ("TEXT", 1, 0, None)
+        assert column_info["created_at"] == ("TEXT", 1, 0, "CURRENT_TIMESTAMP")
+
+
+def test_packet_checkpoint_recovery_migration_applies_005_to_existing_004(
+    tmp_path: Path,
+) -> None:
+    old_dir = tmp_path / "old"
+    _write_project_migrations_subset(
+        old_dir,
+        (
+            "001_init.sql",
+            "002_packet_gateway.sql",
+            "003_phase4_detection.sql",
+            "004_trust_score_compensation.sql",
+        ),
+    )
+    db_path = tmp_path / "existing-004.db"
+    apply_migrations(db_path, old_dir)
+    with connect_database(db_path) as connection:
+        _seed_packet_checkpoint_recovery_references(connection)
+        before = {
+            "checkpoints": tuple(connection.execute(
+                "SELECT * FROM detector_checkpoints ORDER BY detector_name, source_table"
+            ).fetchall()),
+            "sessions": tuple(connection.execute(
+                "SELECT * FROM packet_capture_sessions ORDER BY id"
+            ).fetchall()),
+        }
+    result = apply_migrations(db_path, MIGRATIONS_DIR)
+    assert result.applied_versions == [5]
+    with connect_database(db_path) as connection:
+        after = {
+            "checkpoints": tuple(connection.execute(
+                "SELECT * FROM detector_checkpoints ORDER BY detector_name, source_table"
+            ).fetchall()),
+            "sessions": tuple(connection.execute(
+                "SELECT * FROM packet_capture_sessions ORDER BY id"
+            ).fetchall()),
+        }
+    assert after == before
+
+
+def test_packet_checkpoint_recovery_rejects_duplicate_operation_id(tmp_path: Path) -> None:
+    db_path = tmp_path / "duplicate-operation.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    with connect_database(db_path) as connection:
+        _seed_packet_checkpoint_recovery_references(connection)
+        _insert_packet_checkpoint_recovery(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_packet_checkpoint_recovery(connection)
+
+
+def test_packet_checkpoint_recovery_rejects_duplicate_detector_target(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "duplicate-detector-target.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    with connect_database(db_path) as connection:
+        _seed_packet_checkpoint_recovery_references(connection)
+        _insert_packet_checkpoint_recovery(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_packet_checkpoint_recovery(
+                connection,
+                operation_id="20260806T010001Z-111111111111",
+            )
+
+
+def test_packet_checkpoint_recovery_rejects_invalid_detector_or_source(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "invalid-detector-source.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    with connect_database(db_path) as connection:
+        _seed_packet_checkpoint_recovery_references(connection)
+        for values in (
+            {"detector_name": "mqtt_rule"},
+            {"source_table": "mqtt_feature_logs"},
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                _insert_packet_checkpoint_recovery(connection, **values)
+
+
+def test_packet_checkpoint_recovery_rejects_changed_last_processed_id(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "changed-last-processed-id.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    with connect_database(db_path) as connection:
+        _seed_packet_checkpoint_recovery_references(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_packet_checkpoint_recovery(connection, last_processed_id_after=43)
+
+
+def test_packet_checkpoint_recovery_rejects_negative_skip_counts(tmp_path: Path) -> None:
+    db_path = tmp_path / "negative-skip-counts.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    with connect_database(db_path) as connection:
+        _seed_packet_checkpoint_recovery_references(connection)
+        for values in (
+            {"skipped_session_count": -1},
+            {"skipped_processable_session_count": -1},
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                _insert_packet_checkpoint_recovery(connection, **values)
+
+
+def test_packet_checkpoint_recovery_foreign_keys_restrict_referenced_rows(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "recovery-foreign-keys.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    with connect_database(db_path) as connection:
+        _seed_packet_checkpoint_recovery_references(connection)
+        _insert_packet_checkpoint_recovery(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                DELETE FROM detector_checkpoints
+                WHERE detector_name = 'packet_rule'
+                  AND source_table = 'packet_feature_logs'
+                """
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                DELETE FROM packet_capture_sessions
+                WHERE session_id = '11111111-1111-4111-8111-111111111111'
+                """
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                DELETE FROM packet_capture_sessions
+                WHERE session_id = '22222222-2222-4222-8222-222222222222'
+                """
+            )
+
+
+def test_failed_005_migration_rolls_back_schema_and_version_record(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "failed-005.db"
+    migrations_004_dir = tmp_path / "migrations-004"
+    _write_project_migrations_subset(
+        migrations_004_dir,
+        (
+            "001_init.sql",
+            "002_packet_gateway.sql",
+            "003_phase4_detection.sql",
+            "004_trust_score_compensation.sql",
+        ),
+    )
+    apply_migrations(db_path, migrations_004_dir)
+
+    broken_migrations_dir = tmp_path / "broken-migrations"
+    _write_project_migrations_subset(
+        broken_migrations_dir,
+        (
+            "001_init.sql",
+            "002_packet_gateway.sql",
+            "003_phase4_detection.sql",
+            "004_trust_score_compensation.sql",
+            "005_packet_checkpoint_recovery.sql",
+        ),
+    )
+    migration_005 = broken_migrations_dir / "005_packet_checkpoint_recovery.sql"
+    migration_005.write_text(
+        migration_005.read_text(encoding="utf-8")
+        + "\nINSERT INTO missing_packet_checkpoint_recovery_table (id) VALUES (1);\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MigrationError):
+        apply_migrations(db_path, broken_migrations_dir)
+
+    with connect_database(db_path) as connection:
+        assert _migration_versions(connection) == [1, 2, 3, 4]
+        assert not _table_exists(connection, "packet_checkpoint_recoveries")
 
 
 def test_missing_migration_directory_fails_before_touching_db(tmp_path: Path) -> None:
@@ -615,8 +905,8 @@ def test_runner_applies_002_and_003_to_existing_001_db_and_preserves_rows(
 
     with connect_database(db_path) as connection:
         assert result.baselined_versions == [1]
-        assert result.applied_versions == [2, 3, 4]
-        assert _migration_versions(connection) == [1, 2, 3, 4]
+        assert result.applied_versions == [2, 3, 4, 5]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5]
         device = connection.execute(
             "SELECT device_id, status, trust_score FROM devices"
         ).fetchone()
@@ -657,10 +947,10 @@ def test_runner_skips_already_applied_migrations(tmp_path: Path) -> None:
     second = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert first.applied_versions == [1, 2, 3, 4]
+        assert first.applied_versions == [1, 2, 3, 4, 5]
         assert second.applied_versions == []
-        assert second.skipped_versions == [1, 2, 3, 4]
-        assert _migration_versions(connection) == [1, 2, 3, 4]
+        assert second.skipped_versions == [1, 2, 3, 4, 5]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5]
 
 
 def test_runner_sorts_migration_files_by_version(tmp_path: Path) -> None:
@@ -795,8 +1085,8 @@ def test_failed_002_migration_can_be_retried_after_fix(tmp_path: Path) -> None:
     result = apply_migrations(db_path, migrations_dir)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [2, 3, 4]
-        assert _migration_versions(connection) == [1, 2, 3, 4]
+        assert result.applied_versions == [2, 3, 4, 5]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5]
         assert not _table_exists(connection, "retry_marker")
         assert _table_exists(connection, "packet_capture_sessions")
         assert "failed_retry_column" not in _column_names(
@@ -1794,8 +2084,8 @@ def test_phase4_migration_applies_003_to_existing_002_and_preserves_segments(
     result = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [3, 4]
-        assert _migration_versions(connection) == [1, 2, 3, 4]
+        assert result.applied_versions == [3, 4, 5]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5]
         assert {
             "actual_capture_started_at",
             "capture_stop_requested_at",
@@ -2473,8 +2763,8 @@ def test_trust_score_compensation_migration_applies_004_to_existing_003(
     result = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [4]
-        assert _migration_versions(connection) == [1, 2, 3, 4]
+        assert result.applied_versions == [4, 5]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5]
         assert _table_exists(connection, "trust_score_compensations")
         assert tuple(
             connection.execute(

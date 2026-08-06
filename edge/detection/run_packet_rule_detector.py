@@ -88,10 +88,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     range_start=args.range_start,
                     cutoff=args.cutoff,
                 )
-                result = stage.run_until(
+                result = stage.run_until_for_capture_session(
                     db,
                     cycle_range_start=args.range_start,
                     cycle_cutoff=args.cutoff,
+                    expected_capture_session_id=args.session_id,
                 )
                 if args.commit:
                     transaction.commit()

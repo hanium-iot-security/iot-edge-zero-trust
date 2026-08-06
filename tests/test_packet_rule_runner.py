@@ -55,6 +55,25 @@ def test_manual_packet_rule_runner_uses_one_stage_transaction(
     assert payload["created_event_count"] == 1
 
 
+def test_manual_packet_rule_runner_binds_stage_to_requested_capture_session(
+    monkeypatch,
+    capsys,
+) -> None:
+    session = FakeSession()
+    stage = FakeStage()
+    monkeypatch.setattr(run_packet_rule_detector, "SessionLocal", lambda: session)
+    monkeypatch.setattr(run_packet_rule_detector, "PacketRuleDetectorStage", lambda: stage)
+    _stub_ready_range(monkeypatch)
+
+    assert run_packet_rule_detector.main([
+        "--session-id", SESSION_ID,
+        "--range-start", "2026-07-26T10:00:00Z",
+        "--cutoff", "2026-07-26T10:00:10Z",
+    ]) == 0
+
+    assert stage.capture_session_ids == [SESSION_ID]
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -311,6 +330,7 @@ class FakeTransaction:
 class FakeStage:
     def __init__(self) -> None:
         self.call_count = 0
+        self.capture_session_ids: list[str] = []
 
     def run_until(self, db, *, cycle_range_start, cycle_cutoff):
         self.call_count += 1
@@ -327,9 +347,31 @@ class FakeStage:
             completed_window_end_after=cycle_cutoff,
         )
 
+    def run_until_for_capture_session(
+        self,
+        db,
+        *,
+        cycle_range_start,
+        cycle_cutoff,
+        expected_capture_session_id,
+    ):
+        self.capture_session_ids.append(expected_capture_session_id)
+        return self.run_until(
+            db,
+            cycle_range_start=cycle_range_start,
+            cycle_cutoff=cycle_cutoff,
+        )
+
 
 class FailingStage:
-    def run_until(self, db, *, cycle_range_start, cycle_cutoff):
+    def run_until_for_capture_session(
+        self,
+        db,
+        *,
+        cycle_range_start,
+        cycle_cutoff,
+        expected_capture_session_id,
+    ):
         raise RuntimeError("boom")
 
 
