@@ -159,3 +159,102 @@ def test_inventory_entry_rejects_non_regular_file(
 ) -> None:
     with pytest.raises(PacketCheckpointRecoveryError, match="regular file"):
         packet_checkpoint_recovery.inspect_repository_state(untracked_fifo_repository)
+
+
+def test_generated_path_allows_path_outside_repository(tmp_path: Path) -> None:
+    repository_root = _repository(tmp_path)
+    outside = tmp_path / "outside" / "result.json"
+
+    assert packet_checkpoint_recovery.validate_generated_path(
+        repository_root, outside, field_name="result_path"
+    ) == outside.resolve()
+    assert not outside.exists()
+
+
+def test_generated_path_allows_gitignored_path_inside_repository(
+    tmp_path: Path,
+) -> None:
+    repository_root = _repository(tmp_path)
+    (repository_root / ".gitignore").write_text("generated/\n", encoding="utf-8")
+    plan = repository_root / "generated" / "plan.json"
+    artifact_dir = repository_root / "generated"
+    result = repository_root / "generated" / "result.json"
+    lock = repository_root / "generated" / "run.lock"
+    artifact_dir.mkdir()
+
+    checked = packet_checkpoint_recovery.validate_generated_paths(
+        repository_root=repository_root,
+        plan_output=plan,
+        artifact_dir=artifact_dir,
+        result_path=result,
+        lock_paths=(lock,),
+    )
+
+    assert checked == {
+        "plan_output": plan.resolve(),
+        "artifact_dir": artifact_dir.resolve(),
+        "result_path": result.resolve(),
+        "lock_paths": (lock.resolve(),),
+    }
+    assert not plan.exists()
+    assert not result.exists()
+    assert not lock.exists()
+
+
+def test_generated_path_rejects_unignored_path_before_creation(tmp_path: Path) -> None:
+    repository_root = _repository(tmp_path)
+    candidate = repository_root / "generated" / "result.json"
+
+    with pytest.raises(PacketCheckpointRecoveryError, match="result_path must be Git-ignored"):
+        packet_checkpoint_recovery.validate_generated_path(
+            repository_root, candidate, field_name="result_path"
+        )
+
+    assert not candidate.parent.exists()
+    assert not candidate.exists()
+
+
+def test_generated_path_checks_backup_sha256_sidecar(tmp_path: Path) -> None:
+    repository_root = _repository(tmp_path)
+    (repository_root / ".gitignore").write_text("backups/*.db\n", encoding="utf-8")
+    backup = repository_root / "backups" / "checkpoint.db"
+    sidecar = repository_root / "backups" / "checkpoint.db.sha256"
+
+    with pytest.raises(
+        PacketCheckpointRecoveryError, match="backup_sha256_path must be Git-ignored"
+    ):
+        packet_checkpoint_recovery.validate_generated_paths(
+            repository_root=repository_root, backup_path=backup
+        )
+
+    assert not backup.parent.exists()
+    assert not backup.exists()
+    assert not sidecar.exists()
+
+
+def test_plan_output_requires_existing_parent_directory(tmp_path: Path) -> None:
+    repository_root = _repository(tmp_path)
+    plan = tmp_path / "missing" / "plan.json"
+
+    with pytest.raises(
+        PacketCheckpointRecoveryError, match="plan_output parent must already exist"
+    ):
+        packet_checkpoint_recovery.validate_generated_paths(
+            repository_root=repository_root, plan_output=plan
+        )
+
+    assert not plan.parent.exists()
+
+
+def test_artifact_directory_must_already_exist(tmp_path: Path) -> None:
+    repository_root = _repository(tmp_path)
+    artifact_dir = tmp_path / "missing-artifacts"
+
+    with pytest.raises(
+        PacketCheckpointRecoveryError, match="artifact_dir must be an existing directory"
+    ):
+        packet_checkpoint_recovery.validate_generated_paths(
+            repository_root=repository_root, artifact_dir=artifact_dir
+        )
+
+    assert not artifact_dir.exists()

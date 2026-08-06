@@ -10,7 +10,7 @@ from pathlib import Path
 import stat
 import subprocess
 from datetime import datetime
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from edge.detection.phase4_time import format_db_utc
 
@@ -26,6 +26,80 @@ _VOLATILE_PLAN_KEYS = frozenset({
 
 class PacketCheckpointRecoveryError(Exception):
     """Raised when a packet checkpoint recovery plan is invalid."""
+
+
+def validate_generated_path(
+    repository_root: Path, candidate: str | Path, *, field_name: str
+) -> Path:
+    root = repository_root.expanduser().resolve(strict=True)
+    raw = Path(candidate).expanduser()
+    path = (raw if raw.is_absolute() else root / raw).resolve(strict=False)
+    if not path.is_relative_to(root):
+        return path
+    result = subprocess.run(
+        ["git", "check-ignore", "--quiet", "--", path.relative_to(root).as_posix()],
+        cwd=root,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise PacketCheckpointRecoveryError(f"{field_name} must be Git-ignored")
+    return path
+
+
+def require_existing_parent(path: Path, *, field_name: str) -> Path:
+    parent = path.expanduser().resolve(strict=False).parent
+    if not parent.is_dir():
+        raise PacketCheckpointRecoveryError(f"{field_name} parent must already exist")
+    return parent
+
+
+def require_existing_directory(path: Path, *, field_name: str) -> Path:
+    resolved = path.expanduser().resolve(strict=False)
+    if not resolved.is_dir():
+        raise PacketCheckpointRecoveryError(f"{field_name} must be an existing directory")
+    return resolved
+
+
+def validate_generated_paths(
+    *,
+    repository_root: Path,
+    plan_output: Path | None = None,
+    artifact_dir: Path | None = None,
+    backup_path: Path | None = None,
+    result_path: Path | None = None,
+    lock_paths: Sequence[Path] = (),
+) -> dict[str, object]:
+    checked: dict[str, object] = {}
+    if plan_output is not None:
+        require_existing_parent(plan_output, field_name="plan_output")
+        checked["plan_output"] = validate_generated_path(
+            repository_root, plan_output, field_name="plan_output"
+        )
+    if artifact_dir is not None:
+        checked["artifact_dir"] = validate_generated_path(
+            repository_root,
+            require_existing_directory(artifact_dir, field_name="artifact_dir"),
+            field_name="artifact_dir",
+        )
+    if backup_path is not None:
+        backup = validate_generated_path(
+            repository_root, backup_path, field_name="backup_path"
+        )
+        checked["backup_path"] = backup
+        checked["backup_sha256_path"] = validate_generated_path(
+            repository_root,
+            backup.with_suffix(backup.suffix + ".sha256"),
+            field_name="backup_sha256_path",
+        )
+    if result_path is not None:
+        checked["result_path"] = validate_generated_path(
+            repository_root, result_path, field_name="result_path"
+        )
+    checked["lock_paths"] = tuple(
+        validate_generated_path(repository_root, path, field_name="lock_path")
+        for path in lock_paths
+    )
+    return checked
 
 
 def _without_volatile_fields(value: object) -> object:
