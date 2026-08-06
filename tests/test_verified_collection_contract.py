@@ -387,7 +387,7 @@ def test_retrospective_payload_provenance_forbids_firmware_reported_version() ->
             included_device_ids=("esp32_02",),
             payload_schema_version="phase5-packet-rate-udp-payload-v1",
             payload_schema_provenance=(
-                PayloadSchemaProvenance.RETROSPECTIVE_SOURCE_AND_PCAP_VERIFICATION
+                PayloadSchemaProvenance.RETROSPECTIVE_OPERATOR_ATTESTED_WITH_PCAP_INVENTORY
             ),
             firmware_reported_payload_schema_version="phase5-packet-rate-udp-payload-v1",
         )
@@ -638,7 +638,7 @@ def test_identity_rejects_attack_target_mismatch() -> None:
         firmware_version="phase5-packet-rate-sender-v2",
         payload_schema_version="phase5-packet-rate-udp-payload-v1",
         payload_schema_provenance=(
-            PayloadSchemaProvenance.RETROSPECTIVE_SOURCE_AND_PCAP_VERIFICATION
+            PayloadSchemaProvenance.RETROSPECTIVE_OPERATOR_ATTESTED_WITH_PCAP_INVENTORY
         ),
         firmware_reported_payload_schema_version=None,
     )

@@ -43,6 +43,7 @@ from edge.packet.capture_policy import (
     CapturePolicy,
     is_capture_eligible,
 )
+from edge.phase5.verified_collection_contract import DatasetSessionIdentity
 
 _UTC_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
@@ -695,6 +696,22 @@ def _validate_phase5_session_devices(spec: PacketIFSessionSpec) -> None:
         )
 
 
+def _dataset_session_identity(spec: PacketIFSessionSpec) -> DatasetSessionIdentity:
+    """Collect the Dataset Session fields a Collection Manifest must reproduce."""
+    return DatasetSessionIdentity(
+        split=spec.split,
+        traffic_label=spec.traffic_label,
+        collection_slot_id=spec.collection_slot_id or "",
+        source_capture_group_id=spec.source_capture_group_id or "",
+        normal_policy_version=spec.normal_policy_version or "",
+        firmware_version=spec.firmware_version or "",
+        payload_schema_version=spec.payload_schema_version or "",
+        background_traffic_present=bool(spec.background_traffic_present),
+        source_commit_sha=spec.source_commit_sha,
+        capture_filter=spec.capture_filter,
+    )
+
+
 def _validate_run_manifest_references(
     manifest_path: Path,
     manifest: PacketIFDatasetManifest,
@@ -736,6 +753,7 @@ def _validate_run_manifest_references(
             target_device_id=spec.target_device_id,
             target_source_ip=spec.target_source_ip,
             included_device_ips=included_device_ips,
+            dataset_identity=_dataset_session_identity(spec),
             required=False,
         )
         assert_run_manifest_complete(run_manifest, reference.run_id)

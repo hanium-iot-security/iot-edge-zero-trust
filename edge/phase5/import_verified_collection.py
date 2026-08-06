@@ -90,6 +90,17 @@ NORMAL_PAYLOAD_SCHEMA_VERSION = "phase5-normal-payload-v1"
 ATTACK_FIRMWARE_VERSION = "phase5-packet-rate-sender-v2"
 ATTACK_PAYLOAD_SCHEMA_VERSION = "phase5-packet-rate-udp-payload-v1"
 
+# Dataset 전체가 하나의 정상 정책과 하나의 Capture Filter를 써야 한다.
+REQUIRED_NORMAL_POLICY_VERSION = "phase5-normal-policy-v1.1"
+REQUIRED_CAPTURE_FILTER = "tcp or udp"
+
+# 설계 12절이 고정한 Session 53의 실측 증적. ESP32의 udp.endPacket()==1은 수신
+# ACK가 아니므로 960과 880의 차이를 원인으로 단정하지 않고 UNRESOLVED로 남긴다.
+SESSION_53_SENDER_REPORTED_PACKETS = 960
+SESSION_53_GATEWAY_OBSERVED_PACKETS = 880
+SESSION_53_OBSERVATION_GAP_PACKETS = 80
+SESSION_53_OBSERVATION_GAP_CAUSE = "UNRESOLVED"
+
 ELIGIBLE_SEGMENT_STATUSES = frozenset({"PROCESSED", "EMPTY"})
 NOMINAL_WINDOW_SECONDS = 10
 _RUN_ID_PREFIX = "verified-"
@@ -352,12 +363,26 @@ class VerifiedCollectionSessionSpec:
             )
         if (
             self.payload_schema_provenance
-            is not PayloadSchemaProvenance.RETROSPECTIVE_SOURCE_AND_PCAP_VERIFICATION
+            is not PayloadSchemaProvenance.RETROSPECTIVE_OPERATOR_ATTESTED_WITH_PCAP_INVENTORY
         ):
             # 수집 당시 Firmware는 Payload Schema Version을 출력하지 않았다.
             raise ValueError(
                 "attack Session payload_schema_provenance must be "
-                "RETROSPECTIVE_SOURCE_AND_PCAP_VERIFICATION"
+                "RETROSPECTIVE_OPERATOR_ATTESTED_WITH_PCAP_INVENTORY"
+            )
+        # 설계 12절의 실측 증적을 필수로 강제한다. 값이 다르면 다른 수집분이거나
+        # 인계 자료를 잘못 옮긴 것이므로 Batch 전체를 멈춘다.
+        if self.sender_reported_packets != SESSION_53_SENDER_REPORTED_PACKETS:
+            raise ValueError(
+                "attack Session sender_reported_packets must be "
+                f"{SESSION_53_SENDER_REPORTED_PACKETS}: "
+                f"{self.sender_reported_packets!r}"
+            )
+        if self.observation_gap_cause not in (None, SESSION_53_OBSERVATION_GAP_CAUSE):
+            raise ValueError(
+                "attack Session observation_gap_cause must be "
+                f"{SESSION_53_OBSERVATION_GAP_CAUSE!r}: "
+                f"{self.observation_gap_cause!r}"
             )
 
 
@@ -407,20 +432,33 @@ class VerifiedCollectionImportSpec:
         if not isinstance(raw_sessions, list) or not raw_sessions:
             raise ValueError("Import Spec sessions must be a non-empty list")
 
+        normal_policy_version = require_identifier(
+            payload["normal_policy_version"],
+            "normal_policy_version",
+        )
+        if normal_policy_version != REQUIRED_NORMAL_POLICY_VERSION:
+            raise ValueError(
+                "normal_policy_version must be "
+                f"{REQUIRED_NORMAL_POLICY_VERSION!r}: {normal_policy_version!r}"
+            )
+        capture_filter = require_non_empty_string(
+            payload["capture_filter"],
+            "capture_filter",
+        )
+        if capture_filter != REQUIRED_CAPTURE_FILTER:
+            raise ValueError(
+                f"capture_filter must be {REQUIRED_CAPTURE_FILTER!r}: "
+                f"{capture_filter!r}"
+            )
+
         spec = cls(
             schema_version=schema_version,
             dataset_package_id=require_identifier(
                 payload["dataset_package_id"],
                 "dataset_package_id",
             ),
-            normal_policy_version=require_identifier(
-                payload["normal_policy_version"],
-                "normal_policy_version",
-            ),
-            capture_filter=require_non_empty_string(
-                payload["capture_filter"],
-                "capture_filter",
-            ),
+            normal_policy_version=normal_policy_version,
+            capture_filter=capture_filter,
             sessions=tuple(
                 VerifiedCollectionSessionSpec.from_dict(item)
                 for item in raw_sessions
@@ -580,9 +618,15 @@ def assert_standalone_snapshot(path: Path) -> None:
 
 
 def connect_snapshot_read_only(path: Path) -> sqlite3.Connection:
-    """Open an absolute SQLite Snapshot in a mode that cannot write."""
+    """Open an absolute SQLite Snapshot in a mode that cannot write.
+
+    The absolute-path check runs before any `resolve()` so a relative path is
+    rejected as given, rather than being silently completed against the current
+    working directory.
+    """
     if not path.is_absolute():
         raise ValueError(f"DB snapshot path must be absolute: {path}")
+    path = path.resolve()
     if not path.is_file():
         raise ValueError(f"DB snapshot is not a file: {path}")
     assert_standalone_snapshot(path)
@@ -605,6 +649,10 @@ def preflight_verified_collection(
     """Verify every declared Session read-only and return the batch plan."""
     commit_sha = normalize_sha1(verification_commit_sha, "verification_commit_sha")
     policy = capture_policy or CapturePolicy.from_env()
+    # 상대경로는 resolve 전에 거부한다. resolve 후에 검사하면 CWD 기준으로
+    # 완성된 경로가 절대경로로 보여 통과해버린다.
+    if not db_snapshot.is_absolute():
+        raise ValueError(f"DB snapshot path must be absolute: {db_snapshot}")
     snapshot_path = db_snapshot.resolve()
     pcap_dir = processed_pcap_dir.resolve()
     if not pcap_dir.is_dir():
@@ -694,6 +742,13 @@ def _build_session_plan(
                 f"Capture Session is missing {column}: {session_spec.session_id}"
             )
 
+    started_at = _parse_utc(session_row["started_at"], "started_at")
+    first_window_start = _parse_utc(
+        session_row["first_window_start"],
+        "first_window_start",
+    )
+    ended_at = _parse_utc(session_row["ended_at"], "ended_at")
+
     segments = _load_segments(connection, int(session_row["id"]))
     if not segments:
         raise VerifiedCollectionImportError(
@@ -701,6 +756,12 @@ def _build_session_plan(
         )
     _validate_segment_statuses(session_spec.session_id, segments)
     _validate_contiguous_windows(session_spec.session_id, segments)
+    _validate_session_window_bounds(
+        session_spec.session_id,
+        segments,
+        first_window_start=first_window_start,
+        ended_at=ended_at,
+    )
 
     features = _load_features(connection, int(session_row["id"]))
     _validate_segment_feature_invariants(session_spec.session_id, segments, features)
@@ -717,38 +778,33 @@ def _build_session_plan(
             f"{session_spec.session_id}"
         )
 
-    # background_traffic_present는 Target 필터 적용 전 적격 Row 기준으로 계산한다.
+    # Export Row는 정상·공격 모두 하나의 Device와 그 Source IP로 좁힌다. 정상
+    # Session도 다른 등록 Device의 적격 Row가 섞여 있을 수 있고, 그것까지
+    # Export하면 Dataset이 선언한 기기 범위와 어긋난다.
+    export_device_id = session_spec.target_device_id or session_spec.collection_device_id
+    export_source_ip = session_spec.target_source_ip or device_ips.get(export_device_id)
+    if export_source_ip is None:
+        raise VerifiedCollectionImportError(
+            "export Device is not registered in the snapshot: "
+            f"{session_spec.session_id} (device_id={export_device_id!r})"
+        )
+    exported_rows = [
+        row
+        for row in eligible_rows
+        if str(row["device_id"]) == export_device_id
+        and str(row["peer_ip"]) == export_source_ip
+    ]
+    if not exported_rows:
+        raise VerifiedCollectionImportError(
+            "Session has no eligible rows for the declared export Device and "
+            f"Source IP: {session_spec.session_id} "
+            f"(device_id={export_device_id!r}, source_ip={export_source_ip!r})"
+        )
+
+    # background_traffic_present는 정상·공격 모두 Export 필터 적용 **전** 전체
+    # 적격 Row 기준으로 계산한다.
     all_eligible_devices = {str(row["device_id"]) for row in eligible_rows}
-    if session_spec.is_attack:
-        exported_rows = [
-            row
-            for row in eligible_rows
-            if str(row["device_id"]) == session_spec.target_device_id
-        ]
-        if not exported_rows:
-            raise VerifiedCollectionImportError(
-                "attack Session has no eligible rows for target_device_id: "
-                f"{session_spec.session_id}"
-            )
-    else:
-        exported_rows = list(eligible_rows)
-
-    exported_devices = {str(row["device_id"]) for row in exported_rows}
-    if session_spec.collection_device_id not in exported_devices:
-        raise VerifiedCollectionImportError(
-            "collection_device_id has no eligible rows in this Session: "
-            f"{session_spec.session_id} "
-            f"(collection_device_id={session_spec.collection_device_id!r}, "
-            f"observed={sorted(exported_devices)})"
-        )
-    if not session_spec.is_attack and exported_devices != {
-        session_spec.collection_device_id
-    }:
-        raise VerifiedCollectionImportError(
-            "normal Session must export exactly its collection_device_id rows: "
-            f"{session_spec.session_id} (observed={sorted(exported_devices)})"
-        )
-
+    exported_devices = {export_device_id}
     background_traffic_present = bool(all_eligible_devices - exported_devices)
     pcap_files = _verify_pcap_files(
         session_spec.session_id,
@@ -761,12 +817,9 @@ def _build_session_plan(
     return VerifiedCollectionSessionPlan(
         spec=session_spec,
         capture_interface=str(session_row["capture_interface"]),
-        started_at=_parse_utc(session_row["started_at"], "started_at"),
-        first_window_start=_parse_utc(
-            session_row["first_window_start"],
-            "first_window_start",
-        ),
-        ended_at=_parse_utc(session_row["ended_at"], "ended_at"),
+        started_at=started_at,
+        first_window_start=first_window_start,
+        ended_at=ended_at,
         segments=segments,
         processed_segment_count=sum(
             1 for segment in segments if segment.status == "PROCESSED"
@@ -778,9 +831,7 @@ def _build_session_plan(
         feature_packet_count=sum(int(row["packet_count"]) for row in exported_rows),
         included_device_ids=tuple(sorted(exported_devices)),
         background_traffic_present=background_traffic_present,
-        device_ips={
-            device_id: device_ips[device_id] for device_id in sorted(exported_devices)
-        },
+        device_ips={export_device_id: export_source_ip},
         pcap_files=pcap_files,
         feature_ready_through=feature_ready_through,
     )
@@ -860,6 +911,34 @@ def _validate_segment_statuses(
             raise VerifiedCollectionImportError(
                 f"unknown Segment status {segment.status!r}: {session_id}"
             )
+
+
+def _validate_session_window_bounds(
+    session_id: str,
+    segments: Sequence[SegmentEvidence],
+    *,
+    first_window_start: datetime,
+    ended_at: datetime,
+) -> None:
+    """Tie the Segment range to the Session's own recorded boundaries.
+
+    Contiguity alone does not prove the Segments belong to this Session's
+    declared span: a shifted-but-contiguous run would still pass. The first
+    Segment must start exactly at `first_window_start`, and the last Segment
+    must finish no later than `ended_at`.
+    """
+    if segments[0].window_start != first_window_start:
+        raise VerifiedCollectionImportError(
+            "first Segment window_start must equal the Session first_window_start: "
+            f"{session_id} (session={format_utc(first_window_start)}, "
+            f"segment={format_utc(segments[0].window_start)})"
+        )
+    if segments[-1].window_end > ended_at:
+        raise VerifiedCollectionImportError(
+            "last Segment window_end must not be later than the Session ended_at: "
+            f"{session_id} (session={format_utc(ended_at)}, "
+            f"segment={format_utc(segments[-1].window_end)})"
+        )
 
 
 def _validate_contiguous_windows(
@@ -1264,6 +1343,17 @@ def _build_observation(
         # 원인을 단정하지 않는다. ESP32의 endPacket()==1은 수신 ACK가 아니므로
         # Wi-Fi 손실·ESP32 실패·Pi Drop 중 무엇인지 확정할 수 없다.
         cause = cause or DEFAULT_OBSERVATION_GAP_CAUSE
+
+    if spec.is_attack:
+        _require_session_53_observation(
+            session_id=spec.session_id,
+            sender=sender,
+            gateway=gateway,
+            feature=session_plan.feature_packet_count,
+            gap=gap,
+            cause=cause,
+        )
+
     return VerifiedCollectionObservation(
         feature_packet_count=session_plan.feature_packet_count,
         gateway_observed_packets=gateway,
@@ -1272,6 +1362,44 @@ def _build_observation(
         observation_gap_cause=cause if gap else None,
         gateway_first_attack_packet_at=spec.gateway_first_attack_packet_at,
     )
+
+
+def _require_session_53_observation(
+    *,
+    session_id: str,
+    sender: int | None,
+    gateway: int,
+    feature: int,
+    gap: int | None,
+    cause: str | None,
+) -> None:
+    """Pin Session 53 to the counts recorded in the design.
+
+    These are the only verified attack numbers we have. If the snapshot yields
+    anything else, the input is not the Session the design describes and the
+    whole batch must stop rather than publish a differently-shaped attack set.
+    """
+    expected = {
+        "sender_reported_packets": (sender, SESSION_53_SENDER_REPORTED_PACKETS),
+        "gateway_observed_packets": (gateway, SESSION_53_GATEWAY_OBSERVED_PACKETS),
+        "feature_packet_count": (feature, SESSION_53_GATEWAY_OBSERVED_PACKETS),
+        "observation_gap_packets": (gap, SESSION_53_OBSERVATION_GAP_PACKETS),
+        "observation_gap_cause": (cause, SESSION_53_OBSERVATION_GAP_CAUSE),
+    }
+    mismatched = {
+        field_name: (actual, wanted)
+        for field_name, (actual, wanted) in expected.items()
+        if actual != wanted
+    }
+    if mismatched:
+        details = ", ".join(
+            f"{field_name}: expected={wanted!r}, actual={actual!r}"
+            for field_name, (actual, wanted) in sorted(mismatched.items())
+        )
+        raise VerifiedCollectionImportError(
+            f"attack Session observation does not match the verified Session 53 "
+            f"evidence: {session_id} ({details})"
+        )
 
 
 def _build_run_manifest(
@@ -1459,11 +1587,21 @@ def _source_evidence(
             "epsilon_seconds": plan.capture_policy.epsilon_seconds,
         },
         "scenario_runner_executed": False,
+        "pcap_payload_bytes_parsed": False,
         "note": (
             "This Session was collected manually with ESP32 hardware before the "
             "Dataset v2 Run Manifest contract existed. No Scenario Runner ran and "
             "no Run Manifest was generated at capture time; the preserved DB "
-            "snapshot, PCAP, and Packet Features were verified afterwards."
+            "snapshot, Packet Features, and PCAP file inventory were verified "
+            "afterwards."
+        ),
+        "payload_schema_note": (
+            "The importer does not parse PCAP payload bytes and does not check "
+            "that any packet matches the declared payload schema. PCAP files are "
+            "verified only for existence, size, SHA256, and filename metadata. A "
+            "RETROSPECTIVE_OPERATOR_ATTESTED_WITH_PCAP_INVENTORY payload schema "
+            "version is an operator attestation backed by that inventory, not an "
+            "automated verification of payload content."
         ),
     }
 
@@ -1481,6 +1619,8 @@ def _write_export_spec(
             # 최상위 값은 기존 호출자 호환용 fallback이다. 공식 Session은 모두
             # 자기 Capture Commit을 갖는다.
             "source_commit_sha": plan.verification_commit_sha,
+            # Export가 반드시 이 Package의 Snapshot을 읽었음을 코드로 강제한다.
+            "db_snapshot_sha256": plan.db_snapshot_sha256,
             "sessions": [dict(entry) for entry in export_sessions],
         },
     )

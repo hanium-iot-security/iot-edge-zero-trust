@@ -85,15 +85,22 @@ class CollectionMethod(str, Enum):
 class PayloadSchemaProvenance(str, Enum):
     """Where the recorded Payload Schema Version came from.
 
-    FIRMWARE_REPORTED: the collecting Firmware itself logged this version.
-    RETROSPECTIVE_SOURCE_AND_PCAP_VERIFICATION: the version string was assigned
-        afterwards by verifying Firmware source and captured PCAP bytes. The
-        Firmware never emitted it. Session 53 uses this.
+    FIRMWARE_REPORTED: the collecting Firmware itself logged this version, and
+        the importer records the same string it emitted.
+    RETROSPECTIVE_OPERATOR_ATTESTED_WITH_PCAP_INVENTORY: the Firmware never
+        emitted a version. An operator assigned the name afterwards by reading
+        Firmware source, and the importer only inventories the PCAP files
+        (existence, size, SHA256, filename metadata).
+
+        This importer does **not** parse PCAP payload bytes and does not check
+        that any packet matches the declared schema. The name is an operator
+        attestation backed by a file inventory, not an automated verification
+        of payload content. Session 53 uses this.
     """
 
     FIRMWARE_REPORTED = "FIRMWARE_REPORTED"
-    RETROSPECTIVE_SOURCE_AND_PCAP_VERIFICATION = (
-        "RETROSPECTIVE_SOURCE_AND_PCAP_VERIFICATION"
+    RETROSPECTIVE_OPERATOR_ATTESTED_WITH_PCAP_INVENTORY = (
+        "RETROSPECTIVE_OPERATOR_ATTESTED_WITH_PCAP_INVENTORY"
     )
 
 
@@ -584,7 +591,7 @@ class VerifiedCollectionManifest:
             # 과거 Firmware가 출력하지 않은 Version을 출력했다고 기록하지 않는다.
             raise ValueError(
                 "firmware_reported_payload_schema_version must be null for "
-                "RETROSPECTIVE_SOURCE_AND_PCAP_VERIFICATION provenance"
+                "RETROSPECTIVE_OPERATOR_ATTESTED_WITH_PCAP_INVENTORY provenance"
             )
 
         if self.first_window_start < self.started_at:
@@ -803,6 +810,49 @@ def verify_collection_artifacts(
             )
 
 
+@dataclass(frozen=True)
+class DatasetSessionIdentity:
+    """The Dataset-side values a Collection Manifest must reproduce exactly.
+
+    Verifying only session/scenario/device would let a Collection Manifest claim
+    a different Split, policy version, firmware, or capture commit than the
+    Dataset it is attached to. Every field the Dataset Manifest records about a
+    Session is compared here so the two cannot drift.
+    """
+
+    split: str
+    traffic_label: str
+    collection_slot_id: str
+    source_capture_group_id: str
+    normal_policy_version: str
+    firmware_version: str
+    payload_schema_version: str
+    background_traffic_present: bool
+    source_commit_sha: str
+    capture_filter: str
+
+    COMPARED_FIELDS = (
+        "split",
+        "traffic_label",
+        "collection_slot_id",
+        "source_capture_group_id",
+        "normal_policy_version",
+        "firmware_version",
+        "payload_schema_version",
+        "background_traffic_present",
+        "source_commit_sha",
+        "capture_filter",
+    )
+
+    def manifest_value(self, manifest: "VerifiedCollectionManifest", field_name: str):
+        """Return the Collection Manifest counterpart of a Dataset field."""
+        if field_name == "source_commit_sha":
+            # Dataset은 Session별 수집 Commit을 source_commit_sha로 기록하고,
+            # Collection Manifest는 같은 값을 capture_source_commit_sha로 쓴다.
+            return manifest.capture_source_commit_sha
+        return getattr(manifest, field_name)
+
+
 def validate_verified_collection_identity(
     manifest: VerifiedCollectionManifest,
     *,
@@ -812,6 +862,7 @@ def validate_verified_collection_identity(
     target_device_id: str | None,
     target_source_ip: str | None,
     included_device_ips: Mapping[str, str],
+    dataset_identity: DatasetSessionIdentity | None = None,
 ) -> None:
     """Confirm Collection, Run, and Dataset all describe the same Session.
 
@@ -819,6 +870,9 @@ def validate_verified_collection_identity(
     values, which are null for normal Sessions. The Run Manifest always carries
     a concrete Device because Dataset v2 requires it to identify the exported
     registered Device.
+
+    `dataset_identity` carries the remaining Dataset Session fields. When it is
+    supplied every one of them must match the Collection Manifest exactly.
     """
     if manifest.run_id != run_manifest.run_id:
         raise ValueError(
@@ -854,6 +908,26 @@ def validate_verified_collection_identity(
             f"Devices: collection={sorted(manifest.included_device_ids)}, "
             f"exported={sorted(exported_devices)}"
         )
+
+    if dataset_identity is not None:
+        mismatched = {
+            field_name: (
+                getattr(dataset_identity, field_name),
+                dataset_identity.manifest_value(manifest, field_name),
+            )
+            for field_name in DatasetSessionIdentity.COMPARED_FIELDS
+            if getattr(dataset_identity, field_name)
+            != dataset_identity.manifest_value(manifest, field_name)
+        }
+        if mismatched:
+            details = ", ".join(
+                f"{field_name}: dataset={dataset!r}, collection={collection!r}"
+                for field_name, (dataset, collection) in sorted(mismatched.items())
+            )
+            raise ValueError(
+                "Collection Manifest does not match the Dataset Session: "
+                f"session_id={session_id}: {details}"
+            )
 
     if target_device_id is None:
         # 정상 Session: Dataset Annotation은 Target이 없고, Run Manifest는 실제

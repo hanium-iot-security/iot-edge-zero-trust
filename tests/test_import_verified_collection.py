@@ -11,6 +11,7 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from ai import export_packet_if_dataset as exporter
 from ai.export_packet_if_dataset import (
     PacketIFSessionAnnotation,
     export_packet_if_dataset,
@@ -353,6 +354,13 @@ def _session_entry(
     return entry
 
 
+# 설계 12절이 고정한 Session 53 실측 증적.
+SESSION_53_SENDER_PACKETS = 960
+SESSION_53_GATEWAY_PACKETS = 880
+SESSION_53_SEGMENTS = 2
+SESSION_53_PACKETS_PER_SEGMENT = SESSION_53_GATEWAY_PACKETS // SESSION_53_SEGMENTS
+
+
 def _attack_entry(**overrides) -> dict:
     entry = _session_entry(
         ATTACK_TEST_SESSION,
@@ -363,13 +371,26 @@ def _attack_entry(**overrides) -> dict:
         device="esp32_02",
         firmware="phase5-packet-rate-sender-v2",
         payload="phase5-packet-rate-udp-payload-v1",
-        provenance="RETROSPECTIVE_SOURCE_AND_PCAP_VERIFICATION",
+        provenance="RETROSPECTIVE_OPERATOR_ATTESTED_WITH_PCAP_INVENTORY",
         commit=ATTACK_COMMIT,
         target_device_id="esp32_02",
         target_source_ip="192.168.0.5",
+        sender_reported_packets=SESSION_53_SENDER_PACKETS,
     )
     entry.update(overrides)
     return entry
+
+
+def _add_attack_session(snapshot: SnapshotBuilder, **overrides) -> None:
+    """Seed Session 53 with the gateway packet count the design pins."""
+    kwargs = {
+        "device_id": "esp32_02",
+        "peer_ip": "192.168.0.5",
+        "segments": SESSION_53_SEGMENTS,
+        "packet_count": SESSION_53_PACKETS_PER_SEGMENT,
+    }
+    kwargs.update(overrides)
+    snapshot.add_session(ATTACK_TEST_SESSION, **kwargs)
 
 
 def _spec_payload(sessions: list[dict], **overrides) -> dict:
@@ -411,11 +432,7 @@ def _seed_full_batch(snapshot: SnapshotBuilder) -> None:
     snapshot.add_session(NORMAL_TRAIN_SESSION)
     snapshot.add_session(NORMAL_VALIDATION_SESSION)
     snapshot.add_session(NORMAL_TEST_SESSION)
-    snapshot.add_session(
-        ATTACK_TEST_SESSION,
-        device_id="esp32_02",
-        peer_ip="192.168.0.5",
-    )
+    _add_attack_session(snapshot)
 
 
 def _preflight(snapshot: SnapshotBuilder, spec_payload: dict):
@@ -663,10 +680,8 @@ def test_preflight_detects_background_traffic(snapshot: SnapshotBuilder) -> None
     snapshot.add_session(NORMAL_TRAIN_SESSION)
     snapshot.add_session(NORMAL_VALIDATION_SESSION)
     snapshot.add_session(NORMAL_TEST_SESSION)
-    snapshot.add_session(
-        ATTACK_TEST_SESSION,
-        device_id="esp32_02",
-        peer_ip="192.168.0.5",
+    _add_attack_session(
+        snapshot,
         extra_device=("esp32_01", "192.168.0.4"),
     )
 
@@ -683,11 +698,7 @@ def test_preflight_detects_background_traffic(snapshot: SnapshotBuilder) -> None
 def test_preflight_rejects_missing_session(snapshot: SnapshotBuilder) -> None:
     snapshot.add_session(NORMAL_VALIDATION_SESSION)
     snapshot.add_session(NORMAL_TEST_SESSION)
-    snapshot.add_session(
-        ATTACK_TEST_SESSION,
-        device_id="esp32_02",
-        peer_ip="192.168.0.5",
-    )
+    _add_attack_session(snapshot)
 
     with pytest.raises(VerifiedCollectionImportError, match="not found"):
         _preflight(snapshot, _full_spec())
@@ -697,11 +708,7 @@ def test_preflight_rejects_non_completed_session(snapshot: SnapshotBuilder) -> N
     snapshot.add_session(NORMAL_TRAIN_SESSION, status="RUNNING")
     snapshot.add_session(NORMAL_VALIDATION_SESSION)
     snapshot.add_session(NORMAL_TEST_SESSION)
-    snapshot.add_session(
-        ATTACK_TEST_SESSION,
-        device_id="esp32_02",
-        peer_ip="192.168.0.5",
-    )
+    _add_attack_session(snapshot)
 
     with pytest.raises(VerifiedCollectionImportError, match="COMPLETED"):
         _preflight(snapshot, _full_spec())
@@ -714,11 +721,7 @@ def test_preflight_rejects_ready_segment(snapshot: SnapshotBuilder) -> None:
     )
     snapshot.add_session(NORMAL_VALIDATION_SESSION)
     snapshot.add_session(NORMAL_TEST_SESSION)
-    snapshot.add_session(
-        ATTACK_TEST_SESSION,
-        device_id="esp32_02",
-        peer_ip="192.168.0.5",
-    )
+    _add_attack_session(snapshot)
 
     with pytest.raises(VerifiedCollectionImportError, match="READY"):
         _preflight(snapshot, _full_spec())
@@ -731,11 +734,7 @@ def test_preflight_rejects_failed_segment(snapshot: SnapshotBuilder) -> None:
     )
     snapshot.add_session(NORMAL_VALIDATION_SESSION)
     snapshot.add_session(NORMAL_TEST_SESSION)
-    snapshot.add_session(
-        ATTACK_TEST_SESSION,
-        device_id="esp32_02",
-        peer_ip="192.168.0.5",
-    )
+    _add_attack_session(snapshot)
 
     with pytest.raises(VerifiedCollectionImportError, match="FAILED"):
         _preflight(snapshot, _full_spec())
@@ -747,11 +746,7 @@ def test_preflight_rejects_processed_segment_without_feature(
     snapshot.add_session(NORMAL_TRAIN_SESSION, omit_feature_for_processed=True)
     snapshot.add_session(NORMAL_VALIDATION_SESSION)
     snapshot.add_session(NORMAL_TEST_SESSION)
-    snapshot.add_session(
-        ATTACK_TEST_SESSION,
-        device_id="esp32_02",
-        peer_ip="192.168.0.5",
-    )
+    _add_attack_session(snapshot)
 
     with pytest.raises(VerifiedCollectionImportError, match="PROCESSED"):
         _preflight(snapshot, _full_spec())
@@ -767,11 +762,7 @@ def test_preflight_rejects_empty_segment_with_feature(
     )
     snapshot.add_session(NORMAL_VALIDATION_SESSION)
     snapshot.add_session(NORMAL_TEST_SESSION)
-    snapshot.add_session(
-        ATTACK_TEST_SESSION,
-        device_id="esp32_02",
-        peer_ip="192.168.0.5",
-    )
+    _add_attack_session(snapshot)
 
     with pytest.raises(VerifiedCollectionImportError, match="EMPTY"):
         _preflight(snapshot, _full_spec())
@@ -786,11 +777,7 @@ def test_preflight_accepts_empty_segment_without_feature(
     )
     snapshot.add_session(NORMAL_VALIDATION_SESSION)
     snapshot.add_session(NORMAL_TEST_SESSION)
-    snapshot.add_session(
-        ATTACK_TEST_SESSION,
-        device_id="esp32_02",
-        peer_ip="192.168.0.5",
-    )
+    _add_attack_session(snapshot)
 
     plan = _preflight(snapshot, _full_spec())
     train = plan.session_by_id(NORMAL_TRAIN_SESSION)
@@ -809,11 +796,7 @@ def test_preflight_rejects_window_gap(snapshot: SnapshotBuilder) -> None:
     )
     snapshot.add_session(NORMAL_VALIDATION_SESSION)
     snapshot.add_session(NORMAL_TEST_SESSION)
-    snapshot.add_session(
-        ATTACK_TEST_SESSION,
-        device_id="esp32_02",
-        peer_ip="192.168.0.5",
-    )
+    _add_attack_session(snapshot)
 
     with pytest.raises(VerifiedCollectionImportError, match="contiguous"):
         _preflight(snapshot, _full_spec())
@@ -825,11 +808,7 @@ def test_preflight_rejects_feature_segment_window_mismatch(
     snapshot.add_session(NORMAL_TRAIN_SESSION, feature_window_shift_seconds=10)
     snapshot.add_session(NORMAL_VALIDATION_SESSION)
     snapshot.add_session(NORMAL_TEST_SESSION)
-    snapshot.add_session(
-        ATTACK_TEST_SESSION,
-        device_id="esp32_02",
-        peer_ip="192.168.0.5",
-    )
+    _add_attack_session(snapshot)
 
     with pytest.raises(VerifiedCollectionImportError, match="window"):
         _preflight(snapshot, _full_spec())
@@ -839,11 +818,7 @@ def test_preflight_rejects_no_eligible_rows(snapshot: SnapshotBuilder) -> None:
     snapshot.add_session(NORMAL_TRAIN_SESSION, feature_direction="OUTBOUND")
     snapshot.add_session(NORMAL_VALIDATION_SESSION)
     snapshot.add_session(NORMAL_TEST_SESSION)
-    snapshot.add_session(
-        ATTACK_TEST_SESSION,
-        device_id="esp32_02",
-        peer_ip="192.168.0.5",
-    )
+    _add_attack_session(snapshot)
 
     with pytest.raises(VerifiedCollectionImportError, match="eligible"):
         _preflight(snapshot, _full_spec())
@@ -855,11 +830,7 @@ def test_preflight_rejects_ineligible_capture_timing(
     snapshot.add_session(NORMAL_TRAIN_SESSION, duration=7.5)
     snapshot.add_session(NORMAL_VALIDATION_SESSION)
     snapshot.add_session(NORMAL_TEST_SESSION)
-    snapshot.add_session(
-        ATTACK_TEST_SESSION,
-        device_id="esp32_02",
-        peer_ip="192.168.0.5",
-    )
+    _add_attack_session(snapshot)
 
     with pytest.raises(VerifiedCollectionImportError, match="eligible"):
         _preflight(snapshot, _full_spec())
@@ -869,11 +840,7 @@ def test_preflight_rejects_device_ip_mismatch(snapshot: SnapshotBuilder) -> None
     snapshot.add_session(NORMAL_TRAIN_SESSION, feature_peer_ip="192.168.0.99")
     snapshot.add_session(NORMAL_VALIDATION_SESSION)
     snapshot.add_session(NORMAL_TEST_SESSION)
-    snapshot.add_session(
-        ATTACK_TEST_SESSION,
-        device_id="esp32_02",
-        peer_ip="192.168.0.5",
-    )
+    _add_attack_session(snapshot)
 
     with pytest.raises(VerifiedCollectionImportError, match="eligible"):
         _preflight(snapshot, _full_spec())
@@ -889,13 +856,12 @@ def test_preflight_rejects_collection_device_not_matching_rows(
     )
     snapshot.add_session(NORMAL_VALIDATION_SESSION)
     snapshot.add_session(NORMAL_TEST_SESSION)
-    snapshot.add_session(
-        ATTACK_TEST_SESSION,
-        device_id="esp32_02",
-        peer_ip="192.168.0.5",
-    )
+    _add_attack_session(snapshot)
 
-    with pytest.raises(VerifiedCollectionImportError, match="collection_device_id"):
+    with pytest.raises(
+        VerifiedCollectionImportError,
+        match="no eligible rows for the declared export Device",
+    ):
         _preflight(snapshot, _full_spec())
 
 
@@ -906,11 +872,7 @@ def test_preflight_rejects_missing_pcap(snapshot: SnapshotBuilder) -> None:
     snapshot.add_session(NORMAL_TRAIN_SESSION, write_pcap=False)
     snapshot.add_session(NORMAL_VALIDATION_SESSION)
     snapshot.add_session(NORMAL_TEST_SESSION)
-    snapshot.add_session(
-        ATTACK_TEST_SESSION,
-        device_id="esp32_02",
-        peer_ip="192.168.0.5",
-    )
+    _add_attack_session(snapshot)
 
     with pytest.raises(VerifiedCollectionImportError, match="PCAP"):
         _preflight(snapshot, _full_spec())
@@ -930,11 +892,7 @@ def test_preflight_rejects_pcap_filename_metadata_mismatch(
     snapshot.add_session(NORMAL_TRAIN_SESSION, pcap_filename_override=bogus)
     snapshot.add_session(NORMAL_VALIDATION_SESSION)
     snapshot.add_session(NORMAL_TEST_SESSION)
-    snapshot.add_session(
-        ATTACK_TEST_SESSION,
-        device_id="esp32_02",
-        peer_ip="192.168.0.5",
-    )
+    _add_attack_session(snapshot)
 
     with pytest.raises(VerifiedCollectionImportError, match="PCAP"):
         _preflight(snapshot, _full_spec())
@@ -1174,13 +1132,7 @@ def test_session_53_observation_is_recorded_without_claiming_a_cause(
     snapshot.add_session(NORMAL_TRAIN_SESSION)
     snapshot.add_session(NORMAL_VALIDATION_SESSION)
     snapshot.add_session(NORMAL_TEST_SESSION)
-    snapshot.add_session(
-        ATTACK_TEST_SESSION,
-        device_id="esp32_02",
-        peer_ip="192.168.0.5",
-        segments=2,
-        packet_count=440,
-    )
+    _add_attack_session(snapshot)
     payload = _full_spec()
     payload["sessions"][-1]["sender_reported_packets"] = 960
 
@@ -1221,7 +1173,7 @@ def test_collection_manifest_records_retrospective_payload_provenance(
     )
 
     assert collection.payload_schema_provenance.value == (
-        "RETROSPECTIVE_SOURCE_AND_PCAP_VERIFICATION"
+        "RETROSPECTIVE_OPERATOR_ATTESTED_WITH_PCAP_INVENTORY"
     )
     assert collection.firmware_reported_payload_schema_version is None
     assert collection.provenance_mode.value == "VERIFIED_RETROSPECTIVE_IMPORT"
@@ -1512,8 +1464,8 @@ def _export_from_package(package: Path, snapshot: SnapshotBuilder, tmp_path: Pat
             )
         )
 
-    engine = create_engine(f"sqlite:///{package / 'db-snapshot.db'}")
-    session_factory = sessionmaker(bind=engine)
+    snapshot_path = (package / "db-snapshot.db").resolve()
+    engine, session_factory = exporter._snapshot_session_factory(snapshot_path)
     try:
         with session_factory() as db:
             return export_packet_if_dataset(
@@ -1524,6 +1476,7 @@ def _export_from_package(package: Path, snapshot: SnapshotBuilder, tmp_path: Pat
                 capture_filter=spec_payload["capture_filter"],
                 source_commit_sha=spec_payload["source_commit_sha"],
                 capture_policy=CapturePolicy(),
+                db_snapshot_sha256=spec_payload["db_snapshot_sha256"],
             )
     finally:
         engine.dispose()
@@ -1663,3 +1616,603 @@ def test_backup_api_snapshot_is_accepted(tmp_path: Path) -> None:
         assert connection.execute("SELECT count(*) FROM devices").fetchone()[0] == 1
     finally:
         connection.close()
+
+
+# --- Fix 5: window bounds, background, and export row filtering ---------------
+
+
+def test_normal_session_background_traffic_is_detected_and_excluded(
+    snapshot: SnapshotBuilder,
+) -> None:
+    """A normal Session with another registered Device present is not rejected.
+
+    The extra Device's rows must stay out of the export while still marking
+    background_traffic_present, exactly like the attack case.
+    """
+    snapshot.add_session(
+        NORMAL_TRAIN_SESSION,
+        extra_device=("esp32_02", "192.168.0.5"),
+    )
+    snapshot.add_session(NORMAL_VALIDATION_SESSION)
+    snapshot.add_session(NORMAL_TEST_SESSION)
+    _add_attack_session(snapshot)
+
+    plan = _preflight(snapshot, _full_spec())
+    train = plan.session_by_id(NORMAL_TRAIN_SESSION)
+
+    assert train.background_traffic_present is True
+    assert train.included_device_ids == ("esp32_01",)
+    assert train.device_ips == {"esp32_01": "192.168.0.4"}
+    # 2 Segment × esp32_01 Row 1개. esp32_02 Row는 Export되지 않는다.
+    assert train.eligible_row_count == 2
+
+
+def test_attack_session_without_rows_for_the_declared_target_ip_is_rejected(
+    snapshot: SnapshotBuilder,
+) -> None:
+    """Eligible rows alone are not enough; they must be the declared target's.
+
+    Here the attack Session carries only eligible esp32_01/192.168.0.4 rows, so
+    the declared esp32_02/192.168.0.5 target has nothing to export and the
+    Session must not be silently published with someone else's traffic.
+    """
+    snapshot.add_session(NORMAL_TRAIN_SESSION)
+    snapshot.add_session(NORMAL_VALIDATION_SESSION)
+    snapshot.add_session(NORMAL_TEST_SESSION)
+    _add_attack_session(snapshot, device_id="esp32_01", peer_ip="192.168.0.4")
+
+    with pytest.raises(
+        VerifiedCollectionImportError,
+        match="no eligible rows for the declared export Device",
+    ):
+        _preflight(snapshot, _full_spec())
+
+
+def test_attack_export_excludes_background_rows_from_other_devices(
+    snapshot: SnapshotBuilder,
+) -> None:
+    """Background esp32_01 rows are counted for the flag but never exported."""
+    snapshot.add_session(NORMAL_TRAIN_SESSION)
+    snapshot.add_session(NORMAL_VALIDATION_SESSION)
+    snapshot.add_session(NORMAL_TEST_SESSION)
+    _add_attack_session(snapshot, extra_device=("esp32_01", "192.168.0.4"))
+
+    plan = _preflight(snapshot, _full_spec())
+    attack = plan.session_by_id(ATTACK_TEST_SESSION)
+
+    assert attack.background_traffic_present is True
+    assert attack.included_device_ids == ("esp32_02",)
+    assert attack.device_ips == {"esp32_02": "192.168.0.5"}
+    # Gateway 관측 880개만 집계되고 esp32_01 Background는 제외된다.
+    assert attack.feature_packet_count == SESSION_53_GATEWAY_PACKETS
+
+
+def test_preflight_rejects_first_segment_not_matching_first_window_start(
+    snapshot: SnapshotBuilder,
+) -> None:
+    _seed_full_batch(snapshot)
+    engine = create_engine(f"sqlite:///{snapshot._working_db}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                UPDATE packet_capture_sessions
+                SET first_window_start = :shifted
+                WHERE session_id = :session_id
+                """
+            ),
+            {
+                "shifted": _iso(BASE_TIME + timedelta(seconds=10)),
+                "session_id": NORMAL_TRAIN_SESSION,
+            },
+        )
+    engine.dispose()
+    snapshot._dirty = True
+
+    with pytest.raises(
+        VerifiedCollectionImportError,
+        match="first Segment window_start must equal",
+    ):
+        _preflight(snapshot, _full_spec())
+
+
+def test_preflight_rejects_last_segment_after_session_ended_at(
+    snapshot: SnapshotBuilder,
+) -> None:
+    _seed_full_batch(snapshot)
+    engine = create_engine(f"sqlite:///{snapshot._working_db}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                UPDATE packet_capture_sessions
+                SET ended_at = :early
+                WHERE session_id = :session_id
+                """
+            ),
+            {
+                "early": _iso(BASE_TIME + timedelta(seconds=10)),
+                "session_id": NORMAL_TRAIN_SESSION,
+            },
+        )
+    engine.dispose()
+    snapshot._dirty = True
+
+    with pytest.raises(
+        VerifiedCollectionImportError,
+        match="last Segment window_end must not be later",
+    ):
+        _preflight(snapshot, _full_spec())
+
+
+# --- Fix 4 and 6: pinned Session 53 evidence and batch constants --------------
+
+
+def test_attack_spec_requires_pinned_sender_reported_packets() -> None:
+    payload = _spec_payload(
+        [
+            _session_entry(NORMAL_TRAIN_SESSION, slot="slot-01", split="train"),
+            _session_entry(
+                NORMAL_VALIDATION_SESSION,
+                slot="slot-02",
+                split="validation",
+            ),
+            _session_entry(NORMAL_TEST_SESSION, slot="slot-03", split="test"),
+            _attack_entry(sender_reported_packets=900),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="sender_reported_packets must be 960"):
+        VerifiedCollectionImportSpec.from_json(json.dumps(payload))
+
+
+def test_attack_spec_requires_unresolved_gap_cause() -> None:
+    payload = _spec_payload(
+        [
+            _session_entry(NORMAL_TRAIN_SESSION, slot="slot-01", split="train"),
+            _session_entry(
+                NORMAL_VALIDATION_SESSION,
+                slot="slot-02",
+                split="validation",
+            ),
+            _session_entry(NORMAL_TEST_SESSION, slot="slot-03", split="test"),
+            _attack_entry(observation_gap_cause="WIFI_LOSS"),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="observation_gap_cause"):
+        VerifiedCollectionImportSpec.from_json(json.dumps(payload))
+
+
+def test_preflight_rejects_attack_gateway_count_other_than_880(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    snapshot.add_session(NORMAL_TRAIN_SESSION)
+    snapshot.add_session(NORMAL_VALIDATION_SESSION)
+    snapshot.add_session(NORMAL_TEST_SESSION)
+    _add_attack_session(snapshot, packet_count=100)
+
+    plan = _preflight(snapshot, _full_spec())
+
+    with pytest.raises(
+        VerifiedCollectionImportError,
+        match="verified Session 53 evidence",
+    ):
+        write_verified_collection_package(
+            plan,
+            db_snapshot=snapshot.db_path,
+            processed_pcap_dir=snapshot.pcap_dir,
+            output_root=tmp_path / "exports",
+            verified_at=BASE_TIME + timedelta(days=3),
+        )
+
+
+def test_session_53_pinned_counts_are_published(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+
+    package = _write_package(snapshot, tmp_path)
+    collection = VerifiedCollectionManifest.from_json(
+        (
+            package
+            / "runs"
+            / "verified-packet-rate-flood-test-01"
+            / "verified-collection-manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert collection.observation.sender_reported_packets == 960
+    assert collection.observation.gateway_observed_packets == 880
+    assert collection.observation.feature_packet_count == 880
+    assert collection.observation.observation_gap_packets == 80
+    assert collection.observation.observation_gap_cause == "UNRESOLVED"
+
+
+def test_spec_rejects_other_normal_policy_version() -> None:
+    payload = _spec_payload(
+        [_session_entry(NORMAL_TRAIN_SESSION, slot="slot-01", split="train")],
+        normal_policy_version="phase5-normal-policy-v1.0",
+    )
+
+    with pytest.raises(ValueError, match="normal_policy_version"):
+        VerifiedCollectionImportSpec.from_json(json.dumps(payload))
+
+
+def test_spec_rejects_other_capture_filter() -> None:
+    payload = _spec_payload(
+        [_session_entry(NORMAL_TRAIN_SESSION, slot="slot-01", split="train")],
+        capture_filter="tcp",
+    )
+
+    with pytest.raises(ValueError, match="capture_filter"):
+        VerifiedCollectionImportSpec.from_json(json.dumps(payload))
+
+
+def test_preflight_rejects_relative_db_snapshot_before_resolving(
+    snapshot: SnapshotBuilder,
+) -> None:
+    """A relative path must be refused as given, not completed against CWD."""
+    with pytest.raises(ValueError, match="absolute"):
+        preflight_verified_collection(
+            db_snapshot=Path("relative/iot_security.snapshot.db"),
+            processed_pcap_dir=snapshot.pcap_dir,
+            spec=VerifiedCollectionImportSpec.from_json(json.dumps(_full_spec())),
+            verification_commit_sha=VERIFICATION_COMMIT,
+            capture_policy=CapturePolicy(),
+        )
+
+
+# --- Fix 1: full Dataset/Collection field comparison -------------------------
+
+# 아래 9개는 Collection Manifest 내부 계약을 깨지 않고 단독으로 바꿀 수 있다.
+# traffic_label은 단독 변경이 불가능하다 (attack은 test Split·Target·공격
+# Scenario를 함께 요구한다). 그래서 아래에서 결합 변경으로 따로 검증한다.
+_TAMPERABLE_COLLECTION_FIELDS = (
+    ("split", "validation"),
+    ("collection_slot_id", "normal-stable-train-99"),
+    ("source_capture_group_id", "55555555-5555-4555-8555-555555555555"),
+    ("normal_policy_version", "phase5-normal-policy-v9.9"),
+    ("firmware_version", "phase5-normal-pilot-v9"),
+    ("payload_schema_version", "phase5-normal-payload-v9"),
+    ("background_traffic_present", True),
+    ("capture_source_commit_sha", "f" * 40),
+    ("capture_filter", "tcp"),
+)
+
+
+def _train_collection_path(package: Path) -> Path:
+    return (
+        package
+        / "runs"
+        / "verified-normal-stable-train-01"
+        / "verified-collection-manifest.json"
+    )
+
+
+def _retamper_collection(
+    package: Path,
+    changes: dict,
+    *,
+    dataset_manifest_path: Path | None = None,
+) -> None:
+    """Rewrite Collection Manifest fields and refresh the whole hash chain.
+
+    The Manifest, its sidecar, the Run Manifest reference, the Export Spec, and
+    optionally the already-written Dataset Manifest are all updated so every
+    SHA256 still verifies. That leaves the field-by-field Dataset comparison as
+    the only thing that can catch the change, which is the point of these tests.
+    """
+    collection_path = _train_collection_path(package)
+    payload = json.loads(collection_path.read_text(encoding="utf-8"))
+    payload.update(changes)
+    if "payload_schema_version" in changes:
+        # FIRMWARE_REPORTED provenance는 두 값이 같아야 한다.
+        payload["firmware_reported_payload_schema_version"] = changes[
+            "payload_schema_version"
+        ]
+    collection = VerifiedCollectionManifest.from_dict(payload)
+    collection_path.write_text(collection.to_json(), encoding="utf-8")
+    digest = importer.verified_collection_sha256(collection)
+    Path(f"{collection_path}.sha256").write_text(f"{digest}\n", encoding="ascii")
+
+    run_path = collection_path.parent / "run-manifest.json"
+    run_payload = json.loads(run_path.read_text(encoding="utf-8"))
+    run_payload["session_manifest_ref"]["sha256"] = digest
+    run_manifest = RunManifest.from_json(json.dumps(run_payload))
+    run_path.write_text(run_manifest.to_json(), encoding="utf-8")
+    run_digest = importer.run_manifest_sha256(run_manifest)
+    Path(f"{run_path}.sha256").write_text(f"{run_digest}\n", encoding="ascii")
+
+    spec_path = package / "packet-if-export-spec-v2.json"
+    spec_payload = json.loads(spec_path.read_text(encoding="utf-8"))
+    for entry in spec_payload["sessions"]:
+        if entry["session_id"] == NORMAL_TRAIN_SESSION:
+            entry["run_manifest_ref"]["sha256"] = run_digest
+    spec_path.write_text(json.dumps(spec_payload, indent=2), encoding="utf-8")
+
+    if dataset_manifest_path is not None:
+        dataset_payload = json.loads(
+            dataset_manifest_path.read_text(encoding="utf-8")
+        )
+        for entry in dataset_payload["sessions"]:
+            if entry["session_id"] == NORMAL_TRAIN_SESSION:
+                entry["run_manifest_ref"]["sha256"] = run_digest
+        dataset_manifest_path.write_text(
+            json.dumps(dataset_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        # Dataset Manifest를 고쳤으므로 Dataset CSV Hash는 그대로 두고
+        # Manifest 자체만 갱신된다. Loader는 CSV Hash를 Manifest에서 읽는다.
+
+
+@pytest.mark.parametrize("field_name,value", _TAMPERABLE_COLLECTION_FIELDS)
+def test_export_rejects_collection_field_mismatch(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+    field_name: str,
+    value,
+) -> None:
+    """Every compared field must fail the Export path when it disagrees."""
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+    _retamper_collection(package, {field_name: value})
+
+    with pytest.raises(ValueError, match="does not match the Dataset Session"):
+        _export_from_package(package, snapshot, tmp_path)
+
+
+@pytest.mark.parametrize("field_name,value", _TAMPERABLE_COLLECTION_FIELDS)
+def test_dataset_load_rejects_collection_field_mismatch(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+    field_name: str,
+    value,
+) -> None:
+    """The same comparison must also run when the Dataset is loaded."""
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+    result = _export_from_package(package, snapshot, tmp_path)
+    _retamper_collection(
+        package,
+        {field_name: value},
+        dataset_manifest_path=result.manifest_path,
+    )
+
+    with pytest.raises(ValueError, match="does not match the Dataset Session"):
+        load_packet_if_dataset(result.output_path, result.manifest_path)
+
+
+def test_export_rejects_collection_traffic_label_mismatch(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    """traffic_label cannot be forged alone, so it is checked as a coupled change.
+
+    Declaring `attack` in the Collection Manifest drags along the test Split,
+    the attack Scenario, and the Target fields. The Dataset Session still says
+    normal/train, so the comparison must reject it.
+    """
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+    _retamper_collection(
+        package,
+        {
+            "traffic_label": "attack",
+            "split": "test",
+            "scenario": "packet_rate_flood",
+            "collection_device_id": "esp32_02",
+            "target_device_id": "esp32_02",
+            "target_source_ip": "192.168.0.5",
+            "included_device_ids": ["esp32_02"],
+        },
+    )
+
+    with pytest.raises(ValueError):
+        _export_from_package(package, snapshot, tmp_path)
+
+
+def test_matching_collection_passes_all_compared_fields(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+
+    result = _export_from_package(package, snapshot, tmp_path)
+    dataset = load_packet_if_dataset(result.output_path, result.manifest_path)
+
+    assert len(dataset.manifest.sessions) == 4
+
+
+# --- Fix 2: Dataset Export bound to the Package Snapshot ---------------------
+
+
+def test_export_spec_declares_package_snapshot_sha256(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+
+    package = _write_package(snapshot, tmp_path)
+    spec_payload = _read_json(package / "packet-if-export-spec-v2.json")
+
+    assert spec_payload["db_snapshot_sha256"] == file_sha256(
+        package / "db-snapshot.db"
+    )
+
+
+def test_dataset_manifest_preserves_db_snapshot_sha256(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+
+    result = _export_from_package(package, snapshot, tmp_path)
+    manifest = _read_json(result.manifest_path)
+
+    assert manifest["db_snapshot_sha256"] == file_sha256(
+        package / "db-snapshot.db"
+    )
+
+
+def test_export_rejects_snapshot_that_differs_from_collection_manifest(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    """Exporting from a Snapshot the Collection Manifest never saw is refused."""
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+
+    with pytest.raises(
+        ValueError,
+        match="db_snapshot_sha256 does not match the Snapshot this Export read",
+    ):
+        _export_from_package_with_snapshot_sha256(package, "f" * 64)
+
+
+def _export_from_package_with_snapshot_sha256(package: Path, sha256: str):
+    spec_payload = _read_json(package / "packet-if-export-spec-v2.json")
+    annotations = []
+    for entry in spec_payload["sessions"]:
+        annotations.append(
+            PacketIFSessionAnnotation(
+                session_id=entry["session_id"],
+                split=entry["split"],
+                traffic_label=entry["traffic_label"],
+                scenario=entry["scenario"],
+                target_device_id=entry["target_device_id"],
+                collection_slot_id=entry["collection_slot_id"],
+                source_capture_group_id=entry["source_capture_group_id"],
+                run_manifest_ref=PacketIFRunManifestReference.from_dict(
+                    entry["run_manifest_ref"]
+                ),
+                run_manifest_path=(package / entry["run_manifest_path"]).resolve(),
+                normal_policy_version=entry["normal_policy_version"],
+                firmware_version=entry["firmware_version"],
+                payload_schema_version=entry["payload_schema_version"],
+                target_source_ip=entry["target_source_ip"],
+                included_device_ids=tuple(entry["included_device_ids"]),
+                background_traffic_present=entry["background_traffic_present"],
+                source_commit_sha=entry["source_commit_sha"],
+            )
+        )
+    snapshot_path = (package / "db-snapshot.db").resolve()
+    engine, session_factory = exporter._snapshot_session_factory(snapshot_path)
+    try:
+        with session_factory() as db:
+            return export_packet_if_dataset(
+                db,
+                output_path=package / "mismatch.csv",
+                manifest_path=package / "mismatch-manifest.json",
+                session_annotations=annotations,
+                capture_filter=spec_payload["capture_filter"],
+                source_commit_sha=spec_payload["source_commit_sha"],
+                capture_policy=CapturePolicy(),
+                db_snapshot_sha256=sha256,
+            )
+    finally:
+        engine.dispose()
+
+
+def test_snapshot_session_factory_rejects_relative_path() -> None:
+    with pytest.raises(ValueError, match="absolute"):
+        exporter._snapshot_session_factory(Path("relative/db-snapshot.db"))
+
+
+def test_snapshot_session_factory_is_query_only(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+
+    engine, session_factory = exporter._snapshot_session_factory(
+        (package / "db-snapshot.db").resolve()
+    )
+    try:
+        with session_factory() as db:
+            assert db.execute(text("PRAGMA query_only")).scalar() == 1
+            with pytest.raises(Exception):
+                db.execute(text("UPDATE devices SET trust_score = 1"))
+    finally:
+        engine.dispose()
+
+
+def test_export_cli_requires_db_snapshot_when_spec_declares_one(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+
+    with pytest.raises(ValueError, match="--db-snapshot is required"):
+        exporter.main(
+            [
+                "--output",
+                str(tmp_path / "out.csv"),
+                "--manifest-output",
+                str(tmp_path / "out-manifest.json"),
+                "--spec",
+                str(package / "packet-if-export-spec-v2.json"),
+            ]
+        )
+
+
+def test_export_cli_rejects_snapshot_not_matching_spec(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+    other = tmp_path / "other-snapshot.db"
+    other.write_bytes((package / "db-snapshot.db").read_bytes() + b"\x00")
+
+    with pytest.raises(ValueError, match="does not match the Export Spec"):
+        exporter.main(
+            [
+                "--output",
+                str(tmp_path / "out.csv"),
+                "--manifest-output",
+                str(tmp_path / "out-manifest.json"),
+                "--spec",
+                str(package / "packet-if-export-spec-v2.json"),
+                "--db-snapshot",
+                str(other.resolve()),
+            ]
+        )
+
+
+def test_export_cli_exports_from_package_snapshot(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+    # Dataset Manifest는 Package Root에 둔다. run_manifest_ref.relative_path가
+    # Manifest Directory 기준이라 Runbook도 같은 위치를 지정한다.
+    output = package / "cli-dataset.csv"
+    manifest_output = package / "cli-dataset-manifest.json"
+
+    exit_code = exporter.main(
+        [
+            "--output",
+            str(output),
+            "--manifest-output",
+            str(manifest_output),
+            "--spec",
+            str(package / "packet-if-export-spec-v2.json"),
+            "--db-snapshot",
+            str((package / "db-snapshot.db").resolve()),
+        ]
+    )
+
+    assert exit_code == 0
+    manifest = _read_json(manifest_output)
+    assert manifest["db_snapshot_sha256"] == file_sha256(package / "db-snapshot.db")
+    dataset = load_packet_if_dataset(output, manifest_output)
+    assert len(dataset.manifest.sessions) == 4

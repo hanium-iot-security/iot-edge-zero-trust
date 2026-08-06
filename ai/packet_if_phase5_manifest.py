@@ -19,6 +19,7 @@ from edge.phase5.contracts import (
 )
 from edge.phase5.verified_collection_contract import (
     VERIFIED_COLLECTION_SCHEMA_VERSION,
+    DatasetSessionIdentity,
     VerifiedCollectionManifest,
     load_verified_collection_manifest,
     validate_verified_collection_identity,
@@ -176,6 +177,7 @@ def load_verified_session_manifest(
     target_device_id: str | None,
     target_source_ip: str | None,
     included_device_ips: Mapping[str, str],
+    dataset_identity: DatasetSessionIdentity | None = None,
     required: bool = False,
 ) -> VerifiedCollectionManifest | None:
     """Verify the Run Manifest's Verified Collection reference, when present.
@@ -220,6 +222,7 @@ def load_verified_session_manifest(
         target_device_id=target_device_id,
         target_source_ip=target_source_ip,
         included_device_ips=included_device_ips,
+        dataset_identity=dataset_identity,
     )
     return collection
 

@@ -123,7 +123,7 @@ Segment·Feature 집계는 Importer가 검증 결과로 결정한다.
       "target_source_ip": "192.168.0.5",
       "firmware_version": "phase5-packet-rate-sender-v2",
       "payload_schema_version": "phase5-packet-rate-udp-payload-v1",
-      "payload_schema_provenance": "RETROSPECTIVE_SOURCE_AND_PCAP_VERIFICATION",
+      "payload_schema_provenance": "RETROSPECTIVE_OPERATOR_ATTESTED_WITH_PCAP_INVENTORY",
       "capture_source_commit_sha": "a4b0be29a8353f3b516808e2ed945b6cb251ac61",
       "sender_reported_packets": 960
     }
@@ -136,9 +136,22 @@ Segment·Feature 집계는 Importer가 검증 결과로 결정한다.
 | 필드 | 언제 쓰나 |
 | --- | --- |
 | `source_capture_group_id` | 같은 원본 Capture에서 여러 Session이 파생된 증적이 있을 때만. 생략하면 `session_id` |
-| `sender_reported_packets` | ESP32 Serial 로그의 송신 성공 수. DB에서 유도할 수 없다 |
-| `observation_gap_cause` | 생략하면 `UNRESOLVED` |
+| `sender_reported_packets` | ESP32 Serial 로그의 송신 성공 수. DB에서 유도할 수 없다. **Session 53은 `960` 필수** |
+| `observation_gap_cause` | 생략하면 `UNRESOLVED`. Session 53은 `UNRESOLVED` 외의 값을 거부한다 |
 | `gateway_first_attack_packet_at` | Gateway에서 확인한 첫 공격 Packet 절대 UTC 시각 |
+
+### 고정된 값
+
+아래는 Import Spec에서 바꿀 수 없다. 다른 값을 쓰면 Batch 전체가 거부된다.
+
+| 항목 | 고정값 |
+| --- | --- |
+| `normal_policy_version` | `phase5-normal-policy-v1.1` |
+| `capture_filter` | `tcp or udp` |
+| Session 53 `sender_reported_packets` | `960` |
+| Session 53 Gateway 관측·Feature Packet 수 | `880` (Snapshot에서 계산) |
+| Session 53 `observation_gap_packets` | `80` |
+| Session 53 `observation_gap_cause` | `UNRESOLVED` |
 
 **소스·노션·인계 패키지에서 확인되지 않는 필수값은 임의로 만들지 않는다. 해당
 Batch 전체를 HOLD한다.**
@@ -215,8 +228,8 @@ SHA256·Segment 식별자만 기록하고 원본은 `data/pcap/processed`의 기
 
 ## 8. Dataset v2 Export
 
-생성된 Export Spec을 그대로 쓰고 같은 Package의 Snapshot을 조회한다. 같은 값을
-다시 손으로 입력하지 않는다.
+생성된 Export Spec을 그대로 쓰고 **같은 Package의 Snapshot을 `--db-snapshot`으로
+직접 지정한다.** 같은 값을 다시 손으로 입력하지 않는다.
 
 ```bash
 PACKAGE=/home/pi/iot-edge-zero-trust/data/exports/packet-if-v2-verified-001
@@ -224,15 +237,33 @@ PACKAGE=/home/pi/iot-edge-zero-trust/data/exports/packet-if-v2-verified-001
 python -m ai.export_packet_if_dataset \
   --output "$PACKAGE/packet-if-dataset-v2.csv" \
   --manifest-output "$PACKAGE/packet-if-dataset-v2-manifest.json" \
-  --spec "$PACKAGE/packet-if-export-spec-v2.json"
+  --spec "$PACKAGE/packet-if-export-spec-v2.json" \
+  --db-snapshot "$PACKAGE/db-snapshot.db"
 ```
 
-> `export_packet_if_dataset`의 CLI는 `DATABASE_URL`이 가리키는 DB를 사용한다.
-> Package Snapshot을 조회하려면 실행 전에
-> `DATABASE_URL=sqlite:///$PACKAGE/db-snapshot.db`를 지정한다.
+Dataset Manifest는 **Package Root에 둔다.** `run_manifest_ref.relative_path`가
+Manifest Directory 기준 상대경로이므로 다른 위치에 쓰면 참조가 풀리지 않는다.
+
+`--db-snapshot`은 환경변수 편의 기능이 아니라 계약이다.
+
+- 절대경로만 받는다. 상대경로는 `resolve` 전에 거부한다.
+- `mode=ro` + `PRAGMA query_only=ON`으로 열어 Export가 DB에 쓸 수 없다.
+- 실제 파일 SHA256을 계산해 Export Spec의 `db_snapshot_sha256`과 대조한다.
+- 각 Session의 Collection Manifest에 기록된 `db_snapshot_sha256`과도 대조한다.
+- 결과 Dataset Manifest 최상위에 `db_snapshot_sha256`을 보존한다.
+
+Export Spec에 `db_snapshot_sha256`이 있는데 `--db-snapshot`을 생략하면 Export가
+거부된다. 어떤 DB를 읽었는지 증명하지 못한 Dataset은 만들지 않는다.
 
 Dataset Load 시 `Dataset → Run Manifest → Collection Manifest → Evidence` SHA256
-연쇄가 자동 검증된다. 어느 한 단계라도 변조되면 Load가 실패한다.
+연쇄와 아래 Session 필드 일치가 자동 검증된다. 어느 한 단계라도 어긋나면 Load가
+실패한다.
+
+```text
+split, traffic_label, collection_slot_id, source_capture_group_id,
+normal_policy_version, firmware_version, payload_schema_version,
+background_traffic_present, source_commit_sha, capture_filter
+```
 
 ## 9. PASS / HOLD / FAIL 판정
 
@@ -264,8 +295,20 @@ Truth는 Gateway가 실제 관측하고 Feature와 일치한 **880개**다.
 표현한다. 이 한 Session만으로 일반화된 공격 탐지율을 주장하지 않는다.
 
 Session 53 수집 당시 Firmware는 Payload Schema Version을 Serial에 출력하지 않았다.
-`phase5-packet-rate-udp-payload-v1`은 Source와 PCAP Byte 구조를 사후 검증해 이름을
-부여한 계약이며, Manifest의 `firmware_reported_payload_schema_version`은 `null`이다.
+`phase5-packet-rate-udp-payload-v1`은 운영자가 Firmware Source를 읽고 사후에 부여한
+이름이며, Manifest의 `firmware_reported_payload_schema_version`은 `null`이다.
+
+```text
+payload_schema_provenance = RETROSPECTIVE_OPERATOR_ATTESTED_WITH_PCAP_INVENTORY
+```
+
+**이 Importer는 PCAP Payload Byte를 파싱하지 않는다.** PCAP에 대해 수행하는 것은
+존재 확인, 크기, SHA256, 파일명 Metadata 대조까지다. 어떤 Packet이 선언된 Schema와
+일치하는지는 검사하지 않는다. 따라서 이 값은 **파일 Inventory로 뒷받침된 운영자
+진술**이지 Payload 내용의 자동 검증 결과가 아니다.
+
+보고서나 발표 자료에 "Payload 구조를 자동 검증했다"고 쓰지 않는다. 실제 Payload
+구조 검증이 필요하면 별도 작업으로 구현한 뒤 Provenance 값을 다시 올린다.
 
 ## 11. Rollback
 

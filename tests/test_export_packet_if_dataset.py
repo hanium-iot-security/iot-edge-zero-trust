@@ -373,12 +373,16 @@ def test_load_export_spec_parses_dataset_v2_session_contract(
         encoding="utf-8",
     )
 
-    capture_filter, source_sha, annotations = exporter._load_export_spec(
-        spec_path
-    )
+    (
+        capture_filter,
+        source_sha,
+        snapshot_sha256,
+        annotations,
+    ) = exporter._load_export_spec(spec_path)
 
     assert capture_filter == "tcp or udp"
     assert source_sha == "a" * 40
+    assert snapshot_sha256 is None
     assert len(annotations) == 1
     assert annotations[0].run_manifest_path == run_path.resolve()
     assert annotations[0].run_manifest_ref == run_reference
@@ -877,6 +881,8 @@ def _call_validate_run_manifests(
     manifest_path.write_text("{}", encoding="utf-8")
     exporter._validate_run_manifests_for_export(
         (annotation,),
+        capture_filter="tcp or udp",
+        source_commit_sha="a" * 40,
         exported_rows=[
             {
                 "session_id": SESSION_ID,
@@ -1359,7 +1365,12 @@ def test_export_spec_parses_optional_session_source_commit(tmp_path: Path) -> No
         encoding="utf-8",
     )
 
-    _capture_filter, top_level, annotations = exporter._load_export_spec(spec_path)
+    (
+        _capture_filter,
+        top_level,
+        _snapshot_sha256,
+        annotations,
+    ) = exporter._load_export_spec(spec_path)
 
     assert top_level == "c" * 40
     assert annotations[0].source_commit_sha == "a" * 40
