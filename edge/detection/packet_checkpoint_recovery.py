@@ -5,6 +5,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
+from pathlib import Path
+import stat
+import subprocess
 from datetime import datetime
 from typing import Mapping
 
@@ -68,3 +72,74 @@ def verify_plan_sha256(plan: Mapping[str, object]) -> None:
     actual = calculate_plan_sha256(plan)
     if not isinstance(expected, str) or not hmac.compare_digest(expected, actual):
         raise PacketCheckpointRecoveryError("plan SHA256 mismatch")
+
+
+def _git(repository_root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    ).stdout
+
+
+def _sha256_open_regular_file(path: Path, expected: os.stat_result) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise PacketCheckpointRecoveryError("untracked entry must be a regular file")
+        if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
+            raise PacketCheckpointRecoveryError("untracked entry changed before hashing")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _inventory_entry(repository_root: Path, relative_path: str) -> dict[str, object]:
+    relative = Path(relative_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise PacketCheckpointRecoveryError("invalid untracked repository path")
+    absolute = repository_root / relative
+    before = absolute.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise PacketCheckpointRecoveryError("untracked entry must be a regular file")
+    digest = _sha256_open_regular_file(absolute, before)
+    after = absolute.lstat()
+    identity_before = (
+        before.st_mode, before.st_dev, before.st_ino,
+        before.st_size, before.st_mtime_ns,
+    )
+    identity_after = (
+        after.st_mode, after.st_dev, after.st_ino,
+        after.st_size, after.st_mtime_ns,
+    )
+    if identity_before != identity_after:
+        raise PacketCheckpointRecoveryError("untracked file changed during inventory")
+    return {"path": relative.as_posix(), "size": after.st_size, "sha256": digest}
+
+
+def inspect_repository_state(repository_root: str | Path) -> dict[str, object]:
+    root = Path(repository_root).expanduser().resolve(strict=True)
+    commit = _git(root, "rev-parse", "HEAD").strip()
+    tracked = _git(root, "diff", "--name-only", "--").splitlines()
+    staged = _git(root, "diff", "--cached", "--name-only", "--").splitlines()
+    untracked = _git(
+        root, "ls-files", "--others", "--exclude-standard", "-z"
+    ).split("\0")
+    inventory = [_inventory_entry(root, path) for path in untracked if path]
+    if tracked or staged:
+        raise PacketCheckpointRecoveryError("tracked/staged worktree must be clean")
+    return {
+        "repository_root": str(root),
+        "repository_commit": commit,
+        "tracked_worktree_clean": True,
+        "staged_worktree_clean": True,
+        "untracked_inventory": sorted(inventory, key=lambda row: row["path"]),
+    }
