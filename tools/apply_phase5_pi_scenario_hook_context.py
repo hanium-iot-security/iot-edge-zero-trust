@@ -1,8 +1,9 @@
 """Apply the reviewed Phase 5 ScenarioHookContext wiring.
 
 This one-shot maintainer script performs exact, fail-closed replacements against
-run_scenario.py and the execution guide. It deletes itself after a successful
-application so it is not part of the final feature diff.
+run_scenario.py and the execution guide. Both files are fully preflighted in
+memory before either file is written. The script deletes itself only after a
+successful atomic application.
 """
 
 from __future__ import annotations
@@ -21,14 +22,12 @@ def replace_once(text: str, old: str, new: str, *, label: str) -> str:
     if count != 1:
         raise SystemExit(
             f"HOLD: {label} expected exactly once, found {count}. "
-            "Do not edit manually; compare the branch with develop first."
+            "No file was written. Compare the branch with develop first."
         )
     return text.replace(old, new, 1)
 
 
-def patch_runner() -> None:
-    text = RUNNER.read_text(encoding="utf-8")
-
+def patched_runner_text(text: str) -> str:
     text = replace_once(
         text,
         "import hashlib\nimport json\nimport re\n",
@@ -118,13 +117,10 @@ def patch_runner() -> None:
         "            )\n",
         label="cleanup context call",
     )
+    return text
 
-    RUNNER.write_text(text, encoding="utf-8", newline="\n")
 
-
-def patch_guide() -> None:
-    text = GUIDE.read_text(encoding="utf-8")
-
+def patched_guide_text(text: str) -> str:
     old = (
         "> `[TODO: 실기기 검증 필요]` `edge/scenarios/cleanup.py` 하단에 주석으로만 남아있는 "
         "`pi_baseline_check`/`pi_cleanup_hook` 예시 뼈대를 실제 구현으로 채우고 주석을 해제해야 위 명령이 동작한다. "
@@ -153,13 +149,19 @@ def patch_guide() -> None:
         "- 복구가 필요하면 증적 확인 후 기존 승인형 Firewall Release, Baseline Recovery, "
         "Trust Score Compensation 절차를 별도로 사용한다.\n\n"
     )
-    text = replace_once(text, marker, section + marker, label="guide safety section")
-    GUIDE.write_text(text, encoding="utf-8", newline="\n")
+    return replace_once(text, marker, section + marker, label="guide safety section")
 
 
 def main() -> int:
-    patch_runner()
-    patch_guide()
+    original_runner = RUNNER.read_text(encoding="utf-8")
+    original_guide = GUIDE.read_text(encoding="utf-8")
+
+    # Fail-closed preflight: no filesystem writes occur before both transforms pass.
+    new_runner = patched_runner_text(original_runner)
+    new_guide = patched_guide_text(original_guide)
+
+    RUNNER.write_text(new_runner, encoding="utf-8", newline="\n")
+    GUIDE.write_text(new_guide, encoding="utf-8", newline="\n")
     SELF.unlink()
     print("PHASE5_PI_SCENARIO_HOOK_CONTEXT_PATCH=PASS")
     return 0
