@@ -11,20 +11,13 @@
 #error "Set PACKET_RATE_CONFIGURED to 1 after reviewing the local firmware configuration."
 #endif
 
-#if PACKET_RATE_DEVICE_SLOT != 2
-#error "PACKET_RATE_DEVICE_SLOT must be 2. This firmware is restricted to esp32_02."
-#endif
-
-#if PACKET_RATE_TARGET_PORT < 1 || PACKET_RATE_TARGET_PORT > 65535
-#error "PACKET_RATE_TARGET_PORT must be between 1 and 65535."
-#endif
-
-#if PACKET_RATE_LOCAL_UDP_PORT < 1 || PACKET_RATE_LOCAL_UDP_PORT > 65535
-#error "PACKET_RATE_LOCAL_UDP_PORT must be between 1 and 65535."
-#endif
-
 const char* DEVICE_ID = "esp32_02";
-const char* FIRMWARE_VERSION = "phase5-packet-rate-sender-v1";
+const unsigned int DEVICE_SLOT = 2U;
+const char* EXPECTED_LOCAL_IP_TEXT = "192.168.0.5";
+const char* TARGET_IP_TEXT = "192.168.0.20";
+const uint16_t TARGET_UDP_PORT = 19999U;
+const uint16_t LOCAL_UDP_PORT = 42100U;
+const char* FIRMWARE_VERSION = "phase5-packet-rate-sender-v2";
 
 const unsigned long MIN_RATE_PPS = 1UL;
 const unsigned long MAX_RATE_PPS = 100UL;
@@ -106,15 +99,15 @@ void printBootContract() {
   Serial.print("device_id=");
   Serial.println(DEVICE_ID);
   Serial.print("device_slot=");
-  Serial.println(PACKET_RATE_DEVICE_SLOT);
+  Serial.println(DEVICE_SLOT);
   Serial.print("expected_local_ip=");
-  Serial.println(PACKET_RATE_EXPECTED_LOCAL_IP);
+  Serial.println(EXPECTED_LOCAL_IP_TEXT);
   Serial.print("target_ip=");
-  Serial.println(PACKET_RATE_TARGET_IP);
+  Serial.println(TARGET_IP_TEXT);
   Serial.print("target_port=");
-  Serial.println(PACKET_RATE_TARGET_PORT);
+  Serial.println(TARGET_UDP_PORT);
   Serial.print("local_udp_port=");
-  Serial.println(PACKET_RATE_LOCAL_UDP_PORT);
+  Serial.println(LOCAL_UDP_PORT);
   Serial.print("safety_max_pps=");
   Serial.println(MAX_RATE_PPS);
   Serial.print("safety_max_duration_sec=");
@@ -133,15 +126,15 @@ bool startUdpSocket() {
     return false;
   }
 
-  udpStarted = udp.begin(PACKET_RATE_LOCAL_UDP_PORT) == 1;
+  udpStarted = udp.begin(LOCAL_UDP_PORT) == 1;
   if (!udpStarted) {
     Serial.print("udp_start_failed local_port=");
-    Serial.println(PACKET_RATE_LOCAL_UDP_PORT);
+    Serial.println(LOCAL_UDP_PORT);
     return false;
   }
 
   Serial.print("udp_ready local_port=");
-  Serial.println(PACKET_RATE_LOCAL_UDP_PORT);
+  Serial.println(LOCAL_UDP_PORT);
   return true;
 }
 
@@ -181,7 +174,7 @@ bool connectWifiWithTimeout() {
 
   if (!expectedLocalIpMatches()) {
     Serial.print("warning reason=local_ip_mismatch expected=");
-    Serial.print(PACKET_RATE_EXPECTED_LOCAL_IP);
+    Serial.print(EXPECTED_LOCAL_IP_TEXT);
     Serial.print(" actual=");
     Serial.println(WiFi.localIP());
   }
@@ -204,13 +197,13 @@ void printStatus() {
     Serial.println("0.0.0.0");
   }
   Serial.print("expected_local_ip=");
-  Serial.println(PACKET_RATE_EXPECTED_LOCAL_IP);
+  Serial.println(EXPECTED_LOCAL_IP_TEXT);
   Serial.print("expected_local_ip_match=");
   printBoolean(expectedLocalIpMatches());
   Serial.print("target_ip=");
-  Serial.println(PACKET_RATE_TARGET_IP);
+  Serial.println(TARGET_IP_TEXT);
   Serial.print("target_port=");
-  Serial.println(PACKET_RATE_TARGET_PORT);
+  Serial.println(TARGET_UDP_PORT);
   Serial.print("udp_ready=");
   printBoolean(udpStarted);
   Serial.print("attack_active=");
@@ -257,9 +250,9 @@ void finishAttack(const char* reason) {
     Serial.println("0.0.0.0");
   }
   Serial.print("target_ip=");
-  Serial.println(PACKET_RATE_TARGET_IP);
+  Serial.println(TARGET_IP_TEXT);
   Serial.print("target_port=");
-  Serial.println(PACKET_RATE_TARGET_PORT);
+  Serial.println(TARGET_UDP_PORT);
   Serial.print("requested_pps=");
   Serial.println(attackRatePps);
   Serial.print("duration_sec=");
@@ -340,7 +333,7 @@ void startAttack(
 
   if (!expectedLocalIpMatches()) {
     Serial.print("start_rejected reason=local_ip_mismatch expected=");
-    Serial.print(PACKET_RATE_EXPECTED_LOCAL_IP);
+    Serial.print(EXPECTED_LOCAL_IP_TEXT);
     Serial.print(" actual=");
     Serial.println(WiFi.localIP());
     return;
@@ -379,9 +372,9 @@ void startAttack(
   Serial.print("local_ip=");
   Serial.println(WiFi.localIP());
   Serial.print("target_ip=");
-  Serial.println(PACKET_RATE_TARGET_IP);
+  Serial.println(TARGET_IP_TEXT);
   Serial.print("target_port=");
-  Serial.println(PACKET_RATE_TARGET_PORT);
+  Serial.println(TARGET_UDP_PORT);
   Serial.print("requested_pps=");
   Serial.println(attackRatePps);
   Serial.print("duration_sec=");
@@ -393,7 +386,7 @@ void startAttack(
 }
 
 void sendScheduledPacket() {
-  const int beginResult = udp.beginPacket(targetIp, PACKET_RATE_TARGET_PORT);
+  const int beginResult = udp.beginPacket(targetIp, TARGET_UDP_PORT);
   if (beginResult != 1) {
     failedPackets++;
     return;
@@ -552,8 +545,8 @@ void setup() {
   printBootContract();
 
   expectedLocalIpValid =
-      expectedLocalIp.fromString(PACKET_RATE_EXPECTED_LOCAL_IP);
-  targetIpValid = targetIp.fromString(PACKET_RATE_TARGET_IP);
+      expectedLocalIp.fromString(EXPECTED_LOCAL_IP_TEXT);
+  targetIpValid = targetIp.fromString(TARGET_IP_TEXT);
 
   if (!expectedLocalIpValid) {
     Serial.println("configuration_error reason=invalid_expected_local_ip");
