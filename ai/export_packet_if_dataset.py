@@ -12,8 +12,8 @@ from pathlib import Path
 import tempfile
 from typing import Any, Mapping, Sequence
 
-from sqlalchemy import text
-from sqlalchemy.orm import Session
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.orm import Session, sessionmaker
 
 from ai.packet_if_contract import PACKET_IF_NOMINAL_WINDOW_SECONDS
 from ai.packet_if_dataset import (
@@ -29,7 +29,9 @@ from ai.packet_if_phase5_manifest import (
     PacketIFRunManifestReference,
     assert_run_manifest_complete,
     load_verified_run_manifest,
+    load_verified_session_manifest,
     normalize_device_ids,
+    normalize_sha256,
     normalize_optional_ipv4,
     require_bool,
     require_canonical_uuid4,
@@ -47,6 +49,8 @@ from edge.packet.capture_policy import (
     CapturePolicy,
     is_capture_eligible,
 )
+from edge.phase5.import_verified_collection import assert_standalone_snapshot
+from edge.phase5.verified_collection_contract import DatasetSessionIdentity
 
 
 @dataclass(frozen=True)
@@ -78,6 +82,9 @@ class PacketIFSessionAnnotation:
     target_source_ip: str | None = None
     included_device_ids: tuple[str, ...] = ()
     background_traffic_present: bool | None = None
+    # Verified Collection으로 이관하는 Session은 각자 다른 Commit에서 수집됐다.
+    # 값이 없으면 Export 전체의 최상위 source_commit_sha를 사용한다.
+    source_commit_sha: str | None = None
 
 
 def export_packet_if_dataset(
@@ -89,6 +96,7 @@ def export_packet_if_dataset(
     capture_filter: str,
     source_commit_sha: str,
     capture_policy: CapturePolicy,
+    db_snapshot_sha256: str | None = None,
 ) -> PacketIFExportResult:
     """Write a deterministic Packet IF CSV and its immutable provenance manifest.
 
@@ -118,6 +126,11 @@ def export_packet_if_dataset(
     if not isinstance(capture_filter, str):
         raise ValueError("capture_filter must be a string")
     _validate_git_commit_sha(source_commit_sha)
+    if db_snapshot_sha256 is not None:
+        db_snapshot_sha256 = normalize_sha256(
+            db_snapshot_sha256,
+            "db_snapshot_sha256",
+        )
     if output_path.exists():
         raise FileExistsError(f"Packet IF dataset already exists: {output_path}")
     if manifest_path.exists():
@@ -179,6 +192,9 @@ def export_packet_if_dataset(
         annotations,
         exported_rows=exported_rows,
         manifest_path=manifest_path,
+        capture_filter=capture_filter,
+        source_commit_sha=source_commit_sha,
+        db_snapshot_sha256=db_snapshot_sha256,
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -199,6 +215,7 @@ def export_packet_if_dataset(
             capture_policy=capture_policy,
             dataset_sha256=dataset_sha256,
             per_session_sha256=per_session_sha256,
+            db_snapshot_sha256=db_snapshot_sha256,
         )
         _write_json_atomically(manifest_path, manifest_payload)
         manifest_created = True
@@ -529,6 +546,9 @@ def _normalize_session_annotations(
             annotation.background_traffic_present,
             "background_traffic_present",
         )
+        session_source_commit_sha = annotation.source_commit_sha
+        if session_source_commit_sha is not None:
+            _validate_git_commit_sha(session_source_commit_sha)
         seen_session_ids.add(session_id)
         normalized.append(
             PacketIFSessionAnnotation(
@@ -556,6 +576,7 @@ def _normalize_session_annotations(
                 target_source_ip=target_source_ip,
                 included_device_ids=included_ids,
                 background_traffic_present=background_traffic_present,
+                source_commit_sha=session_source_commit_sha,
             )
         )
     normalized_annotations = tuple(normalized)
@@ -599,6 +620,9 @@ def _validate_run_manifests_for_export(
     *,
     exported_rows: list[dict[str, Any]],
     manifest_path: Path,
+    capture_filter: str,
+    source_commit_sha: str,
+    db_snapshot_sha256: str | None = None,
 ) -> None:
     devices_by_session: dict[str, dict[str, str]] = {}
     for row in exported_rows:
@@ -624,6 +648,7 @@ def _validate_run_manifests_for_export(
             run_manifest_path,
             expected_sha256=reference.sha256,
         )
+        included_device_ips = devices_by_session.get(annotation.session_id, {})
         validate_run_manifest_identity(
             run_manifest,
             reference,
@@ -631,8 +656,45 @@ def _validate_run_manifests_for_export(
             scenario=annotation.scenario,
             target_device_id=annotation.target_device_id,
             target_source_ip=annotation.target_source_ip,
-            included_device_ips=devices_by_session.get(annotation.session_id, {}),
+            included_device_ips=included_device_ips,
         )
+        # Export 시점에도 Collection Manifest 연쇄와 전체 필드 일치를 검증한다.
+        # Dataset Load에서만 확인하면 어긋난 Package가 일단 Export되어버린다.
+        collection = load_verified_session_manifest(
+            run_manifest_path,
+            run_manifest,
+            session_id=annotation.session_id,
+            scenario=annotation.scenario,
+            target_device_id=annotation.target_device_id,
+            target_source_ip=annotation.target_source_ip,
+            included_device_ips=included_device_ips,
+            dataset_identity=DatasetSessionIdentity(
+                split=annotation.split,
+                traffic_label=annotation.traffic_label,
+                collection_slot_id=annotation.collection_slot_id,
+                source_capture_group_id=annotation.source_capture_group_id,
+                normal_policy_version=annotation.normal_policy_version,
+                firmware_version=annotation.firmware_version,
+                payload_schema_version=annotation.payload_schema_version,
+                background_traffic_present=bool(
+                    annotation.background_traffic_present
+                ),
+                source_commit_sha=(
+                    annotation.source_commit_sha or source_commit_sha
+                ),
+                capture_filter=capture_filter,
+            ),
+            required=False,
+        )
+        if collection is not None and db_snapshot_sha256 is not None:
+            if collection.db_snapshot_sha256 != db_snapshot_sha256:
+                raise ValueError(
+                    "Collection Manifest db_snapshot_sha256 does not match the "
+                    "Snapshot this Export read: "
+                    f"session_id={annotation.session_id}, "
+                    f"collection={collection.db_snapshot_sha256}, "
+                    f"export={db_snapshot_sha256}"
+                )
         assert_run_manifest_complete(run_manifest, reference.run_id)
 
 
@@ -646,6 +708,7 @@ def _build_manifest_payload(
     capture_policy: CapturePolicy,
     dataset_sha256: str,
     per_session_sha256: dict[str, str],
+    db_snapshot_sha256: str | None = None,
 ) -> dict[str, Any]:
     sessions_by_id = {
         str(session["session_id"]): session
@@ -685,7 +748,9 @@ def _build_manifest_payload(
                 "status": str(session["status"]),
                 "capture_interface": str(session["capture_interface"]),
                 "capture_filter": capture_filter,
-                "source_commit_sha": source_commit_sha,
+                "source_commit_sha": (
+                    annotation.source_commit_sha or source_commit_sha
+                ),
                 "started_at": str(session["started_at"]),
                 "first_window_start": str(session["first_window_start"]),
                 "ended_at": str(session["ended_at"]),
@@ -711,6 +776,7 @@ def _build_manifest_payload(
         )
 
     return {
+        "db_snapshot_sha256": db_snapshot_sha256,
         "dataset_version": PACKET_IF_DATASET_VERSION,
         "capture_policy_version": capture_policy.version,
         "capture_policy": {
@@ -804,7 +870,7 @@ def _write_json_atomically(
 
 def _load_export_spec(
     path: Path,
-) -> tuple[str, str, tuple[PacketIFSessionAnnotation, ...]]:
+) -> tuple[str, str, str | None, tuple[PacketIFSessionAnnotation, ...]]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -819,6 +885,12 @@ def _load_export_spec(
         raise ValueError("capture_filter must be a string")
     source_commit_sha = payload.get("source_commit_sha")
     _validate_git_commit_sha(source_commit_sha)
+    raw_snapshot_sha256 = payload.get("db_snapshot_sha256")
+    db_snapshot_sha256 = (
+        None
+        if raw_snapshot_sha256 is None
+        else normalize_sha256(raw_snapshot_sha256, "db_snapshot_sha256")
+    )
 
     raw_sessions = payload.get("sessions")
     if not isinstance(raw_sessions, list) or not raw_sessions:
@@ -870,11 +942,13 @@ def _load_export_spec(
                 background_traffic_present=raw_session.get(
                     "background_traffic_present"
                 ),
+                source_commit_sha=raw_session.get("source_commit_sha"),
             )
         )
     return (
         capture_filter,
         source_commit_sha,
+        db_snapshot_sha256,
         _normalize_session_annotations(annotations),
     )
 
@@ -901,24 +975,95 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=True,
         help="Split·Label·Scenario·Capture 출처를 선언한 Export Spec JSON",
     )
+    parser.add_argument(
+        "--db-snapshot",
+        type=Path,
+        default=None,
+        help=(
+            "Verified Collection Package의 db-snapshot.db 절대경로. 지정하면 이 "
+            "Snapshot을 mode=ro·query_only로 열고 SHA256을 검증한 뒤 Export합니다. "
+            "생략하면 기존처럼 DATABASE_URL의 DB를 사용합니다."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def _snapshot_session_factory(db_snapshot: Path):
+    """Open a Package Snapshot read-only for Export.
+
+    The absolute-path check runs before any `resolve()` so a relative path is
+    refused as given rather than completed against the current directory.
+    """
+    if not db_snapshot.is_absolute():
+        raise ValueError(f"--db-snapshot must be an absolute path: {db_snapshot}")
+    snapshot_path = db_snapshot.resolve()
+    if not snapshot_path.is_file():
+        raise ValueError(f"--db-snapshot is not a file: {snapshot_path}")
+    assert_standalone_snapshot(snapshot_path)
+
+    engine = create_engine(
+        f"sqlite:///file:{snapshot_path.as_posix()}?mode=ro&uri=true",
+        connect_args={"check_same_thread": False},
+    )
+
+    @event.listens_for(engine, "connect")
+    def _set_query_only(dbapi_connection, _record):  # pragma: no cover - hook
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA query_only=ON")
+        finally:
+            cursor.close()
+
+    return engine, sessionmaker(bind=engine)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    capture_filter, source_commit_sha, annotations = _load_export_spec(
-        args.spec
-    )
-    with SessionLocal() as db:
-        result = export_packet_if_dataset(
-            db,
-            output_path=args.output,
-            manifest_path=args.manifest_output,
-            session_annotations=annotations,
-            capture_filter=capture_filter,
-            source_commit_sha=source_commit_sha,
-            capture_policy=CapturePolicy.from_env(),
-        )
+    (
+        capture_filter,
+        source_commit_sha,
+        spec_snapshot_sha256,
+        annotations,
+    ) = _load_export_spec(args.spec)
+
+    db_snapshot_sha256: str | None = None
+    engine = None
+    if args.db_snapshot is not None:
+        engine, session_factory = _snapshot_session_factory(args.db_snapshot)
+        db_snapshot_sha256 = file_sha256(args.db_snapshot.resolve())
+        if (
+            spec_snapshot_sha256 is not None
+            and spec_snapshot_sha256 != db_snapshot_sha256
+        ):
+            engine.dispose()
+            raise ValueError(
+                "--db-snapshot SHA256 does not match the Export Spec "
+                f"db_snapshot_sha256: spec={spec_snapshot_sha256}, "
+                f"actual={db_snapshot_sha256}"
+            )
+    else:
+        if spec_snapshot_sha256 is not None:
+            raise ValueError(
+                "Export Spec declares db_snapshot_sha256, so --db-snapshot is "
+                "required to prove the Export read that Snapshot"
+            )
+        session_factory = SessionLocal
+
+    try:
+        with session_factory() as db:
+            result = export_packet_if_dataset(
+                db,
+                output_path=args.output,
+                manifest_path=args.manifest_output,
+                session_annotations=annotations,
+                capture_filter=capture_filter,
+                source_commit_sha=source_commit_sha,
+                capture_policy=CapturePolicy.from_env(),
+                db_snapshot_sha256=db_snapshot_sha256,
+            )
+    finally:
+        if engine is not None:
+            engine.dispose()
 
     print(f"output={result.output_path}")
     print(f"manifest={result.manifest_path}")

@@ -17,6 +17,13 @@ from edge.phase5.contracts import (
     is_supported_run_manifest_schema_version,
     run_manifest_sha256,
 )
+from edge.phase5.verified_collection_contract import (
+    VERIFIED_COLLECTION_SCHEMA_VERSION,
+    DatasetSessionIdentity,
+    VerifiedCollectionManifest,
+    load_verified_collection_manifest,
+    validate_verified_collection_identity,
+)
 
 
 PACKET_IF_DATASET_VERSION_V1 = "packet-if-dataset-v1"
@@ -159,6 +166,65 @@ def load_verified_run_manifest(
             f"expected={expected}, actual={sidecar_sha256}"
         )
     return manifest
+
+
+def load_verified_session_manifest(
+    run_manifest_path: Path,
+    run_manifest: RunManifest,
+    *,
+    session_id: str,
+    scenario: str,
+    target_device_id: str | None,
+    target_source_ip: str | None,
+    included_device_ips: Mapping[str, str],
+    dataset_identity: DatasetSessionIdentity | None = None,
+    required: bool = False,
+) -> VerifiedCollectionManifest | None:
+    """Verify the Run Manifest's Verified Collection reference, when present.
+
+    Existing Scenario Runner Runs carry `session_manifest_ref=null` and stay
+    accepted with `required=False`; only Verified Collection Runs must resolve.
+    The reference is resolved relative to the already-verified Run Manifest, so
+    the whole chain Dataset -> Run -> Collection -> Evidence is hash-verified.
+    """
+    reference = run_manifest.session_manifest_ref
+    if reference is None:
+        if required:
+            raise ValueError(
+                "Verified Collection Runs must declare session_manifest_ref: "
+                f"run_id={run_manifest.run_id!r}"
+            )
+        return None
+
+    if reference.schema_version != VERIFIED_COLLECTION_SCHEMA_VERSION:
+        raise ValueError(
+            "unsupported session_manifest_ref schema version: "
+            f"{reference.schema_version!r}"
+        )
+
+    run_directory = run_manifest_path.parent.resolve()
+    collection_path = (run_directory / reference.relative_path).resolve()
+    if run_directory not in collection_path.parents:
+        raise ValueError(
+            "session_manifest_ref escapes the Run Manifest directory: "
+            f"{reference.relative_path}"
+        )
+
+    collection = load_verified_collection_manifest(
+        collection_path,
+        expected_sha256=reference.sha256,
+    )
+    validate_verified_collection_identity(
+        collection,
+        run_manifest=run_manifest,
+        session_id=session_id,
+        scenario=scenario,
+        target_device_id=target_device_id,
+        target_source_ip=target_source_ip,
+        included_device_ips=included_device_ips,
+        dataset_identity=dataset_identity,
+    )
+    return collection
 
 
 def validate_run_manifest_identity(
