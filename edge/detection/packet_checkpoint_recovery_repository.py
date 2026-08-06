@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import sqlite3
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from edge.detection.phase4_time import parse_db_utc
 
@@ -130,6 +130,104 @@ def get_existing_recovery(
           AND target_capture_session_id = ?
         """,
         (detector_name, source_table, target_session_id),
+    ).fetchone()
+
+
+def update_checkpoint_conditionally(
+    connection: sqlite3.Connection,
+    *,
+    before: Mapping[str, object],
+    after: Mapping[str, object],
+) -> int:
+    cursor = connection.execute(
+        """
+        UPDATE detector_checkpoints
+        SET last_completed_window_end = ?, updated_at = ?
+        WHERE detector_name = ?
+          AND source_table = ?
+          AND last_processed_id IS ?
+          AND last_completed_window_end = ?
+          AND updated_at = ?
+        """,
+        (
+            after["last_completed_window_end"],
+            after["updated_at"],
+            before["detector_name"],
+            before["source_table"],
+            before["last_processed_id"],
+            before["last_completed_window_end"],
+            before["updated_at"],
+        ),
+    )
+    return cursor.rowcount
+
+
+def insert_recovery_audit(
+    connection: sqlite3.Connection,
+    *,
+    audit: Mapping[str, object],
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO packet_checkpoint_recoveries (
+            operation_id, detector_name, source_table,
+            current_capture_session_id, target_capture_session_id,
+            last_processed_id_before, last_processed_id_after,
+            last_completed_window_end_before, last_completed_window_end_after,
+            updated_at_before, updated_at_after, plan_sha256, plan_json,
+            skipped_session_count, skipped_processable_session_count,
+            approved_by, reason, repository_commit, database_path,
+            backup_path, backup_sha256
+        )
+        VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        """,
+        (
+            audit["operation_id"],
+            audit["detector_name"],
+            audit["source_table"],
+            audit["current_capture_session_id"],
+            audit["target_capture_session_id"],
+            audit["last_processed_id_before"],
+            audit["last_processed_id_after"],
+            audit["last_completed_window_end_before"],
+            audit["last_completed_window_end_after"],
+            audit["updated_at_before"],
+            audit["updated_at_after"],
+            audit["plan_sha256"],
+            audit["plan_json"],
+            audit["skipped_session_count"],
+            audit["skipped_processable_session_count"],
+            audit["approved_by"],
+            audit["reason"],
+            audit["repository_commit"],
+            audit["database_path"],
+            audit["backup_path"],
+            audit["backup_sha256"],
+        ),
+    )
+    return cursor.rowcount
+
+
+def get_recovery_audit(
+    connection: sqlite3.Connection,
+    operation_id: str,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT id, operation_id, detector_name, source_table,
+               current_capture_session_id, target_capture_session_id,
+               last_processed_id_before, last_processed_id_after,
+               last_completed_window_end_before, last_completed_window_end_after,
+               updated_at_before, updated_at_after, plan_sha256, plan_json,
+               skipped_session_count, skipped_processable_session_count,
+               approved_by, reason, repository_commit, database_path,
+               backup_path, backup_sha256, created_at
+        FROM packet_checkpoint_recoveries
+        WHERE operation_id = ?
+        """,
+        (operation_id,),
     ).fetchone()
 
 

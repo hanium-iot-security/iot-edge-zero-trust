@@ -1,7 +1,8 @@
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -19,8 +20,10 @@ from edge.detection.packet_checkpoint_recovery import (
     PacketCheckpointRecoveryError,
     attach_plan_sha256,
     build_recovery_plan,
+    execute_packet_checkpoint_recovery,
     verify_plan_sha256,
 )
+from edge.detection import packet_checkpoint_recovery_repository as recovery_repository
 from edge.detection.packet_checkpoint_recovery_repository import (
     calculate_packet_feature_readiness,
 )
@@ -1918,3 +1921,454 @@ def test_dry_run_cli_returns_two_for_precommit_validation_error(
     assert "error:" in captured.err
     assert captured.out == ""
     assert not plan_output.exists()
+
+
+def _execute_fixture(tmp_path: Path) -> dict[str, object]:
+    repository_root = _repository(tmp_path)
+    database = tmp_path / "execute.db"
+    _seed_valid_recovery_database(database).close()
+    plan_output = tmp_path / "execute-plan.json"
+    plan = packet_checkpoint_recovery.inspect_packet_checkpoint_recovery(
+        **_dry_run_arguments(
+            tmp_path,
+            database=database,
+            repository_root=repository_root,
+            plan_output=plan_output,
+        )
+    )
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    return {
+        "repository_root": repository_root,
+        "database": database,
+        "plan_output": plan_output,
+        "plan": plan,
+        "artifact_dir": artifact_dir,
+    }
+
+
+def _valid_execute_kwargs(fixture: dict[str, object]) -> dict[str, object]:
+    return {
+        "plan_file": fixture["plan_output"],
+        "db_path": fixture["database"],
+        "artifact_dir": fixture["artifact_dir"],
+        "confirm": packet_checkpoint_recovery.EXECUTE_CONFIRMATION,
+    }
+
+
+def _allow_execute_on_test_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        packet_checkpoint_recovery, "_current_platform_name", lambda: "posix"
+    )
+    monkeypatch.setattr(
+        packet_checkpoint_recovery,
+        "acquire_recovery_locks",
+        lambda locks: nullcontext(),
+    )
+
+
+def _checkpoint(database: Path) -> sqlite3.Row:
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        row = recovery_repository.get_checkpoint(
+            connection, "packet_rule", "packet_feature_logs"
+        )
+    assert row is not None
+    return row
+
+
+def test_execute_creates_verified_backup_before_begin_immediate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    events: list[str] = []
+    real_backup = packet_checkpoint_recovery.create_sqlite_backup
+    real_verify = packet_checkpoint_recovery.verify_database
+    real_update = recovery_repository.update_checkpoint_conditionally
+
+    def record_backup(source: Path, backup: Path):
+        events.append("backup")
+        return real_backup(source, backup)
+
+    def record_verify(database: Path):
+        if Path(database).name == "database.backup.db":
+            events.append("backup_verified")
+        return real_verify(database)
+
+    def record_update(connection: sqlite3.Connection, **kwargs: object) -> int:
+        assert connection.in_transaction is True
+        events.append("transaction_mutation")
+        return real_update(connection, **kwargs)
+
+    monkeypatch.setattr(packet_checkpoint_recovery, "create_sqlite_backup", record_backup)
+    monkeypatch.setattr(packet_checkpoint_recovery, "verify_database", record_verify)
+    monkeypatch.setattr(recovery_repository, "update_checkpoint_conditionally", record_update)
+    kwargs = _valid_execute_kwargs(fixture)
+
+    result = execute_packet_checkpoint_recovery(**kwargs)
+
+    assert "platform_name" not in kwargs
+    assert "lock_factory" not in kwargs
+    assert result["database_committed"] is True
+    assert events.index("backup") < events.index("backup_verified")
+    assert events.index("backup_verified") < events.index("transaction_mutation")
+
+
+def test_execute_rechecks_full_canonical_plan_inside_begin_immediate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    real_build = packet_checkpoint_recovery.build_recovery_plan
+    transaction_states: list[bool] = []
+
+    def record_build(connection: sqlite3.Connection, **kwargs: object):
+        transaction_states.append(connection.in_transaction)
+        return real_build(connection, **kwargs)
+
+    monkeypatch.setattr(packet_checkpoint_recovery, "build_recovery_plan", record_build)
+
+    execute_packet_checkpoint_recovery(**_valid_execute_kwargs(fixture))
+
+    assert transaction_states == [False, True]
+
+
+def test_execute_rejects_changed_checkpoint_updated_at_and_rolls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    before = dict(_checkpoint(fixture["database"]))
+    real_update = recovery_repository.update_checkpoint_conditionally
+
+    def change_updated_at_then_update(
+        connection: sqlite3.Connection, **kwargs: object
+    ) -> int:
+        connection.execute(
+            """
+            UPDATE detector_checkpoints
+            SET updated_at = ?
+            WHERE detector_name = 'packet_rule'
+              AND source_table = 'packet_feature_logs'
+            """,
+            (OTHER_UTC,),
+        )
+        return real_update(connection, **kwargs)
+
+    monkeypatch.setattr(
+        recovery_repository,
+        "update_checkpoint_conditionally",
+        change_updated_at_then_update,
+    )
+
+    with pytest.raises(PacketCheckpointRecoveryError, match="conditional checkpoint"):
+        execute_packet_checkpoint_recovery(**_valid_execute_kwargs(fixture))
+
+    assert dict(_checkpoint(fixture["database"])) == before
+    with sqlite3.connect(fixture["database"]) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM packet_checkpoint_recoveries"
+        ).fetchone()[0] == 0
+
+
+def test_execute_keeps_last_processed_id_and_advances_only_time_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    before = dict(_checkpoint(fixture["database"]))
+
+    execute_packet_checkpoint_recovery(**_valid_execute_kwargs(fixture))
+
+    after = dict(_checkpoint(fixture["database"]))
+    assert after["last_processed_id"] == before["last_processed_id"] == 42
+    assert after["last_completed_window_end"] == _db_utc(TARGET_FIRST)
+    assert after["updated_at"] != before["updated_at"]
+
+
+def test_execute_inserts_exactly_one_audit_row_in_same_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    real_insert = recovery_repository.insert_recovery_audit
+    transaction_states: list[bool] = []
+
+    def record_insert(connection: sqlite3.Connection, **kwargs: object) -> int:
+        transaction_states.append(connection.in_transaction)
+        return real_insert(connection, **kwargs)
+
+    monkeypatch.setattr(recovery_repository, "insert_recovery_audit", record_insert)
+
+    result = execute_packet_checkpoint_recovery(**_valid_execute_kwargs(fixture))
+
+    with sqlite3.connect(fixture["database"]) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT * FROM packet_checkpoint_recoveries"
+        ).fetchall()
+    assert transaction_states == [True]
+    assert len(rows) == 1
+    assert rows[0]["operation_id"] == result["operation_id"]
+    assert rows[0]["backup_sha256"] == result["backup_sha256"]
+
+
+def test_execute_requires_total_changes_delta_two(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+
+    result = execute_packet_checkpoint_recovery(**_valid_execute_kwargs(fixture))
+
+    assert result["transaction_total_changes_delta"] == 2
+
+
+def test_backup_failure_leaves_live_database_and_artifacts_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    before = fixture["database"].read_bytes()
+
+    def fail_backup(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("backup failed")
+
+    monkeypatch.setattr(packet_checkpoint_recovery, "create_sqlite_backup", fail_backup)
+
+    with pytest.raises(RuntimeError, match="backup failed"):
+        execute_packet_checkpoint_recovery(**_valid_execute_kwargs(fixture))
+
+    assert fixture["database"].read_bytes() == before
+    assert list(fixture["artifact_dir"].iterdir()) == []
+
+
+def test_precommit_failure_preserves_verified_backup_and_rolls_back_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    before = dict(_checkpoint(fixture["database"]))
+
+    def fail_audit(*args: object, **kwargs: object) -> int:
+        raise RuntimeError("precommit failure")
+
+    monkeypatch.setattr(recovery_repository, "insert_recovery_audit", fail_audit)
+
+    with pytest.raises(RuntimeError, match="precommit failure"):
+        execute_packet_checkpoint_recovery(**_valid_execute_kwargs(fixture))
+
+    operation_dirs = list(fixture["artifact_dir"].iterdir())
+    assert len(operation_dirs) == 1
+    backup = operation_dirs[0] / "database.backup.db"
+    assert backup.is_file()
+    assert backup.with_suffix(".db.sha256").is_file()
+    verification = packet_checkpoint_recovery.verify_database(backup)
+    assert verification.integrity_check == "ok"
+    assert verification.foreign_key_violations == ()
+    assert dict(_checkpoint(fixture["database"])) == before
+
+
+def test_duplicate_operation_or_detector_target_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    with sqlite3.connect(fixture["database"]) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        _insert_recovery_audit(connection)
+    backup_calls = 0
+
+    def reject_backup(*args: object, **kwargs: object) -> None:
+        nonlocal backup_calls
+        backup_calls += 1
+
+    monkeypatch.setattr(packet_checkpoint_recovery, "create_sqlite_backup", reject_backup)
+
+    with pytest.raises(PacketCheckpointRecoveryError, match="DUPLICATE_RECOVERY"):
+        execute_packet_checkpoint_recovery(**_valid_execute_kwargs(fixture))
+
+    assert backup_calls == 0
+
+
+def test_execute_rejects_changed_untracked_inventory_before_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    (fixture["repository_root"] / "new-evidence.bin").write_bytes(b"changed\n")
+    monkeypatch.setattr(
+        packet_checkpoint_recovery,
+        "create_sqlite_backup",
+        lambda *args, **kwargs: pytest.fail("backup must not start"),
+    )
+
+    with pytest.raises(PacketCheckpointRecoveryError, match="repository state"):
+        execute_packet_checkpoint_recovery(**_valid_execute_kwargs(fixture))
+
+
+def test_execute_rejects_database_path_different_from_plan_before_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    other_database = tmp_path / "other.db"
+    _seed_valid_recovery_database(other_database).close()
+    kwargs = _valid_execute_kwargs(fixture)
+    kwargs["db_path"] = other_database
+    monkeypatch.setattr(
+        packet_checkpoint_recovery,
+        "create_sqlite_backup",
+        lambda *args, **kwargs: pytest.fail("backup must not start"),
+    )
+
+    with pytest.raises(PacketCheckpointRecoveryError, match="database path"):
+        execute_packet_checkpoint_recovery(**kwargs)
+
+
+def test_execute_rejects_global_running_session_before_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    with sqlite3.connect(fixture["database"]) as connection:
+        _insert_capture_session(
+            connection,
+            session_id=RUNNING_SESSION_A,
+            capture_interface="eth-running",
+            first_window_start=TARGET_READY_THROUGH + timedelta(seconds=10),
+            status="RUNNING",
+        )
+        connection.commit()
+    monkeypatch.setattr(
+        packet_checkpoint_recovery,
+        "create_sqlite_backup",
+        lambda *args, **kwargs: pytest.fail("backup must not start"),
+    )
+
+    with pytest.raises(PacketCheckpointRecoveryError, match="RUNNING_CAPTURE_SESSIONS"):
+        execute_packet_checkpoint_recovery(**_valid_execute_kwargs(fixture))
+
+
+def test_execute_rejects_wrong_processable_skip_confirmation_before_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    plan = fixture["plan"]
+    plan["summary"]["skips_processable_sessions"] = True
+    plan["summary"]["warning_codes"] = ["PROCESSABLE_SESSION_SKIP"]
+    plan["plan_sha256"] = packet_checkpoint_recovery.calculate_plan_sha256(plan)
+    fixture["plan_output"].write_text(json.dumps(plan), encoding="utf-8")
+    monkeypatch.setattr(
+        packet_checkpoint_recovery,
+        "create_sqlite_backup",
+        lambda *args, **kwargs: pytest.fail("backup must not start"),
+    )
+
+    with pytest.raises(PacketCheckpointRecoveryError, match="confirmation mismatch"):
+        execute_packet_checkpoint_recovery(**_valid_execute_kwargs(fixture))
+
+
+def test_execute_rejects_missing_artifact_directory_without_creating_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    missing = tmp_path / "missing-artifacts"
+    kwargs = _valid_execute_kwargs(fixture)
+    kwargs["artifact_dir"] = missing
+
+    with pytest.raises(PacketCheckpointRecoveryError, match="existing directory"):
+        execute_packet_checkpoint_recovery(**kwargs)
+
+    assert not missing.exists()
+
+
+def test_execute_lock_conflict_prevents_backup_artifact_and_database_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    monkeypatch.setattr(
+        packet_checkpoint_recovery, "_current_platform_name", lambda: "posix"
+    )
+    before = fixture["database"].read_bytes()
+
+    @contextmanager
+    def conflicting_locks(locks: object):
+        raise PacketCheckpointRecoveryError("lock conflict")
+        yield
+
+    monkeypatch.setattr(
+        packet_checkpoint_recovery, "acquire_recovery_locks", conflicting_locks
+    )
+
+    with pytest.raises(PacketCheckpointRecoveryError, match="lock conflict"):
+        execute_packet_checkpoint_recovery(**_valid_execute_kwargs(fixture))
+
+    assert fixture["database"].read_bytes() == before
+    assert list(fixture["artifact_dir"].iterdir()) == []
+
+
+def test_execute_rejects_windows_before_lock_backup_artifact_and_database_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "untouched.db"
+    database.write_bytes(b"not sqlite")
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    monkeypatch.setattr(
+        packet_checkpoint_recovery, "_current_platform_name", lambda: "nt"
+    )
+    monkeypatch.setattr(
+        packet_checkpoint_recovery,
+        "acquire_recovery_locks",
+        lambda locks: pytest.fail("locks must not be acquired"),
+    )
+    before = database.read_bytes()
+
+    with pytest.raises(PacketCheckpointRecoveryError, match="POSIX"):
+        execute_packet_checkpoint_recovery(
+            plan_file=tmp_path / "missing-plan.json",
+            db_path=database,
+            artifact_dir=artifact_dir,
+            confirm=packet_checkpoint_recovery.EXECUTE_CONFIRMATION,
+        )
+
+    assert database.read_bytes() == before
+    assert list(artifact_dir.iterdir()) == []
+
+
+def test_execute_public_signature_has_no_platform_override() -> None:
+    assert "platform_name" not in inspect.signature(
+        execute_packet_checkpoint_recovery
+    ).parameters
+
+
+def test_execute_rejects_platform_name_keyword_in_general_python_call(
+    tmp_path: Path,
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    kwargs = _valid_execute_kwargs(fixture)
+    with pytest.raises(TypeError):
+        execute_packet_checkpoint_recovery(**kwargs, platform_name="posix")
+
+
+def test_execute_public_signature_has_no_lock_factory_override() -> None:
+    assert "lock_factory" not in inspect.signature(
+        execute_packet_checkpoint_recovery
+    ).parameters
+
+
+def test_execute_rejects_lock_factory_keyword_in_general_python_call(
+    tmp_path: Path,
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    kwargs = _valid_execute_kwargs(fixture)
+    with pytest.raises(TypeError):
+        execute_packet_checkpoint_recovery(
+            **kwargs,
+            lock_factory=lambda path: nullcontext(),
+        )

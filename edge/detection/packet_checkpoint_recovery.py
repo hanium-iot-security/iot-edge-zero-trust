@@ -13,6 +13,7 @@ from pathlib import Path
 import sqlite3
 import stat
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from tempfile import NamedTemporaryFile
 from typing import Callable, ContextManager, Iterator, Mapping, Sequence
@@ -24,6 +25,11 @@ from edge.detection.phase4_time import format_db_utc, parse_db_utc
 from edge.features import run_packet_feature_extractor
 from edge.orchestration import run_detection_orchestrator
 from edge.runtime_lock import single_instance_lock
+from edge.scripts.phase4_cutover_storage import (
+    create_sqlite_backup,
+    file_sha256,
+    verify_database,
+)
 
 
 PLAN_SCHEMA_VERSION = "packet-checkpoint-gap-recovery-plan-v1"
@@ -556,6 +562,358 @@ def inspect_packet_checkpoint_recovery(
     )
     _write_json_atomically(paths["plan_output"], plan)
     return plan
+
+
+def _current_platform_name() -> str:
+    return os.name
+
+
+def require_execute_platform(platform_name: str) -> None:
+    if platform_name != "posix":
+        raise PacketCheckpointRecoveryError(
+            "execute is supported only on POSIX; dry-run is available on Windows"
+        )
+
+
+def _load_plan(plan_file: str | Path) -> tuple[Path, dict[str, object]]:
+    path = Path(plan_file).expanduser().resolve(strict=True)
+    if not path.is_file():
+        raise PacketCheckpointRecoveryError("plan file must be a regular file")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PacketCheckpointRecoveryError("plan file must contain valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise PacketCheckpointRecoveryError("plan file must contain a JSON object")
+    verify_plan_sha256(payload)
+    return path, payload
+
+
+def _locks_from_plan(plan: Mapping[str, object]) -> tuple[ResolvedRecoveryLock, ...]:
+    entries = plan.get("locks")
+    if not isinstance(entries, list):
+        raise PacketCheckpointRecoveryError("plan locks are invalid")
+    locks: list[ResolvedRecoveryLock] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            raise PacketCheckpointRecoveryError("plan locks are invalid")
+        path = entry.get("path")
+        roles = entry.get("roles")
+        if not isinstance(path, str) or not isinstance(roles, list) or not all(
+            isinstance(role, str) for role in roles
+        ):
+            raise PacketCheckpointRecoveryError("plan locks are invalid")
+        locks.append(ResolvedRecoveryLock(Path(path).resolve(strict=False), tuple(roles)))
+    if serialize_resolved_locks(locks) != tuple(dict(entry) for entry in entries):
+        raise PacketCheckpointRecoveryError("plan locks are not canonical")
+    return tuple(locks)
+
+
+def _rebuild_execute_plan(
+    connection: sqlite3.Connection,
+    *,
+    plan: Mapping[str, object],
+    repository_state: Mapping[str, object],
+    database: Path,
+    locks: Sequence[ResolvedRecoveryLock],
+) -> dict[str, object]:
+    return build_recovery_plan(
+        connection,
+        repository_state=repository_state,
+        database_path=database,
+        detector_name=str(plan["detector_name"]),
+        current_session_id=str(plan["current_session_id"]),
+        target_session_id=str(plan["target_session_id"]),
+        approved_by=str(plan["approved_by"]),
+        reason=str(plan["reason"]),
+        lock_entries=serialize_resolved_locks(locks),
+    )
+
+
+def _require_same_canonical_plan(
+    plan: Mapping[str, object], rebuilt: Mapping[str, object]
+) -> None:
+    if canonical_plan_binding(plan) != canonical_plan_binding(rebuilt):
+        reasons = rebuilt.get("blocking_reasons")
+        detail = ",".join(str(reason) for reason in reasons) if reasons else "changed"
+        raise PacketCheckpointRecoveryError(f"canonical plan changed: {detail}")
+    if not rebuilt.get("can_execute"):
+        reasons = rebuilt.get("blocking_reasons", ())
+        raise PacketCheckpointRecoveryError(
+            "recovery plan cannot execute: "
+            + ",".join(str(reason) for reason in reasons)
+        )
+
+
+def _other_checkpoint_rows(
+    connection: sqlite3.Connection, detector_name: str, source_table: str
+) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        tuple(row)
+        for row in connection.execute(
+            """
+            SELECT detector_name, source_table, last_processed_id,
+                   last_completed_window_end, updated_at
+            FROM detector_checkpoints
+            WHERE NOT (detector_name = ? AND source_table = ?)
+            ORDER BY detector_name, source_table
+            """,
+            (detector_name, source_table),
+        ).fetchall()
+    )
+
+
+def _remove_failed_backup_artifacts(
+    operation_dir: Path, backup_path: Path, backup_sha256_path: Path
+) -> None:
+    backup_sha256_path.unlink(missing_ok=True)
+    backup_path.unlink(missing_ok=True)
+    try:
+        operation_dir.rmdir()
+    except OSError:
+        pass
+
+
+def _execute_locked_recovery(
+    *,
+    plan_path: Path,
+    plan: dict[str, object],
+    database: Path,
+    artifact_root: Path,
+    operation_id: str,
+    operation_dir: Path,
+    backup_path: Path,
+    backup_sha256_path: Path,
+    result_path: Path,
+    locks: Sequence[ResolvedRecoveryLock],
+) -> dict[str, object]:
+    repository_state = inspect_repository_state(str(plan["repository_root"]))
+    if repository_state != plan.get("repository_state"):
+        raise PacketCheckpointRecoveryError("repository state changed from plan")
+
+    with sqlite3.connect(database, isolation_level=None) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        require_migration_005(connection)
+        rebuilt = _rebuild_execute_plan(
+            connection,
+            plan=plan,
+            repository_state=repository_state,
+            database=database,
+            locks=locks,
+        )
+        _require_same_canonical_plan(plan, rebuilt)
+        if recovery_repository.get_recovery_audit(connection, operation_id) is not None:
+            raise PacketCheckpointRecoveryError("duplicate recovery operation_id")
+
+        live_verification = verify_database(database)
+        if (
+            live_verification.integrity_check != "ok"
+            or live_verification.foreign_key_violations
+        ):
+            raise PacketCheckpointRecoveryError(
+                "live database failed integrity or foreign-key checks"
+            )
+        data_version_before = int(connection.execute("PRAGMA data_version").fetchone()[0])
+        operation_dir.mkdir()
+        try:
+            backup = create_sqlite_backup(database, backup_path)
+            if backup.database_path != backup_path or backup.sha256_path != backup_sha256_path:
+                raise PacketCheckpointRecoveryError("backup artifact path mismatch")
+            if file_sha256(backup_path) != backup.sha256:
+                raise PacketCheckpointRecoveryError("backup SHA256 mismatch")
+            backup_verification = verify_database(backup_path)
+            if (
+                backup_verification.integrity_check != "ok"
+                or backup_verification.foreign_key_violations
+            ):
+                raise PacketCheckpointRecoveryError(
+                    "backup database failed integrity or foreign-key checks"
+                )
+        except Exception:
+            _remove_failed_backup_artifacts(
+                operation_dir, backup_path, backup_sha256_path
+            )
+            raise
+        data_version_after = int(connection.execute("PRAGMA data_version").fetchone()[0])
+        if data_version_after != data_version_before:
+            raise PacketCheckpointRecoveryError("database changed during backup")
+
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            current_plan_path, transaction_plan = _load_plan(plan_path)
+            if current_plan_path != plan_path or transaction_plan != plan:
+                raise PacketCheckpointRecoveryError("plan file changed before mutation")
+            transaction_repository_state = inspect_repository_state(
+                str(plan["repository_root"])
+            )
+            if transaction_repository_state != repository_state:
+                raise PacketCheckpointRecoveryError("repository state changed before mutation")
+            transaction_plan_rebuilt = _rebuild_execute_plan(
+                connection,
+                plan=plan,
+                repository_state=transaction_repository_state,
+                database=database,
+                locks=locks,
+            )
+            _require_same_canonical_plan(plan, transaction_plan_rebuilt)
+
+            checkpoint_plan = plan["checkpoint"]
+            if not isinstance(checkpoint_plan, Mapping):
+                raise PacketCheckpointRecoveryError("checkpoint plan is invalid")
+            before = checkpoint_plan.get("before")
+            planned_after = checkpoint_plan.get("after")
+            if not isinstance(before, Mapping) or not isinstance(planned_after, Mapping):
+                raise PacketCheckpointRecoveryError("checkpoint plan is invalid")
+            updated_at_after = format_db_utc(_utc_now().replace(microsecond=0))
+            after = {**planned_after, "updated_at": updated_at_after}
+            other_checkpoints_before = _other_checkpoint_rows(
+                connection, str(before["detector_name"]), str(before["source_table"])
+            )
+            changes_before = connection.total_changes
+            if recovery_repository.update_checkpoint_conditionally(
+                connection, before=before, after=after
+            ) != 1:
+                raise PacketCheckpointRecoveryError(
+                    "conditional checkpoint update affected an unexpected row count"
+                )
+            sessions_between = plan.get("sessions_between", [])
+            if not isinstance(sessions_between, list):
+                raise PacketCheckpointRecoveryError("plan session summary is invalid")
+            audit = {
+                "operation_id": operation_id,
+                "detector_name": before["detector_name"],
+                "source_table": before["source_table"],
+                "current_capture_session_id": plan["current_session_id"],
+                "target_capture_session_id": plan["target_session_id"],
+                "last_processed_id_before": before["last_processed_id"],
+                "last_processed_id_after": after["last_processed_id"],
+                "last_completed_window_end_before": before["last_completed_window_end"],
+                "last_completed_window_end_after": after["last_completed_window_end"],
+                "updated_at_before": before["updated_at"],
+                "updated_at_after": updated_at_after,
+                "plan_sha256": plan["plan_sha256"],
+                "plan_json": json.dumps(
+                    plan, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ),
+                "skipped_session_count": len(sessions_between),
+                "skipped_processable_session_count": sum(
+                    row.get("classification") == "SKIPPED_FULL_READY_COMPLETED"
+                    for row in sessions_between
+                    if isinstance(row, Mapping)
+                ),
+                "approved_by": plan["approved_by"],
+                "reason": plan["reason"],
+                "repository_commit": plan["repository_commit"],
+                "database_path": str(database),
+                "backup_path": str(backup_path),
+                "backup_sha256": backup.sha256,
+            }
+            if recovery_repository.insert_recovery_audit(
+                connection, audit=audit
+            ) != 1:
+                raise PacketCheckpointRecoveryError(
+                    "recovery audit insert affected an unexpected row count"
+                )
+            delta = connection.total_changes - changes_before
+            if delta != 2:
+                raise PacketCheckpointRecoveryError(
+                    "transaction total_changes delta must be exactly 2"
+                )
+            checkpoint_after = recovery_repository.get_checkpoint(
+                connection, str(before["detector_name"]), str(before["source_table"])
+            )
+            if checkpoint_after is None or dict(checkpoint_after) != after:
+                raise PacketCheckpointRecoveryError("checkpoint verification failed")
+            if recovery_repository.get_recovery_audit(connection, operation_id) is None:
+                raise PacketCheckpointRecoveryError("recovery audit verification failed")
+            if _other_checkpoint_rows(
+                connection, str(before["detector_name"]), str(before["source_table"])
+            ) != other_checkpoints_before:
+                raise PacketCheckpointRecoveryError("unrelated checkpoint changed")
+            if connection.execute("PRAGMA foreign_key_check").fetchall():
+                raise PacketCheckpointRecoveryError(
+                    "transaction foreign-key verification failed"
+                )
+            connection.execute("COMMIT")
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+
+    post_commit = verify_database(database)
+    if post_commit.integrity_check != "ok" or post_commit.foreign_key_violations:
+        raise PacketCheckpointRecoveryError(
+            "post-commit database failed integrity or foreign-key checks"
+        )
+    result: dict[str, object] = {
+        "operation_id": operation_id,
+        "database_committed": True,
+        "database_path": str(database),
+        "artifact_dir": str(artifact_root),
+        "backup_path": str(backup_path),
+        "backup_sha256_path": str(backup_sha256_path),
+        "backup_sha256": backup.sha256,
+        "result_path": str(result_path),
+        "plan_sha256": plan["plan_sha256"],
+        "transaction_total_changes_delta": delta,
+        "post_commit_verified_at": format_db_utc(
+            _utc_now().replace(microsecond=0)
+        ),
+    }
+    _write_json_atomically(result_path, result)
+    return result
+
+
+def execute_packet_checkpoint_recovery(
+    *,
+    plan_file: str | Path,
+    db_path: str | Path,
+    artifact_dir: str | Path,
+    confirm: str,
+    confirm_skip_processable: str | None = None,
+) -> dict[str, object]:
+    require_execute_platform(_current_platform_name())
+    plan_path, plan = _load_plan(plan_file)
+    database = require_plan_database_path(plan, db_path)
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        require_migration_005(connection)
+    require_execute_confirmations(
+        plan,
+        confirm=confirm,
+        confirm_skip_processable=confirm_skip_processable,
+    )
+    repository_root = Path(str(plan["repository_root"])).resolve(strict=True)
+    locks = _locks_from_plan(plan)
+    operation_id = str(uuid.uuid4())
+    artifact_root = Path(artifact_dir).expanduser().resolve(strict=False)
+    operation_dir = artifact_root / operation_id
+    backup_path = operation_dir / "database.backup.db"
+    result_path = operation_dir / "result.json"
+    paths = validate_generated_paths(
+        repository_root=repository_root,
+        artifact_dir=artifact_root,
+        backup_path=backup_path,
+        result_path=result_path,
+        lock_paths=tuple(lock.path for lock in locks),
+    )
+    backup_sha256_path = paths["backup_sha256_path"]
+    if not isinstance(backup_sha256_path, Path):
+        raise PacketCheckpointRecoveryError("backup SHA256 path is invalid")
+    with acquire_recovery_locks(locks):
+        return _execute_locked_recovery(
+            plan_path=plan_path,
+            plan=plan,
+            database=database,
+            artifact_root=artifact_root,
+            operation_id=operation_id,
+            operation_dir=operation_dir,
+            backup_path=backup_path,
+            backup_sha256_path=backup_sha256_path,
+            result_path=result_path,
+            locks=locks,
+        )
 
 
 def resolve_database_path(db_path: str | Path) -> Path:
