@@ -28,6 +28,20 @@ class PacketCheckpointRecoveryError(Exception):
     """Raised when a packet checkpoint recovery plan is invalid."""
 
 
+def resolve_database_path(db_path: str | Path) -> Path:
+    resolved = Path(db_path).expanduser().resolve(strict=True)
+    if not resolved.is_file():
+        raise PacketCheckpointRecoveryError("database path must be a regular file")
+    return resolved
+
+
+def require_plan_database_path(plan: Mapping[str, object], db_path: str | Path) -> Path:
+    resolved = resolve_database_path(db_path)
+    if str(resolved) != plan.get("database_path"):
+        raise PacketCheckpointRecoveryError("database path does not match plan")
+    return resolved
+
+
 def validate_generated_path(
     repository_root: Path, candidate: str | Path, *, field_name: str
 ) -> Path:

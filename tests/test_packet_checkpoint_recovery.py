@@ -89,6 +89,56 @@ def test_verify_plan_sha256_rejects_bound_field_tampering() -> None:
         verify_plan_sha256(plan)
 
 
+def test_canonical_plan_sha_changes_when_resolved_database_path_changes(
+    tmp_path: Path,
+) -> None:
+    first_db = tmp_path / "first.db"
+    second_db = tmp_path / "second.db"
+    first_db.write_bytes(b"first")
+    second_db.write_bytes(b"second")
+
+    first_plan = attach_plan_sha256(
+        {"database_path": str(first_db.resolve())}, generated_at=UTC_A
+    )
+    second_plan = attach_plan_sha256(
+        {"database_path": str(second_db.resolve())}, generated_at=UTC_A
+    )
+
+    assert first_plan["plan_sha256"] != second_plan["plan_sha256"]
+
+
+def test_database_path_requires_existing_regular_file(tmp_path: Path) -> None:
+    directory = tmp_path / "directory"
+    directory.mkdir()
+
+    with pytest.raises(PacketCheckpointRecoveryError, match="regular file"):
+        packet_checkpoint_recovery.resolve_database_path(directory)
+
+
+def test_require_plan_database_path_rejects_different_resolved_path(
+    tmp_path: Path,
+) -> None:
+    first_db = tmp_path / "first.db"
+    second_db = tmp_path / "second.db"
+    first_db.write_bytes(b"first")
+    second_db.write_bytes(b"second")
+    plan = {"database_path": str(first_db.resolve())}
+
+    with pytest.raises(PacketCheckpointRecoveryError, match="database path"):
+        packet_checkpoint_recovery.require_plan_database_path(plan, second_db)
+
+
+def test_require_plan_database_path_accepts_same_resolved_path(tmp_path: Path) -> None:
+    database = tmp_path / "iot.db"
+    database.write_bytes(b"sqlite fixture")
+    plan = {"database_path": str(database.resolve())}
+
+    assert (
+        packet_checkpoint_recovery.require_plan_database_path(plan, database)
+        == database.resolve()
+    )
+
+
 def test_repository_state_rejects_tracked_changes(tmp_path: Path) -> None:
     repository_root = _repository(tmp_path)
     (repository_root / "tracked.txt").write_bytes(b"changed\n")
