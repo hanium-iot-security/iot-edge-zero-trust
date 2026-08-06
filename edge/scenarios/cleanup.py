@@ -1,105 +1,385 @@
-"""실행 전 Baseline 확인 / 실행 후 Cleanup 훅.
+"""Scenario Runner 실행 전 Baseline 확인과 실행 후 안전 점검.
 
-  - Baseline: Device ``normal`` 상태, 시작 Trust Score, 활성 Firewall/
-    iptables Rule 없음, 정상 MQTT 연결 가능 상태를 확인한다.
-  - Cleanup: 공격 Process·MQTT Client·Firewall Rule·iptables를 정리하고
-    다음 Run 실행 가능 상태를 확인한다. 실패하면 새 Run을 시작하지 않고
-    RESET_FAILED로 기록한다 (Scenario Runner가 처리).
+실제 공격 실행용 Hook은 :class:`ScenarioHookContext`를 받아 현재 Run의 대상
+Session·Device·IP를 명시적으로 확인한다. Raspberry Pi Hook은 읽기 전용 점검만
+수행하며 Trust Score, Device 상태, Firewall Rule, iptables 상태를 자동 복구하지
+않는다.
 
-DB·iptables 접근은 Raspberry Pi에서만 완전하게 수행할 수 있으므로, 여기서는
-Protocol과 안전한 기본값(no-op=항상 성공)만 제공한다. Pi #2에서 실제 구현을 연결한다.
-
-.. important:: Cleanup 구현 시 금지 사항
-   실제 Cleanup 훅을 구현할 때 다음 동작은 허용하지 않는다 — 대신 승인된 Firewall
-   Release 절차·보상(compensating) 절차를 사용하고 기존 Audit 이력은 보존해야 한다.
-
-   - ``firewall_rules`` 이력 Row를 직접 DELETE하는 것
-   - Trust Score를 직접 임의의 값으로 초기화하는 것
-   - Device 상태를 직접 임의의 값으로 초기화하는 것
-
-   Trust Score를 되돌려야 하는 경우 ``edge/trust/trust_compensation.py``의
-   ``inspect_trust_compensation``/``execute_trust_compensation`` (운영자 승인·
-   사유 입력·DB 백업·SHA256·Audit JSON 로그를 갖춘 보상 절차, CLI는
-   ``edge/trust/run_trust_compensation.py``)을 사용한다. 이 절차는 사람이 건별로
-   ``approved_by``·``reason``·``--confirm``을 입력하도록 설계된 운영자 도구이므로,
-   Scenario Runner가 매 반복 실행 뒤 자동으로 호출하는 ``CleanupHook``에 그대로
-   결합하지 않는다 — 자동 Cleanup은 "정상 상태로 복귀했는지 확인"까지만 담당하고,
-   이미 반영된 Trust Score를 되돌려야 하는 예외 상황은 운영자가 별도로 위 도구를
-   사용해 처리한다.
-
-   또한 ``default_baseline_check``/``default_cleanup_hook``(no-op)은 Local
-   개발·Dry-run 전용이다. ``ScenarioRunner``는 ``allow_execute=True``(CLI
-   ``--execute``)로 실공격을 실행하려 할 때, ``baseline_check``/``cleanup_hook``이
-   이 no-op 기본값과 동일한 객체인지 identity 비교로 확인하고, 그렇다면
-   ``UnsafeExecutionRefusedError``로 실행 자체를 거부한다.
-   Pi에서 non-dry-run 실행을 준비할 때는 반드시 아래 예시 뼈대를 실제
-   DB/iptables 확인 로직으로 교체한 뒤 ``ScenarioRunner``에 전달해야 하며,
-   교체하지 않으면 ``allow_execute=True``를 줘도 실행이 거부된다.
+승인된 복구가 필요하면 기존 Firewall Release, Baseline Recovery, Trust Score
+Compensation 절차를 별도로 사용한다. Scenario Runner Cleanup에서 DB 이력 삭제,
+Trust Score 초기화, Device 상태 초기화 또는 iptables Rule 삭제를 수행하지 않는다.
 """
 
 from __future__ import annotations
 
+import os
+import sqlite3
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
+from urllib.parse import quote
+
+from backend.app.config import settings
+
+
+REQUIRED_RUNTIME_SERVICES: tuple[str, ...] = (
+    "mosquitto",
+    "mqtt-subscriber",
+    "mqtt-feature-builder",
+    "detection-orchestrator",
+    "firewall-worker",
+    "gateway-metrics",
+    "iot-edge-api",
+)
+
+_CONFLICT_PROCESS_MARKERS: tuple[str, ...] = (
+    " -m attacks.",
+    "edge.detection.run_packet_rule_detector",
+    "edge.detection.run_packet_ai_detector",
+    "edge.detection.run_packet_checkpoint_recovery",
+    "edge.features.run_packet_feature_extractor",
+    "packet_checkpoint_recovery",
+    "phase5_packet_rule_resume",
+)
+
+
+@dataclass(frozen=True)
+class ScenarioHookContext:
+    """Baseline과 Cleanup이 공유하는 단일 Run의 불변 식별 정보."""
+
+    run_id: str
+    scenario_id: str
+    session_id: str | None
+    target_device_id: str | None
+    source_ip: str | None
+    target_host: str | None
+    evaluation_scope: str
+    execution_node: str
 
 
 class BaselineCheck(Protocol):
-    """실행 전 Baseline 확인.
+    """실행 전 읽기 전용 Baseline 확인 계약."""
 
-    Device ``normal`` 상태, 시작 Trust Score, 활성 Firewall·iptables Rule
-    없음, 정상 MQTT 연결 가능 상태를 확인하고 실패 시 ``(False, 사유)``를 반환한다.
-    """
-
-    def __call__(self) -> tuple[bool, str | None]: ...
+    def __call__(
+        self, context: ScenarioHookContext
+    ) -> tuple[bool, str | None]: ...
 
 
 class CleanupHook(Protocol):
-    """실행 후 Cleanup.
+    """공격 명령 종료 후 잔여 공격 프로세스 확인 계약."""
 
-    공격 Process·MQTT Client 종료, Firewall Rule·iptables 정리, Device·Trust 상태 복구를 수행하고 성공 여부를 반환한다.
+    def __call__(
+        self, context: ScenarioHookContext
+    ) -> tuple[bool, str | None]: ...
 
-    구현 시 firewall_rules 이력 삭제, Trust Score/Device 상태 직접 초기화는
-    금지한다 (승인된 Release·보상 절차를 사용할 것 — 모듈 docstring 참고).
+
+def default_baseline_check(
+    _context: ScenarioHookContext | None = None,
+) -> tuple[bool, str | None]:
+    """Local 개발과 Dry-run용 no-op Hook.
+
+    실제 실행에서는 :class:`~edge.scenarios.run_scenario.ScenarioRunner`가 이 함수의
+    identity를 확인해 실행을 거부한다. 선택적 인자는 기존 Local 테스트의 직접 호출
+    호환성만 유지한다.
     """
 
-    def __call__(self) -> tuple[bool, str | None]: ...
-
-
-def default_baseline_check() -> tuple[bool, str | None]:
-    """로컬 개발/Dry-run 기본값 — 항상 통과. Pi에서는 반드시 교체해야 한다.
-
-    non-dry-run 실행에는 ``ScenarioRunner(allow_execute=True)``와 함께
-    실제 훅을 명시적으로 전달해야 한다 — 이 no-op 기본값을 그대로 실공격
-    실행에 사용하지 않는다.
-    """
     return True, None
 
 
-def default_cleanup_hook() -> tuple[bool, str | None]:
-    """로컬 개발/Dry-run 기본값 — 항상 통과. Pi에서는 반드시 교체해야 한다.
+def default_cleanup_hook(
+    _context: ScenarioHookContext | None = None,
+) -> tuple[bool, str | None]:
+    """Local 개발과 Dry-run용 no-op Hook."""
 
-    non-dry-run 실행에는 ``ScenarioRunner(allow_execute=True)``와 함께
-    실제 훅을 명시적으로 전달해야 한다 — 이 no-op 기본값을 그대로 실공격
-    실행에 사용하지 않는다.
-    """
     return True, None
 
 
-# --- Pi #2에서 연결할 훅의 예시 뼈대 ---
-#
-# def pi_baseline_check() -> tuple[bool, str | None]:
-#     # TODO: devices.status == 'normal' 확인
-#     # TODO: 시작 Trust Score 기록
-#     # TODO: 활성 firewall_rules / iptables Rule 없음 확인
-#     # TODO: 정상 MQTT 연결·Publish 가능 확인
-#     return True, None
-#
-#
-# def pi_cleanup_hook() -> tuple[bool, str | None]:
-#     # TODO: 공격 MQTT Client / 스캔 Process 종료
-#     # TODO: firewall_rules DB Row는 DELETE하지 말고, 승인된 Firewall Release
-#     #       절차(예: 상태를 REMOVED로 전이)로만 정리한다 (Audit 이력 보존)
-#     # TODO: Trust Score를 자동으로 되돌려야 하는 상황이 감지되면, 여기서 직접
-#     #       초기화하지 말고 False를 반환해 RESET_FAILED로 기록한 뒤, 운영자가
-#     #       edge/trust/trust_compensation.py(execute_trust_compensation) 또는
-#     #       edge/trust/run_trust_compensation.py CLI로 승인 절차를 거쳐 처리한다.
-#     return True, None
+def _absolute_sqlite_path(database_url: str) -> Path:
+    prefix = "sqlite:///"
+    if not database_url.startswith(prefix):
+        raise ValueError(
+            "database_url_not_sqlite: Pi Baseline은 sqlite:/// 절대경로만 허용합니다"
+        )
+
+    raw_path = database_url.removeprefix(prefix)
+    if not raw_path or raw_path == ":memory:":
+        raise ValueError("database_path_invalid: 실제 SQLite 파일 경로가 필요합니다")
+
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        raise ValueError(
+            f"database_path_not_absolute: DATABASE_URL={database_url!r}"
+        )
+    if not path.is_file():
+        raise ValueError(f"database_file_missing: path={path}")
+    return path.resolve()
+
+
+def _connect_sqlite_read_only(database_url: str) -> sqlite3.Connection:
+    path = _absolute_sqlite_path(database_url)
+    uri_path = quote(path.as_posix(), safe="/:")
+    connection = sqlite3.connect(
+        f"file:{uri_path}?mode=ro",
+        uri=True,
+        timeout=5.0,
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only=ON")
+    connection.execute("PRAGMA busy_timeout=5000")
+    return connection
+
+
+def _read_service_states() -> dict[str, str]:
+    """필수 Runtime과 Packet Capture의 현재 systemd 상태를 조회한다."""
+
+    states: dict[str, str] = {}
+    for service in (*REQUIRED_RUNTIME_SERVICES, "packet-capture"):
+        try:
+            completed = subprocess.run(
+                ["systemctl", "is-active", service],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+                shell=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            states[service] = f"ERROR:{exc}"
+            continue
+        state = completed.stdout.strip() or completed.stderr.strip() or "unknown"
+        states[service] = state
+    return states
+
+
+def _find_conflicting_processes() -> list[str]:
+    """공격·수동 Detector·Recovery 계열의 잔존 프로세스를 읽기 전용 조회한다."""
+
+    try:
+        completed = subprocess.run(
+            ["ps", "-eo", "pid=,args="],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [f"process_inventory_error: {exc}"]
+
+    if completed.returncode != 0:
+        reason = completed.stderr.strip() or f"exit_code={completed.returncode}"
+        return [f"process_inventory_error: {reason}"]
+
+    current_pid = os.getpid()
+    matches: list[str] = []
+    for raw_line in completed.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        pid_text, _, command = line.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        if any(marker in f" {command}" for marker in _CONFLICT_PROCESS_MARKERS):
+            matches.append(line)
+    return matches
+
+
+def _list_project_firewall_rules(source_ip: str | None) -> list[str]:
+    """기존 root Wrapper의 list 명령으로 실제 프로젝트 Rule을 읽기 전용 조회한다."""
+
+    try:
+        completed = subprocess.run(
+            [
+                settings.firewall_sudo_path,
+                "-n",
+                settings.firewall_wrapper_path,
+                "list",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=settings.firewall_command_timeout_seconds,
+            check=False,
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [f"firewall_inventory_error: {exc}"]
+
+    if completed.returncode != 0:
+        reason = completed.stderr.strip() or f"exit_code={completed.returncode}"
+        return [f"firewall_inventory_error: {reason}"]
+
+    project_rules = [
+        line.strip()
+        for line in completed.stdout.splitlines()
+        if "hanium-firewall:" in line
+    ]
+    if source_ip:
+        project_rules = [
+            line
+            for line in project_rules
+            if f"-s {source_ip} " in f"{line} "
+            or f"-s {source_ip}/32 " in f"{line} "
+        ]
+    return project_rules
+
+
+def _active_firewall_rows(
+    connection: sqlite3.Connection,
+    *,
+    target_device_id: str | None,
+    source_ip: str | None,
+) -> list[sqlite3.Row]:
+    conditions: list[str] = []
+    params: list[str] = []
+    if target_device_id:
+        conditions.append("device_id = ?")
+        params.append(target_device_id)
+    if source_ip:
+        conditions.append("source_ip = ?")
+        params.append(source_ip)
+    if not conditions:
+        return []
+
+    sql = (
+        "SELECT id, device_id, source_ip, status "
+        "FROM firewall_rules "
+        "WHERE status IN ('PENDING', 'APPLIED') AND ("
+        + " OR ".join(conditions)
+        + ") ORDER BY id"
+    )
+    return list(connection.execute(sql, params).fetchall())
+
+
+def pi_baseline_check(
+    context: ScenarioHookContext,
+) -> tuple[bool, str | None]:
+    """Raspberry Pi 실공격 직전의 최소 읽기 전용 안전 Gate.
+
+    DB Row나 운영 상태를 변경하지 않는다. 실패 시 공격은 시작되지 않으며 구체적인
+    원인을 반환한다.
+    """
+
+    try:
+        connection = _connect_sqlite_read_only(settings.database_url)
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        return False, str(exc)
+
+    try:
+        if context.target_device_id:
+            device = connection.execute(
+                "SELECT device_id, ip_address, status, trust_score "
+                "FROM devices WHERE device_id = ?",
+                (context.target_device_id,),
+            ).fetchone()
+            if device is None:
+                return (
+                    False,
+                    f"device_not_found: device_id={context.target_device_id}",
+                )
+            if device["status"] != "normal":
+                return (
+                    False,
+                    "device_not_normal: "
+                    f"device_id={context.target_device_id} "
+                    f"status={device['status']} trust_score={device['trust_score']}",
+                )
+
+        active_rules = _active_firewall_rows(
+            connection,
+            target_device_id=context.target_device_id,
+            source_ip=context.source_ip,
+        )
+        if active_rules:
+            summaries = [
+                f"id={row['id']},device={row['device_id']},"
+                f"source_ip={row['source_ip']},status={row['status']}"
+                for row in active_rules
+            ]
+            return False, "active_firewall_rule: " + "; ".join(summaries)
+
+        if context.session_id:
+            capture_session = connection.execute(
+                "SELECT session_id, status, ended_at "
+                "FROM packet_capture_sessions WHERE session_id = ?",
+                (context.session_id,),
+            ).fetchone()
+            if capture_session is None:
+                return False, f"capture_session_not_found: {context.session_id}"
+            if (
+                capture_session["status"] != "RUNNING"
+                or capture_session["ended_at"] is not None
+            ):
+                return (
+                    False,
+                    "capture_session_not_running: "
+                    f"session_id={context.session_id} "
+                    f"status={capture_session['status']} "
+                    f"ended_at={capture_session['ended_at']}",
+                )
+    except sqlite3.Error as exc:
+        return False, f"baseline_db_query_failed: {exc}"
+    finally:
+        connection.close()
+
+    actual_firewall_rules = _list_project_firewall_rules(context.source_ip)
+    inventory_errors = [
+        item for item in actual_firewall_rules if item.startswith("firewall_inventory_error:")
+    ]
+    if inventory_errors:
+        return False, inventory_errors[0]
+    if actual_firewall_rules:
+        return False, "active_iptables_rule: " + " | ".join(actual_firewall_rules)
+
+    conflicts = _find_conflicting_processes()
+    if conflicts:
+        return False, "conflicting_process: " + " | ".join(conflicts)
+
+    states = _read_service_states()
+    inactive_required = {
+        service: states.get(service, "missing")
+        for service in REQUIRED_RUNTIME_SERVICES
+        if states.get(service) != "active"
+    }
+    if inactive_required:
+        details = ", ".join(
+            f"{service}={state}"
+            for service, state in sorted(inactive_required.items())
+        )
+        return False, f"runtime_service_not_active: {details}"
+
+    capture_state = states.get("packet-capture", "missing")
+    expected_capture_state = "active" if context.session_id else "inactive"
+    if capture_state != expected_capture_state:
+        return (
+            False,
+            "packet_capture_state_mismatch: "
+            f"session_id={context.session_id} expected={expected_capture_state} "
+            f"actual={capture_state}",
+        )
+
+    return True, None
+
+
+def pi_cleanup_hook(
+    context: ScenarioHookContext,
+) -> tuple[bool, str | None]:
+    """공격 명령 종료 후 잔여 공격·수동 실행 프로세스만 확인한다.
+
+    이 함수는 DB, Trust Score, Device 상태, Firewall Rule, iptables를 변경하지
+    않는다. Observation과 승인형 복구가 필요한 상태는 그대로 보존한다.
+    """
+
+    conflicts = _find_conflicting_processes()
+    if conflicts:
+        return (
+            False,
+            "residual_attack_process: "
+            f"run_id={context.run_id} "
+            + " | ".join(conflicts),
+        )
+    return True, None
