@@ -36,9 +36,9 @@ REQUIRED_RUNTIME_SERVICES: tuple[str, ...] = (
 _CONFLICT_PROCESS_MARKERS: tuple[str, ...] = (
     " -m attacks.",
     "edge.detection.run_packet_rule_detector",
-    "edge.detection.run_packet_if_detector",
+    "edge.detection.run_packet_ai_detector",
     "edge.detection.run_packet_checkpoint_recovery",
-    "edge.packet.run_packet_feature_extractor",
+    "edge.features.run_packet_feature_extractor",
     "packet_checkpoint_recovery",
     "phase5_packet_rule_resume",
 )
