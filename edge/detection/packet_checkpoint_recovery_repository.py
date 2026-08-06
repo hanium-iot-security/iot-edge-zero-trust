@@ -15,6 +15,19 @@ SUPPORTED_DETECTORS = {
     "packet_if": "packet_feature_logs",
 }
 
+PROTECTED_TABLES = (
+    "detection_events",
+    "trust_score_history",
+    "devices",
+    "isolation_history",
+    "firewall_rules",
+    "mqtt_logs",
+    "feature_logs",
+    "packet_capture_sessions",
+    "packet_capture_segments",
+    "packet_feature_logs",
+)
+
 
 @dataclass(frozen=True)
 class RecoverySessionReadiness:
@@ -41,6 +54,28 @@ def get_checkpoint(
         """,
         (detector_name, source_table),
     ).fetchone()
+
+
+def snapshot_protected_rows(
+    connection: sqlite3.Connection,
+    *,
+    requested_checkpoint_key: tuple[str, str],
+) -> dict[str, tuple[tuple[object, ...], ...]]:
+    snapshot = {
+        table: tuple(connection.execute(f"SELECT * FROM {table} ORDER BY rowid"))
+        for table in PROTECTED_TABLES
+    }
+    snapshot["detector_checkpoints"] = tuple(
+        connection.execute(
+            """
+            SELECT * FROM detector_checkpoints
+            WHERE NOT (detector_name = ? AND source_table = ?)
+            ORDER BY detector_name, source_table
+            """,
+            requested_checkpoint_key,
+        )
+    )
+    return snapshot
 
 
 def get_capture_session(

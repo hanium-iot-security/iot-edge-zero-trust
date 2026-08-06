@@ -26,6 +26,7 @@ from edge.detection.packet_checkpoint_recovery import (
 from edge.detection import packet_checkpoint_recovery_repository as recovery_repository
 from edge.detection.packet_checkpoint_recovery_repository import (
     calculate_packet_feature_readiness,
+    snapshot_protected_rows,
 )
 from edge.packet.capture_session_repository import get_packet_feature_ready_through
 
@@ -1982,6 +1983,43 @@ def _checkpoint(database: Path) -> sqlite3.Row:
         )
     assert row is not None
     return row
+
+
+def test_snapshot_protected_rows_excludes_only_requested_checkpoint(
+    tmp_path: Path,
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    with sqlite3.connect(fixture["database"]) as connection:
+        snapshot = snapshot_protected_rows(
+            connection,
+            requested_checkpoint_key=("packet_rule", "packet_feature_logs"),
+        )
+
+    assert "detector_checkpoints" in snapshot
+    assert all(
+        row[:2] != ("packet_rule", "packet_feature_logs")
+        for row in snapshot["detector_checkpoints"]
+    )
+
+
+def test_execute_changes_only_requested_checkpoint_and_one_audit_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    key = ("packet_rule", "packet_feature_logs")
+    with sqlite3.connect(fixture["database"]) as connection:
+        before = snapshot_protected_rows(connection, requested_checkpoint_key=key)
+
+    execute_packet_checkpoint_recovery(**_valid_execute_kwargs(fixture))
+
+    with sqlite3.connect(fixture["database"]) as connection:
+        after = snapshot_protected_rows(connection, requested_checkpoint_key=key)
+        audit_count = connection.execute(
+            "SELECT COUNT(*) FROM packet_checkpoint_recoveries"
+        ).fetchone()[0]
+    assert after == before
+    assert audit_count == 1
 
 
 def test_execute_creates_verified_backup_before_begin_immediate(
