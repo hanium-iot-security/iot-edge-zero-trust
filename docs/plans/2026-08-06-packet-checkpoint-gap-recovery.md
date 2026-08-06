@@ -19,7 +19,7 @@
 - 기존 Baseline Recovery와 Trust Compensation의 안전 패턴은 참고하되 private helper import나 광범위한 공통화는 하지 않는다.
 - SQLite Authorizer는 v1 범위에서 제외한다. 고정 SQL, 조건부 UPDATE, Row 수, Snapshot 회귀 테스트로 변경 범위를 증명한다.
 - 계획/백업/결과/Lock 생성 경로가 Repository 내부이면 파일 생성 전에 실제 Git ignore 대상인지 확인한다. `.gitignore`는 수정하지 않는다.
-- Dry-run은 Windows와 POSIX에서 지원한다. Execute는 `os.name == "posix"`에서만 허용하고 Windows에서는 Lock·Backup·Artifact·DB 변경 전에 Exit 2로 거부한다.
+- Dry-run은 Windows와 POSIX에서 지원한다. Execute는 내부 `_current_platform_name()`이 반환한 실제 `os.name`이 `"posix"`일 때만 허용하고 Windows에서는 Lock·Backup·Artifact·DB 변경 전에 Exit 2로 거부한다. 공개 Execute API에는 플랫폼 Override 인자를 두지 않는다.
 - `plan_output.parent`와 Execute의 최상위 `artifact_dir`는 CLI 실행 전에 이미 존재해야 한다. CLI는 Plan 상위 Directory를 만들지 않고, Execute는 기존 `artifact_dir` 아래 `operation_id` Directory만 생성한다.
 - 모든 테스트는 독립 임시 SQLite DB와 임시 Git Repository를 사용한다.
 
@@ -86,7 +86,7 @@ def valid_dry_run_kwargs(fixture: RecoveryFixture) -> dict[str, object]:
     """inspect_packet_checkpoint_recovery()의 완전한 성공 인자를 반환한다."""
 
 def valid_execute_kwargs(fixture: RecoveryFixture, plan_file: Path) -> dict[str, object]:
-    """독립 DB, platform_name='posix', Task 9 Fake Lock을 포함한 성공 인자를 반환한다."""
+    """독립 DB와 Task 9 Fake Lock을 포함하되 플랫폼 Override는 포함하지 않는다."""
 ```
 
 Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 뒤 Initial Commit을 만들고, 제품 Repository나 실제 DB 경로를 참조하지 않는다. UUID는 `uuid.UUID(..., version=4)` 검증을 통과하는 고정 Test ID를 사용한다.
@@ -406,8 +406,10 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
   - `test_repository_state_rejects_staged_changes`
   - `test_repository_state_records_untracked_path_size_and_sha256`
   - `test_repository_state_does_not_modify_untracked_file_named_zero`
+  - `test_repository_state_rejects_untracked_symlink`
+  - `test_inventory_entry_rejects_non_regular_file`
 
-  마지막 테스트는 `0` 파일의 Before/After bytes와 SHA를 비교하며 특정 SHA를 제품 코드에 넣지 않는다. Dry-run/Execute 사이 Inventory 변경 통합 검증은 Execute Workflow가 존재하는 Task 11에서 추가한다.
+  파일 `0` 테스트는 Before/After bytes와 SHA를 비교하며 특정 SHA를 제품 코드에 넣지 않는다. Symlink 테스트는 `os.symlink()` 생성 권한이나 지원이 없을 때 해당 이유로만 `pytest.skip()`한다. 비일반 파일 테스트는 `os.mkfifo()`를 지원하는 플랫폼에서 FIFO를 만들고, 지원하지 않으면 해당 Fixture만 Skip한다. 이 Skip은 Production에서 Symlink·FIFO·Socket 등 비일반 Entry를 허용하는 근거가 아니다. Dry-run/Execute 사이 Inventory 변경 통합 검증은 Execute Workflow가 존재하는 Task 11에서 추가한다.
 
 - [ ] **Step 2: RED 확인**
 
@@ -428,14 +430,43 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
           encoding="utf-8",
       ).stdout
 
+  def _sha256_open_regular_file(path: Path, expected: os.stat_result) -> str:
+      flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+      descriptor = os.open(path, flags)
+      try:
+          opened = os.fstat(descriptor)
+          if not stat.S_ISREG(opened.st_mode):
+              raise PacketCheckpointRecoveryError("untracked entry must be a regular file")
+          if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
+              raise PacketCheckpointRecoveryError("untracked entry changed before hashing")
+          digest = hashlib.sha256()
+          while chunk := os.read(descriptor, 1024 * 1024):
+              digest.update(chunk)
+          return digest.hexdigest()
+      finally:
+          os.close(descriptor)
+
   def _inventory_entry(repository_root: Path, relative_path: str) -> dict[str, object]:
-      absolute = (repository_root / relative_path).resolve(strict=True)
-      before = absolute.stat()
-      digest = file_sha256(absolute)
-      after = absolute.stat()
-      if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+      relative = Path(relative_path)
+      if relative.is_absolute() or ".." in relative.parts:
+          raise PacketCheckpointRecoveryError("invalid untracked repository path")
+      absolute = repository_root / relative
+      before = absolute.lstat()
+      if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+          raise PacketCheckpointRecoveryError("untracked entry must be a regular file")
+      digest = _sha256_open_regular_file(absolute, before)
+      after = absolute.lstat()
+      identity_before = (
+          before.st_mode, before.st_dev, before.st_ino,
+          before.st_size, before.st_mtime_ns,
+      )
+      identity_after = (
+          after.st_mode, after.st_dev, after.st_ino,
+          after.st_size, after.st_mtime_ns,
+      )
+      if identity_before != identity_after:
           raise PacketCheckpointRecoveryError("untracked file changed during inventory")
-      return {"path": Path(relative_path).as_posix(), "size": after.st_size, "sha256": digest}
+      return {"path": relative.as_posix(), "size": after.st_size, "sha256": digest}
 
   def inspect_repository_state(repository_root: str | Path) -> dict[str, object]:
       root = Path(repository_root).expanduser().resolve(strict=True)
@@ -457,7 +488,7 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
       }
   ```
 
-  `_inventory_entry()`는 일반 파일만 허용하고 Path를 읽기 전후 `stat()`해 크기 변화를 감지한다. 삭제·수정·이동·Stage·`git clean`은 호출하지 않는다.
+  `_inventory_entry()`는 `resolve()`로 Entry를 따라가지 않는다. `lstat()`으로 Symlink와 비일반 Entry를 Hash 전에 거부하고, 열린 Descriptor의 `fstat()` Identity를 비교한 뒤에만 내용을 읽는다. Hash 후에도 `lstat()` Identity 전체를 다시 비교한다. 기존 Entry는 삭제·수정·이동·Stage하지 않으며 `git clean`을 호출하지 않는다.
 
 - [ ] **Step 4: GREEN 확인**
 
@@ -673,6 +704,8 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
   - `test_recovery_readiness_matches_existing_helper_for_normal_and_empty_segments`
   - `test_recovery_readiness_matches_existing_helper_for_ready_failed_and_missing_window`
   - `test_recovery_readiness_matches_existing_helper_for_error_code_and_feature_mismatch`
+  - `test_target_full_ready_rejects_segment_before_first_window`
+  - `test_target_full_ready_rejects_overlapping_or_extra_segment`
 
 - [ ] **Step 2: RED 확인**
 
@@ -714,7 +747,8 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
   ) -> list[sqlite3.Row]:
       return connection.execute(
           """
-          SELECT pcsg.window_start, pcsg.window_end, pcsg.status, pcsg.error_code,
+          SELECT pcsg.id AS segment_id,
+                 pcsg.window_start, pcsg.window_end, pcsg.status, pcsg.error_code,
                  COUNT(pfl.id) AS feature_count
           FROM packet_capture_segments pcsg
           LEFT JOIN packet_feature_logs pfl ON pfl.capture_segment_id = pcsg.id
@@ -747,11 +781,13 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
       ready_through: datetime | None = None
       segment_count = 0
       feature_row_count = 0
+      consumed_segment_ids: list[int] = []
       blocking_reasons: list[str] = []
       rows = _list_segment_feature_counts(connection, session_id)
       for row in rows:
           start = parse_db_utc(row["window_start"], "window_start")
           if start < expected:
+              blocking_reasons.append("SEGMENT_BEFORE_OR_OVERLAPPING_PREFIX")
               continue
           if start > expected:
               blocking_reasons.append("MISSING_WINDOW")
@@ -770,13 +806,18 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
               break
           segment_count += 1
           feature_row_count += count
+          consumed_segment_ids.append(int(row["segment_id"]))
           ready_through = end
           expected = end
       last_end = _last_segment_window_end(rows)
+      all_segment_ids = [int(row["segment_id"]) for row in rows]
       full_ready = (
           session["status"] == "COMPLETED"
           and ready_through is not None
           and ready_through == last_end
+          and segment_count == len(rows)
+          and consumed_segment_ids == all_segment_ids
+          and len(consumed_segment_ids) == len(set(consumed_segment_ids))
           and not blocking_reasons
       )
       return RecoverySessionReadiness(
@@ -787,7 +828,7 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
 
   기준 의미는 기존 `edge.packet.capture_session_repository.get_packet_feature_ready_through()`다. Parity Test는 같은 임시 SQLite DB를 SQLAlchemy `Session`과 raw `sqlite3.Connection`으로 각각 열고 정상, `EMPTY`, `READY`, `FAILED`, 누락 Window, `error_code`, Feature Row 불일치 Fixture마다 `first_window_start`와 `packet_feature_ready_through`가 동일한 aware `datetime`인지 비교한다. Recovery 구현은 기존 Helper를 리팩터링하지 않고 sqlite3로 동일한 contiguous-prefix를 계산하며 Canonical Plan을 만들 때만 `format_db_utc()`로 변환한다.
 
-  `PROCESSED`에는 같은 Session·Window의 `packet_feature_logs`가 1건 이상, `EMPTY`에는 0건이어야 한다. Target full-ready는 기존 contiguous-prefix 의미 위에 추가되는 더 강한 Recovery 전용 조건으로, Session이 `COMPLETED`이고 전체 Segment가 `PROCESSED/EMPTY`이며 Ready Through가 마지막 Window End와 일치해야만 `full_ready=True`다.
+  `PROCESSED`에는 같은 Session·Window의 `packet_feature_logs`가 1건 이상, `EMPTY`에는 0건이어야 한다. Target full-ready는 기존 contiguous-prefix 의미 위에 추가되는 더 강한 Recovery 전용 조건이다. Session이 `COMPLETED`이고 전체 Segment가 `PROCESSED/EMPTY`이며 Ready Through가 마지막 Window End와 일치해야 한다. 또한 `first_window_start`보다 앞선 Segment, 중복·겹침 Segment, Prefix에서 소비되지 않은 추가 Segment가 없어야 하며 `segment_count == len(rows)`와 `consumed_segment_ids == all_segment_ids`를 모두 만족해야 `full_ready=True`다. 기존 Helper의 Prefix 결과는 수정하거나 약화하지 않는다.
 
 - [ ] **Step 4: GREEN 확인과 기존 Repository 의미 회귀**
 
@@ -1073,7 +1114,7 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
 **Interfaces:**
 - Consumes: `edge.scripts.phase4_cutover_storage.create_sqlite_backup()`와 `verify_database()`.
 - Repository produces: `update_checkpoint_conditionally(connection: sqlite3.Connection, *, before: Mapping[str, object], after: Mapping[str, object]) -> int`, `insert_recovery_audit(connection: sqlite3.Connection, *, audit: Mapping[str, object]) -> int`, `get_recovery_audit(connection: sqlite3.Connection, operation_id: str) -> sqlite3.Row | None`.
-- Core produces: `require_execute_platform(platform_name: str) -> None`, `execute_packet_checkpoint_recovery(*, plan_file: str | Path, db_path: str | Path, artifact_dir: str | Path, confirm: str, confirm_skip_processable: str | None = None, platform_name: str | None = None, lock_factory: Callable[[Path], ContextManager[None]] = single_instance_lock) -> dict[str, object]`.
+- Core produces: `_current_platform_name() -> str`, `require_execute_platform(platform_name: str) -> None`, `execute_packet_checkpoint_recovery(*, plan_file: str | Path, db_path: str | Path, artifact_dir: str | Path, confirm: str, confirm_skip_processable: str | None = None, lock_factory: Callable[[Path], ContextManager[None]] = single_instance_lock) -> dict[str, object]`.
 
 - [ ] **Step 1: Backup·TOCTOU·Mutation 테스트 작성**
 
@@ -1095,6 +1136,19 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
   - `test_execute_rejects_missing_artifact_directory_without_creating_it`
   - `test_execute_lock_conflict_prevents_backup_artifact_and_database_changes`
   - `test_execute_rejects_windows_before_lock_backup_artifact_and_database_changes`
+  - `test_execute_public_signature_has_no_platform_override`
+  - `test_execute_rejects_platform_name_keyword_in_general_python_call`
+
+  Windows에서 실행되는 성공 Workflow 테스트는 공개 인자 없이 다음 패턴을 사용한다.
+
+  ```python
+  def test_execute_creates_verified_backup_before_begin_immediate(monkeypatch, fixture):
+      monkeypatch.setattr(recovery, "_current_platform_name", lambda: "posix")
+      kwargs = valid_execute_kwargs(fixture, fixture.plan_output)
+      assert "platform_name" not in kwargs
+      result = execute_packet_checkpoint_recovery(**kwargs)
+      assert result["database_committed"] is True
+  ```
 
 - [ ] **Step 2: RED 확인**
 
@@ -1119,6 +1173,9 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
   먼저 운영체제 Gate를 구현한다.
 
   ```python
+  def _current_platform_name() -> str:
+      return os.name
+
   def require_execute_platform(platform_name: str) -> None:
       if platform_name != "posix":
           raise PacketCheckpointRecoveryError(
@@ -1126,9 +1183,9 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
           )
   ```
 
-  Windows에서는 Manual Runner가 `msvcrt`, 공용 Runtime Lock이 `O_EXCL`, Packet Feature Extractor가 무잠금 경로를 사용하므로 같은 Path만으로 상호배제를 보장하지 못한다. `execute_packet_checkpoint_recovery()`는 `platform_name or os.name`을 위 함수로 가장 먼저 검사한다. Windows 단위 테스트에서 POSIX 성공 경로가 필요할 때만 `platform_name="posix"`와 Task 9의 Fake `lock_factory`를 주입하며 실제 POSIX 상호운용을 검증했다고 기록하지 않는다.
+  Windows에서는 Manual Runner가 `msvcrt`, 공용 Runtime Lock이 `O_EXCL`, Packet Feature Extractor가 무잠금 경로를 사용하므로 같은 Path만으로 상호배제를 보장하지 못한다. `execute_packet_checkpoint_recovery()`는 공개 인자를 읽거나 파일에 접근하기 전에 `require_execute_platform(_current_platform_name())`을 가장 먼저 호출한다. 공개 Signature와 CLI에는 `platform_name`을 두지 않으므로 일반 Python 호출과 CLI 모두 `platform_name="posix"` 같은 값으로 Gate를 우회할 수 없다.
 
-  Task 11의 성공·Rollback 통합 테스트는 모두 `platform_name="posix"`와 기록 가능한 Fake Lock Factory를 명시적으로 전달한다. Windows 거부 테스트만 `platform_name="nt"`를 전달하고 모든 Mutation Spy의 호출 수가 0인지 확인한다.
+  Windows에서 Task 11의 성공·Rollback Workflow를 검증할 때는 공개 Execute 인자를 바꾸지 않고 `_current_platform_name()`만 `lambda: "posix"`로 Monkeypatch하며 기록 가능한 Fake Lock Factory를 전달한다. Windows 거부 테스트는 `_current_platform_name()`을 `lambda: "nt"`로 Monkeypatch하고 모든 Mutation Spy의 호출 수가 0인지 확인한다. `inspect.signature()`로 공개 플랫폼 인자가 없음을 확인하고, `platform_name="posix"` Keyword 호출은 Python `TypeError`로 거부되는지 별도 테스트한다.
 
   Workflow를 다음 순서로 구현한다.
 
@@ -1187,6 +1244,7 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
   - `test_execute_cli_never_auto_restores_committed_database`
   - `test_execute_cli_requires_plan_file_database_artifact_and_confirmation`
   - `test_execute_cli_returns_two_for_windows_platform_rejection`
+  - `test_execute_cli_rejects_platform_name_option`
   - `test_execute_holds_all_locks_through_post_commit_verification_and_result_write`
 
 - [ ] **Step 2: RED 확인**
@@ -1242,7 +1300,7 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
       return 0
   ```
 
-  Commit 후 live DB 검증 또는 Result JSON 실패 시 Checkpoint/Audit/Backup을 유지하고 자동 Restore를 금지한다. Result에는 `database_committed=true`, `operation_status=HOLD`를 표시한다. CLI의 성공·Exit 3 Mapping 테스트는 Core 함수를 Monkeypatch해 플랫폼과 무관한 출력 계약만 확인한다. Lock 수명 통합 테스트는 `platform_name="posix"`와 Injected Lock의 해제 시점을 기록하는 Test Double을 사용해 모든 Lock이 성공 Result write와 Commit 후 HOLD 처리까지 유지되는지 검증한다. Windows Execute 거부는 Exit 2이며 Lock Factory, Backup Factory, Artifact Writer, DB Mutation Spy의 호출 수가 모두 0이어야 한다.
+  Commit 후 live DB 검증 또는 Result JSON 실패 시 Checkpoint/Audit/Backup을 유지하고 자동 Restore를 금지한다. Result에는 `database_committed=true`, `operation_status=HOLD`를 표시한다. CLI의 성공·Exit 3 Mapping 테스트는 Core 함수를 Monkeypatch해 플랫폼과 무관한 출력 계약만 확인한다. Lock 수명 통합 테스트는 `_current_platform_name()`을 `lambda: "posix"`로 Monkeypatch하고 Injected Lock의 해제 시점을 기록하는 Test Double을 사용해 모든 Lock이 성공 Result write와 Commit 후 HOLD 처리까지 유지되는지 검증한다. Windows Execute 거부는 Exit 2이며 Lock Factory, Backup Factory, Artifact Writer, DB Mutation Spy의 호출 수가 모두 0이어야 한다.
 
 - [ ] **Step 4: GREEN 확인**
 
@@ -1563,7 +1621,7 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
   `docs/packet-checkpoint-gap-recovery-runbook.md`에는 순서대로 다음을 작성한다.
 
   1. Migration 005 Backup·검증·별도 적용 단계
-  2. Dry-run은 Windows/POSIX 지원, Execute는 Raspberry Pi의 POSIX에서만 수행하며 Windows Execute는 금지
+  2. Dry-run은 Windows/POSIX 지원, Execute는 공개 플랫폼 Override 없이 실제 OS를 검사하며 Raspberry Pi의 POSIX에서만 수행하고 Windows Execute는 금지
   3. 실제 POSIX `flock` 상호운용은 병합 후 Pi 운영 DB가 아닌 복사 DB Smoke에서 확인
   4. Repository Root에서 tracked/staged clean 확인과 untracked inventory 보존
   5. `plan_output.parent`와 최상위 `artifact_dir` 사전 생성·권한·Git ignore 확인
@@ -1613,14 +1671,17 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
 | Migration 005 별도 적용과 Audit | 1, 2, 10, 17 |
 | Canonical Plan·결정적 SHA·Plan JSON 입력 | 3, 10, 11, 12 |
 | tracked/staged 거부·untracked inventory 보존 | 4, 10, 11 |
+| untracked Symlink·FIFO·Socket 등 비일반 Entry 거부 | 4, 10, 11 |
 | Repository 내부 생성 경로 Git ignore Gate | 5, 9, 10, 11 |
 | Plan Parent·Artifact Directory 사전 존재 | 5, 10, 11, 17 |
 | resolved absolute DB Path 바인딩 | 6, 10, 11 |
 | 기존 Helper와 Readiness 의미 Parity | 7, 16 |
 | Target full-ready 강화·전역 RUNNING Gate | 7, 10, 11 |
+| Target Segment 전체·정확히 1회 Prefix 소비 | 7, 10, 11 |
 | full-ready Session Skip 분류·추가 승인 | 8, 10, 12 |
 | 실제 Lock 경로·중복 제거·정렬 획득 | 9, 11 |
 | Windows/POSIX Dry-run·POSIX 전용 Execute | 10, 11, 12, 17 |
+| 공개 플랫폼 Override 없는 실제 OS Gate | 11, 12, 17 |
 | 실제 POSIX Lock 상호운용은 병합 후 Pi 복사 DB Smoke | 9, 17 |
 | Backup·TOCTOU·조건부 UPDATE·Audit·Delta 2 | 11 |
 | Exit 2/3·Commit 후 HOLD | 12 |
@@ -1636,9 +1697,11 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
 - 요청 Detector의 `last_processed_id`는 유지되고 시간 경계만 Target `first_window_start`로 전진한다.
 - Checkpoint 1건과 Audit 1건 외 DB Row, PCAP, untracked 파일은 불변이다.
 - Dry-run Plan과 Execute 재생성 Plan의 Canonical Payload/SHA가 동일하고 다른 DB Path에서는 재사용되지 않는다.
+- Untracked Inventory는 `lstat()`·`fstat()`으로 확인한 일반 파일만 Hash하며 Symlink와 기타 비일반 Entry를 변경 없이 거부한다.
+- Target full-ready는 모든 Segment가 정확히 한 번 연속 Prefix에 소비되고 `segment_count == len(rows)`일 때만 성립한다.
 - 처리 가능 Session Skip은 Plan SHA에 바인딩된 추가 확인 없이는 실행되지 않는다.
 - 모든 실제 고유 Lock은 Repository Root 기준 절대경로로 계산해 정렬·단일 획득하고 사후 검증까지 유지한다.
-- Dry-run은 Windows와 POSIX에서 동작하고, Execute는 POSIX가 아니면 어떤 Lock·Backup·Artifact·DB 변경 전에도 Exit 2로 거부된다.
+- Dry-run은 Windows와 POSIX에서 동작하고, Execute는 공개 Override 없이 실제 `os.name`을 검사하여 POSIX가 아니면 어떤 Lock·Backup·Artifact·DB 변경 전에도 Exit 2로 거부된다.
 - Plan 상위 Directory와 최상위 Artifact Directory는 미리 존재하며, CLI는 Plan 상위를 만들지 않고 Execute는 Artifact 아래 operation Directory만 만든다.
 - Migration 미적용, RUNNING Session, Git 상태/Inventory/경로/Checkpoint/Readiness/TOCTOU 불일치는 Backup 또는 Mutation 전에 차단된다.
 - Commit 전 실패는 Exit 2와 Rollback, Commit 후 검증·Artifact 실패는 Exit 3/HOLD로 구분된다.
