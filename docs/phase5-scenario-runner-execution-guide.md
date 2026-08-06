@@ -6,7 +6,7 @@
 
 ---
 
-## 0. 실행 전 반드시 확인 — Pi Baseline/Cleanup 연결 전 실공격 금지
+## 0. 실행 전 반드시 확인 — Pi Hook 실기기 Smoke 전 실공격 금지
 
 Scenario Runner는 기본적으로 항상 Dry-run으로 동작한다. 실제 공격을 실행하려면 아래 조건을 모두 만족해야 하며, 하나라도 빠지면 Runner가 실행 자체를 거부한다 (코드로 강제됨).
 
@@ -41,7 +41,7 @@ UnsafeExecutionRefusedError: <scenario_id>의 실공격 실행이 거부되었�
 baseline_check/cleanup_hook이 아직 기본 no-op 구현입니다.
 ```
 
-이 메시지가 뜨면 정상 동작이다. 아직 Pi 훅이 연결 안 됐다는 뜻이므로, 코드를 우회하려 하지 말고 담당자에게 Pi 훅 연결 상태를 확인한다.
+이 메시지가 뜨면 정상 동작이다. 현재 실행에 실제 Pi Hook 모듈이 연결되지 않고 기본 no-op Hook이 선택된 상태라는 뜻이므로, 코드를 우회하지 말고 `--baseline-check-module`과 `--cleanup-hook-module` 지정값을 확인한다.
 
 ---
 
