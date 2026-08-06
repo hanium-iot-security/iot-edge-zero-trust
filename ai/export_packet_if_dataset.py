@@ -78,6 +78,9 @@ class PacketIFSessionAnnotation:
     target_source_ip: str | None = None
     included_device_ids: tuple[str, ...] = ()
     background_traffic_present: bool | None = None
+    # Verified Collection으로 이관하는 Session은 각자 다른 Commit에서 수집됐다.
+    # 값이 없으면 Export 전체의 최상위 source_commit_sha를 사용한다.
+    source_commit_sha: str | None = None
 
 
 def export_packet_if_dataset(
@@ -529,6 +532,9 @@ def _normalize_session_annotations(
             annotation.background_traffic_present,
             "background_traffic_present",
         )
+        session_source_commit_sha = annotation.source_commit_sha
+        if session_source_commit_sha is not None:
+            _validate_git_commit_sha(session_source_commit_sha)
         seen_session_ids.add(session_id)
         normalized.append(
             PacketIFSessionAnnotation(
@@ -556,6 +562,7 @@ def _normalize_session_annotations(
                 target_source_ip=target_source_ip,
                 included_device_ids=included_ids,
                 background_traffic_present=background_traffic_present,
+                source_commit_sha=session_source_commit_sha,
             )
         )
     normalized_annotations = tuple(normalized)
@@ -685,7 +692,9 @@ def _build_manifest_payload(
                 "status": str(session["status"]),
                 "capture_interface": str(session["capture_interface"]),
                 "capture_filter": capture_filter,
-                "source_commit_sha": source_commit_sha,
+                "source_commit_sha": (
+                    annotation.source_commit_sha or source_commit_sha
+                ),
                 "started_at": str(session["started_at"]),
                 "first_window_start": str(session["first_window_start"]),
                 "ended_at": str(session["ended_at"]),
@@ -870,6 +879,7 @@ def _load_export_spec(
                 background_traffic_present=raw_session.get(
                     "background_traffic_present"
                 ),
+                source_commit_sha=raw_session.get("source_commit_sha"),
             )
         )
     return (

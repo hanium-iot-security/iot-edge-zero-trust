@@ -1154,3 +1154,212 @@ def _insert_packet_feature(
             "window_end": window_end,
         },
     )
+
+
+# --- Session-level capture source commit -------------------------------------
+
+
+def _export_with_session_commits(
+    db,
+    *,
+    output_path: Path,
+    session_commits: dict[str, str | None],
+    top_level_commit: str = "c" * 40,
+):
+    annotations: list[PacketIFSessionAnnotation] = []
+    for session_id, session_commit in session_commits.items():
+        run_path, run_reference = _write_run_manifest(
+            output_path.parent,
+            session_id=session_id,
+            scenario="normal_stable",
+            target_device_id="esp32_01",
+            source_ip="192.168.0.4",
+            is_attack=False,
+        )
+        annotations.append(
+            PacketIFSessionAnnotation(
+                session_id=session_id,
+                split="train",
+                traffic_label="normal",
+                scenario="normal_stable",
+                collection_slot_id=f"slot-{session_id}",
+                source_capture_group_id=session_id,
+                run_manifest_ref=run_reference,
+                run_manifest_path=run_path,
+                normal_policy_version="phase5-normal-policy-v1.1",
+                firmware_version="phase5-normal-pilot-v1",
+                payload_schema_version="phase5-normal-payload-v1",
+                included_device_ids=("esp32_01",),
+                background_traffic_present=False,
+                source_commit_sha=session_commit,
+            )
+        )
+    return export_packet_if_dataset(
+        db,
+        output_path=output_path,
+        manifest_path=output_path.with_suffix(".manifest.json"),
+        session_annotations=annotations,
+        capture_filter="tcp or udp",
+        source_commit_sha=top_level_commit,
+        capture_policy=CapturePolicy(),
+    )
+
+
+def _seed_normal_session(
+    db,
+    session_id: str,
+    *,
+    base_id: int,
+    window_offset_seconds: int = 0,
+) -> None:
+    """Seed one COMPLETED Session with a single eligible INBOUND row.
+
+    packet_capture_segments has UNIQUE(capture_interface, window_start,
+    window_end), so multiple Sessions on eth0 must occupy different windows.
+    """
+    start = datetime(2026, 7, 26, 10, 0, 0, tzinfo=timezone.utc) + timedelta(
+        seconds=window_offset_seconds
+    )
+    window_start = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    window_end = (start + timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    session_pk = _insert_capture_session(
+        db,
+        session_id,
+        first_window_start=window_start,
+    )
+    segment_id = _insert_segment(
+        db,
+        session_pk=session_pk,
+        segment_id=base_id,
+        window_start=window_start,
+        window_end=window_end,
+    )
+    _insert_packet_feature(
+        db,
+        feature_id=base_id,
+        segment_id=segment_id,
+        device_id="esp32_01",
+        peer_ip="192.168.0.4",
+        direction="INBOUND",
+        window_start=window_start,
+        window_end=window_end,
+    )
+
+
+def _manifest_sessions(result) -> dict[str, dict[str, Any]]:
+    payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    return {
+        session["session_id"]: session
+        for session in payload["sessions"]
+    }
+
+
+def test_export_records_distinct_session_source_commits(
+    SessionLocal,
+    tmp_path: Path,
+) -> None:
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01", "192.168.0.4")
+        _seed_normal_session(db, SESSION_ID, base_id=1)
+        _seed_normal_session(
+            db,
+            OTHER_SESSION_ID,
+            base_id=2,
+            window_offset_seconds=60,
+        )
+        db.commit()
+
+        result = _export_with_session_commits(
+            db,
+            output_path=tmp_path / "packet-if-commits.csv",
+            session_commits={
+                SESSION_ID: "a" * 40,
+                OTHER_SESSION_ID: "b" * 40,
+            },
+        )
+
+    sessions = _manifest_sessions(result)
+    assert sessions[SESSION_ID]["source_commit_sha"] == "a" * 40
+    assert sessions[OTHER_SESSION_ID]["source_commit_sha"] == "b" * 40
+
+
+def test_export_falls_back_to_top_level_source_commit(
+    SessionLocal,
+    tmp_path: Path,
+) -> None:
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01", "192.168.0.4")
+        _seed_normal_session(db, SESSION_ID, base_id=1)
+        db.commit()
+
+        result = _export_with_session_commits(
+            db,
+            output_path=tmp_path / "packet-if-fallback.csv",
+            session_commits={SESSION_ID: None},
+        )
+
+    sessions = _manifest_sessions(result)
+    assert sessions[SESSION_ID]["source_commit_sha"] == "c" * 40
+
+
+def test_export_rejects_invalid_session_source_commit(
+    SessionLocal,
+    tmp_path: Path,
+) -> None:
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01", "192.168.0.4")
+        _seed_normal_session(db, SESSION_ID, base_id=1)
+        db.commit()
+
+        with pytest.raises(ValueError, match="source_commit_sha"):
+            _export_with_session_commits(
+                db,
+                output_path=tmp_path / "packet-if-invalid.csv",
+                session_commits={SESSION_ID: "A" * 40},
+            )
+
+
+def test_export_spec_parses_optional_session_source_commit(tmp_path: Path) -> None:
+    run_path, run_reference = _write_run_manifest(
+        tmp_path,
+        session_id=SESSION_ID,
+        scenario="normal_stable",
+        target_device_id="esp32_01",
+        source_ip="192.168.0.4",
+        is_attack=False,
+    )
+    spec_path = tmp_path / "export-spec.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "capture_filter": "tcp or udp",
+                "source_commit_sha": "c" * 40,
+                "sessions": [
+                    {
+                        "session_id": SESSION_ID,
+                        "split": "train",
+                        "traffic_label": "normal",
+                        "scenario": "normal_stable",
+                        "collection_slot_id": "slot-01",
+                        "source_capture_group_id": SESSION_ID,
+                        "run_manifest_ref": run_reference.to_dict(),
+                        "run_manifest_path": str(
+                            run_path.relative_to(tmp_path)
+                        ),
+                        "normal_policy_version": "phase5-normal-policy-v1.1",
+                        "firmware_version": "phase5-normal-pilot-v1",
+                        "payload_schema_version": "phase5-normal-payload-v1",
+                        "included_device_ids": ["esp32_01"],
+                        "background_traffic_present": False,
+                        "source_commit_sha": "a" * 40,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _capture_filter, top_level, annotations = exporter._load_export_spec(spec_path)
+
+    assert top_level == "c" * 40
+    assert annotations[0].source_commit_sha == "a" * 40
