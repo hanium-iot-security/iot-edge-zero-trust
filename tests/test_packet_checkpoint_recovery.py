@@ -34,6 +34,9 @@ CURRENT_FIRST = datetime(2026, 8, 6, 10, 0, 0, tzinfo=timezone.utc)
 CURRENT_READY_THROUGH = datetime(2026, 8, 6, 10, 0, 20, tzinfo=timezone.utc)
 TARGET_FIRST = datetime(2026, 8, 6, 10, 1, 0, tzinfo=timezone.utc)
 TARGET_READY_THROUGH = datetime(2026, 8, 6, 10, 1, 20, tzinfo=timezone.utc)
+PROCESSABLE_SKIP_SESSION = "55555555-5555-4555-8555-555555555555"
+FAILED_SKIP_SESSION = "66666666-6666-4666-8666-666666666666"
+NOT_READY_SKIP_SESSION = "77777777-7777-4777-8777-777777777777"
 
 
 def _git(repository_root: Path, *args: str) -> str:
@@ -268,6 +271,201 @@ def _build_plan(
 
 def _blocking_codes(plan: dict[str, object]) -> set[str]:
     return set(plan["blocking_reasons"])
+
+
+def test_plan_classifies_full_ready_completed_session_as_processable_skip(
+    tmp_path: Path,
+) -> None:
+    connection = _seed_valid_recovery_database(tmp_path / "processable-skip.db")
+    try:
+        skipped_first = CURRENT_READY_THROUGH + timedelta(seconds=10)
+        skipped_pk = _insert_capture_session(
+            connection,
+            session_id=PROCESSABLE_SKIP_SESSION,
+            capture_interface="eth-skipped",
+            first_window_start=skipped_first,
+        )
+        _insert_capture_segment(
+            connection,
+            session_pk=skipped_pk,
+            capture_interface="eth-skipped",
+            window_start=skipped_first,
+            status="PROCESSED",
+            feature_count=1,
+        )
+        _insert_capture_segment(
+            connection,
+            session_pk=skipped_pk,
+            capture_interface="eth-skipped",
+            window_start=skipped_first + timedelta(seconds=10),
+            status="EMPTY",
+        )
+        connection.commit()
+
+        plan = _build_plan(connection, tmp_path=tmp_path)
+
+        assert plan["sessions_between"] == [
+            {
+                "classification": "SKIPPED_FULL_READY_COMPLETED",
+                "session_id": PROCESSABLE_SKIP_SESSION,
+                "first_window_start": _db_utc(skipped_first),
+                "packet_feature_ready_through": _db_utc(
+                    skipped_first + timedelta(seconds=20)
+                ),
+                "segment_count": 2,
+                "feature_row_count": 1,
+                "warning_codes": ["PROCESSABLE_SESSION_SKIP"],
+            }
+        ]
+        assert plan["summary"]["skips_processable_sessions"] is True
+        assert plan["summary"]["warning_codes"] == [
+            "PROCESSABLE_SESSION_SKIP"
+        ]
+        assert plan["summary"]["current_session_classification"] == "EXHAUSTED_CURRENT"
+        assert (
+            plan["summary"]["target_session_classification"]
+            == "TARGET_FULL_READY_COMPLETED"
+        )
+    finally:
+        connection.close()
+
+
+def test_plan_classifies_failed_and_not_ready_sessions_separately(
+    tmp_path: Path,
+) -> None:
+    connection = _seed_valid_recovery_database(tmp_path / "nonprocessable-skips.db")
+    try:
+        failed_first = CURRENT_READY_THROUGH + timedelta(seconds=10)
+        not_ready_first = failed_first + timedelta(seconds=10)
+        _insert_capture_session(
+            connection,
+            session_id=FAILED_SKIP_SESSION,
+            capture_interface="eth-failed",
+            first_window_start=failed_first,
+            status="FAILED",
+        )
+        not_ready_pk = _insert_capture_session(
+            connection,
+            session_id=NOT_READY_SKIP_SESSION,
+            capture_interface="eth-not-ready",
+            first_window_start=not_ready_first,
+        )
+        _insert_capture_segment(
+            connection,
+            session_pk=not_ready_pk,
+            capture_interface="eth-not-ready",
+            window_start=not_ready_first,
+            status="READY",
+        )
+        connection.commit()
+
+        plan = _build_plan(connection, tmp_path=tmp_path)
+
+        assert [row["classification"] for row in plan["sessions_between"]] == [
+            "SKIPPED_FAILED",
+            "SKIPPED_NOT_READY",
+        ]
+        assert plan["summary"]["skips_processable_sessions"] is False
+        assert plan["summary"]["warning_codes"] == []
+    finally:
+        connection.close()
+
+
+def test_processable_skip_requires_plan_sha_bound_confirmation(
+    tmp_path: Path,
+) -> None:
+    connection = _seed_valid_recovery_database(tmp_path / "confirm-processable.db")
+    try:
+        skipped_first = CURRENT_READY_THROUGH + timedelta(seconds=10)
+        skipped_pk = _insert_capture_session(
+            connection,
+            session_id=PROCESSABLE_SKIP_SESSION,
+            capture_interface="eth-skipped",
+            first_window_start=skipped_first,
+        )
+        _insert_capture_segment(
+            connection,
+            session_pk=skipped_pk,
+            capture_interface="eth-skipped",
+            window_start=skipped_first,
+            status="EMPTY",
+        )
+        connection.commit()
+        plan = attach_plan_sha256(_build_plan(connection, tmp_path=tmp_path), generated_at=UTC_A)
+
+        packet_checkpoint_recovery.require_execute_confirmations(
+            plan,
+            confirm="APPLY-PACKET-CHECKPOINT-GAP-RECOVERY",
+            confirm_skip_processable=(
+                f"SKIP-PROCESSABLE-SESSIONS:{plan['plan_sha256']}"
+            ),
+        )
+    finally:
+        connection.close()
+
+
+def test_processable_skip_rejects_missing_or_wrong_confirmation(tmp_path: Path) -> None:
+    plan = {
+        "plan_sha256": "a" * 64,
+        "summary": {"skips_processable_sessions": True},
+    }
+
+    with pytest.raises(
+        PacketCheckpointRecoveryError, match="processable-session confirmation mismatch"
+    ):
+        packet_checkpoint_recovery.require_execute_confirmations(
+            plan,
+            confirm="APPLY-PACKET-CHECKPOINT-GAP-RECOVERY",
+            confirm_skip_processable=None,
+        )
+    with pytest.raises(
+        PacketCheckpointRecoveryError, match="processable-session confirmation mismatch"
+    ):
+        packet_checkpoint_recovery.require_execute_confirmations(
+            plan,
+            confirm="APPLY-PACKET-CHECKPOINT-GAP-RECOVERY",
+            confirm_skip_processable="SKIP-PROCESSABLE-SESSIONS:" + "b" * 64,
+        )
+
+
+def test_nonprocessable_gap_does_not_require_processable_skip_confirmation(
+    tmp_path: Path,
+) -> None:
+    connection = _seed_valid_recovery_database(tmp_path / "confirm-nonprocessable.db")
+    try:
+        _insert_capture_session(
+            connection,
+            session_id=FAILED_SKIP_SESSION,
+            capture_interface="eth-failed",
+            first_window_start=CURRENT_READY_THROUGH + timedelta(seconds=10),
+            status="FAILED",
+        )
+        connection.commit()
+        plan = attach_plan_sha256(_build_plan(connection, tmp_path=tmp_path), generated_at=UTC_A)
+
+        packet_checkpoint_recovery.require_execute_confirmations(
+            plan,
+            confirm="APPLY-PACKET-CHECKPOINT-GAP-RECOVERY",
+            confirm_skip_processable=None,
+        )
+    finally:
+        connection.close()
+
+
+def test_confirmation_is_rejected_when_plan_has_no_processable_skip() -> None:
+    plan = {
+        "plan_sha256": "a" * 64,
+        "summary": {"skips_processable_sessions": False},
+    }
+
+    with pytest.raises(
+        PacketCheckpointRecoveryError, match="processable-session confirmation not allowed"
+    ):
+        packet_checkpoint_recovery.require_execute_confirmations(
+            plan,
+            confirm="APPLY-PACKET-CHECKPOINT-GAP-RECOVERY",
+            confirm_skip_processable="SKIP-PROCESSABLE-SESSIONS:" + "a" * 64,
+        )
 
 
 def _insert_recovery_audit(connection: sqlite3.Connection) -> None:

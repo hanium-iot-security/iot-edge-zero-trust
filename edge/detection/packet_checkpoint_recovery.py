@@ -18,6 +18,8 @@ from edge.detection.phase4_time import format_db_utc, parse_db_utc
 
 
 PLAN_SCHEMA_VERSION = "packet-checkpoint-gap-recovery-plan-v1"
+EXECUTE_CONFIRMATION = "APPLY-PACKET-CHECKPOINT-GAP-RECOVERY"
+PROCESSABLE_SKIP_PREFIX = "SKIP-PROCESSABLE-SESSIONS:"
 _VOLATILE_PLAN_KEYS = frozenset({
     "plan_sha256", "generated_at", "executed_at", "operation_id", "mode",
     "plan_path", "artifact_dir", "backup_path", "result_path", "backup_sha256",
@@ -52,6 +54,70 @@ def _readiness_summary(
         "full_ready": readiness.full_ready,
         "blocking_reasons": list(readiness.blocking_reasons),
     }
+
+
+def classify_skipped_sessions(
+    connection: sqlite3.Connection,
+    *,
+    checkpoint_window_end: str,
+    target_first_window_start: str,
+) -> list[dict[str, object]]:
+    summaries: list[dict[str, object]] = []
+    for session in recovery_repository.list_sessions_between(
+        connection,
+        after_window_end=checkpoint_window_end,
+        before_window_start=target_first_window_start,
+    ):
+        readiness = recovery_repository.calculate_packet_feature_readiness(
+            connection, str(session["session_id"])
+        )
+        if session["status"] == "FAILED":
+            classification = "SKIPPED_FAILED"
+        elif session["status"] == "RUNNING":
+            classification = "BLOCKING_RUNNING"
+        elif readiness is not None and readiness.full_ready:
+            classification = "SKIPPED_FULL_READY_COMPLETED"
+        else:
+            classification = "SKIPPED_NOT_READY"
+        summaries.append(
+            {
+                "classification": classification,
+                "session_id": str(session["session_id"]),
+                "first_window_start": str(session["first_window_start"]),
+                "packet_feature_ready_through": (
+                    format_db_utc(readiness.packet_feature_ready_through)
+                    if readiness is not None
+                    and readiness.packet_feature_ready_through is not None
+                    else None
+                ),
+                "segment_count": readiness.segment_count if readiness is not None else 0,
+                "feature_row_count": (
+                    readiness.feature_row_count if readiness is not None else 0
+                ),
+                "warning_codes": (
+                    ["PROCESSABLE_SESSION_SKIP"]
+                    if classification == "SKIPPED_FULL_READY_COMPLETED"
+                    else []
+                ),
+            }
+        )
+    return summaries
+
+
+def require_execute_confirmations(
+    plan: Mapping[str, object],
+    *,
+    confirm: str,
+    confirm_skip_processable: str | None,
+) -> None:
+    if confirm != EXECUTE_CONFIRMATION:
+        raise PacketCheckpointRecoveryError("execute confirmation mismatch")
+    expected = f"{PROCESSABLE_SKIP_PREFIX}{plan['plan_sha256']}"
+    skips = bool(plan["summary"]["skips_processable_sessions"])
+    if skips and confirm_skip_processable != expected:
+        raise PacketCheckpointRecoveryError("processable-session confirmation mismatch")
+    if not skips and confirm_skip_processable is not None:
+        raise PacketCheckpointRecoveryError("processable-session confirmation not allowed")
 
 
 def build_recovery_plan(
@@ -176,18 +242,18 @@ def build_recovery_plan(
     )
     sessions_between: list[dict[str, object]] = []
     if checkpoint_window is not None and target_first is not None:
-        sessions_between = [
-            {
-                "session_id": str(row["session_id"]),
-                "first_window_start": str(row["first_window_start"]),
-                "status": str(row["status"]),
-            }
-            for row in recovery_repository.list_sessions_between(
-                connection,
-                after_window_end=format_db_utc(checkpoint_window),
-                before_window_start=format_db_utc(target_first),
-            )
-        ]
+        sessions_between = classify_skipped_sessions(
+            connection,
+            checkpoint_window_end=format_db_utc(checkpoint_window),
+            target_first_window_start=format_db_utc(target_first),
+        )
+    skips_processable_sessions = any(
+        row["classification"] == "SKIPPED_FULL_READY_COMPLETED"
+        for row in sessions_between
+    )
+    warning_codes = (
+        ["PROCESSABLE_SESSION_SKIP"] if skips_processable_sessions else []
+    )
 
     return {
         "plan_schema_version": PLAN_SCHEMA_VERSION,
@@ -214,6 +280,27 @@ def build_recovery_plan(
         ),
         "sessions_between": sessions_between,
         "running_sessions": running_sessions,
+        "summary": {
+            "current_session_classification": (
+                "EXHAUSTED_CURRENT"
+                if checkpoint_window is not None
+                and current_readiness is not None
+                and checkpoint_window == current_readiness.packet_feature_ready_through
+                else None
+            ),
+            "skipped_sessions": sessions_between,
+            "running_sessions": [
+                {"classification": "BLOCKING_RUNNING", **session}
+                for session in running_sessions
+            ],
+            "target_session_classification": (
+                "TARGET_FULL_READY_COMPLETED"
+                if target_readiness is not None and target_readiness.full_ready
+                else None
+            ),
+            "skips_processable_sessions": skips_processable_sessions,
+            "warning_codes": warning_codes,
+        },
         "existing_recovery": (
             dict(existing_recovery) if existing_recovery is not None else None
         ),
