@@ -6,15 +6,22 @@ import hashlib
 import hmac
 import json
 import os
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
 import stat
 import subprocess
 from datetime import datetime
-from typing import Mapping, Sequence
+from typing import Callable, ContextManager, Iterator, Mapping, Sequence
 
+from backend.app.config import Settings
 from edge.detection import packet_checkpoint_recovery_repository as recovery_repository
+from edge.detection import run_packet_ai_detector, run_packet_rule_detector
 from edge.detection.phase4_time import format_db_utc, parse_db_utc
+from edge.features import run_packet_feature_extractor
+from edge.orchestration import run_detection_orchestrator
+from edge.runtime_lock import single_instance_lock
 
 
 PLAN_SCHEMA_VERSION = "packet-checkpoint-gap-recovery-plan-v1"
@@ -30,6 +37,86 @@ _VOLATILE_PLAN_KEYS = frozenset({
 
 class PacketCheckpointRecoveryError(Exception):
     """Raised when a packet checkpoint recovery plan is invalid."""
+
+
+@dataclass(frozen=True)
+class ResolvedRecoveryLock:
+    path: Path
+    roles: tuple[str, ...]
+
+
+def _absolute_lock_path(repository_root: Path, path: Path) -> Path:
+    candidate = path if path.is_absolute() else repository_root / path
+    return candidate.resolve(strict=False)
+
+
+def resolve_recovery_locks(
+    *,
+    repository_root: Path,
+    database_url: str,
+    orchestrator_lock_path: Path | None,
+    manual_lock_path: Path | None,
+    extractor_lock_path: Path | None,
+) -> tuple[ResolvedRecoveryLock, ...]:
+    orchestrator = run_detection_orchestrator.resolve_lock_path(
+        Settings(
+            database_url=database_url,
+            orchestrator_lock_path=(
+                str(orchestrator_lock_path)
+                if orchestrator_lock_path is not None
+                else ""
+            ),
+        )
+    )
+    rule_manual = (
+        manual_lock_path
+        if manual_lock_path is not None
+        else run_packet_rule_detector.DEFAULT_LOCK_PATH
+    )
+    if_manual = (
+        manual_lock_path
+        if manual_lock_path is not None
+        else run_packet_ai_detector.DEFAULT_LOCK_PATH
+    )
+    extractor = (
+        extractor_lock_path
+        if extractor_lock_path is not None
+        else run_packet_feature_extractor.DEFAULT_LOCK_PATH
+    )
+    roles_by_path: dict[Path, set[str]] = {}
+    for role, path in (
+        ("detection_orchestrator", orchestrator),
+        ("packet_rule_manual", rule_manual),
+        ("packet_if_manual", if_manual),
+        ("packet_feature_extractor", extractor),
+    ):
+        absolute = _absolute_lock_path(repository_root, Path(path))
+        roles_by_path.setdefault(absolute, set()).add(role)
+    return tuple(
+        ResolvedRecoveryLock(path, tuple(sorted(roles)))
+        for path, roles in sorted(roles_by_path.items(), key=lambda item: str(item[0]))
+    )
+
+
+def serialize_resolved_locks(
+    locks: Sequence[ResolvedRecoveryLock],
+) -> tuple[dict[str, object], ...]:
+    return tuple(
+        {"path": str(lock.path), "roles": list(lock.roles)}
+        for lock in sorted(locks, key=lambda item: str(item.path))
+    )
+
+
+@contextmanager
+def acquire_recovery_locks(
+    locks: Sequence[ResolvedRecoveryLock],
+    *,
+    lock_factory: Callable[[Path], ContextManager[None]] = single_instance_lock,
+) -> Iterator[None]:
+    with ExitStack() as stack:
+        for lock in sorted(locks, key=lambda item: str(item.path)):
+            stack.enter_context(lock_factory(lock.path))
+        yield
 
 
 def _readiness_summary(

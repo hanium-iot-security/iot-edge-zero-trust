@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import os
@@ -768,6 +769,188 @@ def test_generated_path_checks_backup_sha256_sidecar(tmp_path: Path) -> None:
     assert not backup.parent.exists()
     assert not backup.exists()
     assert not sidecar.exists()
+
+
+def test_lock_resolution_uses_orchestrator_manual_and_extractor_contracts(
+    tmp_path: Path,
+) -> None:
+    repository_root = tmp_path.resolve()
+
+    locks = packet_checkpoint_recovery.resolve_recovery_locks(
+        repository_root=repository_root,
+        database_url="sqlite:///data/recovery.db",
+        orchestrator_lock_path=None,
+        manual_lock_path=None,
+        extractor_lock_path=None,
+    )
+
+    assert packet_checkpoint_recovery.serialize_resolved_locks(locks) == (
+        {
+            "path": str((repository_root / "data/pcap/.extractor.lock").resolve()),
+            "roles": ["packet_feature_extractor"],
+        },
+        {
+            "path": str(
+                (repository_root / "data/phase4-detection-cycle.lock").resolve()
+            ),
+            "roles": ["packet_if_manual", "packet_rule_manual"],
+        },
+        {
+            "path": str(
+                (repository_root / "data/recovery.db.orchestrator.lock").resolve()
+            ),
+            "roles": ["detection_orchestrator"],
+        },
+    )
+
+
+def test_lock_resolution_preserves_orchestrator_non_sqlite_fallback(
+    tmp_path: Path,
+) -> None:
+    locks = packet_checkpoint_recovery.resolve_recovery_locks(
+        repository_root=tmp_path,
+        database_url="postgresql://localhost/iot",
+        orchestrator_lock_path=None,
+        manual_lock_path=None,
+        extractor_lock_path=None,
+    )
+
+    orchestrator = next(
+        lock for lock in locks if lock.roles == ("detection_orchestrator",)
+    )
+    assert orchestrator.path == (
+        tmp_path / "data/detection-orchestrator.lock"
+    ).resolve()
+
+
+def test_relative_lock_paths_resolve_from_repository_root(tmp_path: Path) -> None:
+    locks = packet_checkpoint_recovery.resolve_recovery_locks(
+        repository_root=tmp_path,
+        database_url="postgresql://localhost/iot",
+        orchestrator_lock_path=Path("locks/orchestrator.lock"),
+        manual_lock_path=Path("locks/manual.lock"),
+        extractor_lock_path=Path("locks/extractor.lock"),
+    )
+
+    assert {lock.path for lock in locks} == {
+        (tmp_path / "locks/orchestrator.lock").resolve(),
+        (tmp_path / "locks/manual.lock").resolve(),
+        (tmp_path / "locks/extractor.lock").resolve(),
+    }
+
+
+def test_shared_rule_if_lock_is_acquired_once_with_both_roles(tmp_path: Path) -> None:
+    locks = packet_checkpoint_recovery.resolve_recovery_locks(
+        repository_root=tmp_path,
+        database_url="postgresql://localhost/iot",
+        orchestrator_lock_path=None,
+        manual_lock_path=None,
+        extractor_lock_path=None,
+    )
+
+    manual = [lock for lock in locks if "packet_rule_manual" in lock.roles]
+    assert manual == [
+        packet_checkpoint_recovery.ResolvedRecoveryLock(
+            path=(tmp_path / "data/phase4-detection-cycle.lock").resolve(),
+            roles=("packet_if_manual", "packet_rule_manual"),
+        )
+    ]
+
+
+def test_duplicate_orchestrator_and_manual_path_is_acquired_once(
+    tmp_path: Path,
+) -> None:
+    shared = Path("locks/shared.lock")
+    locks = packet_checkpoint_recovery.resolve_recovery_locks(
+        repository_root=tmp_path,
+        database_url="postgresql://localhost/iot",
+        orchestrator_lock_path=shared,
+        manual_lock_path=shared,
+        extractor_lock_path=Path("locks/extractor.lock"),
+    )
+
+    assert locks == tuple(sorted(locks, key=lambda lock: str(lock.path)))
+    assert next(lock for lock in locks if lock.path == (tmp_path / shared).resolve()) == (
+        packet_checkpoint_recovery.ResolvedRecoveryLock(
+            path=(tmp_path / shared).resolve(),
+            roles=(
+                "detection_orchestrator",
+                "packet_if_manual",
+                "packet_rule_manual",
+            ),
+        )
+    )
+    assert len(locks) == 2
+
+
+def test_unique_locks_are_acquired_in_sorted_absolute_path_order_with_injected_lock(
+    tmp_path: Path,
+) -> None:
+    first = (tmp_path / "a.lock").resolve()
+    second = (tmp_path / "b.lock").resolve()
+    events: list[tuple[str, Path]] = []
+
+    @contextmanager
+    def fake_lock(path: Path):
+        events.append(("enter", path))
+        try:
+            yield
+        finally:
+            events.append(("exit", path))
+
+    locks = (
+        packet_checkpoint_recovery.ResolvedRecoveryLock(second, ("second",)),
+        packet_checkpoint_recovery.ResolvedRecoveryLock(first, ("first",)),
+    )
+
+    with packet_checkpoint_recovery.acquire_recovery_locks(
+        locks, lock_factory=fake_lock
+    ):
+        assert events == [("enter", first), ("enter", second)]
+
+    assert events == [
+        ("enter", first),
+        ("enter", second),
+        ("exit", second),
+        ("exit", first),
+    ]
+
+
+def test_acquire_recovery_locks_releases_already_acquired_locks_on_conflict(
+    tmp_path: Path,
+) -> None:
+    first = (tmp_path / "a.lock").resolve()
+    conflict = (tmp_path / "b.lock").resolve()
+    last = (tmp_path / "c.lock").resolve()
+    events: list[tuple[str, Path]] = []
+
+    @contextmanager
+    def fake_lock(path: Path):
+        events.append(("enter", path))
+        if path == conflict:
+            raise RuntimeError("lock conflict")
+        try:
+            yield
+        finally:
+            events.append(("exit", path))
+
+    locks = (
+        packet_checkpoint_recovery.ResolvedRecoveryLock(last, ("last",)),
+        packet_checkpoint_recovery.ResolvedRecoveryLock(conflict, ("conflict",)),
+        packet_checkpoint_recovery.ResolvedRecoveryLock(first, ("first",)),
+    )
+
+    with pytest.raises(RuntimeError, match="lock conflict"):
+        with packet_checkpoint_recovery.acquire_recovery_locks(
+            locks, lock_factory=fake_lock
+        ):
+            pytest.fail("conflicting lock must prevent entry")
+
+    assert events == [
+        ("enter", first),
+        ("enter", conflict),
+        ("exit", first),
+    ]
 
 
 def test_plan_output_requires_existing_parent_directory(tmp_path: Path) -> None:

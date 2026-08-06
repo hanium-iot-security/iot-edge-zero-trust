@@ -985,10 +985,15 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
       *, repository_root, database_url, orchestrator_lock_path,
       manual_lock_path, extractor_lock_path,
   ) -> tuple[ResolvedRecoveryLock, ...]:
-      orchestrator = orchestrator_lock_path or runtime_lock.resolve_lock_path(
-          database_url,
-          suffix=".orchestrator.lock",
-          fallback=str(run_packet_rule_detector.DEFAULT_LOCK_PATH),
+      orchestrator = run_detection_orchestrator.resolve_lock_path(
+          Settings(
+              database_url=database_url,
+              orchestrator_lock_path=(
+                  str(orchestrator_lock_path)
+                  if orchestrator_lock_path is not None
+                  else ""
+              ),
+          )
       )
       manual = manual_lock_path or run_packet_rule_detector.DEFAULT_LOCK_PATH
       extractor = extractor_lock_path or run_packet_feature_extractor.DEFAULT_LOCK_PATH
@@ -1026,7 +1031,7 @@ Fixture는 임시 Repository 내부 생성 경로를 `.gitignore`에 포함한 �
           yield
   ```
 
-  Orchestrator 경로는 실제 Settings/DB URL로 `resolve_lock_path()`를 호출한 결과를 사용한다. Manual Rule/IF와 Extractor의 상대 기본값 및 Override는 Repository Root 기준으로 절대경로화한다. `(resolved_path, roles[])`로 합친 후 같은 Path를 두 번 획득하지 않는다. Task 5 Gate가 모든 Lock Path를 먼저 승인한 뒤 획득한다. Windows 단위 테스트는 주입한 Fake Lock으로 순서·중복·해제를 검증하며 실제 상호운용을 주장하지 않는다. Lock 충돌 시 Backup 무변경 통합 테스트는 Task 11, Commit 후 Result 처리까지 Lock 유지 테스트는 Task 12에서 추가한다.
+  Orchestrator 경로는 제공된 `database_url`과 `orchestrator_lock_path` Override를 담은 실제 `Settings`로 `run_detection_orchestrator.resolve_lock_path()`를 호출한 결과를 사용한다. Override가 없고 URL이 non-SQLite이면 실제 Orchestrator fallback인 `data/detection-orchestrator.lock`을 유지하며 다른 fallback을 만들지 않는다. Manual Rule/IF와 Extractor의 상대 기본값 및 Override는 Repository Root 기준으로 절대경로화한다. `(resolved_path, roles[])`로 합친 후 같은 Path를 두 번 획득하지 않는다. Task 5 Gate가 모든 Lock Path를 먼저 승인한 뒤 획득한다. Windows 단위 테스트는 주입한 Fake Lock으로 순서·중복·해제를 검증하며 실제 상호운용을 주장하지 않는다. Lock 충돌 시 Backup 무변경 통합 테스트는 Task 11, Commit 후 Result 처리까지 Lock 유지 테스트는 Task 12에서 추가한다.
 
 - [ ] **Step 4: GREEN 및 기존 Lock 회귀 확인**
 
