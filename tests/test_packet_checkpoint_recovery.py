@@ -5,6 +5,7 @@ import importlib
 import json
 import os
 from pathlib import Path
+import shlex
 import sqlite3
 import subprocess
 
@@ -1503,6 +1504,20 @@ def test_dry_run_writes_canonical_plan_atomically_after_all_gates_pass(
     assert plan["plan_sha256"] == packet_checkpoint_recovery.calculate_plan_sha256(
         plan
     )
+    assert shlex.split(plan["execute_command"]) == [
+        "python",
+        "-m",
+        "edge.detection.run_packet_checkpoint_recovery",
+        "execute",
+        "--plan-file",
+        str(plan_output.resolve()),
+        "--db-path",
+        str(database.resolve()),
+        "--artifact-dir",
+        "<ARTIFACT_DIR>",
+        "--confirm",
+        packet_checkpoint_recovery.EXECUTE_CONFIRMATION,
+    ]
     assert len(fsync_calls) == 1
     assert len(replace_calls) == 1
     temporary_path, final_path = replace_calls[0]
@@ -1617,6 +1632,20 @@ def test_dry_run_reports_checkpoint_before_after_running_gate_and_skip_summary(
             status="RUNNING",
             started_at=failed_start,
         )
+        processable_start = failed_start + timedelta(seconds=20)
+        processable_pk = _insert_capture_session(
+            connection,
+            session_id=PROCESSABLE_SKIP_SESSION,
+            capture_interface="eth-processable",
+            first_window_start=processable_start,
+        )
+        _insert_capture_segment(
+            connection,
+            session_pk=processable_pk,
+            capture_interface="eth-processable",
+            window_start=processable_start,
+            status="EMPTY",
+        )
         connection.commit()
     finally:
         connection.close()
@@ -1649,6 +1678,7 @@ def test_dry_run_reports_checkpoint_before_after_running_gate_and_skip_summary(
     assert classifications == {
         FAILED_SKIP_SESSION: "SKIPPED_FAILED",
         RUNNING_SESSION_A: "BLOCKING_RUNNING",
+        PROCESSABLE_SKIP_SESSION: "SKIPPED_FULL_READY_COMPLETED",
     }
     assert {role for lock in plan["locks"] for role in lock["roles"]} == {
         "detection_orchestrator",
@@ -1656,10 +1686,25 @@ def test_dry_run_reports_checkpoint_before_after_running_gate_and_skip_summary(
         "packet_if_manual",
         "packet_feature_extractor",
     }
-    assert "execute" in plan["execute_command"]
-    assert str(database.resolve()) in plan["execute_command"]
-    assert str(plan_output.resolve()) in plan["execute_command"]
-    assert packet_checkpoint_recovery.EXECUTE_CONFIRMATION in plan["execute_command"]
+    assert shlex.split(plan["execute_command"]) == [
+        "python",
+        "-m",
+        "edge.detection.run_packet_checkpoint_recovery",
+        "execute",
+        "--plan-file",
+        str(plan_output.resolve()),
+        "--db-path",
+        str(database.resolve()),
+        "--artifact-dir",
+        "<ARTIFACT_DIR>",
+        "--confirm",
+        packet_checkpoint_recovery.EXECUTE_CONFIRMATION,
+        "--confirm-skip-processable",
+        (
+            f"{packet_checkpoint_recovery.PROCESSABLE_SKIP_PREFIX}"
+            f"{plan['plan_sha256']}"
+        ),
+    ]
 
 
 @pytest.mark.parametrize("schema_mutation", ("migration", "table", "index"))
