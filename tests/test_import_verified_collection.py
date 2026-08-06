@@ -11,7 +11,13 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from ai.export_packet_if_dataset import (
+    PacketIFSessionAnnotation,
+    export_packet_if_dataset,
+)
+from ai.packet_if_dataset import load_packet_if_dataset
 from ai.packet_if_phase5_manifest import (
+    PacketIFRunManifestReference,
     load_verified_run_manifest,
     load_verified_session_manifest,
 )
@@ -60,15 +66,17 @@ class SnapshotBuilder:
 
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.db_path = (root / "iot_security.snapshot.db").resolve()
+        self._working_db = (root / "iot_security.db").resolve()
+        self._snapshot_db = (root / "iot_security.snapshot.db").resolve()
         self.pcap_dir = root / "pcap" / "processed"
         self.pcap_dir.mkdir(parents=True, exist_ok=True)
-        apply_migrations(self.db_path, MIGRATIONS_DIR)
-        self._engine = create_engine(f"sqlite:///{self.db_path}")
+        apply_migrations(self._working_db, MIGRATIONS_DIR)
+        self._engine = create_engine(f"sqlite:///{self._working_db}")
         self._SessionLocal = sessionmaker(bind=self._engine)
         self._segment_id = 0
         self._feature_id = 0
         self._window_cursor = 0
+        self._dirty = True
         with self._SessionLocal() as db:
             for device_id, ip in (
                 ("esp32_01", "192.168.0.4"),
@@ -84,6 +92,29 @@ class SnapshotBuilder:
                     {"device_id": device_id, "ip": ip},
                 )
             db.commit()
+
+    @property
+    def db_path(self) -> Path:
+        """Return a consistent standalone snapshot of the seeded database.
+
+        The working database runs in WAL mode, so its main file can be nearly
+        empty while the data sits in `<db>-wal`. The Runbook requires operators
+        to hand the importer a SQLite Backup API snapshot, and this fixture
+        performs exactly that step so tests exercise the real input shape.
+        """
+        if self._dirty:
+            self._engine.dispose()
+            source = sqlite3.connect(self._working_db)
+            try:
+                destination = sqlite3.connect(self._snapshot_db)
+                try:
+                    source.backup(destination)
+                finally:
+                    destination.close()
+            finally:
+                source.close()
+            self._dirty = False
+        return self._snapshot_db
 
     def dispose(self) -> None:
         self._engine.dispose()
@@ -110,6 +141,7 @@ class SnapshotBuilder:
         feature_window_shift_seconds: int = 0,
         packet_count: int = 10,
     ) -> None:
+        self._dirty = True
         statuses = segment_statuses or tuple("PROCESSED" for _ in range(segments))
         first_start = BASE_TIME + timedelta(seconds=10 * self._window_cursor)
         ended_at = first_start + timedelta(seconds=10 * len(statuses))
@@ -1447,3 +1479,187 @@ def test_package_does_not_modify_snapshot_or_pcap(
         path.name: file_sha256(path)
         for path in sorted(snapshot.pcap_dir.iterdir())
     } == pcap_before
+
+
+# --- Dataset v2 integration --------------------------------------------------
+
+
+def _export_from_package(package: Path, snapshot: SnapshotBuilder, tmp_path: Path):
+    """Run the real Dataset v2 exporter against the Package snapshot."""
+    spec_payload = _read_json(package / "packet-if-export-spec-v2.json")
+    annotations = []
+    for entry in spec_payload["sessions"]:
+        annotations.append(
+            PacketIFSessionAnnotation(
+                session_id=entry["session_id"],
+                split=entry["split"],
+                traffic_label=entry["traffic_label"],
+                scenario=entry["scenario"],
+                target_device_id=entry["target_device_id"],
+                collection_slot_id=entry["collection_slot_id"],
+                source_capture_group_id=entry["source_capture_group_id"],
+                run_manifest_ref=PacketIFRunManifestReference.from_dict(
+                    entry["run_manifest_ref"]
+                ),
+                run_manifest_path=(package / entry["run_manifest_path"]).resolve(),
+                normal_policy_version=entry["normal_policy_version"],
+                firmware_version=entry["firmware_version"],
+                payload_schema_version=entry["payload_schema_version"],
+                target_source_ip=entry["target_source_ip"],
+                included_device_ids=tuple(entry["included_device_ids"]),
+                background_traffic_present=entry["background_traffic_present"],
+                source_commit_sha=entry["source_commit_sha"],
+            )
+        )
+
+    engine = create_engine(f"sqlite:///{package / 'db-snapshot.db'}")
+    session_factory = sessionmaker(bind=engine)
+    try:
+        with session_factory() as db:
+            return export_packet_if_dataset(
+                db,
+                output_path=package / "packet-if-dataset-v2.csv",
+                manifest_path=package / "packet-if-dataset-v2-manifest.json",
+                session_annotations=annotations,
+                capture_filter=spec_payload["capture_filter"],
+                source_commit_sha=spec_payload["source_commit_sha"],
+                capture_policy=CapturePolicy(),
+            )
+    finally:
+        engine.dispose()
+
+
+def test_package_export_spec_drives_dataset_v2_end_to_end(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+
+    result = _export_from_package(package, snapshot, tmp_path)
+    dataset = load_packet_if_dataset(result.output_path, result.manifest_path)
+
+    assert set(dataset.session_ids("train")) == {NORMAL_TRAIN_SESSION}
+    assert set(dataset.session_ids("validation")) == {NORMAL_VALIDATION_SESSION}
+    assert set(dataset.session_ids("test")) == {
+        NORMAL_TEST_SESSION,
+        ATTACK_TEST_SESSION,
+    }
+    commits = {
+        session.session_id: session.source_commit_sha
+        for session in dataset.manifest.sessions
+    }
+    assert commits[NORMAL_TRAIN_SESSION] == CAPTURE_COMMIT
+    assert commits[ATTACK_TEST_SESSION] == ATTACK_COMMIT
+    assert dataset.manifest.normal_policy_version == "phase5-normal-policy-v1.1"
+
+
+def test_dataset_load_fails_when_collection_evidence_is_tampered(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+    result = _export_from_package(package, snapshot, tmp_path)
+
+    evidence_path = (
+        package
+        / "runs"
+        / "verified-normal-stable-train-01"
+        / "evidence"
+        / "session-snapshot.json"
+    )
+    payload = _read_json(evidence_path)
+    payload["capture_interface"] = "eth1"
+    evidence_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="artifact"):
+        load_packet_if_dataset(result.output_path, result.manifest_path)
+
+
+def test_dataset_load_fails_when_collection_manifest_is_tampered(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+    result = _export_from_package(package, snapshot, tmp_path)
+
+    collection_path = (
+        package
+        / "runs"
+        / "verified-normal-stable-train-01"
+        / "verified-collection-manifest.json"
+    )
+    payload = _read_json(collection_path)
+    payload["capture_source_commit_sha"] = "f" * 40
+    collection_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="SHA256 mismatch"):
+        load_packet_if_dataset(result.output_path, result.manifest_path)
+
+
+def test_dataset_load_fails_when_collection_sidecar_is_tampered(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_full_batch(snapshot)
+    package = _write_package(snapshot, tmp_path)
+    result = _export_from_package(package, snapshot, tmp_path)
+
+    sidecar = (
+        package
+        / "runs"
+        / "verified-normal-stable-train-01"
+        / "verified-collection-manifest.json.sha256"
+    )
+    sidecar.write_text(f"{'0' * 64}\n", encoding="ascii")
+
+    with pytest.raises(ValueError, match="sidecar SHA256 mismatch"):
+        load_packet_if_dataset(result.output_path, result.manifest_path)
+
+
+def test_connect_snapshot_rejects_live_wal_database(tmp_path: Path) -> None:
+    """A WAL-mode database is not a consistent standalone snapshot.
+
+    Its main file can be a few kilobytes while every table lives in `<db>-wal`,
+    so copying it alone would silently produce an empty package.
+    """
+    live_db = (tmp_path / "live.db").resolve()
+    connection = sqlite3.connect(live_db)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE devices (device_id TEXT)")
+        connection.execute("INSERT INTO devices VALUES ('esp32_01')")
+        connection.commit()
+        assert Path(f"{live_db}-wal").stat().st_size > 0
+
+        with pytest.raises(VerifiedCollectionImportError, match="WAL"):
+            connect_snapshot_read_only(live_db)
+    finally:
+        connection.close()
+
+
+def test_backup_api_snapshot_is_accepted(tmp_path: Path) -> None:
+    """The Runbook's SQLite Backup API output passes the standalone check."""
+    live_db = (tmp_path / "live.db").resolve()
+    snapshot_db = (tmp_path / "snapshot.db").resolve()
+    source = sqlite3.connect(live_db)
+    try:
+        source.execute("PRAGMA journal_mode=WAL")
+        source.execute("CREATE TABLE devices (device_id TEXT)")
+        source.execute("INSERT INTO devices VALUES ('esp32_01')")
+        source.commit()
+        destination = sqlite3.connect(snapshot_db)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+    finally:
+        source.close()
+
+    connection = connect_snapshot_read_only(snapshot_db)
+    try:
+        assert connection.execute("SELECT count(*) FROM devices").fetchone()[0] == 1
+    finally:
+        connection.close()

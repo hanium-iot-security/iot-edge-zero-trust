@@ -562,12 +562,30 @@ class VerifiedCollectionBatchPlan:
         raise KeyError(session_id)
 
 
+def assert_standalone_snapshot(path: Path) -> None:
+    """Refuse a database file whose content still lives in a WAL sidecar.
+
+    A live WAL-mode database can be a few kilobytes on disk while every table
+    sits in `<db>-wal`. Copying only the main file would produce a package that
+    verifies cleanly and contains nothing. The Runbook requires a consistent
+    standalone snapshot made with the SQLite Backup API, which has no WAL.
+    """
+    wal_path = Path(f"{path}-wal")
+    if wal_path.is_file() and wal_path.stat().st_size > 0:
+        raise VerifiedCollectionImportError(
+            "DB snapshot still has a non-empty WAL sidecar, so it is not a "
+            "consistent standalone snapshot. Create it with the SQLite Backup "
+            f"API (or checkpoint and close all writers) first: {wal_path}"
+        )
+
+
 def connect_snapshot_read_only(path: Path) -> sqlite3.Connection:
     """Open an absolute SQLite Snapshot in a mode that cannot write."""
     if not path.is_absolute():
         raise ValueError(f"DB snapshot path must be absolute: {path}")
     if not path.is_file():
         raise ValueError(f"DB snapshot is not a file: {path}")
+    assert_standalone_snapshot(path)
     uri = f"file:{path.as_posix()}?mode=ro"
     connection = sqlite3.connect(uri, uri=True)
     connection.row_factory = sqlite3.Row

@@ -331,3 +331,4 @@ type: 작업 내용 요약
 - [Packet Isolation Forest 가이드](docs/packet-if-runbook.md)
 - [Packet IF Dataset Manifest v2 계약](docs/packet-if-dataset-v2.md)
 - [Packet IF Phase 5 평가 가이드](docs/packet-if-phase5-evaluation.md)
+- [Phase 5 Verified Collection Import 운영 가이드](docs/phase5-verified-collection-import.md)
