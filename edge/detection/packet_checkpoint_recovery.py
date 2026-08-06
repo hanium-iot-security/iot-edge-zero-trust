@@ -6,13 +6,15 @@ import hashlib
 import hmac
 import json
 import os
+import shlex
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
 import stat
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
+from tempfile import NamedTemporaryFile
 from typing import Callable, ContextManager, Iterator, Mapping, Sequence
 
 from backend.app.config import Settings
@@ -27,6 +29,9 @@ from edge.runtime_lock import single_instance_lock
 PLAN_SCHEMA_VERSION = "packet-checkpoint-gap-recovery-plan-v1"
 EXECUTE_CONFIRMATION = "APPLY-PACKET-CHECKPOINT-GAP-RECOVERY"
 PROCESSABLE_SKIP_PREFIX = "SKIP-PROCESSABLE-SESSIONS:"
+_MIGRATION_005_SCHEMA_SHA256 = (
+    "a4237ba4405a99a62c533e89fc75d68c76c09bfdc77e73587027022ac326bc0d"
+)
 _VOLATILE_PLAN_KEYS = frozenset({
     "plan_sha256", "generated_at", "executed_at", "operation_id", "mode",
     "plan_path", "artifact_dir", "backup_path", "result_path", "backup_sha256",
@@ -395,6 +400,160 @@ def build_recovery_plan(
         "blocking_reasons": blocking_reasons,
         "can_execute": not blocking_reasons,
     }
+
+
+def require_migration_005(connection: sqlite3.Connection) -> None:
+    try:
+        migration = connection.execute(
+            "SELECT version, name FROM schema_migrations WHERE version = 5"
+        ).fetchone()
+        schema_rows = connection.execute(
+            """
+            SELECT type, name, tbl_name, sql
+            FROM sqlite_master
+            WHERE name IN (
+                'packet_checkpoint_recoveries',
+                'uq_packet_checkpoint_recovery_detector_target'
+            )
+            ORDER BY type, name
+            """
+        ).fetchall()
+    except sqlite3.DatabaseError as exc:
+        raise PacketCheckpointRecoveryError(
+            "Migration 005 schema does not match the recovery contract"
+        ) from exc
+    schema_json = json.dumps(
+        [list(row) for row in schema_rows],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    schema_sha256 = hashlib.sha256(schema_json.encode("utf-8")).hexdigest()
+    if (
+        migration is None
+        or tuple(migration) != (5, "packet_checkpoint_recovery")
+        or schema_sha256 != _MIGRATION_005_SCHEMA_SHA256
+    ):
+        raise PacketCheckpointRecoveryError(
+            "Migration 005 schema does not match the recovery contract"
+        )
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _execute_command(
+    *, database: Path, plan_path: Path, plan: Mapping[str, object]
+) -> str:
+    command = [
+        "python",
+        "-m",
+        "edge.detection.run_packet_checkpoint_recovery",
+        "execute",
+        "--db-path",
+        str(database),
+        "--plan",
+        str(plan_path),
+        "--confirm",
+        EXECUTE_CONFIRMATION,
+    ]
+    if plan["summary"]["skips_processable_sessions"]:
+        command.extend(
+            [
+                "--confirm-skip-processable",
+                f"{PROCESSABLE_SKIP_PREFIX}{plan['plan_sha256']}",
+            ]
+        )
+    return shlex.join(command)
+
+
+def _write_json_atomically(path: Path, payload: Mapping[str, object]) -> None:
+    temporary_path: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(payload, temporary, ensure_ascii=False, sort_keys=True, indent=2)
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
+def inspect_packet_checkpoint_recovery(
+    *,
+    db_path: str | Path,
+    repository_root: str | Path,
+    detector_name: str,
+    current_session_id: str,
+    target_session_id: str,
+    approved_by: str,
+    reason: str,
+    plan_output: str | Path,
+    orchestrator_lock_path: Path | None = None,
+    manual_lock_path: Path | None = None,
+    extractor_lock_path: Path | None = None,
+) -> dict[str, object]:
+    database = resolve_database_path(db_path)
+    root = Path(repository_root).expanduser().resolve(strict=True)
+    raw_plan_output = Path(plan_output).expanduser()
+    plan_path = (
+        raw_plan_output if raw_plan_output.is_absolute() else root / raw_plan_output
+    ).resolve(strict=False)
+    require_existing_parent(plan_path, field_name="plan_output")
+
+    wal_path = database.with_name(f"{database.name}-wal")
+    read_only_options = "mode=ro" if wal_path.exists() else "mode=ro&immutable=1"
+    with sqlite3.connect(
+        f"file:{database}?{read_only_options}", uri=True
+    ) as connection:
+        connection.row_factory = sqlite3.Row
+        require_migration_005(connection)
+        locks = resolve_recovery_locks(
+            repository_root=root,
+            database_url=f"sqlite:///{database}",
+            orchestrator_lock_path=orchestrator_lock_path,
+            manual_lock_path=manual_lock_path,
+            extractor_lock_path=extractor_lock_path,
+        )
+        paths = validate_generated_paths(
+            repository_root=root,
+            plan_output=plan_path,
+            lock_paths=tuple(lock.path for lock in locks),
+        )
+        repository_state = inspect_repository_state(root)
+        payload = build_recovery_plan(
+            connection,
+            repository_state=repository_state,
+            database_path=database,
+            detector_name=detector_name,
+            current_session_id=current_session_id,
+            target_session_id=target_session_id,
+            approved_by=approved_by,
+            reason=reason,
+            lock_entries=serialize_resolved_locks(locks),
+        )
+
+    plan = attach_plan_sha256(
+        payload, generated_at=_utc_now().replace(microsecond=0)
+    )
+    plan["execute_command"] = _execute_command(
+        database=database,
+        plan_path=paths["plan_output"],
+        plan=plan,
+    )
+    _write_json_atomically(paths["plan_output"], plan)
+    return plan
 
 
 def resolve_database_path(db_path: str | Path) -> Path:

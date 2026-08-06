@@ -1,6 +1,8 @@
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
+import importlib
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -1437,3 +1439,437 @@ def test_target_full_ready_rejects_overlapping_or_extra_segment(
         assert readiness.blocking_reasons
     finally:
         connection.close()
+
+
+def _dry_run_arguments(
+    tmp_path: Path,
+    *,
+    database: Path,
+    repository_root: Path,
+    plan_output: Path,
+) -> dict[str, object]:
+    return {
+        "db_path": database,
+        "repository_root": repository_root,
+        "detector_name": "packet_rule",
+        "current_session_id": CURRENT_SESSION,
+        "target_session_id": TARGET_SESSION,
+        "approved_by": "operator@example.com",
+        "reason": "recover capture-session gap",
+        "plan_output": plan_output,
+        "orchestrator_lock_path": tmp_path / "locks" / "orchestrator.lock",
+        "manual_lock_path": tmp_path / "locks" / "manual.lock",
+        "extractor_lock_path": tmp_path / "locks" / "extractor.lock",
+    }
+
+
+def test_dry_run_writes_canonical_plan_atomically_after_all_gates_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository_root = _repository(tmp_path)
+    database = tmp_path / "recovery.db"
+    _seed_valid_recovery_database(database).close()
+    plan_output = tmp_path / "recovery-plan.json"
+    fsync_calls: list[int] = []
+    replace_calls: list[tuple[Path, Path]] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def record_fsync(descriptor: int) -> None:
+        fsync_calls.append(descriptor)
+        real_fsync(descriptor)
+
+    def record_replace(source: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
+        replace_calls.append((Path(source), Path(target)))
+        real_replace(source, target)
+
+    monkeypatch.setattr(packet_checkpoint_recovery, "_utc_now", lambda: UTC_A)
+    monkeypatch.setattr(packet_checkpoint_recovery.os, "fsync", record_fsync)
+    monkeypatch.setattr(packet_checkpoint_recovery.os, "replace", record_replace)
+
+    plan = packet_checkpoint_recovery.inspect_packet_checkpoint_recovery(
+        **_dry_run_arguments(
+            tmp_path,
+            database=database,
+            repository_root=repository_root,
+            plan_output=plan_output,
+        )
+    )
+
+    assert json.loads(plan_output.read_text(encoding="utf-8")) == plan
+    assert plan_output.read_bytes().endswith(b"\n")
+    verify_plan_sha256(plan)
+    assert plan["plan_sha256"] == packet_checkpoint_recovery.calculate_plan_sha256(
+        plan
+    )
+    assert len(fsync_calls) == 1
+    assert len(replace_calls) == 1
+    temporary_path, final_path = replace_calls[0]
+    assert temporary_path.parent == plan_output.parent
+    assert final_path == plan_output
+    assert not temporary_path.exists()
+    assert [path for path in plan_output.parent.iterdir() if path == plan_output] == [
+        plan_output
+    ]
+
+
+@pytest.mark.parametrize("live_wal", (False, True))
+def test_dry_run_is_query_only_and_does_not_create_artifact_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    live_wal: bool,
+) -> None:
+    repository_root = _repository(tmp_path)
+    database = tmp_path / "query-only.db"
+    writer = _seed_valid_recovery_database(database)
+    if live_wal:
+        writer.execute("PRAGMA wal_autocheckpoint = 0")
+        _insert_capture_session(
+            writer,
+            session_id=RUNNING_SESSION_A,
+            capture_interface="eth-live-wal",
+            first_window_start=TARGET_READY_THROUGH + timedelta(seconds=10),
+            status="RUNNING",
+        )
+        writer.commit()
+    else:
+        writer.close()
+    plan_output = tmp_path / "query-only-plan.json"
+    artifact_directory = tmp_path / "artifacts"
+    before_database = database.read_bytes()
+    before_sidecars = {
+        suffix: (tmp_path / f"{database.name}{suffix}").exists()
+        for suffix in ("-journal", "-wal", "-shm")
+    }
+    wal_path = tmp_path / f"{database.name}-wal"
+    before_wal = wal_path.read_bytes() if wal_path.exists() else None
+    connect_calls: list[tuple[object, dict[str, object]]] = []
+    real_connect = sqlite3.connect
+
+    def record_connect(database_arg: object, *args: object, **kwargs: object):
+        connect_calls.append((database_arg, dict(kwargs)))
+        return real_connect(database_arg, *args, **kwargs)
+
+    monkeypatch.setattr(packet_checkpoint_recovery.sqlite3, "connect", record_connect)
+
+    try:
+        plan = packet_checkpoint_recovery.inspect_packet_checkpoint_recovery(
+            **_dry_run_arguments(
+                tmp_path,
+                database=database,
+                repository_root=repository_root,
+                plan_output=plan_output,
+            )
+        )
+        after_database = database.read_bytes()
+        after_sidecars = {
+            suffix: (tmp_path / f"{database.name}{suffix}").exists()
+            for suffix in ("-journal", "-wal", "-shm")
+        }
+        after_wal = wal_path.read_bytes() if wal_path.exists() else None
+    finally:
+        if live_wal:
+            writer.close()
+
+    assert len(connect_calls) == 1
+    connection_uri, connection_options = connect_calls[0]
+    assert connection_uri.startswith(f"file:{database.resolve()}?mode=ro")
+    assert connection_options == {"uri": True}
+    assert after_database == before_database
+    if live_wal:
+        assert "immutable=1" not in connection_uri
+        assert before_wal is not None
+        assert after_wal == before_wal
+        assert plan["can_execute"] is False
+        assert plan["running_sessions"] == [
+            {
+                "session_id": RUNNING_SESSION_A,
+                "started_at": _db_utc(TARGET_READY_THROUGH),
+            }
+        ]
+    else:
+        assert "immutable=1" in connection_uri
+        assert after_sidecars == before_sidecars
+    assert not artifact_directory.exists()
+
+
+def test_dry_run_reports_checkpoint_before_after_running_gate_and_skip_summary(
+    tmp_path: Path,
+) -> None:
+    repository_root = _repository(tmp_path)
+    database = tmp_path / "report.db"
+    connection = _seed_valid_recovery_database(database)
+    try:
+        failed_start = CURRENT_READY_THROUGH + timedelta(seconds=10)
+        _insert_capture_session(
+            connection,
+            session_id=FAILED_SKIP_SESSION,
+            capture_interface="eth-failed",
+            first_window_start=failed_start,
+            status="FAILED",
+        )
+        _insert_capture_session(
+            connection,
+            session_id=RUNNING_SESSION_A,
+            capture_interface="eth-running",
+            first_window_start=failed_start + timedelta(seconds=10),
+            status="RUNNING",
+            started_at=failed_start,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    plan_output = tmp_path / "report-plan.json"
+
+    plan = packet_checkpoint_recovery.inspect_packet_checkpoint_recovery(
+        **_dry_run_arguments(
+            tmp_path,
+            database=database,
+            repository_root=repository_root,
+            plan_output=plan_output,
+        )
+    )
+
+    assert plan["can_execute"] is False
+    assert "RUNNING_CAPTURE_SESSIONS" in plan["blocking_reasons"]
+    assert plan["running_sessions"] == [
+        {"session_id": RUNNING_SESSION_A, "started_at": _db_utc(failed_start)}
+    ]
+    assert plan["checkpoint"]["before"]["last_completed_window_end"] == _db_utc(
+        CURRENT_READY_THROUGH
+    )
+    assert plan["checkpoint"]["after"]["last_completed_window_end"] == _db_utc(
+        TARGET_FIRST
+    )
+    classifications = {
+        row["session_id"]: row["classification"]
+        for row in plan["summary"]["skipped_sessions"]
+    }
+    assert classifications == {
+        FAILED_SKIP_SESSION: "SKIPPED_FAILED",
+        RUNNING_SESSION_A: "BLOCKING_RUNNING",
+    }
+    assert {role for lock in plan["locks"] for role in lock["roles"]} == {
+        "detection_orchestrator",
+        "packet_rule_manual",
+        "packet_if_manual",
+        "packet_feature_extractor",
+    }
+    assert "execute" in plan["execute_command"]
+    assert str(database.resolve()) in plan["execute_command"]
+    assert str(plan_output.resolve()) in plan["execute_command"]
+    assert packet_checkpoint_recovery.EXECUTE_CONFIRMATION in plan["execute_command"]
+
+
+@pytest.mark.parametrize("schema_mutation", ("migration", "table", "index"))
+def test_dry_run_rejects_missing_005_row_or_table_before_plan_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    schema_mutation: str,
+) -> None:
+    repository_root = _repository(tmp_path)
+    database = tmp_path / f"missing-{schema_mutation}.db"
+    connection = _seed_valid_recovery_database(database)
+    try:
+        if schema_mutation == "migration":
+            connection.execute("DELETE FROM schema_migrations WHERE version = 5")
+        elif schema_mutation == "table":
+            connection.execute("DROP TABLE packet_checkpoint_recoveries")
+        else:
+            connection.execute(
+                "DROP INDEX uq_packet_checkpoint_recovery_detector_target"
+            )
+        connection.commit()
+    finally:
+        connection.close()
+    plan_output = tmp_path / f"missing-{schema_mutation}-plan.json"
+
+    def reject_subprocess(*args: object, **kwargs: object) -> None:
+        pytest.fail("schema gate must run before repository subprocess gates")
+
+    monkeypatch.setattr(packet_checkpoint_recovery.subprocess, "run", reject_subprocess)
+
+    with pytest.raises(PacketCheckpointRecoveryError, match="Migration 005 schema"):
+        packet_checkpoint_recovery.inspect_packet_checkpoint_recovery(
+            **_dry_run_arguments(
+                tmp_path,
+                database=database,
+                repository_root=repository_root,
+                plan_output=plan_output,
+            )
+        )
+
+    assert not plan_output.exists()
+
+
+def test_dry_run_rejects_missing_plan_parent_before_temporary_file_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository_root = _repository(tmp_path)
+    database = tmp_path / "missing-parent.db"
+    _seed_valid_recovery_database(database).close()
+    plan_output = tmp_path / "missing" / "plan.json"
+
+    def reject_connect(*args: object, **kwargs: object) -> None:
+        pytest.fail("plan parent gate must run before database schema inspection")
+
+    def reject_temporary_file(*args: object, **kwargs: object) -> None:
+        pytest.fail("temporary file must not be created for a missing plan parent")
+
+    monkeypatch.setattr(packet_checkpoint_recovery.sqlite3, "connect", reject_connect)
+    monkeypatch.setattr(
+        packet_checkpoint_recovery, "NamedTemporaryFile", reject_temporary_file
+    )
+
+    with pytest.raises(
+        PacketCheckpointRecoveryError, match="plan_output parent must already exist"
+    ):
+        packet_checkpoint_recovery.inspect_packet_checkpoint_recovery(
+            **_dry_run_arguments(
+                tmp_path,
+                database=database,
+                repository_root=repository_root,
+                plan_output=plan_output,
+            )
+        )
+
+    assert not plan_output.parent.exists()
+
+
+def test_dry_run_plan_output_does_not_change_untracked_inventory(
+    tmp_path: Path,
+) -> None:
+    repository_root = _repository(tmp_path)
+    (repository_root / ".gitignore").write_text("generated/\n", encoding="utf-8")
+    _git(repository_root, "add", ".gitignore")
+    _git(repository_root, "commit", "-m", "ignore generated plans")
+    (repository_root / "evidence.bin").write_bytes(b"evidence\n")
+    plan_parent = repository_root / "generated"
+    plan_parent.mkdir()
+    plan_output = plan_parent / "plan.json"
+    database = tmp_path / "inventory.db"
+    _seed_valid_recovery_database(database).close()
+    before = packet_checkpoint_recovery.inspect_repository_state(repository_root)
+
+    plan = packet_checkpoint_recovery.inspect_packet_checkpoint_recovery(
+        **_dry_run_arguments(
+            tmp_path,
+            database=database,
+            repository_root=repository_root,
+            plan_output=plan_output,
+        )
+    )
+
+    after = packet_checkpoint_recovery.inspect_repository_state(repository_root)
+    assert plan["repository_state"]["untracked_inventory"] == (
+        before["untracked_inventory"]
+    )
+    assert after["untracked_inventory"] == before["untracked_inventory"]
+
+
+def test_dry_run_does_not_call_posix_execute_platform_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository_root = _repository(tmp_path)
+    database = tmp_path / "cross-platform.db"
+    _seed_valid_recovery_database(database).close()
+    plan_output = tmp_path / "cross-platform-plan.json"
+
+    def reject_execute_gate() -> None:
+        pytest.fail("dry-run must not call the POSIX-only Execute platform gate")
+
+    monkeypatch.setattr(
+        packet_checkpoint_recovery,
+        "_require_posix_execute_platform",
+        reject_execute_gate,
+        raising=False,
+    )
+
+    plan = packet_checkpoint_recovery.inspect_packet_checkpoint_recovery(
+        **_dry_run_arguments(
+            tmp_path,
+            database=database,
+            repository_root=repository_root,
+            plan_output=plan_output,
+        )
+    )
+
+    assert plan["can_execute"] is True
+
+
+@pytest.mark.parametrize(
+    "missing_flag",
+    (
+        "--db-path",
+        "--repository-root",
+        "--detector",
+        "--current-session-id",
+        "--target-session-id",
+        "--approved-by",
+        "--reason",
+        "--plan-output",
+    ),
+)
+def test_dry_run_cli_requires_all_identity_and_output_arguments(
+    tmp_path: Path,
+    missing_flag: str,
+) -> None:
+    cli = importlib.import_module("edge.detection.run_packet_checkpoint_recovery")
+    values = {
+        "--db-path": str(tmp_path / "iot.db"),
+        "--repository-root": str(tmp_path),
+        "--detector": "packet_rule",
+        "--current-session-id": CURRENT_SESSION,
+        "--target-session-id": TARGET_SESSION,
+        "--approved-by": "operator@example.com",
+        "--reason": "recover capture-session gap",
+        "--plan-output": str(tmp_path / "plan.json"),
+    }
+    argv = [item for flag, value in values.items() for item in (flag, value)]
+    missing_index = argv.index(missing_flag)
+    del argv[missing_index : missing_index + 2]
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.build_parser().parse_args(argv)
+
+    assert exc_info.value.code == 2
+
+
+def test_dry_run_cli_returns_two_for_precommit_validation_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = importlib.import_module("edge.detection.run_packet_checkpoint_recovery")
+    repository_root = _repository(tmp_path)
+    missing_database = tmp_path / "missing.db"
+    plan_output = tmp_path / "plan.json"
+
+    exit_code = cli.main(
+        [
+            "--db-path",
+            str(missing_database),
+            "--repository-root",
+            str(repository_root),
+            "--detector",
+            "packet_rule",
+            "--current-session-id",
+            CURRENT_SESSION,
+            "--target-session-id",
+            TARGET_SESSION,
+            "--approved-by",
+            "operator@example.com",
+            "--reason",
+            "recover capture-session gap",
+            "--plan-output",
+            str(plan_output),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "error:" in captured.err
+    assert captured.out == ""
+    assert not plan_output.exists()
