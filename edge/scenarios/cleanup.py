@@ -189,6 +189,45 @@ def _find_conflicting_processes() -> list[str]:
     return matches
 
 
+def _list_project_firewall_rules(source_ip: str | None) -> list[str]:
+    """기존 root Wrapper의 list 명령으로 실제 프로젝트 Rule을 읽기 전용 조회한다."""
+
+    try:
+        completed = subprocess.run(
+            [
+                settings.firewall_sudo_path,
+                "-n",
+                settings.firewall_wrapper_path,
+                "list",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=settings.firewall_command_timeout_seconds,
+            check=False,
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [f"firewall_inventory_error: {exc}"]
+
+    if completed.returncode != 0:
+        reason = completed.stderr.strip() or f"exit_code={completed.returncode}"
+        return [f"firewall_inventory_error: {reason}"]
+
+    project_rules = [
+        line.strip()
+        for line in completed.stdout.splitlines()
+        if "hanium-firewall:" in line
+    ]
+    if source_ip:
+        project_rules = [
+            line
+            for line in project_rules
+            if f"-s {source_ip} " in f"{line} "
+            or f"-s {source_ip}/32 " in f"{line} "
+        ]
+    return project_rules
+
+
 def _active_firewall_rows(
     connection: sqlite3.Connection,
     *,
@@ -286,6 +325,15 @@ def pi_baseline_check(
         return False, f"baseline_db_query_failed: {exc}"
     finally:
         connection.close()
+
+    actual_firewall_rules = _list_project_firewall_rules(context.source_ip)
+    inventory_errors = [
+        item for item in actual_firewall_rules if item.startswith("firewall_inventory_error:")
+    ]
+    if inventory_errors:
+        return False, inventory_errors[0]
+    if actual_firewall_rules:
+        return False, "active_iptables_rule: " + " | ".join(actual_firewall_rules)
 
     conflicts = _find_conflicting_processes()
     if conflicts:

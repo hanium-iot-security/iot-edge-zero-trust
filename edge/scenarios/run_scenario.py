@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import re
 import subprocess
@@ -60,6 +61,7 @@ from edge.phase5.contracts import (
 from edge.scenarios.cleanup import (
     BaselineCheck,
     CleanupHook,
+    ScenarioHookContext,
     default_baseline_check,
     default_cleanup_hook,
 )
@@ -76,6 +78,23 @@ DEFAULT_OBSERVATION_BUFFER_SECONDS = 30.0
 
 AWAITING_SESSION_CORRELATION = "AWAITING_SESSION_CORRELATION"
 DRY_RUN_EXCLUSION_REASON = "DRY_RUN"
+
+def _call_scenario_hook(
+    hook: BaselineCheck | CleanupHook,
+    context: ScenarioHookContext,
+) -> tuple[bool, str | None]:
+    """Context-aware Hook을 호출한다.
+
+    기존 Local 단위 테스트의 no-arg 더미 Hook만 한시적으로 호환한다.
+    실제 Pi Hook은 반드시 ScenarioHookContext를 받아야 한다.
+    """
+    try:
+        parameters = inspect.signature(hook).parameters
+    except (TypeError, ValueError):
+        parameters = {"context": object()}
+    if not parameters:
+        return hook()  # type: ignore[call-arg]
+    return hook(context)
 
 # run_id는 파일시스템 경로(``runs_root / run_id``)로 그대로 사용되므로, 경로 순회
 # (``../``)나 절대경로/구분자 주입을 막기 위해 허용 문자를 제한한다.
@@ -438,6 +457,17 @@ class ScenarioRunner:
                 target_host=target_host,
             )
 
+        hook_context = ScenarioHookContext(
+            run_id=run_id,
+            scenario_id=scenario_id,
+            session_id=session_id,
+            target_device_id=target_device_id,
+            source_ip=source_ip,
+            target_host=target_host,
+            evaluation_scope=evaluation_scope.value,
+            execution_node=self.execution_node,
+        )
+
         args = self._build_args(
             defn, target_device_id=target_device_id, target_host=target_host, extra_args=extra_args
         )
@@ -446,7 +476,9 @@ class ScenarioRunner:
         started_at = _utc_now()
 
         try:
-            baseline_ok, baseline_reason = self.baseline_check()
+            baseline_ok, baseline_reason = _call_scenario_hook(
+                self.baseline_check, hook_context
+            )
         except Exception as exc:
             baseline_ok = False
             baseline_reason = f"baseline_check_exception: {exc}"
@@ -535,7 +567,9 @@ class ScenarioRunner:
 
         ended_at = _utc_now()
         try:
-            cleanup_ok, cleanup_reason = self.cleanup_hook()
+            cleanup_ok, cleanup_reason = _call_scenario_hook(
+                self.cleanup_hook, hook_context
+            )
         except Exception as exc:
             cleanup_ok = False
             cleanup_reason = f"cleanup_hook_exception: {exc}"

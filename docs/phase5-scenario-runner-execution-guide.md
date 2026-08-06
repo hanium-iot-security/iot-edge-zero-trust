@@ -13,9 +13,12 @@ Scenario Runner는 기본적으로 항상 Dry-run으로 동작한다. 실제 공
 1. CLI에 `--execute` 플래그를 명시해야 한다. 지정하지 않으면 무조건 Dry-run.
 2. `--execute`와 함께 `--baseline-check-module`, `--cleanup-hook-module`로 실제 Pi 훅을 지정해야 한다. 이 두 옵션 없이 `--execute`만 주면 항상 거부된다 — CLI가 기본으로 만드는 `ScenarioRunner`에는 실제 훅이 연결되어 있지 않기 때문이다.
 
-두 옵션은 `module.submodule:function_name` 형식으로 실제 훅 함수의 위치를 지정한다. 예:
+두 옵션은 `module.submodule:function_name` 형식으로 실제 훅 함수의 위치를 지정한다.
+Pi에서는 상대경로 기본값이 다른 DB를 가리키지 않도록 운영 DB의 절대경로를 먼저 명시한다.
 
 ```bash
+export DATABASE_URL="sqlite:////home/pi/iot-edge-zero-trust/backend/data/iot_security.db"
+
 python -m edge.scenarios.run_scenario \
   --scenario mqtt_abnormal_publish_rate \
   --target-device-id esp32_02 \
@@ -27,7 +30,7 @@ python -m edge.scenarios.run_scenario \
   --execute
 ```
 
-> `[TODO: 실기기 검증 필요]` `edge/scenarios/cleanup.py` 하단에 주석으로만 남아있는 `pi_baseline_check`/`pi_cleanup_hook` 예시 뼈대를 실제 구현으로 채우고 주석을 해제해야 위 명령이 동작한다. 뼈대를 채우지 않은 상태에서 위 두 옵션에 존재하지 않는 함수를 지정하면 `모듈 경로 형식이 올바르지 않습니다` 또는 `함수가 없습니다` 에러로 명확히 거부된다.
+> `edge.scenarios.cleanup:pi_baseline_check`와 `pi_cleanup_hook`은 동일한 `ScenarioHookContext`를 받는다. Baseline은 SQLite read-only 조회, 필수 Runtime, Capture Session, 활성 Firewall 요청, 충돌 프로세스를 확인한다. Cleanup은 잔여 공격·수동 실행 프로세스만 확인하며 DB·Trust·Device·Firewall·iptables 상태를 변경하지 않는다.
 
 Hook 경로는 저장소에서 검토한 신뢰 가능한 모듈만 지정한다. 모듈을 불러올 수 없거나 지정한 속성이 호출 가능한 함수가 아니면 실행 전에 종료 코드 2로 거부된다. Baseline Hook 예외는 공격 시작 전 `ENVIRONMENT_ERROR`로, 공격 후 Cleanup Hook 예외는 `RESET_FAILED`로 기록하며 결과 Manifest를 보존한다.
 
@@ -90,6 +93,16 @@ Packet 계열 3개는 전부 `requires_packet_rule_gate=True`다. Phase 4 Packet
 Registry의 `firewall_rule_expected=true`, `block_expected=true`는 대표 시나리오가 최종적으로 검증해야 할 **후보 계약**이지, 현재 실기기에서 달성됐다는 결과가 아니다. 현재 실행량이 독립된 10초 Window를 충분히 만들고 Trust Score를 30점 미만까지 낮추는지는 아직 실측되지 않았다. Pi 증적으로 Trust 감점→`isolated`→Firewall `APPLIED`→실제 차단이 확인되기 전까지 공식 FULL_E2E 반복 실행과 완료 판정은 운영상 `HOLD`한다. 이 PR의 병합만으로 FULL_E2E 격리 검증이 완료된 것으로 기록하지 않는다.
 
 ---
+
+## 1.1 Pi Hook 최소 안전 계약
+
+- `--session-id`가 있으면 해당 `packet_capture_sessions` Row가 `RUNNING`이고 `ended_at IS NULL`이어야 하며 `packet-capture.service`도 `active`여야 한다.
+- `--session-id`가 없는 Detection-only 실행에서는 의도하지 않은 수집을 막기 위해 `packet-capture.service`가 `inactive`여야 한다.
+- 대상 Device가 있으면 DB에 존재하고 `devices.status=normal`이어야 한다.
+- 대상 Device 또는 Source IP에 `PENDING`/`APPLIED` Firewall Rule이 있으면 공격을 시작하지 않는다.
+- DB에 활성 Row가 없더라도 실제 iptables에 대상 Source IP의 `hanium-firewall:` Rule이 남아 있으면 공격을 시작하지 않는다. Baseline은 기존 root Wrapper의 `list` 명령으로 읽기만 하며 Rule을 삭제하지 않는다.
+- 공격 종료 직후 Cleanup은 잔여 Process만 확인한다. Detection·Trust·Firewall·실제 Block Observation 전에 자동 Release나 Trust Recovery를 수행하지 않는다.
+- 복구가 필요하면 증적 확인 후 기존 승인형 Firewall Release, Baseline Recovery, Trust Score Compensation 절차를 별도로 사용한다.
 
 ## 2. Dry-run과 반복 실행 방법
 
