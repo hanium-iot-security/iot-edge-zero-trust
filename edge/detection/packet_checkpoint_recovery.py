@@ -7,12 +7,14 @@ import hmac
 import json
 import os
 from pathlib import Path
+import sqlite3
 import stat
 import subprocess
 from datetime import datetime
 from typing import Mapping, Sequence
 
-from edge.detection.phase4_time import format_db_utc
+from edge.detection import packet_checkpoint_recovery_repository as recovery_repository
+from edge.detection.phase4_time import format_db_utc, parse_db_utc
 
 
 PLAN_SCHEMA_VERSION = "packet-checkpoint-gap-recovery-plan-v1"
@@ -26,6 +28,199 @@ _VOLATILE_PLAN_KEYS = frozenset({
 
 class PacketCheckpointRecoveryError(Exception):
     """Raised when a packet checkpoint recovery plan is invalid."""
+
+
+def _readiness_summary(
+    session: sqlite3.Row,
+    readiness: recovery_repository.RecoverySessionReadiness,
+) -> dict[str, object]:
+    return {
+        "session_id": readiness.session_id,
+        "status": str(session["status"]),
+        "first_window_start": (
+            format_db_utc(readiness.first_window_start)
+            if readiness.first_window_start is not None
+            else None
+        ),
+        "packet_feature_ready_through": (
+            format_db_utc(readiness.packet_feature_ready_through)
+            if readiness.packet_feature_ready_through is not None
+            else None
+        ),
+        "segment_count": readiness.segment_count,
+        "feature_row_count": readiness.feature_row_count,
+        "full_ready": readiness.full_ready,
+        "blocking_reasons": list(readiness.blocking_reasons),
+    }
+
+
+def build_recovery_plan(
+    connection: sqlite3.Connection,
+    *,
+    repository_state: Mapping[str, object],
+    database_path: Path,
+    detector_name: str,
+    current_session_id: str,
+    target_session_id: str,
+    approved_by: str,
+    reason: str,
+    lock_entries: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    source_table = recovery_repository.SUPPORTED_DETECTORS.get(detector_name)
+    if source_table is None:
+        raise PacketCheckpointRecoveryError(
+            f"unsupported detector: {detector_name}"
+        )
+
+    blocking_reasons: list[str] = []
+    checkpoint = recovery_repository.get_checkpoint(
+        connection, detector_name, source_table
+    )
+    current_session = recovery_repository.get_capture_session(
+        connection, current_session_id
+    )
+    target_session = recovery_repository.get_capture_session(
+        connection, target_session_id
+    )
+    current_readiness = recovery_repository.calculate_packet_feature_readiness(
+        connection, current_session_id
+    )
+    target_readiness = recovery_repository.calculate_packet_feature_readiness(
+        connection, target_session_id
+    )
+
+    if checkpoint is None:
+        blocking_reasons.append("CHECKPOINT_NOT_FOUND")
+    if current_session is None:
+        blocking_reasons.append("CURRENT_SESSION_NOT_FOUND")
+    elif current_session["status"] != "COMPLETED":
+        blocking_reasons.append("CURRENT_SESSION_NOT_COMPLETED")
+    if target_session is None:
+        blocking_reasons.append("TARGET_SESSION_NOT_FOUND")
+    elif target_session["status"] != "COMPLETED":
+        blocking_reasons.append("TARGET_SESSION_NOT_COMPLETED")
+    if current_session_id == target_session_id:
+        blocking_reasons.append("CURRENT_AND_TARGET_SESSION_MATCH")
+
+    checkpoint_window: datetime | None = None
+    if checkpoint is not None and checkpoint["last_completed_window_end"] is not None:
+        checkpoint_window = parse_db_utc(
+            checkpoint["last_completed_window_end"],
+            "last_completed_window_end",
+        )
+    elif checkpoint is not None:
+        blocking_reasons.append("CHECKPOINT_WINDOW_END_MISSING")
+
+    if current_readiness is None:
+        if current_session is not None:
+            blocking_reasons.append("CURRENT_SESSION_READINESS_MISSING")
+    elif current_readiness.packet_feature_ready_through is None:
+        blocking_reasons.append("CURRENT_SESSION_NOT_FEATURE_READY")
+    elif checkpoint_window is not None:
+        if checkpoint_window < current_readiness.packet_feature_ready_through:
+            blocking_reasons.append(
+                "CURRENT_SESSION_HAS_READY_PREFIX_AFTER_CHECKPOINT"
+            )
+        elif checkpoint_window > current_readiness.packet_feature_ready_through:
+            blocking_reasons.append("CURRENT_CHECKPOINT_NOT_AT_READY_THROUGH")
+
+    target_first: datetime | None = None
+    if target_readiness is None:
+        if target_session is not None:
+            blocking_reasons.append("TARGET_SESSION_READINESS_MISSING")
+    else:
+        target_first = target_readiness.first_window_start
+        if not target_readiness.full_ready:
+            blocking_reasons.append("TARGET_SESSION_NOT_FULL_READY")
+    if checkpoint_window is not None and target_first is not None:
+        if target_first <= checkpoint_window:
+            blocking_reasons.append("CHECKPOINT_WOULD_NOT_ADVANCE")
+
+    running_rows = recovery_repository.list_running_capture_sessions(connection)
+    running_sessions = [
+        {"session_id": str(row["session_id"]), "started_at": str(row["started_at"])}
+        for row in running_rows
+    ]
+    if running_sessions:
+        blocking_reasons.append("RUNNING_CAPTURE_SESSIONS")
+
+    existing_recovery = recovery_repository.get_existing_recovery(
+        connection,
+        detector_name=detector_name,
+        source_table=source_table,
+        target_session_id=target_session_id,
+    )
+    if existing_recovery is not None:
+        blocking_reasons.append("DUPLICATE_RECOVERY")
+
+    checkpoint_before = (
+        {
+            "detector_name": str(checkpoint["detector_name"]),
+            "source_table": str(checkpoint["source_table"]),
+            "last_processed_id": checkpoint["last_processed_id"],
+            "last_completed_window_end": checkpoint["last_completed_window_end"],
+            "updated_at": checkpoint["updated_at"],
+        }
+        if checkpoint is not None
+        else None
+    )
+    checkpoint_after = (
+        {
+            "detector_name": detector_name,
+            "source_table": source_table,
+            "last_processed_id": checkpoint["last_processed_id"],
+            "last_completed_window_end": format_db_utc(target_first),
+        }
+        if checkpoint is not None and target_first is not None
+        else None
+    )
+    sessions_between: list[dict[str, object]] = []
+    if checkpoint_window is not None and target_first is not None:
+        sessions_between = [
+            {
+                "session_id": str(row["session_id"]),
+                "first_window_start": str(row["first_window_start"]),
+                "status": str(row["status"]),
+            }
+            for row in recovery_repository.list_sessions_between(
+                connection,
+                after_window_end=format_db_utc(checkpoint_window),
+                before_window_start=format_db_utc(target_first),
+            )
+        ]
+
+    return {
+        "plan_schema_version": PLAN_SCHEMA_VERSION,
+        "repository_root": repository_state.get("repository_root"),
+        "repository_commit": repository_state.get("repository_commit"),
+        "repository_state": dict(repository_state),
+        "database_path": str(database_path.resolve()),
+        "detector_name": detector_name,
+        "source_table": source_table,
+        "current_session_id": current_session_id,
+        "target_session_id": target_session_id,
+        "approved_by": approved_by,
+        "reason": reason,
+        "checkpoint": {"before": checkpoint_before, "after": checkpoint_after},
+        "current_session": (
+            _readiness_summary(current_session, current_readiness)
+            if current_session is not None and current_readiness is not None
+            else None
+        ),
+        "target_session": (
+            _readiness_summary(target_session, target_readiness)
+            if target_session is not None and target_readiness is not None
+            else None
+        ),
+        "sessions_between": sessions_between,
+        "running_sessions": running_sessions,
+        "existing_recovery": (
+            dict(existing_recovery) if existing_recovery is not None else None
+        ),
+        "locks": [dict(entry) for entry in lock_entries],
+        "blocking_reasons": blocking_reasons,
+        "can_execute": not blocking_reasons,
+    }
 
 
 def resolve_database_path(db_path: str | Path) -> Path:

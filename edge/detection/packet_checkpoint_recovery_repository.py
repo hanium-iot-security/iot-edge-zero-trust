@@ -1,0 +1,231 @@
+"""Fixed SQLite reads for packet checkpoint gap recovery."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+import sqlite3
+from typing import Sequence
+
+from edge.detection.phase4_time import parse_db_utc
+
+
+SUPPORTED_DETECTORS = {
+    "packet_rule": "packet_feature_logs",
+    "packet_if": "packet_feature_logs",
+}
+
+
+@dataclass(frozen=True)
+class RecoverySessionReadiness:
+    session_id: str
+    first_window_start: datetime | None
+    packet_feature_ready_through: datetime | None
+    segment_count: int
+    feature_row_count: int
+    full_ready: bool
+    blocking_reasons: tuple[str, ...]
+
+
+def get_checkpoint(
+    connection: sqlite3.Connection,
+    detector_name: str,
+    source_table: str,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT detector_name, source_table, last_processed_id,
+               last_completed_window_end, updated_at
+        FROM detector_checkpoints
+        WHERE detector_name = ? AND source_table = ?
+        """,
+        (detector_name, source_table),
+    ).fetchone()
+
+
+def get_capture_session(
+    connection: sqlite3.Connection,
+    session_id: str,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT id, session_id, capture_interface, started_at,
+               first_window_start, ended_at, capture_gap_start,
+               capture_gap_end, status, created_at, updated_at
+        FROM packet_capture_sessions
+        WHERE session_id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+
+
+def list_capture_segments(
+    connection: sqlite3.Connection,
+    session_id: str,
+) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT pcsg.id, pcsg.capture_session_id, pcsg.file_name,
+               pcsg.capture_interface, pcsg.window_start, pcsg.window_end,
+               pcsg.status, pcsg.packet_count, pcsg.processed_at,
+               pcsg.error_code, pcsg.error_message,
+               pcsg.created_at, pcsg.updated_at
+        FROM packet_capture_segments pcsg
+        JOIN packet_capture_sessions pcs ON pcs.id = pcsg.capture_session_id
+        WHERE pcs.session_id = ?
+        ORDER BY pcsg.window_start ASC, pcsg.id ASC
+        """,
+        (session_id,),
+    ).fetchall()
+
+
+def list_running_capture_sessions(
+    connection: sqlite3.Connection,
+) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT session_id, started_at
+        FROM packet_capture_sessions
+        WHERE status = 'RUNNING'
+        ORDER BY started_at ASC, session_id ASC
+        """
+    ).fetchall()
+
+
+def list_sessions_between(
+    connection: sqlite3.Connection,
+    *,
+    after_window_end: str,
+    before_window_start: str,
+) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT id, session_id, capture_interface, started_at,
+               first_window_start, ended_at, status
+        FROM packet_capture_sessions
+        WHERE first_window_start IS NOT NULL
+          AND unixepoch(first_window_start) > unixepoch(?)
+          AND unixepoch(first_window_start) < unixepoch(?)
+        ORDER BY first_window_start ASC, id ASC
+        """,
+        (after_window_end, before_window_start),
+    ).fetchall()
+
+
+def get_existing_recovery(
+    connection: sqlite3.Connection,
+    *,
+    detector_name: str,
+    source_table: str,
+    target_session_id: str,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT id, operation_id, detector_name, source_table,
+               current_capture_session_id, target_capture_session_id,
+               plan_sha256, created_at
+        FROM packet_checkpoint_recoveries
+        WHERE detector_name = ?
+          AND source_table = ?
+          AND target_capture_session_id = ?
+        """,
+        (detector_name, source_table, target_session_id),
+    ).fetchone()
+
+
+def _list_segment_feature_counts(
+    connection: sqlite3.Connection,
+    session_id: str,
+) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT pcsg.id AS segment_id,
+               pcsg.window_start, pcsg.window_end, pcsg.status, pcsg.error_code,
+               COUNT(pfl.id) AS feature_count
+        FROM packet_capture_segments pcsg
+        LEFT JOIN packet_feature_logs pfl ON pfl.capture_segment_id = pcsg.id
+        JOIN packet_capture_sessions pcs ON pcs.id = pcsg.capture_session_id
+        WHERE pcs.session_id = ?
+        GROUP BY pcsg.id, pcsg.window_start, pcsg.window_end,
+                 pcsg.status, pcsg.error_code
+        ORDER BY pcsg.window_start ASC, pcsg.id ASC
+        """,
+        (session_id,),
+    ).fetchall()
+
+
+def _last_segment_window_end(rows: Sequence[sqlite3.Row]) -> datetime | None:
+    if not rows:
+        return None
+    return max(parse_db_utc(row["window_end"], "window_end") for row in rows)
+
+
+def calculate_packet_feature_readiness(
+    connection: sqlite3.Connection,
+    session_id: str,
+) -> RecoverySessionReadiness | None:
+    session = get_capture_session(connection, session_id)
+    if session is None:
+        return None
+    raw_first = session["first_window_start"]
+    if raw_first is None:
+        return RecoverySessionReadiness(
+            session_id, None, None, 0, 0, False, ("NO_FIRST_WINDOW",)
+        )
+
+    first = parse_db_utc(raw_first, "first_window_start")
+    expected = first
+    ready_through: datetime | None = None
+    segment_count = 0
+    feature_row_count = 0
+    consumed_segment_ids: list[int] = []
+    blocking_reasons: list[str] = []
+    rows = _list_segment_feature_counts(connection, session_id)
+    for row in rows:
+        start = parse_db_utc(row["window_start"], "window_start")
+        if start < expected:
+            blocking_reasons.append("SEGMENT_BEFORE_OR_OVERLAPPING_PREFIX")
+            continue
+        if start > expected:
+            blocking_reasons.append("MISSING_WINDOW")
+            break
+        status = str(row["status"])
+        count = int(row["feature_count"])
+        if status not in {"PROCESSED", "EMPTY"} or row["error_code"] is not None:
+            blocking_reasons.append("NON_TERMINAL_OR_ERROR")
+            break
+        if (status == "PROCESSED" and count == 0) or (
+            status == "EMPTY" and count != 0
+        ):
+            blocking_reasons.append("FEATURE_COUNT_MISMATCH")
+            break
+        end = parse_db_utc(row["window_end"], "window_end")
+        if end != start + timedelta(seconds=10):
+            blocking_reasons.append("INVALID_WINDOW_DURATION")
+            break
+        segment_count += 1
+        feature_row_count += count
+        consumed_segment_ids.append(int(row["segment_id"]))
+        ready_through = end
+        expected = end
+
+    last_end = _last_segment_window_end(rows)
+    all_segment_ids = [int(row["segment_id"]) for row in rows]
+    full_ready = (
+        session["status"] == "COMPLETED"
+        and ready_through is not None
+        and ready_through == last_end
+        and segment_count == len(rows)
+        and consumed_segment_ids == all_segment_ids
+        and len(consumed_segment_ids) == len(set(consumed_segment_ids))
+        and not blocking_reasons
+    )
+    return RecoverySessionReadiness(
+        session_id,
+        first,
+        ready_through,
+        segment_count,
+        feature_row_count,
+        full_ready,
+        tuple(blocking_reasons),
+    )
