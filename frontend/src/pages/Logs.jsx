@@ -459,182 +459,154 @@ export default function Logs() {
   }
 
   const columns = [
-    {
-      key: "id",
-      header: "ID",
-      align: "right",
-      width: 70,
-      render: (value) =>
-        value ?? "-",
-    },
-    {
-      key: "device_id",
-      header: "Device",
-      width: 150,
-      render: (value) => (
-        <strong
-          className="device-id-cell"
-          title={value || ""}
-        >
-          {value || "미매핑"}
-        </strong>
-      ),
-    },
-    {
-      key: "topic",
-      header: "Topic",
-      width: 280,
-      render: (value) => (
-        <span
-          className="topic-cell"
-          title={value || ""}
-        >
-          {value || "-"}
-        </span>
-      ),
-    },
-    {
-      key: "payload",
-      header: "Payload",
-      width: 320,
-      render: (value, log) => (
-        <button
-          type="button"
-          className="payload-preview-button"
-          title={formatPayloadPreview(
-            value
-          )}
-          onClick={(event) => {
-            event.stopPropagation();
-            setSelectedLog(log);
-          }}
-        >
-          <span className="payload-preview">
-            {formatPayloadPreview(
-              value
-            )}
-          </span>
-
-          <span className="payload-detail-label">
-            상세보기
-          </span>
-        </button>
-      ),
-    },
-    {
-      key: "payload_size",
-      header: "Size",
-      align: "right",
-      width: 130,
-      render: (value) => (
-        <div className="payload-size-cell">
-          <strong>
-            {value === null ||
-              value === undefined
-              ? "-"
-              : `${formatNumber(
+  {
+    key: "id",
+    header: "ID",
+    align: "right",
+    width: 70,
+    render: (value) =>
+      value ?? "-",
+  },
+  {
+    key: "device_id",
+    header: "Device",
+    width: 150,
+    render: (value) => (
+      <strong
+        className="device-id-cell"
+        title={value || ""}
+      >
+        {value || "미매핑"}
+      </strong>
+    ),
+  },
+  {
+    key: "topic",
+    header: "Topic",
+    width: 280,
+    render: (value) => (
+      <span
+        className="topic-cell"
+        title={value || ""}
+      >
+        {value || "-"}
+      </span>
+    ),
+  },
+  {
+    key: "payload",
+    header: "Payload",
+    width: 320,
+    render: (value) => (
+      <span
+        className="payload-preview"
+        title={formatPayloadPreview(
+          value
+        )}
+      >
+        {formatPayloadPreview(
+          value
+        )}
+      </span>
+    ),
+  },
+  {
+    key: "payload_size",
+    header: "Size",
+    align: "right",
+    width: 130,
+    render: (value) => (
+      <div className="payload-size-cell">
+        <strong>
+          {value === null ||
+          value === undefined
+            ? "-"
+            : `${formatNumber(
                 value
               )} B`}
-          </strong>
+        </strong>
 
-          <StatusBadge
-            status={
-              getPayloadSizeStatus(
-                value
-              )
-            }
-            label={
-              getPayloadSizeLabel(
-                value
-              )
-            }
-            size="small"
-          />
-        </div>
-      ),
-    },
-    {
-      key: "is_json_valid",
-      header: "JSON",
-      width: 100,
-      render: (value) => (
         <StatusBadge
           status={
-            normalizeBoolean(value)
-              ? "normal"
-              : "danger"
+            getPayloadSizeStatus(
+              value
+            )
           }
           label={
-            normalizeBoolean(value)
-              ? "Valid"
-              : "Invalid"
+            getPayloadSizeLabel(
+              value
+            )
           }
           size="small"
         />
-      ),
-    },
-    {
-      key: "is_topic_valid",
-      header: "Topic Valid",
-      width: 120,
-      render: (value) => (
-        <StatusBadge
-          status={
-            normalizeBoolean(value)
-              ? "normal"
-              : "warning"
-          }
-          label={
-            normalizeBoolean(value)
-              ? "Valid"
-              : "Invalid"
-          }
-          size="small"
-        />
-      ),
-    },
-    {
-      key: "error_message",
-      header: "Error",
-      width: 260,
-      render: (value) => (
-        <span
-          className={
-            value
-              ? "log-error-cell"
-              : "text-muted"
-          }
-          title={value || ""}
-        >
-          {value || "-"}
-        </span>
-      ),
-    },
-    {
-      key: "received_at",
-      header: "Received At",
-      width: 190,
-      render: (value) =>
-        formatMqttLogTimestamp(value),
-    },
-    {
-      key: "detail",
-      header: "상세",
-      width: 110,
-      render: (_, log) => (
-        <button
-          type="button"
-          className="button button-small button-secondary"
-          onClick={(event) => {
-            event.stopPropagation();
-            setSelectedLog(log);
-          }}
-        >
-          상세보기
-        </button>
-      ),
-    },
-  ];
+      </div>
+    ),
+  },
+  {
+    key: "is_json_valid",
+    header: "JSON",
+    width: 100,
+    render: (value) => (
+      <StatusBadge
+        status={
+          normalizeBoolean(value)
+            ? "normal"
+            : "danger"
+        }
+        label={
+          normalizeBoolean(value)
+            ? "Valid"
+            : "Invalid"
+        }
+        size="small"
+      />
+    ),
+  },
+  {
+    key: "is_topic_valid",
+    header: "Topic Valid",
+    width: 120,
+    render: (value) => (
+      <StatusBadge
+        status={
+          normalizeBoolean(value)
+            ? "normal"
+            : "warning"
+        }
+        label={
+          normalizeBoolean(value)
+            ? "Valid"
+            : "Invalid"
+        }
+        size="small"
+      />
+    ),
+  },
+  {
+    key: "error_message",
+    header: "Error",
+    width: 260,
+    render: (value) => (
+      <span
+        className={
+          value
+            ? "log-error-cell"
+            : "text-muted"
+        }
+        title={value || ""}
+      >
+        {value || "-"}
+      </span>
+    ),
+  },
+  {
+    key: "received_at",
+    header: "Received At",
+    width: 190,
+    render: (value) =>
+      formatMqttLogTimestamp(value),
+  },
+];
 
   return (
     <div className="page-container">
@@ -920,7 +892,7 @@ export default function Logs() {
               error={error}
               onRetry={handleRefresh}
               rowKey="id"
-              minWidth={1750}
+              minWidth={1550}
               tableLabel="MQTT 로그 목록"
               emptyTitle="표시할 MQTT 로그가 없습니다."
               emptyDescription="MQTT Subscriber가 실행 중이고 메시지를 정상적으로 수신하는지 확인해 주세요."

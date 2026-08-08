@@ -829,26 +829,6 @@ export default function Devices() {
         );
       },
     },
-    {
-      key: "detail",
-      header: "상세",
-      width: 110,
-      render: (_, device) => (
-        <button
-          type="button"
-          className="button button-small button-secondary"
-          onClick={(event) => {
-            event.stopPropagation();
-
-            openDeviceDetail(
-              device
-            );
-          }}
-        >
-          상세보기
-        </button>
-      ),
-    },
   ];
 
   return (
@@ -958,7 +938,7 @@ export default function Devices() {
                 0
               )}
               description="Trust Score 30 미만"
-              status="danger"
+              status="isolated"
             />
 
             <SummaryCard

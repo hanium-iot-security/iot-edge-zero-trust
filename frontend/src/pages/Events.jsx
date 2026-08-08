@@ -173,14 +173,12 @@ function getIncidentFamilyLabel(
   incidentFamily
 ) {
   const labels = {
+    IDENTITY: "Identity",
+    MESSAGE_POLICY: "Message Policy",
     FLOODING: "Flooding",
+    NETWORK_POLICY: "Network Policy",
     SCAN: "Port Scan",
-    AI_ONLY: "AI 단독 탐지",
-    MALFORMED: "Malformed",
-    UNKNOWN_DEVICE:
-      "미등록 기기",
-    TOPIC_ABUSE:
-      "비정상 Topic",
+    AI_ONLY: "AI 단독 이상탐지",
   };
 
   return (
@@ -195,18 +193,16 @@ function getSeverityStatus(severity) {
     String(severity || "")
       .toLowerCase();
 
-  if (
-    normalized === "critical" ||
-    normalized === "high"
-  ) {
-    return normalized;
+  if (normalized === "high") {
+    return "high";
   }
 
-  if (
-    normalized === "medium" ||
-    normalized === "low"
-  ) {
-    return normalized;
+  if (normalized === "medium") {
+    return "medium";
+  }
+
+  if (normalized === "low") {
+    return "low";
   }
 
   return "unknown";
@@ -503,11 +499,7 @@ export default function Events() {
         if (
           String(
             event.severity
-          ).toLowerCase() === "high" ||
-          String(
-            event.severity
-          ).toLowerCase() ===
-          "critical"
+          ).toLowerCase() === "high"
         ) {
           highSeverityCount += 1;
         }
@@ -576,15 +568,16 @@ export default function Events() {
 
   const columns = [
     {
-      key: "id",
-      header: "ID",
-      align: "right",
-      width: 70,
+      key: "detected_at",
+      header: "Detected At",
+      width: 180,
+      render: (value) =>
+        formatKST(value),
     },
     {
       key: "device_id",
-      header: "Device",
-      width: 130,
+      header: "Device / Subject IP",
+      width: 170,
       render: (value, event) => (
         <div className="device-cell">
           <span>
@@ -634,7 +627,7 @@ export default function Events() {
     {
       key: "incident_family",
       header: "Incident Family",
-      width: 150,
+      width: 160,
       render: (value) => (
         <StatusBadge
           status={
@@ -725,74 +718,6 @@ export default function Events() {
         </span>
       ),
     },
-    {
-      key: "policy_version",
-      header: "Policy",
-      width: 140,
-      render: (value) =>
-        value || "-",
-    },
-    {
-      key: "analysis_window_start",
-      header: "분석 Window",
-      width: 210,
-      render: (_, event) => (
-        <div className="window-cell">
-          <span>
-            {formatKST(
-              event.analysis_window_start
-            )}
-          </span>
-
-          <span className="window-separator">
-            ~
-          </span>
-
-          <span>
-            {formatKST(
-              event.analysis_window_end
-            )}
-          </span>
-        </div>
-      ),
-    },
-    {
-      key: "description",
-      header: "Description",
-      width: 260,
-      render: (value) => (
-        <span
-          className="description-cell"
-          title={value || ""}
-        >
-          {value || "-"}
-        </span>
-      ),
-    },
-    {
-      key: "detected_at",
-      header: "Detected At",
-      width: 180,
-      render: (value) =>
-        formatKST(value),
-    },
-    {
-      key: "evidence",
-      header: "Evidence",
-      width: 110,
-      render: (_, event) => (
-        <button
-          type="button"
-          className="button button-small button-secondary"
-          onClick={(clickEvent) => {
-            clickEvent.stopPropagation();
-            setSelectedEvent(event);
-          }}
-        >
-          상세보기
-        </button>
-      ),
-    },
   ];
 
   return (
@@ -857,12 +782,17 @@ export default function Events() {
             aria-label="탐지 이벤트 요약"
           >
             <SummaryCard
-              title="전체 이벤트"
+              title="High"
               value={formatNumber(
-                total,
+                eventSummary.highSeverityCount,
                 0
               )}
-              description="현재 조회 조건에 해당하는 전체 이벤트"
+              description="현재 페이지 High Severity"
+              status={
+                eventSummary.highSeverityCount > 0
+                  ? "danger"
+                  : "default"
+              }
             />
 
             <SummaryCard
@@ -875,13 +805,12 @@ export default function Events() {
             />
 
             <SummaryCard
-              title="AI 탐지"
+              title="AI 이상탐지"
               value={formatNumber(
                 eventSummary.aiCount,
                 0
               )}
-              description="현재 페이지 AI 기반 탐지"
-              status="warning"
+              description="현재 페이지 AI 기반 이상치 탐지"
             />
 
             <SummaryCard
@@ -891,7 +820,6 @@ export default function Events() {
                 0
               )}
               description="실제 Trust Score 감점에 사용됨"
-              status="danger"
             />
 
             <SummaryCard
@@ -911,24 +839,8 @@ export default function Events() {
               )}
               description="Capture Gap으로 Score 미반영"
               status={
-                eventSummary.captureGapCount >
-                  0
+                eventSummary.captureGapCount > 0
                   ? "warning"
-                  : "default"
-              }
-            />
-
-            <SummaryCard
-              title="High 이상"
-              value={formatNumber(
-                eventSummary.highSeverityCount,
-                0
-              )}
-              description="High 또는 Critical Severity"
-              status={
-                eventSummary.highSeverityCount >
-                  0
-                  ? "danger"
                   : "default"
               }
             />
@@ -1025,10 +937,6 @@ export default function Events() {
                 전체
               </option>
 
-              <option value="critical">
-                CRITICAL
-              </option>
-
               <option value="high">
                 HIGH
               </option>
@@ -1062,8 +970,20 @@ export default function Events() {
                 전체
               </option>
 
+              <option value="IDENTITY">
+                IDENTITY
+              </option>
+
+              <option value="MESSAGE_POLICY">
+                MESSAGE_POLICY
+              </option>
+
               <option value="FLOODING">
                 FLOODING
+              </option>
+
+              <option value="NETWORK_POLICY">
+                NETWORK_POLICY
               </option>
 
               <option value="SCAN">
@@ -1072,14 +992,6 @@ export default function Events() {
 
               <option value="AI_ONLY">
                 AI_ONLY
-              </option>
-
-              <option value="MALFORMED">
-                MALFORMED
-              </option>
-
-              <option value="UNKNOWN_DEVICE">
-                UNKNOWN_DEVICE
               </option>
             </select>
           </div>
@@ -1160,7 +1072,7 @@ export default function Events() {
               error={error}
               onRetry={handleRefresh}
               rowKey="id"
-              minWidth={2300}
+              minWidth={1450}
               tableLabel="탐지 이벤트 목록"
               emptyTitle="표시할 탐지 이벤트가 없습니다."
               emptyDescription="탐지 Worker가 실행 중인지 확인하거나 다른 조회 조건을 선택해 주세요."
@@ -1175,12 +1087,7 @@ export default function Events() {
                 if (
                   String(
                     event.severity
-                  ).toLowerCase() ===
-                  "high" ||
-                  String(
-                    event.severity
-                  ).toLowerCase() ===
-                  "critical"
+                  ).toLowerCase() === "high"
                 ) {
                   return "table-row-danger";
                 }
@@ -1194,6 +1101,7 @@ export default function Events() {
 
                 return "";
               }}
+              onRowClick={setSelectedEvent}
             />
           </div>
         )}
@@ -1258,20 +1166,14 @@ export default function Events() {
             <section className="event-detail-summary">
               <div className="event-detail-item">
                 <span>
-                  Detector
+                  Score Delta
                 </span>
 
-                <StatusBadge
-                  status={
-                    getDetectorStatus(
-                      selectedEvent
-                    )
-                  }
-                  label={
-                    selectedEvent.detector_type ||
-                    "-"
-                  }
-                />
+                <strong>
+                  {formatScoreDelta(
+                    selectedEvent.score_delta
+                  )}
+                </strong>
               </div>
 
               <div className="event-detail-item">
@@ -1440,13 +1342,25 @@ export default function Events() {
               </p>
             </section>
 
+            {getDetectorStatus(
+              selectedEvent
+            ) === "ai" && (
+                <section className="event-detail-section">
+                  <h3>AI 이상탐지 정보</h3>
+
+                  <p className="text-muted">
+                    AI 탐지는 이상치 여부를 판단한
+                    결과이며, 공격 유형을 직접
+                    분류한 결과가 아닙니다.
+                  </p>
+                </section>
+              )}
+
             <section className="event-detail-section">
               <h3>Detection Evidence</h3>
 
               <JsonViewer
-                data={
-                  selectedEvent.evidence
-                }
+                data={selectedEvent.evidence}
               />
             </section>
           </div>

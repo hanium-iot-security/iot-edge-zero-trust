@@ -24,6 +24,10 @@ const DEFAULT_LIMIT = 20;
 const POLLING_INTERVAL_MS = 10_000;
 const IS_DEV = import.meta.env.DEV;
 
+/* =========================================================
+   Formatting
+   ========================================================= */
+
 function formatKST(dateString) {
   if (!dateString) {
     return "-";
@@ -82,6 +86,10 @@ function normalizeSearchValue(value) {
     .toLowerCase();
 }
 
+/* =========================================================
+   Firewall
+   ========================================================= */
+
 function getFirewallStatusTheme(status) {
   const normalized =
     String(status || "")
@@ -126,6 +134,10 @@ function getFirewallStatusLabel(status) {
     "규칙 없음"
   );
 }
+
+/* =========================================================
+   Isolation
+   ========================================================= */
 
 function getIsolationActionStatus(action) {
   const normalized =
@@ -194,6 +206,27 @@ function getTrustStatus(score) {
   return "normal";
 }
 
+function getTrustStatusLabel(status) {
+  const labels = {
+    normal: "정상",
+    warning: "주의",
+    danger: "위험",
+    isolated: "격리",
+    unknown: "확인 불가",
+  };
+
+  const normalized =
+    String(status || "")
+      .trim()
+      .toLowerCase();
+
+  return (
+    labels[normalized] ||
+    status ||
+    "확인 불가"
+  );
+}
+
 function formatElapsedTime(dateString) {
   if (!dateString) {
     return "-";
@@ -211,7 +244,7 @@ function formatElapsedTime(dateString) {
       0,
       Math.floor(
         (Date.now() - timestamp) /
-        1000
+          1000
       )
     );
 
@@ -267,18 +300,21 @@ function getLatestRuleMap(rules) {
     const currentTime =
       new Date(
         rule.updated_at ||
-        rule.created_at ||
-        0
+          rule.created_at ||
+          0
       ).getTime();
 
     const existingTime =
       new Date(
         existingRule.updated_at ||
-        existingRule.created_at ||
-        0
+          existingRule.created_at ||
+          0
       ).getTime();
 
-    if (currentTime > existingTime) {
+    if (
+      currentTime >
+      existingTime
+    ) {
       ruleMap.set(
         rule.device_id,
         rule
@@ -288,6 +324,91 @@ function getLatestRuleMap(rules) {
 
   return ruleMap;
 }
+
+/* =========================================================
+   Recovery UI
+   ========================================================= */
+
+/*
+ * 현재 api.js에는 Recovery Command API가 없습니다.
+ *
+ * 따라서 여기서는 Recovery 실행 가능 여부를
+ * Frontend에서 확정하지 않고 현재 상태만 보여줍니다.
+ *
+ * 실제 Preflight / approval / execute 결과는
+ * Backend Recovery API가 추가된 뒤 연결해야 합니다.
+ */
+function getRecoveryUiStatus(device) {
+  if (!device) {
+    return {
+      status: "unknown",
+      label: "확인 불가",
+      description:
+        "기기 상태를 확인할 수 없습니다.",
+    };
+  }
+
+  const trustStatus =
+    String(
+      device.status ||
+        getTrustStatus(
+          device.trust_score
+        )
+    ).toLowerCase();
+
+  const firewallStatus =
+    String(
+      device.firewall_status ||
+        ""
+    ).toUpperCase();
+
+  if (trustStatus !== "isolated") {
+    return {
+      status: "unknown",
+      label: "대상 아님",
+      description:
+        "현재 isolated 상태의 기기가 아닙니다.",
+    };
+  }
+
+  if (firewallStatus === "FAILED") {
+    return {
+      status: "failed",
+      label: "확인 필요",
+      description:
+        "Firewall 상태가 FAILED입니다. Recovery 실행 전 백엔드 Preflight 확인이 필요합니다.",
+    };
+  }
+
+  if (firewallStatus === "PENDING") {
+    return {
+      status: "pending",
+      label: "대기 중",
+      description:
+        "Firewall 적용이 아직 완료되지 않았습니다.",
+    };
+  }
+
+  if (!firewallStatus) {
+    return {
+      status: "unknown",
+      label: "확인 필요",
+      description:
+        "연결된 Firewall Rule을 확인할 수 없습니다.",
+    };
+  }
+
+  return {
+    status: "eligible",
+    label: "Recovery 확인 가능",
+    description:
+      "현재 격리 상태를 확인했습니다. 실제 Recovery 가능 여부는 Backend Preflight 결과를 기준으로 판단해야 합니다.",
+  };
+}
+
+/* =========================================================
+   Page
+   ========================================================= */
 
 export default function Isolation() {
   const [history, setHistory] =
@@ -325,6 +446,11 @@ export default function Isolation() {
   const [
     selectedHistory,
     setSelectedHistory,
+  ] = useState(null);
+
+  const [
+    selectedIsolatedDevice,
+    setSelectedIsolatedDevice,
   ] = useState(null);
 
   const [loading, setLoading] =
@@ -413,9 +539,11 @@ export default function Isolation() {
             Number(historyData?.total);
 
           setHistory(historyItems);
+
           setIsolatedDevices(
             deviceItems
           );
+
           setFirewallRules(
             firewallItems
           );
@@ -533,8 +661,8 @@ export default function Isolation() {
 
             firewall_status:
               item.firewall_status ??
-              firewallRule?.status ??
-              null,
+                firewallRule?.status ??
+                null,
 
             firewall_rule:
               firewallRule,
@@ -573,16 +701,29 @@ export default function Isolation() {
               item.trigger_event_id
             ).includes(keyword);
 
+          /*
+           * api.js의 Mock getIsolationHistory는
+           * action filter를 직접 적용하지 않으므로
+           * 화면에서도 한 번 더 보정합니다.
+           */
+          const matchesAction =
+            !actionFilter ||
+            String(
+              item.action || ""
+            ).toUpperCase() ===
+              actionFilter;
+
           const matchesFirewall =
             !firewallFilter ||
             String(
               item.firewall_status ||
-              ""
+                ""
             ).toUpperCase() ===
-            firewallFilter;
+              firewallFilter;
 
           return (
             matchesSearch &&
+            matchesAction &&
             matchesFirewall
           );
         }
@@ -590,6 +731,7 @@ export default function Isolation() {
     }, [
       historyWithFirewall,
       searchText,
+      actionFilter,
       firewallFilter,
     ]);
 
@@ -605,7 +747,7 @@ export default function Isolation() {
           const status =
             String(
               device.firewall_status ||
-              ""
+                ""
             ).toUpperCase();
 
           if (status === "APPLIED") {
@@ -658,7 +800,7 @@ export default function Isolation() {
       Math.max(
         0,
         currentOffset -
-        DEFAULT_LIMIT
+          DEFAULT_LIMIT
       )
     );
   }
@@ -675,12 +817,28 @@ export default function Isolation() {
     setOffset(0);
   }
 
+  function handleFirewallChange(value) {
+    setFirewallFilter(value);
+  }
+
   function handleResetFilters() {
     setSearchText("");
     setActionFilter("");
     setFirewallFilter("");
     setOffset(0);
   }
+
+  function closeHistoryDetail() {
+    setSelectedHistory(null);
+  }
+
+  function closeRecoveryDetail() {
+    setSelectedIsolatedDevice(null);
+  }
+
+  /* =========================================================
+     Current Isolation Table
+     ========================================================= */
 
   const isolatedDeviceColumns = [
     {
@@ -707,40 +865,55 @@ export default function Isolation() {
       key: "status",
       header: "Trust 상태",
       width: 120,
-      render: (value) => (
-        <StatusBadge
-          status={value || "isolated"}
-          label="격리"
-          size="small"
-        />
-      ),
+      render: (value, device) => {
+        const status =
+          String(
+            value ||
+              getTrustStatus(
+                device.trust_score
+              )
+          ).toLowerCase();
+
+        return (
+          <StatusBadge
+            status={status}
+            label={
+              getTrustStatusLabel(
+                status
+              )
+            }
+            size="small"
+          />
+        );
+      },
     },
     {
       key: "trust_score",
       header: "Trust Score",
       align: "right",
       width: 120,
-      render: (value) => (
-        <div className="trust-score-cell">
-          <strong>
-            {formatNumber(value)}
-          </strong>
+      render: (value) => {
+        const status =
+          getTrustStatus(value);
 
-          <StatusBadge
-            status={getTrustStatus(
-              value
-            )}
-            label={
-              getTrustStatus(
-                value
-              ) === "isolated"
-                ? "격리 기준"
-                : "점수 확인"
-            }
-            size="small"
-          />
-        </div>
-      ),
+        return (
+          <div className="trust-score-cell">
+            <strong>
+              {formatNumber(value)}
+            </strong>
+
+            <StatusBadge
+              status={status}
+              label={
+                getTrustStatusLabel(
+                  status
+                )
+              }
+              size="small"
+            />
+          </div>
+        );
+      },
     },
     {
       key: "firewall_status",
@@ -781,6 +954,10 @@ export default function Isolation() {
       ),
     },
   ];
+
+  /* =========================================================
+     Isolation History Table
+     ========================================================= */
 
   const isolationHistoryColumns = [
     {
@@ -863,7 +1040,7 @@ export default function Isolation() {
       render: (value, item) =>
         formatNumber(
           value ??
-          item.trust_score_before
+            item.trust_score_before
         ),
     },
     {
@@ -874,7 +1051,7 @@ export default function Isolation() {
       render: (value, item) =>
         formatNumber(
           value ??
-          item.trust_score
+            item.trust_score
         ),
     },
     {
@@ -900,24 +1077,12 @@ export default function Isolation() {
       render: (value) =>
         formatKST(value),
     },
-    {
-      key: "detail",
-      header: "상세",
-      width: 110,
-      render: (_, item) => (
-        <button
-          type="button"
-          className="button button-small button-secondary"
-          onClick={(event) => {
-            event.stopPropagation();
-            setSelectedHistory(item);
-          }}
-        >
-          상세보기
-        </button>
-      ),
-    },
   ];
+
+  const selectedRecoveryStatus =
+    getRecoveryUiStatus(
+      selectedIsolatedDevice
+    );
 
   return (
     <div className="page-container">
@@ -927,8 +1092,8 @@ export default function Isolation() {
         updatedAt={
           lastUpdated
             ? formatKST(
-              lastUpdated
-            )
+                lastUpdated
+              )
             : undefined
         }
         onRefresh={handleRefresh}
@@ -946,10 +1111,8 @@ export default function Isolation() {
             </strong>
 
             <p>
-              {pollWarning}
-              {" "}
-              이전에 조회한 격리 데이터를
-              계속 표시합니다.
+              {pollWarning} 이전에 조회한
+              격리 데이터를 계속 표시합니다.
             </p>
           </div>
 
@@ -986,9 +1149,8 @@ export default function Isolation() {
               )}
               description="Trust 상태가 isolated인 기기"
               status={
-                isolationSummary.isolated >
-                  0
-                  ? "danger"
+                isolationSummary.isolated > 0
+                  ? "isolated"
                   : "default"
               }
             />
@@ -1009,8 +1171,7 @@ export default function Isolation() {
               )}
               description="격리 결정 후 차단 적용 대기"
               status={
-                isolationSummary.pending >
-                  0
+                isolationSummary.pending > 0
                   ? "warning"
                   : "default"
               }
@@ -1023,8 +1184,7 @@ export default function Isolation() {
               )}
               description="차단 규칙 적용 실패"
               status={
-                isolationSummary.failed >
-                  0
+                isolationSummary.failed > 0
                   ? "danger"
                   : "default"
               }
@@ -1037,8 +1197,7 @@ export default function Isolation() {
               )}
               description="연결된 Firewall Rule 없음"
               status={
-                isolationSummary.missing >
-                  0
+                isolationSummary.missing > 0
                   ? "warning"
                   : "default"
               }
@@ -1054,6 +1213,10 @@ export default function Isolation() {
           </section>
         )}
 
+      {/* =====================================================
+          Current Isolated Devices
+          ===================================================== */}
+
       <section className="panel packet-table-panel">
         <div className="panel-header">
           <div>
@@ -1062,9 +1225,9 @@ export default function Isolation() {
             </h2>
 
             <p className="panel-description">
-              격리 판단 상태와 실제
-              Firewall 적용 상태를
-              분리해서 표시합니다.
+              행을 선택하면 Trust,
+              Firewall 상태와 Recovery
+              준비 상태를 확인할 수 있습니다.
             </p>
           </div>
 
@@ -1079,7 +1242,9 @@ export default function Isolation() {
         <div className="packet-table-scroll">
           <DataTable
             columns={isolatedDeviceColumns}
-            rows={isolatedDevicesWithFirewall}
+            rows={
+              isolatedDevicesWithFirewall
+            }
             loading={
               loading &&
               isolatedDevices.length === 0
@@ -1105,7 +1270,7 @@ export default function Isolation() {
 
               if (
                 device.firewall_status ===
-                "PENDING" ||
+                  "PENDING" ||
                 !device.firewall_status
               ) {
                 return "table-row-warning";
@@ -1113,9 +1278,16 @@ export default function Isolation() {
 
               return "";
             }}
+            onRowClick={
+              setSelectedIsolatedDevice
+            }
           />
         </div>
       </section>
+
+      {/* =====================================================
+          Isolation History
+          ===================================================== */}
 
       <section className="panel packet-table-panel">
         <div className="panel-header">
@@ -1123,9 +1295,9 @@ export default function Isolation() {
             <h2>격리 이력</h2>
 
             <p className="panel-description">
-              격리·해제 판단과 연결된
-              Trust Score History 및
-              Trigger Event를 확인합니다.
+              행을 선택하면 격리·해제 판단과
+              연결된 Trust Score History 및
+              Trigger Event를 확인할 수 있습니다.
             </p>
           </div>
 
@@ -1197,7 +1369,7 @@ export default function Isolation() {
               id="firewall-status-filter"
               value={firewallFilter}
               onChange={(event) => {
-                setFirewallFilter(
+                handleFirewallChange(
                   event.target.value
                 );
               }}
@@ -1226,10 +1398,10 @@ export default function Isolation() {
         </div>
 
         {searchText &&
-          !loading &&
-          !error &&
-          history.length > 0 &&
-          filteredHistory.length === 0 ? (
+        !loading &&
+        !error &&
+        history.length > 0 &&
+        filteredHistory.length === 0 ? (
           <EmptyState
             title="검색 조건에 맞는 격리 이력이 없습니다."
             description="다른 Device ID, 사유 또는 Trigger Event ID를 검색해 주세요."
@@ -1241,13 +1413,15 @@ export default function Isolation() {
         ) : (
           <div className="packet-table-scroll">
             <DataTable
-              columns={isolationHistoryColumns}
+              columns={
+                isolationHistoryColumns
+              }
               rows={filteredHistory}
               loading={loading}
               error={error}
               onRetry={handleRefresh}
               rowKey="id"
-              minWidth={1600}
+              minWidth={1450}
               tableLabel="격리 이력"
               emptyTitle="표시할 격리 이력이 없습니다."
               emptyDescription="아직 격리 또는 격리 해제 기록이 생성되지 않았습니다."
@@ -1261,7 +1435,7 @@ export default function Isolation() {
 
                 if (
                   item.firewall_status ===
-                  "PENDING" ||
+                    "PENDING" ||
                   !item.firewall_status
                 ) {
                   return "table-row-warning";
@@ -1269,7 +1443,9 @@ export default function Isolation() {
 
                 return "";
               }}
-              onRowClick={setSelectedHistory}
+              onRowClick={
+                setSelectedHistory
+              }
             />
           </div>
         )}
@@ -1299,6 +1475,281 @@ export default function Isolation() {
           )}
       </section>
 
+      {/* =====================================================
+          Recovery Detail
+          ===================================================== */}
+
+      <DetailModal
+        open={Boolean(
+          selectedIsolatedDevice
+        )}
+        title={
+          selectedIsolatedDevice
+            ? `${selectedIsolatedDevice.device_id} Recovery`
+            : "Recovery"
+        }
+        description="현재 격리 상태와 Firewall 상태를 확인한 뒤 Recovery를 수행합니다."
+        onClose={
+          closeRecoveryDetail
+        }
+        size="large"
+        footer={
+          <>
+            <button
+              type="button"
+              className="button button-ghost"
+              onClick={
+                closeRecoveryDetail
+              }
+            >
+              닫기
+            </button>
+
+            <button
+              type="button"
+              className="button"
+              disabled
+              title="Backend Recovery API 연동 후 활성화됩니다."
+            >
+              Recovery 실행
+            </button>
+          </>
+        }
+      >
+        {selectedIsolatedDevice && (
+          <div className="isolation-detail">
+            <section className="isolation-detail-summary">
+              <div className="isolation-detail-item">
+                <span>
+                  Device ID
+                </span>
+
+                <strong>
+                  {
+                    selectedIsolatedDevice.device_id
+                  }
+                </strong>
+              </div>
+
+              <div className="isolation-detail-item">
+                <span>
+                  IP Address
+                </span>
+
+                <strong>
+                  {
+                    selectedIsolatedDevice.ip_address ||
+                    "-"
+                  }
+                </strong>
+              </div>
+
+              <div className="isolation-detail-item">
+                <span>
+                  현재 Trust Score
+                </span>
+
+                <strong>
+                  {formatNumber(
+                    selectedIsolatedDevice.trust_score
+                  )}
+                </strong>
+              </div>
+
+              <div className="isolation-detail-item">
+                <span>
+                  Trust 상태
+                </span>
+
+                <StatusBadge
+                  status={
+                    selectedIsolatedDevice.status ||
+                    getTrustStatus(
+                      selectedIsolatedDevice.trust_score
+                    )
+                  }
+                  label={
+                    getTrustStatusLabel(
+                      selectedIsolatedDevice.status ||
+                      getTrustStatus(
+                        selectedIsolatedDevice.trust_score
+                      )
+                    )
+                  }
+                />
+              </div>
+
+              <div className="isolation-detail-item">
+                <span>
+                  Firewall 상태
+                </span>
+
+                <StatusBadge
+                  status={
+                    getFirewallStatusTheme(
+                      selectedIsolatedDevice.firewall_status
+                    )
+                  }
+                  label={
+                    getFirewallStatusLabel(
+                      selectedIsolatedDevice.firewall_status
+                    )
+                  }
+                />
+              </div>
+
+              <div className="isolation-detail-item">
+                <span>
+                  마지막 통신
+                </span>
+
+                <strong>
+                  {formatKST(
+                    selectedIsolatedDevice.last_seen_at
+                  )}
+                </strong>
+              </div>
+            </section>
+
+            <section className="isolation-detail-section">
+              <h3>
+                Recovery 준비 상태
+              </h3>
+
+              <div className="detail-list">
+                <div>
+                  <dt>상태</dt>
+
+                  <dd>
+                    <StatusBadge
+                      status={
+                        selectedRecoveryStatus.status
+                      }
+                      label={
+                        selectedRecoveryStatus.label
+                      }
+                    />
+                  </dd>
+                </div>
+
+                <div>
+                  <dt>
+                    Preflight
+                  </dt>
+
+                  <dd>
+                    Backend 연동 대기
+                  </dd>
+                </div>
+              </div>
+
+              <p className="text-muted">
+                {
+                  selectedRecoveryStatus.description
+                }
+              </p>
+            </section>
+
+            {selectedIsolatedDevice.firewall_rule && (
+              <section className="isolation-detail-section">
+                <h3>
+                  현재 Firewall Rule
+                </h3>
+
+                <dl className="detail-list">
+                  <div>
+                    <dt>Rule ID</dt>
+
+                    <dd>
+                      {selectedIsolatedDevice.firewall_rule.id ??
+                        "-"}
+                    </dd>
+                  </div>
+
+                  <div>
+                    <dt>Source IP</dt>
+
+                    <dd>
+                      {selectedIsolatedDevice.firewall_rule.source_ip ||
+                        "-"}
+                    </dd>
+                  </div>
+
+                  <div>
+                    <dt>Protocol</dt>
+
+                    <dd>
+                      {selectedIsolatedDevice.firewall_rule.protocol ||
+                        "-"}
+                    </dd>
+                  </div>
+
+                  <div>
+                    <dt>Port</dt>
+
+                    <dd>
+                      {selectedIsolatedDevice.firewall_rule.destination_port ??
+                        "-"}
+                    </dd>
+                  </div>
+
+                  <div>
+                    <dt>Action</dt>
+
+                    <dd>
+                      {selectedIsolatedDevice.firewall_rule.action ||
+                        "-"}
+                    </dd>
+                  </div>
+
+                  <div>
+                    <dt>
+                      Retry Count
+                    </dt>
+
+                    <dd>
+                      {selectedIsolatedDevice.firewall_rule.retry_count ??
+                        0}
+                    </dd>
+                  </div>
+
+                  <div>
+                    <dt>
+                      Last Error
+                    </dt>
+
+                    <dd className="break-word">
+                      {selectedIsolatedDevice.firewall_rule.last_error ||
+                        "-"}
+                    </dd>
+                  </div>
+                </dl>
+              </section>
+            )}
+
+            <section className="isolation-detail-section">
+              <h3>
+                Recovery 실행 조건
+              </h3>
+
+              <p className="text-muted">
+                실제 Recovery 실행 전에는
+                Backend의 Preflight 결과와
+                운영자 승인 여부를 확인해야
+                합니다. 현재 Frontend API
+                모듈에는 Recovery Command
+                Endpoint가 없어 실행 버튼은
+                비활성화되어 있습니다.
+              </p>
+            </section>
+          </div>
+        )}
+      </DetailModal>
+
+      {/* =====================================================
+          Isolation History Detail
+          ===================================================== */}
+
       <DetailModal
         open={Boolean(
           selectedHistory
@@ -1311,20 +1762,18 @@ export default function Isolation() {
         description={
           selectedHistory
             ? `${selectedHistory.device_id || "Device 없음"} · ${getIsolationActionLabel(
-              selectedHistory.action
-            )}`
+                selectedHistory.action
+              )}`
             : undefined
         }
-        onClose={() =>
-          setSelectedHistory(null)
-        }
+        onClose={closeHistoryDetail}
         size="large"
         footer={
           <button
             type="button"
             className="button button-secondary"
-            onClick={() =>
-              setSelectedHistory(null)
+            onClick={
+              closeHistoryDetail
             }
           >
             닫기
@@ -1344,55 +1793,73 @@ export default function Isolation() {
               </div>
 
               <div className="isolation-detail-item">
-                <span>격리 Action</span>
+                <span>
+                  격리 Action
+                </span>
 
                 <StatusBadge
-                  status={getIsolationActionStatus(
-                    selectedHistory.action
-                  )}
-                  label={getIsolationActionLabel(
-                    selectedHistory.action
-                  )}
+                  status={
+                    getIsolationActionStatus(
+                      selectedHistory.action
+                    )
+                  }
+                  label={
+                    getIsolationActionLabel(
+                      selectedHistory.action
+                    )
+                  }
                 />
               </div>
 
               <div className="isolation-detail-item">
-                <span>Firewall 상태</span>
+                <span>
+                  Firewall 상태
+                </span>
 
                 <StatusBadge
-                  status={getFirewallStatusTheme(
-                    selectedHistory.firewall_status
-                  )}
-                  label={getFirewallStatusLabel(
-                    selectedHistory.firewall_status
-                  )}
+                  status={
+                    getFirewallStatusTheme(
+                      selectedHistory.firewall_status
+                    )
+                  }
+                  label={
+                    getFirewallStatusLabel(
+                      selectedHistory.firewall_status
+                    )
+                  }
                 />
               </div>
 
               <div className="isolation-detail-item">
-                <span>이전 Score</span>
+                <span>
+                  이전 Score
+                </span>
 
                 <strong>
                   {formatNumber(
                     selectedHistory.previous_score ??
-                    selectedHistory.trust_score_before
+                      selectedHistory.trust_score_before
                   )}
                 </strong>
               </div>
 
               <div className="isolation-detail-item">
-                <span>변경 Score</span>
+                <span>
+                  변경 Score
+                </span>
 
                 <strong>
                   {formatNumber(
                     selectedHistory.new_score ??
-                    selectedHistory.trust_score
+                      selectedHistory.trust_score
                   )}
                 </strong>
               </div>
 
               <div className="isolation-detail-item">
-                <span>Created At</span>
+                <span>
+                  Created At
+                </span>
 
                 <strong>
                   {formatKST(
@@ -1440,7 +1907,9 @@ export default function Isolation() {
             </section>
 
             <section className="isolation-detail-section">
-              <h3>Firewall Rule</h3>
+              <h3>
+                Firewall Rule
+              </h3>
 
               {selectedHistory.firewall_rule ? (
                 <dl className="detail-list">
@@ -1454,7 +1923,9 @@ export default function Isolation() {
                   </div>
 
                   <div>
-                    <dt>Source IP</dt>
+                    <dt>
+                      Source IP
+                    </dt>
 
                     <dd>
                       {selectedHistory.firewall_rule.source_ip ||
@@ -1463,7 +1934,9 @@ export default function Isolation() {
                   </div>
 
                   <div>
-                    <dt>Protocol</dt>
+                    <dt>
+                      Protocol
+                    </dt>
 
                     <dd>
                       {selectedHistory.firewall_rule.protocol ||

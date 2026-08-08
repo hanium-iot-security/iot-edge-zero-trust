@@ -26,13 +26,15 @@ const ONLINE_THRESHOLD_SECONDS =
   ONLINE_THRESHOLD_MULTIPLIER;
 
 const POLLING_INTERVAL_MS =
-  COLLECTION_INTERVAL_SECONDS *
-  1_000;
+  COLLECTION_INTERVAL_SECONDS * 1_000;
 
-const STATUS_UPDATE_INTERVAL_MS =
-  1_000;
+const STATUS_UPDATE_INTERVAL_MS = 1_000;
 
 const IS_DEV = import.meta.env.DEV;
+
+/* =========================================================
+   Formatting
+   ========================================================= */
 
 function formatKST(dateString) {
   if (!dateString) {
@@ -63,7 +65,8 @@ function formatKST(dateString) {
 function formatMetric(
   value,
   unit = "",
-  maximumFractionDigits = 2
+  maximumFractionDigits = 2,
+  minimumFractionDigits = 0
 ) {
   if (
     value === null ||
@@ -82,9 +85,26 @@ function formatMetric(
   return `${number.toLocaleString(
     "ko-KR",
     {
+      minimumFractionDigits,
       maximumFractionDigits,
     }
   )}${unit}`;
+}
+
+/*
+ * 시스템 자원은 Phase 6-A 표시 계약에 따라
+ * 소수점 1자리로 고정해서 표시한다.
+ *
+ * MetricCard에서 unit을 별도로 출력하기 때문에
+ * 여기서는 숫자 문자열만 반환한다.
+ */
+function formatResourceValue(value) {
+  return formatMetric(
+    value,
+    "",
+    1,
+    1
+  );
 }
 
 function formatInteger(value) {
@@ -152,19 +172,34 @@ function formatElapsedTime(dateString) {
   return `${elapsedHours}시간 전`;
 }
 
+/* =========================================================
+   Gateway Status
+   ========================================================= */
+
 function getGatewayStatus(
   collectedAt,
   hasMetric,
   hasApiError
 ) {
+  /*
+   * Metric을 한 번도 받지 못했고
+   * API 요청 자체도 실패했다면 API_ERROR.
+   */
   if (hasApiError && !hasMetric) {
     return "API_ERROR";
   }
 
+  /*
+   * API 요청은 성공했지만 저장된 Metric이 없는 상태.
+   */
   if (!hasMetric) {
     return "NO_DATA";
   }
 
+  /*
+   * Metric은 존재하지만 수집 시간이 없거나
+   * 잘못된 값이면 최신 상태를 보장할 수 없으므로 STALE.
+   */
   if (!collectedAt) {
     return "STALE";
   }
@@ -225,6 +260,10 @@ function getGatewayStatusTheme(
   );
 }
 
+/* =========================================================
+   Resource Status
+   ========================================================= */
+
 function getResourceStatus(value) {
   const number = Number(value);
 
@@ -260,6 +299,10 @@ function getTemperatureStatus(value) {
 
   return "normal";
 }
+
+/* =========================================================
+   Network Interface
+   ========================================================= */
 
 function getInterfaceStatus(
   interfaceData
@@ -382,9 +425,7 @@ function InterfaceCard({
       </header>
 
       <div className="interface-name-row">
-        <span>
-          Interface
-        </span>
+        <span>Interface</span>
 
         <strong>
           {interfaceData?.interface_name ||
@@ -439,7 +480,8 @@ function InterfaceCard({
           >
             {formatMetric(
               rxRate,
-              " B/s"
+              " B/s",
+              2
             )}
           </strong>
         </div>
@@ -457,7 +499,8 @@ function InterfaceCard({
           >
             {formatMetric(
               txRate,
-              " B/s"
+              " B/s",
+              2
             )}
           </strong>
         </div>
@@ -485,6 +528,10 @@ function InterfaceCard({
     </article>
   );
 }
+
+/* =========================================================
+   Gateway Status Page
+   ========================================================= */
 
 export default function GatewayStatus() {
   const [
@@ -735,6 +782,13 @@ export default function GatewayStatus() {
       gatewayStatus
     );
 
+  const interfaceSummaryStatus =
+    interfaceSummary.down > 0 ||
+    interfaceSummary.missing > 0 ||
+    interfaceSummary.unknown > 0
+      ? "warning"
+      : "normal";
+
   return (
     <div className="page-container">
       <PageHeader
@@ -762,11 +816,9 @@ export default function GatewayStatus() {
             </strong>
 
             <p>
-              {pollWarning}
-              {" "}
-              마지막으로 수신한
-              Gateway Metric을 계속
-              표시합니다.
+              {pollWarning} 마지막으로
+              수신한 Gateway Metric을
+              계속 표시합니다.
             </p>
           </div>
 
@@ -811,6 +863,12 @@ export default function GatewayStatus() {
               value="NO DATA"
               description="API 요청은 성공했지만 Metric이 없습니다."
               status="unknown"
+              footer={
+                <StatusBadge
+                  status="NO_DATA"
+                  size="small"
+                />
+              }
             />
           </section>
 
@@ -838,9 +896,7 @@ export default function GatewayStatus() {
               status={gatewayTheme}
               footer={
                 <StatusBadge
-                  status={
-                    gatewayStatus
-                  }
+                  status={gatewayStatus}
                   size="small"
                 />
               }
@@ -854,19 +910,15 @@ export default function GatewayStatus() {
               description={formatKST(
                 latestMetric.collected_at
               )}
-              status={
-                gatewayStatus ===
-                "ONLINE"
-                  ? "normal"
-                  : "warning"
-              }
+              status={gatewayTheme}
             />
 
             <SummaryCard
               title="실제 수집 간격"
               value={formatMetric(
                 latestMetric.sample_interval_seconds,
-                "초"
+                "초",
+                2
               )}
               description={`기준 수집 주기 ${COLLECTION_INTERVAL_SECONDS}초`}
             />
@@ -876,13 +928,17 @@ export default function GatewayStatus() {
               value={
                 interfaceSummary.connected
               }
-              description={`DOWN ${interfaceSummary.down} · 미인식 ${interfaceSummary.missing}`}
+              description={[
+                `DOWN ${interfaceSummary.down}`,
+                `미인식 ${interfaceSummary.missing}`,
+                interfaceSummary.unknown > 0
+                  ? `미확인 ${interfaceSummary.unknown}`
+                  : null,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
               status={
-                interfaceSummary.down > 0 ||
-                interfaceSummary.missing >
-                  0
-                  ? "warning"
-                  : "normal"
+                interfaceSummaryStatus
               }
             />
           </section>
@@ -927,9 +983,7 @@ export default function GatewayStatus() {
 
             <div className="gateway-overview-detail">
               <div>
-                <span>
-                  Metric ID
-                </span>
+                <span>Metric ID</span>
 
                 <strong>
                   {formatInteger(
@@ -955,9 +1009,7 @@ export default function GatewayStatus() {
           <section>
             <div className="section-heading">
               <div>
-                <h2>
-                  시스템 자원
-                </h2>
+                <h2>시스템 자원</h2>
 
                 <p>
                   Raspberry Pi의 현재
@@ -971,9 +1023,9 @@ export default function GatewayStatus() {
             <div className="metric-card-grid">
               <MetricCard
                 label="CPU"
-                value={
+                value={formatResourceValue(
                   latestMetric.cpu_percent
-                }
+                )}
                 unit="%"
                 percentage={
                   latestMetric.cpu_percent
@@ -986,9 +1038,9 @@ export default function GatewayStatus() {
 
               <MetricCard
                 label="Memory"
-                value={
+                value={formatResourceValue(
                   latestMetric.memory_percent
-                }
+                )}
                 unit="%"
                 percentage={
                   latestMetric.memory_percent
@@ -1001,9 +1053,9 @@ export default function GatewayStatus() {
 
               <MetricCard
                 label="Disk"
-                value={
+                value={formatResourceValue(
                   latestMetric.disk_percent
-                }
+                )}
                 unit="%"
                 percentage={
                   latestMetric.disk_percent
@@ -1013,15 +1065,16 @@ export default function GatewayStatus() {
                 )}
                 description={`사용량 ${formatMetric(
                   latestMetric.disk_used_mb,
-                  " MB"
+                  " MB",
+                  1
                 )}`}
               />
 
               <MetricCard
                 label="Temperature"
-                value={
+                value={formatResourceValue(
                   latestMetric.temperature_c
-                }
+                )}
                 unit="℃"
                 status={getTemperatureStatus(
                   latestMetric.temperature_c
@@ -1063,6 +1116,15 @@ export default function GatewayStatus() {
                   label={`미인식 ${interfaceSummary.missing}`}
                   size="small"
                 />
+
+                {interfaceSummary.unknown >
+                  0 && (
+                  <StatusBadge
+                    status="unknown"
+                    label={`미확인 ${interfaceSummary.unknown}`}
+                    size="small"
+                  />
+                )}
               </div>
             </div>
 
