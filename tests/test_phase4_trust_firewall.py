@@ -374,6 +374,65 @@ def test_trust_v2_representative_tie_break_uses_penalty_severity_time_and_id(
         assert same_time_larger_id not in representative_ids
 
 
+def test_trust_v2_applies_windows_in_analysis_chronological_order(
+    SessionLocal,
+) -> None:
+    second_cutoff = datetime(2026, 7, 23, 10, 0, 20, tzinfo=timezone.utc)
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01", trust_score=100)
+        later_event = _insert_event(
+            db,
+            "esp32_01",
+            "ABNORMAL_TOPIC",
+            event_id=10,
+            incident_family="MESSAGE_POLICY",
+            analysis_window_start="2026-07-23T10:00:10Z",
+            analysis_window_end="2026-07-23T10:00:20Z",
+            detected_at="2026-07-23T10:00:11Z",
+        )
+        earlier_event = _insert_event(
+            db,
+            "esp32_01",
+            "ABNORMAL_TOPIC",
+            event_id=11,
+            incident_family="MESSAGE_POLICY",
+            analysis_window_start=WINDOW_START,
+            analysis_window_end=WINDOW_END,
+            detected_at="2026-07-23T10:00:01Z",
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            result = apply_trust_score_v2_until(
+                db,
+                cycle_range_start=CYCLE_START,
+                cycle_cutoff=second_cutoff,
+            )
+
+        assert [change.representative_event_ids for change in result.changes] == [
+            [earlier_event],
+            [later_event],
+        ]
+        history = db.execute(
+            text(
+                """
+                SELECT analysis_window_start, previous_score, new_score
+                FROM trust_score_history
+                ORDER BY id ASC
+                """
+            )
+        ).mappings().all()
+        assert [row["analysis_window_start"] for row in history] == [
+            WINDOW_START,
+            "2026-07-23T10:00:10Z",
+        ]
+        assert [(row["previous_score"], row["new_score"]) for row in history] == [
+            (100, 80),
+            (80, 60),
+        ]
+
+
 def test_trust_v2_marks_past_window_events_as_late_without_legacy_inference(
     SessionLocal,
 ) -> None:

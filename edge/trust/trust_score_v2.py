@@ -307,14 +307,17 @@ def _fetch_candidate_events(
                       )
                   )
               )
-            ORDER BY id ASC
             """
         ),
         {
             "cutoff": format_db_utc(cutoff),
         },
     ).mappings()
-    return [dict(row) for row in rows]
+    events = [dict(row) for row in rows]
+    return sorted(
+        events,
+        key=lambda event: (*_event_window(event), int(event["id"])),
+    )
 
 
 def _group_events(events: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
