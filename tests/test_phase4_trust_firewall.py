@@ -433,6 +433,52 @@ def test_trust_v2_applies_windows_in_analysis_chronological_order(
         ]
 
 
+def test_trust_v2_orders_legacy_events_by_detected_at_fallback_window(
+    SessionLocal,
+) -> None:
+    second_cutoff = datetime(2026, 7, 23, 10, 0, 20, tzinfo=timezone.utc)
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01", trust_score=100)
+        later_event = _insert_event(
+            db,
+            "esp32_01",
+            "ABNORMAL_TOPIC",
+            event_id=10,
+            incident_family="MESSAGE_POLICY",
+            analysis_window_start=None,
+            analysis_window_end=None,
+            detected_at="2026-07-23T10:00:11Z",
+        )
+        earlier_event = _insert_event(
+            db,
+            "esp32_01",
+            "ABNORMAL_TOPIC",
+            event_id=11,
+            incident_family="MESSAGE_POLICY",
+            analysis_window_start=None,
+            analysis_window_end=None,
+            detected_at="2026-07-23T10:00:01Z",
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            result = apply_trust_score_v2_until(
+                db,
+                cycle_range_start=CYCLE_START,
+                cycle_cutoff=second_cutoff,
+            )
+
+        assert [change.representative_event_ids for change in result.changes] == [
+            [earlier_event],
+            [later_event],
+        ]
+        assert [change.analysis_window_start for change in result.changes] == [
+            CYCLE_START,
+            CUTOFF,
+        ]
+
+
 def test_trust_v2_marks_past_window_events_as_late_without_legacy_inference(
     SessionLocal,
 ) -> None:
