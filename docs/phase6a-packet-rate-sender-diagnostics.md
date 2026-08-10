@@ -76,14 +76,18 @@ end_packet_fail
 
 상세 Counter는 실패 단계별 관측값이며, `failed`는 기존과 동일하게 실패한 송신 시도 수를 의미한다.
 
+Arduino-ESP32 3.3.8의 현재 `NetworkUDP::write(buffer, size)` 구현과 이 Firmware의 `payload_bytes <= 1400` 상한에서는 `short_write_fail`은 구조적으로 `0`이 예상된다. 이 Counter는 다른 Core/구현으로 변경될 때도 단계 구분 계약을 유지하기 위한 보조 계측이며, 현재 실험에서 `short_write_fail=0` 자체를 정상 송신의 충분조건으로 해석하지 않는다.
+
 ## 5. errno 계측 계약
 
-`errno`는 전역 상태이므로 `udp.endPacket()` 반환 직후 다른 함수 호출 전에 즉시 snapshot한다.
+`errno`는 전역 상태이므로 Firmware에서는 `udp.endPacket()` 반환 직후 다른 Firmware 함수 호출 전에 즉시 snapshot한다.
 
 ```text
 endResult = udp.endPacket()
 endErrno = errno
 ```
+
+다만 Arduino-ESP32 3.3.8의 `endPacket()` 내부에서는 `sendto()` 실패 후 Core의 `log_e()`를 거친 뒤 반환할 수 있으므로, Firmware가 읽는 값은 엄밀한 `sendto()` 직후 값이 아니라 **best-effort 진단 힌트**로 취급한다.
 
 `endResult != 1`인 경우에만 `last_end_packet_errno`를 갱신한다.
 
@@ -105,6 +109,8 @@ skipped_slots = floor((afterSendUs - nextPacketAtUs) / attackIntervalUs) + 1
 
 이 Counter는 UDP API 실패 횟수와 별도이며, `attempted`가 목표 송신량보다 줄어든 경우 Scheduler 지연이 실제로 얼마만큼 관여했는지 구분하기 위한 참고값이다.
 
+Host-side 회귀 테스트에서는 대표 경계값과 32-bit `micros()` wrap-around 경계의 skipped-slot 계산을 별도로 검증한다.
+
 ## 7. Serial 출력
 
 기존 필드는 삭제하거나 이름을 바꾸지 않는다.
@@ -123,7 +129,7 @@ schedule_skip_count=0
 
 ## 8. 테스트 전략
 
-Host-side 테스트는 실제 UDP Runtime 성공 여부를 증명하지 않는다. 다음 정적 계약만 검증한다.
+Host-side 테스트는 실제 UDP Runtime 성공 여부를 증명하지 않는다. 다음 정적·산술 계약을 검증한다.
 
 - 진단 Firmware version이 기존 Phase 5 Build와 구분됨
 - 기존 Serial-only 실행 계약 유지
@@ -131,9 +137,11 @@ Host-side 테스트는 실제 UDP Runtime 성공 여부를 증명하지 않는�
 - 기존 no-catch-up 정책 유지
 - 신규 단계별 Counter가 존재함
 - Burst 시작 시 Counter가 초기화됨
-- `endPacket()` 직후 errno를 snapshot함
+- `endPacket()` 반환 직후 errno를 snapshot함
 - 기존 `failedPackets` 필드와 Summary가 유지됨
+- 한 송신 시도에서 `failedPackets`가 실패 경로별 최대 1회 증가함
 - `schedule_skip_count`가 실제 skipped slot 수를 누적함
+- 대표 경계값과 32-bit wrap-around 입력에서 skipped-slot 산술이 의도한 값을 반환함
 - Socket stop/restart 또는 retry 로직이 Burst 정상 종료 경로에 새로 추가되지 않음
 - Burst 내부 packet별 Serial 실패 로그가 추가되지 않음
 
@@ -143,10 +151,21 @@ Host-side 테스트는 실제 UDP Runtime 성공 여부를 증명하지 않는�
 
 공식 Clean Holdout과 분리된 Sender 진단으로 실행한다. `packet-capture.service`를 공식 Session 용도로 시작하지 않고, DB·Trust·Firewall을 변경하지 않는다.
 
+재현 조건은 다음으로 고정하고 증적에 함께 남긴다.
+
+```text
+Arduino IDE = 2.3.10
+esp32 by Espressif Systems = 3.3.8
+Board = ESP32 Dev Module
+Core Debug Level = None
+```
+
+`Core Debug Level`은 `None`으로 유지한다. Error 이상으로 변경하면 Arduino Core 내부 UDP 실패 로그가 packet 단위로 출력되어 80 PPS 타이밍에 영향을 줄 수 있으므로, Debug Level을 변경한 재시험은 별도 Run으로 분리한다.
+
 순서:
 
 ```text
-1. Arduino ESP32 Core 3.3.8 유지 확인
+1. 위 Arduino/Core/Board/Debug 조건 확인
 2. 진단 Firmware 컴파일/업로드
 3. STATUS 확인
 4. START 10 3 64
@@ -180,13 +199,7 @@ begin_packet_fail≈failed
 
 이면 Socket 준비/상태 쪽을 우선 조사한다.
 
-예시 C:
-
-```text
-short_write_fail>0
-```
-
-이면 Buffer/Memory 경로를 별도 조사한다.
+현재 Arduino-ESP32 3.3.8 + 1400B 이하 조건에서 `short_write_fail>0`이 실제 관측되면 예상 계약과 다른 결과이므로, 즉시 Buffer/Write 경로와 사용 Core/Build 조건을 재확인한다. 그러나 `short_write_fail=0`만으로 UDP 전송 성공을 확정하지 않는다.
 
 예시 D:
 
