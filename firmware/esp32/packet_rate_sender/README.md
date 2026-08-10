@@ -58,13 +58,16 @@ local_udp_port=42100
 
 ## 3. Arduino IDE 업로드
 
-진단 재현 시 기존 Session 환경과의 비교를 위해 아래 버전을 유지합니다.
+진단 재현 시 기존 Session 환경과의 비교를 위해 아래 조건을 유지합니다.
 
 ```text
 Arduino IDE = 2.3.10
 esp32 by Espressif Systems = 3.3.8
 Board = ESP32 Dev Module
+Core Debug Level = None
 ```
+
+`Core Debug Level`은 `None`으로 고정합니다. Error 이상으로 올리면 Arduino Core 내부 UDP 실패 로그가 packet 단위로 출력되어 80 PPS 진단 타이밍에 영향을 줄 수 있으므로, Debug Level을 바꾼 재시험은 별도 Run으로 취급합니다.
 
 Phase 6-A 진단 Build의 Firmware 식별자는 다음과 같습니다.
 
@@ -146,7 +149,7 @@ schedule_skip_count
 의미는 다음과 같습니다.
 
 - `begin_packet_fail`: `udp.beginPacket()`이 성공값 `1`을 반환하지 않은 송신 시도 수
-- `short_write_fail`: `udp.write()`가 요청한 Payload 전체 길이를 기록하지 못한 관측 횟수
+- `short_write_fail`: `udp.write()`가 요청한 Payload 전체 길이를 기록하지 못한 관측 횟수. 현재 기준인 Arduino-ESP32 3.3.8과 `payload_bytes <= 1400` 조건에서는 구현 특성상 구조적으로 `0`이 예상되며, 일반적인 단계 구분을 위한 보조 Counter로 유지합니다.
 - `end_packet_fail`: `udp.endPacket()`이 성공값 `1`을 반환하지 않은 관측 횟수
 - `last_end_packet_errno`: 마지막 `endPacket()` 실패 직후 snapshot한 `errno`. Arduino Core 내부 호출 이후 값이므로 **best-effort 진단 힌트**이며 이 값 하나만으로 Root Cause를 확정하지 않습니다.
 - `schedule_skip_count`: 기존 no-catch-up 정책으로 실제 건너뛴 예정 송신 Slot 수
@@ -192,6 +195,8 @@ elapsed_ms
 average_pps
 reason
 ```
+
+실기기 증적에는 사용한 Arduino IDE 버전, ESP32 Core 버전, Board, `Core Debug Level=None`도 함께 기록합니다.
 
 ## 7. 선택적 Raspberry Pi Raw 관측
 
