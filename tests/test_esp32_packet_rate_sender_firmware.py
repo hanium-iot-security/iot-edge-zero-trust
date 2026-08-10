@@ -6,6 +6,7 @@ CONFIG_EXAMPLE = Path(
     "firmware/esp32/packet_rate_sender/packet_rate_firmware_config.example.h"
 )
 README = Path("firmware/esp32/packet_rate_sender/README.md")
+UINT32_MASK = 0xFFFFFFFF
 
 
 def _firmware_source() -> str:
@@ -18,6 +19,22 @@ def _config_source() -> str:
 
 def _function_body(source: str, start: str, end: str) -> str:
     return source[source.index(start) : source.index(end)]
+
+
+def _signed_u32_delta(lhs: int, rhs: int) -> int:
+    delta = (lhs - rhs) & UINT32_MASK
+    return delta if delta < 0x80000000 else delta - 0x100000000
+
+
+def _expected_skipped_slots(
+    next_packet_at_us: int,
+    attack_interval_us: int,
+    after_send_us: int,
+) -> int:
+    if _signed_u32_delta(after_send_us, next_packet_at_us) < 0:
+        return 0
+    elapsed = (after_send_us - next_packet_at_us) & UINT32_MASK
+    return elapsed // attack_interval_us + 1
 
 
 def test_local_config_contains_only_enable_flag_and_wifi_credentials() -> None:
@@ -130,6 +147,23 @@ def test_udp_failure_stages_and_errno_are_instrumented_without_retry() -> None:
     assert send_body.count("udp.endPacket()") == 1
 
 
+def test_failed_packets_counts_each_send_attempt_at_most_once_per_failure_path() -> None:
+    source = _firmware_source()
+    send_body = _function_body(source, "void sendScheduledPacket()", "void updateAttack()")
+    begin_failure_body, post_begin_body = send_body.split(
+        "const size_t written = udp.write(payloadBuffer, attackPayloadBytes);",
+        maxsplit=1,
+    )
+
+    # beginPacket 실패 경로에서 1회 증가 후 즉시 return한다.
+    assert begin_failure_body.count("failedPackets++;") == 1
+    assert "return;" in begin_failure_body
+
+    # write/endPacket 결과는 함께 판정하고 한 송신 시도당 failed를 최대 1회 증가시킨다.
+    assert post_begin_body.count("failedPackets++;") == 1
+    assert "if (written == attackPayloadBytes && endResult == 1)" in post_begin_body
+
+
 def test_scheduler_counts_actual_skipped_slots_and_preserves_no_catch_up() -> None:
     source = _firmware_source()
     update_body = _function_body(
@@ -144,6 +178,22 @@ def test_scheduler_counts_actual_skipped_slots_and_preserves_no_catch_up() -> No
     ) in update_body
     assert "scheduleSkipCount += skippedSlots;" in update_body
     assert "nextPacketAtUs = afterSendUs + attackIntervalUs;" in update_body
+
+
+def test_scheduler_skipped_slot_math_handles_boundaries_and_u32_wrap() -> None:
+    interval = 12_500
+
+    assert _expected_skipped_slots(13_500, interval, 13_499) == 0
+    assert _expected_skipped_slots(13_500, interval, 13_500) == 1
+    assert _expected_skipped_slots(13_500, interval, 38_500) == 3
+
+    base = 0xFFFFFFF0
+    wrapped_next = (base + interval) & UINT32_MASK
+    wrapped_three_missed = (base + (interval * 3)) & UINT32_MASK
+
+    assert _expected_skipped_slots(wrapped_next, interval, base) == 0
+    assert _expected_skipped_slots(wrapped_next, interval, wrapped_next) == 1
+    assert _expected_skipped_slots(wrapped_next, interval, wrapped_three_missed) == 3
 
 
 def test_diagnostic_fields_are_reported_without_per_packet_serial_logging() -> None:
@@ -178,3 +228,11 @@ def test_readme_states_that_only_wifi_credentials_are_local_configuration() -> N
 
     assert "로컬 설정 파일에는 Wi-Fi SSID와 비밀번호만" in text
     assert "주소·포트·Device 식별 계약은 Firmware 내부에 고정" in text
+
+
+def test_readme_pins_core_debug_level_and_short_write_interpretation() -> None:
+    text = README.read_text(encoding="utf-8")
+
+    assert "Core Debug Level = None" in text
+    assert "short_write_fail" in text
+    assert "구조적으로 `0`이 예상" in text
