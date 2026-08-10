@@ -1,6 +1,6 @@
 # Packet Rate Sender 진단 설계
 
-기준일: 2026-08-10
+기준일: 2026-08-11
 
 ## 1. 목적
 
@@ -18,11 +18,11 @@ udp.beginPacket()
 → udp.endPacket()
 ```
 
-그러나 세 단계의 실패를 모두 `failedPackets` 하나로 합산하므로 Session 56의 `failed=453`이 어느 단계에서 발생했는지 현재 로그만으로 구분할 수 없다.
+그러나 세 단계의 실패를 모두 `failedPackets` 하나로 합산하므로 Session 56의 `failed=453`이 어느 단계에서 발생했는지 기존 로그만으로 구분할 수 없었다.
 
 Session 56 두 번째 Burst는 `80 PPS × 15초 = 1200`과 동일한 `attempted=1200`을 기록했으므로, 해당 Run에서는 1200개의 송신 시도 자체가 수행됐다. 따라서 단순 Scheduler missed-slot만으로 453건의 실패를 설명할 수 없다.
 
-사용자 Arduino 환경은 `esp32 by Espressif Systems 3.3.8`이다. 해당 환경과 현재 Firmware 동작을 기준으로 진단한다.
+진단 환경은 `Arduino IDE 2.3.10`, `esp32 by Espressif Systems 3.3.8`, `ESP32 Dev Module`, `Core Debug Level=None`으로 고정한다.
 
 ## 3. 범위
 
@@ -93,7 +93,7 @@ endErrno = errno
 
 성공한 `endPacket()` 뒤의 errno 값은 이전 오류가 남아 있을 수 있으므로 의미 있는 실패 근거로 사용하지 않는다.
 
-이번 진단 PR은 errno histogram이나 특정 errno 원인 매핑을 구현하지 않는다. 실제 ESP32 실행 결과를 받은 뒤 필요할 때 후속 진단한다.
+이번 진단 PR은 errno histogram이나 특정 errno 원인 매핑을 구현하지 않는다. 실제 ESP32 실행 결과를 근거로 후속 진단 필요성을 판단한다.
 
 ## 6. Scheduler 계측 계약
 
@@ -145,7 +145,7 @@ Host-side 테스트는 실제 UDP Runtime 성공 여부를 증명하지 않는�
 - Socket stop/restart 또는 retry 로직이 Burst 정상 종료 경로에 새로 추가되지 않음
 - Burst 내부 packet별 Serial 실패 로그가 추가되지 않음
 
-실제 Root Cause 판정은 ESP32 #2 실기기 결과가 있어야 한다.
+최신 Host-side 실행 결과는 `14 passed in 0.10s`이다. 이 결과는 소스 계약 검증이며 ESP32 Runtime 성공을 단독으로 증명하지 않는다.
 
 ## 9. 실기기 진단 절차
 
@@ -162,7 +162,7 @@ Core Debug Level = None
 
 `Core Debug Level`은 `None`으로 유지한다. Error 이상으로 변경하면 Arduino Core 내부 UDP 실패 로그가 packet 단위로 출력되어 80 PPS 타이밍에 영향을 줄 수 있으므로, Debug Level을 변경한 재시험은 별도 Run으로 분리한다.
 
-순서:
+기본 실행 순서는 다음과 같다.
 
 ```text
 1. 위 Arduino/Core/Board/Debug 조건 확인
@@ -210,7 +210,7 @@ schedule_skip_count > 0
 
 이면 Scheduler 지연이 송신 시도 수 감소에 관여한 것으로 판단한다. 단, UDP API 실패와 Scheduler 지연이 동시에 존재할 수 있으므로 두 Counter를 독립적으로 해석한다.
 
-`end_packet_fail`이 확인되더라도 이번 PR만으로 Socket 재사용이 Root Cause라고 확정하지 않는다. 다음 단계에서 Burst 사이 Socket 재생성 A/B 실험을 별도 변경으로 수행한다.
+`end_packet_fail`이 확인되더라도 이번 PR만으로 Socket 재사용이 Root Cause라고 확정하지 않는다. 실제 반복 결과가 Socket lifecycle 변경 필요성을 뒷받침할 때에만 별도 A/B 변경을 검토한다.
 
 ## 11. 성공 조건
 
@@ -223,3 +223,104 @@ schedule_skip_count > 0
 - 진단 계측 자체가 80 PPS 송신 타이밍을 불필요하게 교란하지 않는다.
 - 실제 결과가 나오기 전 Root Cause를 과장하지 않는다.
 - 이후 최소 수정 방향을 실측 근거로 결정할 수 있다.
+
+## 12. 2026-08-11 실기기 진단 결과
+
+### 12.1 빌드 및 시작 상태
+
+- Host-side pytest: `14 passed in 0.10s`
+- Arduino compile: PASS
+  - Sketch: `923376 bytes (70%)`
+  - Global variables: `48472 bytes (14%)`
+- ESP32 #2 업로드: PASS
+- `STATUS` 확인:
+  - `firmware_version=phase6a-packet-rate-sender-diagnostics-v1`
+  - `wifi_connected=true`
+  - `local_ip=192.168.0.5`
+  - `expected_local_ip_match=true`
+  - `target_ip=192.168.0.20`
+  - `target_port=19999`
+  - `udp_ready=true`
+  - 진단 Counter 초기값 전부 `0`
+
+### 12.2 10 PPS Smoke
+
+최초 Smoke에서 다음 간헐 실패가 1회 재현됐다.
+
+```text
+attempted=30
+sent=3
+failed=27
+begin_packet_fail=0
+short_write_fail=0
+end_packet_fail=27
+last_end_packet_errno=12
+schedule_skip_count=0
+elapsed_ms=3000
+average_pps=1.00
+```
+
+이 결과는 실패가 Scheduler, `beginPacket()`, short write가 아니라 `endPacket()` 반환 실패와 함께 나타났음을 보여준다. 단, `errno=12`는 best-effort 값이므로 메모리 부족 등 특정 Root Cause를 확정하는 근거로 사용하지 않는다.
+
+같은 Socket을 유지한 이후 Smoke 2회는 각각 `sent=30`, `failed=0`, `attempted=30`으로 정상 완료됐다. ESP32를 재부팅한 뒤 Fresh Boot 첫 Smoke도 `30/30`으로 정상 완료됐다.
+
+따라서 이번 결과만으로 "부팅 직후 첫 Burst 실패" 또는 "Socket 재사용 실패"를 재현성 있는 원인으로 확정할 수 없다.
+
+### 12.3 80 PPS × 15초 반복
+
+`START 80 15 64`를 반복 실행한 결과 4개 Run 모두 다음 조건으로 정상 완료됐다.
+
+```text
+attempted=1200
+sent=1200
+failed=0
+begin_packet_fail=0
+short_write_fail=0
+end_packet_fail=0
+last_end_packet_errno=0
+schedule_skip_count=0
+elapsed_ms=15000
+average_pps=80.00
+```
+
+따라서 현재 통제 조건에서는 Phase 5 Session 56 두 번째 Burst의 `failed=453`을 재현하지 못했다.
+
+### 12.4 Raspberry Pi raw observation
+
+Raspberry Pi `eth0`은 `192.168.0.20/24`로 확인됐고 `wlan0`은 DOWN 상태였다. 공식 `packet-capture.service` 대신 별도 수동 `tcpdump`로 Sender local success와 Pi raw observation을 비교했다.
+
+필터:
+
+```bash
+sudo tcpdump -ni eth0 -q 'udp and src host 192.168.0.5 and dst host 192.168.0.20 and dst port 19999' > /dev/null
+```
+
+Raw 비교 Run #1:
+
+```text
+ESP32 sent=1200
+Pi packets captured=1200
+Pi packets received by filter=1202
+Pi packets dropped by kernel=0
+```
+
+Raw 비교 Run #2:
+
+```text
+ESP32 sent=1200
+Pi packets captured=1200
+Pi packets received by filter=1200
+Pi packets dropped by kernel=0
+```
+
+실제 비교 기준인 `ESP32 sent`와 `Pi packets captured`는 두 Run 모두 `1200 ↔ 1200`으로 일치했다. 따라서 이번 통제 조건에서는 과거 Session 53/55/56에서 보였던 Sender↔Gateway observation gap이 재현되지 않았다.
+
+### 12.5 현재 판정
+
+- 진단 Firmware는 의도한 단계별 Counter를 제공했고 기존 송신 상한/no-catch-up/Socket lifecycle/retry 정책을 변경하지 않았다.
+- 최초 10 PPS Smoke에서 간헐 `endPacket()` 실패 27건을 1회 관측했다.
+- 이후 동일 Socket, Fresh Boot, 80 PPS 반복에서는 해당 실패가 재현되지 않았다.
+- 80 PPS raw 비교 2회에서 ESP32 `sent=1200`과 Pi `captured=1200`이 일치했고 kernel drop은 0이었다.
+- 현재 증거만으로 Wi-Fi, Socket reuse, 메모리 부족 중 어느 하나를 Root Cause로 확정하지 않는다.
+- 과거 Session의 Sender failure와 observation gap 기록은 유효하지만, 이번 통제 조건에서는 반복 재현되지 않았다.
+- 따라서 이 PR에서는 retry 또는 Burst 사이 Socket restart 같은 동작 수정은 추가하지 않고, 진단 계측을 유지한 채 간헐 현상을 미해결 관찰사항으로 기록한다.
