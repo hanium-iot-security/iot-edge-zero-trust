@@ -177,6 +177,12 @@ def execute_baseline_recovery(
     expected_trust_scores: Mapping[str, int],
     artifact_dir: str | Path,
     confirm: str,
+    reason: str | None = None,
+    requested_by: str | None = None,
+    approved_by: str | None = None,
+    requested_at: str | None = None,
+    firewall_release_status: str | None = None,
+    preflight: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Reset only selected Device status/score after locked backup validation."""
 
@@ -281,6 +287,12 @@ def execute_baseline_recovery(
             backup_sha256=backup_sha256,
             device_ids=device_ids,
             error=str(exc),
+            reason=reason,
+            requested_by=requested_by,
+            approved_by=approved_by,
+            requested_at=requested_at,
+            firewall_release_status=firewall_release_status,
+            preflight=preflight,
         )
         if isinstance(exc, BaselineRecoveryError):
             raise
@@ -314,6 +326,12 @@ def execute_baseline_recovery(
             backup_sha256=backup_sha256,
             device_ids=device_ids,
             error=str(exc),
+            reason=reason,
+            requested_by=requested_by,
+            approved_by=approved_by,
+            requested_at=requested_at,
+            firewall_release_status=firewall_release_status,
+            preflight=preflight,
         )
         if isinstance(exc, BaselineRecoveryError):
             raise
@@ -347,6 +365,25 @@ def execute_baseline_recovery(
         "devices": device_changes,
         "log_path": str(log_path),
     }
+    if any(
+        value is not None
+        for value in (
+            reason,
+            requested_by,
+            approved_by,
+            requested_at,
+            firewall_release_status,
+            preflight,
+        )
+    ):
+        report["audit"] = _audit_metadata(
+            reason=reason,
+            requested_by=requested_by,
+            approved_by=approved_by,
+            requested_at=requested_at,
+            firewall_release_status=firewall_release_status,
+            preflight=preflight,
+        )
     try:
         _write_json_log(log_path, report)
     except OSError as exc:
@@ -432,6 +469,12 @@ def _write_failure_log_if_possible(
     backup_sha256: str | None,
     device_ids: Sequence[str],
     error: str,
+    reason: str | None = None,
+    requested_by: str | None = None,
+    approved_by: str | None = None,
+    requested_at: str | None = None,
+    firewall_release_status: str | None = None,
+    preflight: Mapping[str, object] | None = None,
 ) -> None:
     if not log_path.parent.is_dir():
         return
@@ -446,10 +489,48 @@ def _write_failure_log_if_possible(
         "error": error,
         "log_path": str(log_path),
     }
+    if any(
+        value is not None
+        for value in (
+            reason,
+            requested_by,
+            approved_by,
+            requested_at,
+            firewall_release_status,
+            preflight,
+        )
+    ):
+        failure_report["audit"] = _audit_metadata(
+            reason=reason,
+            requested_by=requested_by,
+            approved_by=approved_by,
+            requested_at=requested_at,
+            firewall_release_status=firewall_release_status,
+            preflight=preflight,
+        )
     try:
         _write_json_log(log_path, failure_report)
     except OSError:
         return
+
+
+def _audit_metadata(
+    *,
+    reason: str | None,
+    requested_by: str | None,
+    approved_by: str | None,
+    requested_at: str | None,
+    firewall_release_status: str | None,
+    preflight: Mapping[str, object] | None,
+) -> dict[str, object]:
+    return {
+        "reason": reason,
+        "requested_by": requested_by,
+        "approved_by": approved_by,
+        "requested_at": requested_at,
+        "firewall_release_status": firewall_release_status,
+        "preflight": dict(preflight) if preflight is not None else None,
+    }
 
 
 def _write_json_log(path: Path, payload: Mapping[str, object]) -> None:

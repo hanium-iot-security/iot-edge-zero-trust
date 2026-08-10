@@ -18,9 +18,15 @@
 - `detector_checkpoints`
 - MQTT·Feature·Packet Capture·Packet Feature 데이터
 
-이 CLI는 Firewall Release나 iptables 제거 도구가 아니다. API, Frontend,
-Migration, 신규 Audit 테이블도 만들지 않는다. 실행 증적은 DB 밖의 Backup과 JSON
-파일로 남긴다.
+이 CLI와 Backend Recovery API는 Firewall Release나 iptables 제거 도구가 아니다.
+Frontend, Migration, 신규 Audit 테이블도 만들지 않는다. 실행 증적은 DB 밖의 Backup과
+JSON 파일로 남긴다.
+
+Phase 6-A Backend Recovery API는 이 Core를 감싸는 관리 Command Adapter다. Backend는
+`devices.status`나 `devices.trust_score`를 직접 UPDATE하지 않고, systemd 제어,
+iptables 조회 계층 생성, Firewall Release 실행도 하지 않는다. Runtime Firewall
+검증을 수행할 안전한 기존 read helper가 없는 환경에서는 Preflight를 `HOLD`로 닫고
+Recovery Execute를 허용하지 않는다.
 
 ## 2. 실행 전 Gate
 
@@ -206,6 +212,12 @@ baseline-recovery-YYYYMMDDTHHMMSSZ-<suffix>.json
 JSON의 `backup_sha256`, `backup_integrity_check`,
 `backup_foreign_key_violations`, `integrity_check`, `foreign_key_violations`를 확인한다.
 Backup은 Reset 직전 상태이므로 대상 Device가 여전히 `isolated`와 이전 점수여야 한다.
+
+Backend API를 통해 실행한 경우 JSON의 `audit` 객체에 `reason`, `requested_by`,
+`approved_by`, `requested_at`, `firewall_release_status`, 실행 직전 Preflight 요약이
+추가된다. 이 값은 Recovery 관리자 인증 Context에서 파생하며 요청 Body의 임의
+`approved_by` 문자열을 신뢰하지 않는다. 단순 Preflight 호출은 Artifact를 생성하지
+않는다.
 
 ## 7. 실행 후 검증
 

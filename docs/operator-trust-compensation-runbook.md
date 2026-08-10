@@ -155,3 +155,18 @@ WHERE id = 21;
 
 모든 Gate가 통과한 경우에만 Recovery 전에 active였던 서비스만 원상 복구합니다.
 이 PR 자체는 Raspberry Pi 운영 DB, 서비스, iptables를 변경하지 않습니다.
+
+## 10. Backend Read Contract
+
+Phase 6-A Backend는 Dashboard가 운영 DB를 직접 읽지 않도록 다음 최소 조회 API를
+제공한다.
+
+```text
+GET /api/trust-score/compensations
+```
+
+이 API는 `trust_score_compensations` 감사 Row를 그대로 근거로 사용하며 Detection
+History나 Baseline Recovery Audit과 하나의 Timeline으로 합치지 않는다. `backup_path`
+는 내부 절대 경로 대신 파일명 `backup_reference`로 정규화한다. 조회에는 Recovery
+관리자 인증 헤더를 사용하며, 보상 실행 자체는 계속 이 Runbook의 승인형 CLI/Core
+계약을 따른다.
