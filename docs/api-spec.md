@@ -432,6 +432,13 @@ Baseline Recovery JSON artifact와 Recovery Command denial/failure artifact를 �
 정규화한 목록을 반환합니다. 서버 내부 절대 backup path는 노출하지 않고 파일명
 `backup_reference`와 `backup_sha256`만 제공합니다.
 
+동일 Recovery 요청에서 `baseline-recovery-*.json`과 `recovery-command-*.json`이
+함께 생성되더라도 두 artifact는 하나의 `operation_id`를 공유해야 합니다.
+History 응답은 `operation_id` 기준으로 정규화하여 Recovery 요청 1건을 operation
+1건으로 노출합니다. DB commit 이후 JSON audit 저장 또는 사후 검증이 실패한 경우
+fallback audit은 실제 DB의 Device 사후 상태와 생성된 backup 파일명/SHA256을
+보존합니다.
+
 Query parameters:
 
 - `device_id`

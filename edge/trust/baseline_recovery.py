@@ -177,6 +177,7 @@ def execute_baseline_recovery(
     expected_trust_scores: Mapping[str, int],
     artifact_dir: str | Path,
     confirm: str,
+    operation_id: str | None = None,
     reason: str | None = None,
     requested_by: str | None = None,
     approved_by: str | None = None,
@@ -196,7 +197,7 @@ def execute_baseline_recovery(
     if not database.is_file():
         raise BaselineRecoveryError(f"Database가 존재하지 않습니다: {database}")
 
-    operation_id = _new_operation_id()
+    operation_id = operation_id or _new_operation_id()
     backup_path = artifacts / f"baseline-recovery-{operation_id}.db"
     log_path = artifacts / f"baseline-recovery-{operation_id}.json"
     backup_sha256: str | None = None

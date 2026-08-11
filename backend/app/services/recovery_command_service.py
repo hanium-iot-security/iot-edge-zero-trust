@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -159,10 +160,12 @@ def execute_recovery_command(
     _require_score(expected_trust_score)
     requested_at = _now_utc()
     artifacts = _artifact_dir(artifact_dir)
+    operation_id = _new_operation_id()
 
     if confirm != CONFIRMATION:
         payload = _write_command_audit(
             artifacts,
+            operation_id=operation_id,
             device_id=device_id,
             reason=reason,
             requested_by=admin.principal,
@@ -178,6 +181,7 @@ def execute_recovery_command(
     if not _try_acquire_device_lock(device_id):
         payload = _write_command_audit(
             artifacts,
+            operation_id=operation_id,
             device_id=device_id,
             reason=reason,
             requested_by=admin.principal,
@@ -200,6 +204,7 @@ def execute_recovery_command(
         if not preflight["can_execute"]:
             payload = _write_command_audit(
                 artifacts,
+                operation_id=operation_id,
                 device_id=device_id,
                 reason=reason,
                 requested_by=admin.principal,
@@ -221,6 +226,7 @@ def execute_recovery_command(
                 expected_trust_scores={device_id: expected_trust_score},
                 artifact_dir=artifacts,
                 confirm=confirm,
+                operation_id=operation_id,
                 reason=reason,
                 requested_by=admin.principal,
                 approved_by=admin.principal,
@@ -229,8 +235,12 @@ def execute_recovery_command(
                 preflight=preflight,
             )
         except BaselineRecoveryError as exc:
+            db.rollback()
+            after = _device_snapshot(db, device_id)
+            backup = _backup_artifact_metadata(artifacts, operation_id)
             payload = _write_command_audit(
                 artifacts,
+                operation_id=operation_id,
                 device_id=device_id,
                 reason=reason,
                 requested_by=admin.principal,
@@ -240,6 +250,10 @@ def execute_recovery_command(
                 failure_code="BASELINE_RECOVERY_CORE_FAILED",
                 failure_reason=str(exc),
                 preflight=preflight,
+                after_status=after.get("status"),
+                after_trust_score=after.get("trust_score"),
+                backup_reference=backup["backup_reference"],
+                backup_sha256=backup["backup_sha256"],
             )
             raise RecoveryCoreFailedError(payload) from exc
 
@@ -409,6 +423,7 @@ def _select_failure(
 def _write_command_audit(
     artifacts: Path,
     *,
+    operation_id: str,
     device_id: str,
     reason: str,
     requested_by: str,
@@ -418,8 +433,13 @@ def _write_command_audit(
     failure_code: str | None,
     failure_reason: str | None,
     preflight: Mapping[str, Any] | None,
+    after_status: str | None = None,
+    after_trust_score: int | None = None,
+    backup_reference: str | None = None,
+    backup_sha256: str | None = None,
 ) -> dict[str, Any]:
-    operation_id = _new_operation_id()
+    before_status = None if preflight is None else preflight["current_status"]
+    before_score = None if preflight is None else preflight["current_trust_score"]
     payload = {
         "operation_id": operation_id,
         "result": result,
@@ -428,17 +448,19 @@ def _write_command_audit(
         "requested_by": requested_by,
         "approved_by": approved_by,
         "requested_at": requested_at,
-        "before_status": None if preflight is None else preflight["current_status"],
-        "before_trust_score": None if preflight is None else preflight["current_trust_score"],
-        "after_status": None if preflight is None else preflight["current_status"],
-        "after_trust_score": None if preflight is None else preflight["current_trust_score"],
+        "before_status": before_status,
+        "before_trust_score": before_score,
+        "after_status": after_status if after_status is not None else before_status,
+        "after_trust_score": (
+            after_trust_score if after_trust_score is not None else before_score
+        ),
         "firewall_release_status": (
             "NOT_VERIFIED"
             if preflight is None
             else _firewall_release_status(preflight)
         ),
-        "backup_reference": None,
-        "backup_sha256": None,
+        "backup_reference": backup_reference,
+        "backup_sha256": backup_sha256,
         "failure_code": failure_code,
         "failure_reason": failure_reason,
     }
@@ -456,7 +478,7 @@ def _load_recovery_audits(artifacts: Path) -> list[dict[str, Any]]:
     if not artifacts.is_dir():
         return []
 
-    items: list[dict[str, Any]] = []
+    items_by_operation: dict[str, dict[str, Any]] = {}
     for path in sorted(artifacts.glob("*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -464,12 +486,59 @@ def _load_recovery_audits(artifacts: Path) -> list[dict[str, Any]]:
             continue
         item = _normalize_audit_payload(payload, log_reference=path.name)
         if item is not None:
-            items.append(item)
+            operation_id = item["operation_id"]
+            existing = items_by_operation.get(operation_id)
+            items_by_operation[operation_id] = (
+                item if existing is None else _merge_audit_items(existing, item)
+            )
+    items = list(items_by_operation.values())
     return sorted(
         items,
         key=lambda item: (str(item.get("requested_at") or ""), str(item["operation_id"])),
         reverse=True,
     )
+
+
+def _merge_audit_items(
+    existing: Mapping[str, Any],
+    incoming: Mapping[str, Any],
+) -> dict[str, Any]:
+    primary, secondary = (
+        (incoming, existing)
+        if _audit_source_rank(incoming) >= _audit_source_rank(existing)
+        else (existing, incoming)
+    )
+    merged = dict(primary)
+    for key, value in secondary.items():
+        if _is_missing(merged.get(key)) and not _is_missing(value):
+            merged[key] = value
+    if _is_missing(merged.get("backup_reference")):
+        merged["backup_reference"] = secondary.get("backup_reference")
+    if _is_missing(merged.get("backup_sha256")):
+        merged["backup_sha256"] = secondary.get("backup_sha256")
+    return merged
+
+
+def _audit_source_rank(item: Mapping[str, Any]) -> int:
+    log_reference = str(item.get("log_reference") or "")
+    score = 0
+    if log_reference.startswith("baseline-recovery-"):
+        score += 10
+    if log_reference.startswith("recovery-command-"):
+        score += 20
+    if item.get("backup_reference"):
+        score += 4
+    if item.get("backup_sha256"):
+        score += 4
+    if item.get("failure_code") and item.get("failure_code") != "BASELINE_RECOVERY_FAILED":
+        score += 3
+    if item.get("after_status") is not None:
+        score += 2
+    return score
+
+
+def _is_missing(value: Any) -> bool:
+    return value is None or value == ""
 
 
 def _normalize_audit_payload(
@@ -589,6 +658,40 @@ def _sqlite_database_path(db: Session) -> Path:
     return Path(database).expanduser().resolve()
 
 
+def _device_snapshot(db: Session, device_id: str) -> dict[str, Any]:
+    row = db.execute(
+        text(
+            """
+            SELECT status, trust_score
+            FROM devices
+            WHERE device_id = :device_id
+            """
+        ),
+        {"device_id": device_id},
+    ).mappings().one_or_none()
+    if row is None:
+        return {"status": None, "trust_score": None}
+    return {"status": row["status"], "trust_score": int(row["trust_score"])}
+
+
+def _backup_artifact_metadata(artifacts: Path, operation_id: str) -> dict[str, str | None]:
+    backup_path = artifacts / f"baseline-recovery-{operation_id}.db"
+    if not backup_path.is_file():
+        return {"backup_reference": None, "backup_sha256": None}
+    return {
+        "backup_reference": backup_path.name,
+        "backup_sha256": _file_sha256(backup_path),
+    }
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _write_json_atomically(path: Path, payload: Mapping[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
@@ -631,7 +734,7 @@ def _basename(value: Any) -> str | None:
 
 
 def _first(value: Any) -> Any:
-    if isinstance(value, list | tuple) and value:
+    if isinstance(value, (list, tuple)) and value:
         return value[0]
     return None
 

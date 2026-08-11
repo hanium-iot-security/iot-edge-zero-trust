@@ -219,6 +219,13 @@ Backend API를 통해 실행한 경우 JSON의 `audit` 객체에 `reason`, `requ
 `approved_by` 문자열을 신뢰하지 않는다. 단순 Preflight 호출은 Artifact를 생성하지
 않는다.
 
+Backend API가 Core를 호출하는 경우 Recovery 요청 시작 시 생성한 하나의
+`operation_id`를 Core에도 전달한다. Core artifact와 Backend fallback artifact가
+둘 다 남더라도 History API는 같은 `operation_id`를 하나의 Recovery operation으로
+정규화한다. DB commit 이후 JSON audit 저장 또는 사후 검증이 실패한 경우 fallback
+audit은 DB에서 실제 Device 사후 상태를 다시 조회하고, 생성된 backup 파일명과
+SHA256을 보존해야 한다.
+
 ## 7. 실행 후 검증
 
 ```bash
