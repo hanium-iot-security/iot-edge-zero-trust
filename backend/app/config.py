@@ -14,8 +14,6 @@ class Settings(BaseSettings):
     mqtt_port: int = 1883
     mqtt_normal_topic: str = "iot/+/sensor"
     mqtt_subscribe_topic: str = "iot/+/sensor"
-
-    # MQTT Credentials (Mosquitto 인증·Device별 Topic ACL)
     mqtt_subscriber_username: str = ""
     mqtt_subscriber_password: str = ""
     mqtt_test_tool_username: str = ""

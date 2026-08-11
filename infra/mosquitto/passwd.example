@@ -24,7 +24,8 @@
 #   sudo chmod 0600 /etc/mosquitto/passwd
 
 # 각 명령은 비밀번호를 대화식으로 입력받는다(터미널에 노출되지 않음).
-# 비대화식 자동화가 필요하면 `-b username password` 형식을 쓸 수 있지만, 이 경우 Shell History·CI 로그에 평문이 남을 수 있으므로 로컬 1회성 설정에서만 사용하고 즉시 History를 정리한다.
+# 비대화식 자동화가 필요하면 `-b username password` 형식을 쓸 수 있지만,
+# 이 경우 Shell History·CI 로그에 평문이 남을 수 있으므로 로컬 1회성 설정에서만 사용하고 즉시 History를 정리한다.
 
 # ── 생성된 파일의 형식 ────────────────────────────────────────────────────────
 # 실제로 생성하면 아래와 같이 `username:$7$<iterations>$<salt>$<hash>` 형식의
@@ -37,9 +38,11 @@
 #   mqtt_test_tool:$7$101$<salt-placeholder>$<hash-placeholder>
 
 # ── ESP32 Credential 반영 ─────────────────────────────────────────────────────
-# ESP32는 별도 Python `.env` 대신 Firmware Config Header에 Credential을 넣는다.
-# firmware/esp32/*/{,phase5_,packet_rate_}firmware_config.example.h를 복사한 실제 *_config.h(Git 제외)에 MQTT_USERNAME/MQTT_PASSWORD를 채운다.
-# 값 자체는 이 Password File과 반드시 일치해야 하며, 파일 두 곳(passwd, Firmware Config)이 어긋나면 CONNACK reason code 5(Not Authorized)로 연결이 거부된다.
+# ESP32는 별도 Python `.env` 대신 Firmware Credential Header에 Credential을 넣는다.
+# 아래 두 파일을 각각 같은 디렉터리의 `mqtt_credentials.h`로 복사한 뒤(Git 제외 대상) MQTT_PASSWORD 값을 채운다:
+#   firmware/esp32/normal_sender/mqtt_credentials.example.h   (esp32_01)
+#   firmware/esp32/attack_sender/mqtt_credentials.example.h   (esp32_02)
+# 값 자체는 이 Password File과 반드시 일치해야 하며, 파일 두 곳(passwd, irmware Credential Header)이 어긋나면 CONNACK reason code 5(Not Authorized)로 연결이 거부된다.
 
 # ── Rollback ──────────────────────────────────────────────────────────────
 # 실제 배포 전 기존 설정을 Backup한다.

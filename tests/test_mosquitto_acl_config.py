@@ -1,3 +1,13 @@
+"""Mosquitto 설정·ACL·Credential 문서 검증.
+
+실제 Broker 동작(Own Topic PASS / Cross Topic DENY / Wrong Password DENY /
+Anonymous DENY / Subscriber Read PASS·Write DENY)은 이 저장소 개발 과정에서
+실제 Mosquitto(2.0.18, apt 패키지)로 직접 검증했다. 이 테스트 파일은 그
+검증을 뒷받침하는 설정 파일들이 저장소에 올바른 형태로 존재하는지, 그리고
+"acl_file을 allow_anonymous true 상태에서 먼저 켜면 안 된다"는 안전 불변식이
+운영 mosquitto.conf에서 계속 지켜지는지 확인한다.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -83,9 +93,32 @@ class TestAclFile:
         assert "topic read iot/+/sensor" in block
         assert "write" not in block
 
+    def test_test_tool_has_full_namespace_access(self) -> None:
+        source = ACL_FILE.read_text(encoding="utf-8")
+        block = source.split("user mqtt_test_tool", 1)[1]
+        assert "topic write #" in block
+        assert "topic read #" in block
+
+    def test_test_tool_scope_covers_every_attack_script_topic(self) -> None:
+        import re as _re
+
+        from attacks.config import MALICIOUS_TOPICS
+        from attacks.abnormal_topic_attack import _ABNORMAL_TOPIC_POOL
+        from attacks.unknown_device_attack import _ABNORMAL_TOPICS
+
+        source = ACL_FILE.read_text(encoding="utf-8")
+        block = source.split("user mqtt_test_tool", 1)[1]
+        assert _re.search(r"^topic write #\s*$", block, _re.MULTILINE), (
+            "mqtt_test_tool must allow write on the full namespace (#) so every "
+            "attack-script topic (including non-iot/ ones) is publishable"
+        )
+
+        all_attack_topics = set(MALICIOUS_TOPICS) | set(_ABNORMAL_TOPIC_POOL) | set(
+            _ABNORMAL_TOPICS
+        )
+        assert all_attack_topics, "sanity check: attack topic pools must not be empty"
+
     def test_no_password_values_present(self) -> None:
-        # ACL 파일은 Principal 이름과 Topic 정책만 있어야 한다. 설명 주석에서 "Password"라는 단어 자체는 등장할 수 있지만,
-        # 실제 지시어 줄에는 password/secret 관련 지시어나 해시처럼 보이는 값이 없어야 한다.
         lines = _directive_lines(ACL_FILE.read_text(encoding="utf-8"))
         for line in lines:
             assert not line.startswith("password"), f"password directive found: {line!r}"
@@ -109,6 +142,13 @@ class TestPasswdExample:
         text = PASSWD_EXAMPLE.read_text(encoding="utf-8")
         assert "systemctl restart mosquitto" in text
         assert "cp -a" in text
+
+    def test_references_the_actual_esp32_credential_header_paths(self) -> None:
+        text = PASSWD_EXAMPLE.read_text(encoding="utf-8")
+        assert "firmware/esp32/normal_sender/mqtt_credentials.example.h" in text
+        assert "firmware/esp32/attack_sender/mqtt_credentials.example.h" in text
+        assert Path("firmware/esp32/normal_sender/mqtt_credentials.example.h").is_file()
+        assert Path("firmware/esp32/attack_sender/mqtt_credentials.example.h").is_file()
 
 
 class TestMosquittoReadme:
