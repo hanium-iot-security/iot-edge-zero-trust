@@ -24,9 +24,7 @@ import random
 import string
 import time
 
-import paho.mqtt.client as mqtt
-
-from attacks.config import BROKER_HOST, BROKER_PORT, KEEPALIVE, REGISTERED_DEVICES, NORMAL_TOPIC_TPL
+from attacks.config import build_mqtt_client, BROKER_HOST, BROKER_PORT, KEEPALIVE, REGISTERED_DEVICES, NORMAL_TOPIC_TPL
 
 
 def _rand_str(length: int = 4) -> str:
@@ -94,7 +92,7 @@ def main() -> None:
     else:
         topic_id, payload_id = _default_mismatch_pair()
 
-    client = mqtt.Client(client_id=f"attacker_mismatch_{_rand_str()}")
+    client = build_mqtt_client(client_id=f"attacker_mismatch_{_rand_str()}")
     client.connect(args.host, args.port, KEEPALIVE)
     client.loop_start()
 

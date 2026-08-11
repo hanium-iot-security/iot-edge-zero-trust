@@ -14,9 +14,7 @@ import argparse
 import random
 import time
 
-import paho.mqtt.client as mqtt
-
-from attacks.config import BROKER_HOST, BROKER_PORT, KEEPALIVE, REGISTERED_DEVICES, NORMAL_TOPIC_TPL
+from attacks.config import build_mqtt_client, BROKER_HOST, BROKER_PORT, KEEPALIVE, REGISTERED_DEVICES, NORMAL_TOPIC_TPL
 
 # subscriber의 parse_payload_json / _payload_device_id 기준으로
 # is_json_valid=0 또는 device_id=None 이 되는 패턴만 수록
@@ -62,7 +60,7 @@ def main() -> None:
     device_id = args.device_id
     topic     = NORMAL_TOPIC_TPL.format(device_id=device_id)
 
-    client = mqtt.Client(client_id=f"attacker_malform_{_rand_str()}")
+    client = build_mqtt_client(client_id=f"attacker_malform_{_rand_str()}")
     client.connect(args.host, args.port, KEEPALIVE)
     client.loop_start()
 

@@ -20,6 +20,11 @@ from backend.app.config import settings
 from backend.app.database import SessionLocal
 from edge.detection.phase4_time import format_db_utc
 from edge.features.feature_utils import extract_payload_device_id, payload_size
+from edge.mqtt.identity import (
+    IdentityStatus,
+    classify_mqtt_identity,
+    fetch_registered_device_ids,
+)
 from edge.mqtt.topic_utils import (
     extract_device_id_candidate_from_topic,
     extract_device_id_from_topic,
@@ -108,16 +113,22 @@ def insert_mqtt_log(db: Session, row: dict[str, Any]) -> int:
         row,
     )
     if row["device_id"]:
-        db.execute(
-            text(
-                """
-                UPDATE devices
-                SET last_seen_at = :received_at
-                WHERE device_id = :device_id
-                """
-            ),
-            {"device_id": row["device_id"], "received_at": row["received_at"]},
-        )
+        registered_devices = fetch_registered_device_ids(db)
+        identity = classify_mqtt_identity(row["topic"], row["payload"], registered_devices)
+        if identity.status is IdentityStatus.MATCHED:
+            db.execute(
+                text(
+                    """
+                    UPDATE devices
+                    SET last_seen_at = :received_at
+                    WHERE device_id = :device_id
+                    """
+                ),
+                {
+                    "device_id": identity.attributed_device_id,
+                    "received_at": row["received_at"],
+                },
+            )
     db.commit()
     return int(result.lastrowid or 0)
 
@@ -128,9 +139,25 @@ def save_mqtt_message(topic: str, payload: str | bytes, received_at: datetime | 
         return insert_mqtt_log(db, row)
 
 
+def apply_mqtt_credentials(client: mqtt.Client, *, username: str, password: str) -> None:
+    """설정된 경우에만 MQTT Username/Password 인증을 적용한다.
+
+    Mosquitto가 아직 익명 접근을 허용하는 전환 기간에는 `MQTT_SUBSCRIBER_USERNAME`을
+    비워두면 기존처럼 익명 연결을 유지한다(Broker 강제 전 Credential 기반 정상
+    Client 연결 Smoke 전환 순서). Broker가 인증·ACL을 강제한 뒤에는 Username을 반드시 설정해야 Subscribe가 유지된다.
+    """
+    if username:
+        client.username_pw_set(username, password or None)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    apply_mqtt_credentials(
+        client,
+        username=settings.mqtt_subscriber_username,
+        password=settings.mqtt_subscriber_password,
+    )
 
     def on_connect(client: mqtt.Client, _userdata, _flags, reason_code, _properties) -> None:
         if getattr(reason_code, "is_failure", False):

@@ -29,6 +29,11 @@ from edge.detection.phase4_time import (
     parse_db_utc,
     require_utc_window_boundary,
 )
+from edge.mqtt.identity import (
+    IdentityStatus,
+    classify_mqtt_identity,
+    fetch_registered_device_ids,
+)
 
 
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -182,6 +187,9 @@ def collect_feature_windows(
     registered_devices = registered_feature_devices(db)
     if not registered_devices:
         return 0
+    # Identity 판정(등록 여부)은 Isolation 상태와 무관하게 "이 Device ID를 아는가"만
+    # 확인한다. registered_devices(위)는 그중 Feature 집계 대상(non-isolated)만 거른 별도 기준이다.
+    all_registered_devices = fetch_registered_device_ids(db)
 
     rows = db.execute(
         text(
@@ -190,6 +198,7 @@ def collect_feature_windows(
                 id,
                 device_id,
                 topic,
+                payload,
                 payload_size,
                 received_at,
                 is_json_valid,
@@ -205,7 +214,14 @@ def collect_feature_windows(
 
     grouped: dict[tuple[str, datetime, datetime], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        device_id = str(row["device_id"])
+        # Topic/Payload Identity가 서로 모순되는(DEVICE_ID_MISMATCH) 또는 미등록
+        # 기기가 섞인(UNKNOWN_DEVICE) 메시지는 등록 Device의 정상 Feature 집계
+        # 대상에서 제외한다. Raw mqtt_logs.device_id 값(Topic 후보 or Payload 값)을
+        # 그대로 신뢰하지 않는다.
+        identity = classify_mqtt_identity(row["topic"], row["payload"], all_registered_devices)
+        if identity.status is not IdentityStatus.MATCHED:
+            continue
+        device_id = identity.attributed_device_id
         if device_id not in registered_devices:
             continue
 
@@ -256,6 +272,7 @@ def produce_mqtt_features_until(
         raise ValueError("existing MQTT feature checkpoint exceeds producer_cutoff")
 
     registered_devices = registered_feature_devices(db)
+    all_registered_devices = fetch_registered_device_ids(db)
     source_rows = _fetch_mqtt_sources_after_checkpoint(
         db,
         last_processed_id=last_processed_before,
@@ -292,7 +309,13 @@ def produce_mqtt_features_until(
             continue
         if window_end > cutoff:
             continue
-        device_id = str(source["device_id"]) if source["device_id"] is not None else ""
+        # Topic/Payload Identity가 모순되는(DEVICE_ID_MISMATCH) 또는 미등록 기기가
+        # 섞인(UNKNOWN_DEVICE) 메시지는 등록 Device의 정상 Feature 집계 대상에서
+        # 제외한다. Raw mqtt_logs.device_id 값을 그대로 신뢰하지 않는다.
+        identity = classify_mqtt_identity(source["topic"], source["payload"], all_registered_devices)
+        if identity.status is not IdentityStatus.MATCHED:
+            continue
+        device_id = identity.attributed_device_id
         if device_id not in registered_devices:
             continue
         grouped[(device_id, window_start, window_end)].append(source)
@@ -345,6 +368,7 @@ def _fetch_mqtt_sources_after_checkpoint(
                 id,
                 device_id,
                 topic,
+                payload,
                 payload_size,
                 received_at,
                 is_json_valid,
