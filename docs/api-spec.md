@@ -16,8 +16,13 @@ GET /api/gateway-metrics
 GET /api/detection-events
 GET /api/trust-score/summary
 GET /api/trust-score/{device_id}/history
+GET /api/trust-score/compensations
 GET /api/isolation/history
 GET /api/firewall-rules
+POST /api/recovery/preflight
+POST /api/recovery/execute
+GET /api/recovery/history
+GET /api/recovery/history/{operation_id}
 ```
 
 ## Packet Gateway Read APIs
@@ -189,6 +194,44 @@ analysis_window_end DESC, id DESC
 
 `representative_event_ids_json` is parsed into `representative_event_ids`.
 
+### GET /api/trust-score/compensations
+
+Recovery Dashboard는 운영 DB를 직접 읽지 않고 승인형 Trust Score 보상 이력을 이
+읽기 API로 조회합니다. 이 API는 `trust_score_compensations`만 조회하며 Detection
+History나 Baseline Recovery Audit과 하나의 Timeline으로 합치지 않습니다.
+
+관리자 헤더:
+
+```text
+X-Recovery-Admin-Key: <RECOVERY_ADMIN_API_KEY>
+```
+
+Query parameters:
+
+- `device_id`
+- `limit`: default `100`, minimum `1`, maximum `500`
+- `offset`: default `0`, minimum `0`
+
+Response item:
+
+```text
+id
+operation_id
+device_id
+source_event_id
+source_trust_history_id
+previous_score
+compensation_delta
+new_score
+reason
+approved_by
+backup_reference
+backup_sha256
+created_at
+```
+
+`backup_reference`는 서버 내부 절대 경로가 아니라 파일명만 노출합니다.
+
 ## Isolation History 응답 예시
 
 ```json
@@ -255,6 +298,160 @@ updated_at
 
 The backend only reads DB state. It does not run Firewall Worker logic or iptables.
 
+## Recovery Command APIs
+
+Recovery API는 격리된 Device를 `normal`/`100` Baseline으로 되돌리는 관리 Command
+어댑터입니다. 실제 상태 변경은 `edge.trust.baseline_recovery` 코어가 수행하며,
+Backend는 직접 `devices`를 UPDATE하지 않습니다. 이 API는 systemd 제어, iptables
+조회 계층 생성, Firewall Release 실행, Firewall Worker 실행을 하지 않습니다.
+
+관리자 헤더:
+
+```text
+X-Recovery-Admin-Key: <RECOVERY_ADMIN_API_KEY>
+```
+
+`approved_by`와 `requested_by`는 요청 Body가 아니라 인증된 Recovery 관리자
+principal(`RECOVERY_ADMIN_PRINCIPAL`)에서 파생합니다. Secret은 URL query parameter로
+받지 않습니다.
+
+환경변수:
+
+```text
+RECOVERY_ADMIN_API_KEY=
+RECOVERY_ADMIN_PRINCIPAL=recovery-admin
+RECOVERY_ARTIFACT_DIR=data/recovery/baseline
+```
+
+### POST /api/recovery/preflight
+
+Request:
+
+```json
+{
+  "device_id": "esp32_01",
+  "expected_trust_score": 20
+}
+```
+
+Preflight는 읽기 전용이며 Recovery artifact나 backup을 생성하지 않습니다. 검사 항목:
+
+- Device 존재
+- 현재 `devices.status='isolated'`
+- 현재 Trust Score와 `expected_trust_score` 일치
+- DB의 `PENDING`/`APPLIED` Firewall Rule 0건
+- Runtime Firewall verification
+- `processed_at IS NULL` Detection Event 0건
+- Backup artifact 경로 사용 가능성
+
+현재 Backend가 소유한 안전한 runtime firewall read verifier가 없으면
+`firewall_runtime_verification.status='UNAVAILABLE'`, `result='HOLD'`,
+`can_execute=false`로 실패 폐쇄합니다. Backend가 새 subprocess/iptables 조회 계층을
+만들어 PASS로 추정하지 않습니다.
+
+Response:
+
+```json
+{
+  "device_id": "esp32_01",
+  "current_status": "isolated",
+  "current_trust_score": 20,
+  "can_execute": false,
+  "result": "HOLD",
+  "firewall_db_state": {
+    "passed": true,
+    "count": 0,
+    "active_statuses": ["PENDING", "APPLIED"],
+    "rules": []
+  },
+  "firewall_runtime_verification": {
+    "available": false,
+    "passed": false,
+    "status": "UNAVAILABLE",
+    "rule_count": null,
+    "details": "No backend-owned read-only runtime firewall verifier is configured."
+  },
+  "unprocessed_detection_count": 0,
+  "backup_check": {
+    "artifact_dir": "data/recovery/baseline",
+    "available": true,
+    "failure_reason": null
+  },
+  "failure_code": "FIREWALL_RUNTIME_UNAVAILABLE",
+  "failure_reason": "No backend-owned read-only runtime firewall verifier is configured.",
+  "preflight_errors": []
+}
+```
+
+### POST /api/recovery/execute
+
+Request:
+
+```json
+{
+  "device_id": "esp32_01",
+  "expected_trust_score": 20,
+  "reason": "official firewall release completed",
+  "confirm": "RESET-TO-NORMAL-100"
+}
+```
+
+Execute는 승인·인증 후 preflight를 즉시 다시 수행합니다. 통과하지 못하면
+`409`와 `DENIED` 또는 `HOLD` audit payload를 반환하고 baseline recovery core를
+호출하지 않습니다. 성공 조건에서는 기존 baseline recovery core가 SQLite Backup API,
+SHA256, integrity check, foreign key check, 조건부 UPDATE를 수행합니다.
+
+성공 Response:
+
+```json
+{
+  "operation_id": "20260810T010000Z-abcdef123456",
+  "result": "SUCCESS",
+  "device_id": "esp32_01",
+  "reason": "official firewall release completed",
+  "requested_by": "recovery-admin",
+  "approved_by": "recovery-admin",
+  "requested_at": "2026-08-10T01:00:00Z",
+  "before_status": "isolated",
+  "before_trust_score": 20,
+  "after_status": "normal",
+  "after_trust_score": 100,
+  "firewall_release_status": "VERIFIED_RELEASED",
+  "backup_reference": "baseline-recovery-20260810T010000Z-abcdef123456.db",
+  "backup_sha256": "..."
+}
+```
+
+부분 실패나 사전 Gate 실패는 성공으로 반환하지 않습니다. Firewall Release 성공과
+Baseline Recovery 성공은 별도 의미이며, 이 API는 Firewall Release 자체를 실행하지
+않습니다.
+
+### GET /api/recovery/history
+
+Baseline Recovery JSON artifact와 Recovery Command denial/failure artifact를 읽어
+정규화한 목록을 반환합니다. 서버 내부 절대 backup path는 노출하지 않고 파일명
+`backup_reference`와 `backup_sha256`만 제공합니다.
+
+동일 Recovery 요청에서 `baseline-recovery-*.json`과 `recovery-command-*.json`이
+함께 생성되더라도 두 artifact는 하나의 `operation_id`를 공유해야 합니다.
+History 응답은 `operation_id` 기준으로 정규화하여 Recovery 요청 1건을 operation
+1건으로 노출합니다. DB commit 이후 JSON audit 저장 또는 사후 검증이 실패한 경우
+fallback audit은 실제 DB의 Device 사후 상태와 생성된 backup 파일명/SHA256을
+보존합니다.
+
+Query parameters:
+
+- `device_id`
+- `result`: `SUCCESS`, `DENIED`, `HOLD`, or `FAILED`
+- `limit`: default `100`, minimum `1`, maximum `500`
+- `offset`: default `0`, minimum `0`
+
+### GET /api/recovery/history/{operation_id}
+
+단일 Recovery audit item을 조회합니다. Detection Trust History, Trust Compensation,
+Baseline Recovery는 P0에서 서로 다른 Source로 유지하며 통합 Timeline은 후속 P1
+범위입니다.
+
 ## 현재 구현 상태
 
 현재 backend에 구현된 조회 API는 다음과 같습니다.
@@ -271,6 +468,11 @@ GET /api/gateway-metrics
 GET /api/detection-events
 GET /api/trust-score/summary
 GET /api/trust-score/{device_id}/history
+GET /api/trust-score/compensations
 GET /api/isolation/history
 GET /api/firewall-rules
+POST /api/recovery/preflight
+POST /api/recovery/execute
+GET /api/recovery/history
+GET /api/recovery/history/{operation_id}
 ```
