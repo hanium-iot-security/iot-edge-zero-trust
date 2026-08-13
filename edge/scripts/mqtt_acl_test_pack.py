@@ -1,30 +1,44 @@
 """Mosquitto 허용/거부 Test Pack.
 
 Own Topic PASS / Anonymous DENY / Cross Topic DENY / Wrong Password DENY를
-실제 Broker에 대해 확인한다. `infra/mosquitto/mosquitto-strict.conf`로 띄운
-Strict Test Listener(전환 기간, 별도 Port) 또는 인증·ACL이 이미 강제된 운영 Broker 모두에 사용할 수 있다.
+실제 Broker에 대해 확인한다. `infra/mosquitto/mosquitto-strict-test.conf`로
+띄운 Strict Test Listener(운영 Broker와 별도 Port, 충돌 없이 사전 검증) 또는
+인증·ACL이 이미 강제된 운영 Broker(`mosquitto-strict.conf` 적용 후) 모두에
+사용할 수 있다.
 
-이 스크립트는 Broker의 ACL DENY를 "Publish가 실제로 전달되지 않음"으로 판정한다.
-QoS 0 PUBLISH는 성공 여부를 Client가 직접 알 수 없으므로(Broker가 조용히 버림),
-넓은 권한을 가진 Observer(공식 MQTT Scenario/Test Tool Credential, `iot/#` Read/Write 허용)로 대상 Topic을 Subscribe해두고
+이 스크립트는 Broker의 ACL DENY를 "Publish가 실제로 전달되지 않음"으로
+판정한다. QoS 0 PUBLISH는 성공 여부를 Client가 직접 알 수 없으므로(Broker가
+조용히 버림), 넓은 권한을 가진 Observer(공식 MQTT Scenario/Test Tool
+Credential, `#`(전체 Namespace) Read/Write 허용)로 대상 Topic을 Subscribe해두고
 실제 수신 여부로 PASS/DENY를 판정한다.
 
+신뢰성을 위해 다음을 확인한다:
+  - Check별로 고유한 Nonce를 Payload에 심어, 다른 Check나 실제 운영 트래픽의
+    메시지를 자신의 결과로 오판하지 않는다(같은 Broker에 실제 ESP32가 동시에 붙어 있어도 안전).
+  - Publisher의 CONNECT 자체가 실패한 경우(Credential 오류) 이를 ACL DENY 성공으로 오판하지 않고 별도의 AUTH_FAILED로 보고한다.
+  - Observer의 SUBSCRIBE 자체가 Broker에서 프로토콜 단계로 거부되면(예: 잘못된 Topic Filter 형식) SUBACK Reason Code로 감지해 명확히 알린다.
+    다만 실측 결과 Mosquitto는 Read ACL이 없는 Topic도 SUBACK 자체는 성공으로 응답하고(ACL 검사는 실제 메시지 전달 시점에 조용히 적용됨),
+    이 경우는 SUBACK 성공 이후 메시지가 오지 않는 것으로만 드러난다. 그래서 이 Test Pack은 각 Observer Credential(test_tool, edge_subscriber)의
+    실제 Read 권한을 최소 1개의 PASS 기대 Check에서 Observer로 사용해 자체적으로 검증한다(예: `esp32_01_own_topic_pass`가 test_tool의 Read 권한을,
+    `edge_subscriber_read_pass`가 edge_subscriber의 Read 권한을 검증) — 이 Check가 DENY로 나오면 그 자체가 Observer 설정 문제로 봐야 한다.
+  - `publish()`의 반환값(rc)을 확인해 Client 단에서부터 실패한 경우를 Detail에 남긴다.
+
 실행 예시:
-  python -m edge.scripts.mqtt_acl_test_pack \\
-      --host 192.168.0.20 --port 18831 \\
-      --esp32-01-password '...' --esp32-02-password '...' \\
+  python -m edge.scripts.mqtt_acl_test_pack \
+      --host 192.168.0.20 --port 18831 \
+      --esp32-01-password '...' --esp32-02-password '...' \
       --edge-subscriber-password '...' --test-tool-password '...'
 
-Credential 값은 명령행 인자 또는 환경 변수로 전달한다(우선순위: 인자 > 환경변수).
-이 스크립트나 Repository에는 실제 비밀번호를 저장하지 않는다.
+Credential 값은 명령행 인자보다 환경 변수 사용을 권장한다. 명령행 인자로 넘긴
+값은 Shell History와 프로세스 목록(`ps`)에 그대로 노출될 수 있다.
 
   MQTT_ACL_TEST_ESP32_01_PASSWORD
   MQTT_ACL_TEST_ESP32_02_PASSWORD
   MQTT_ACL_TEST_EDGE_SUBSCRIBER_PASSWORD
   MQTT_ACL_TEST_TEST_TOOL_PASSWORD
 
-종료 코드: 모든 Check가 기대한 결과와 일치하면 0, 하나라도 어긋나면 1을 반환한다.
-이 Exit Code로 배포 파이프라인·Runbook의 Gate로 사용할 수 있다.
+종료 코드: 모든 Check가 기대한 결과와 일치하면 0, 하나라도 어긋나면 1을
+반환한다. 이 Exit Code로 배포 파이프라인·Runbook의 Gate로 사용할 수 있다.
 """
 
 from __future__ import annotations
@@ -32,10 +46,10 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import os
-import sys
 import threading
 import time
 from typing import Callable
+import uuid
 
 import paho.mqtt.client as mqtt
 
@@ -45,6 +59,10 @@ CONNECT_WAIT_SECONDS = 3.0
 
 PASS = "PASS"
 DENY = "DENY"
+#: Publisher의 CONNECT 자체가 거부된 경우(Credential 문제). ACL DENY와는 근본적으로 다른 실패이므로 절대 DENY로 오판하지 않고 이 값으로 구분한다.
+AUTH_FAILED = "AUTH_FAILED"
+#: Check 실행 자체가 실패한 경우(Observer 연결 실패, SUBACK 거부 등).
+ERROR = "ERROR"
 
 
 @dataclass(frozen=True)
@@ -113,6 +131,11 @@ def _connect_and_wait(
     return outcome.reason_code == 0
 
 
+def _subscribe_reason_codes_failed(reason_codes) -> list:
+    """paho ReasonCode 목록 중 실패로 표시된 것만 반환한다."""
+    return [rc for rc in reason_codes if getattr(rc, "is_failure", False)]
+
+
 def _observe_delivery(
     host: str,
     port: int,
@@ -120,21 +143,29 @@ def _observe_delivery(
     topic: str,
     publish_fn: Callable[[], None],
     *,
+    expected_nonce: str,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> bool:
-    """Observer로 topic을 Subscribe해두고, publish_fn 실행 후 실제 수신 여부를 반환한다."""
+    """Observer로 topic을 Subscribe해두고, publish_fn 실행 후 실제 수신 여부를 반환한다.
+    """
     received = threading.Event()
+    subscribed = threading.Event()
+    subscribe_reason_codes: list = []
 
     observer, observer_outcome = _build_client("acl_test_observer", observer_credential)
 
-    def on_message(_client, _userdata, _message) -> None:
-        received.set()
+    def on_message(_client, _userdata, message) -> None:
+        try:
+            payload_text = message.payload.decode("utf-8", errors="replace")
+        except Exception:
+            payload_text = ""
+        if expected_nonce in payload_text:
+            received.set()
 
     observer.on_message = on_message
 
-    subscribed = threading.Event()
-
-    def on_subscribe(_client, _userdata, _mid, _reason_codes, _properties) -> None:
+    def on_subscribe(_client, _userdata, _mid, reason_codes, _properties) -> None:
+        subscribe_reason_codes.extend(reason_codes)
         subscribed.set()
 
     observer.on_subscribe = on_subscribe
@@ -148,6 +179,15 @@ def _observe_delivery(
         observer.loop_stop()
         observer.disconnect()
         raise RuntimeError("Observer SUBSCRIBE 확인(SUBACK)을 받지 못했습니다")
+
+    failed_codes = _subscribe_reason_codes_failed(subscribe_reason_codes)
+    if failed_codes:
+        observer.loop_stop()
+        observer.disconnect()
+        raise RuntimeError(
+            "Observer SUBSCRIBE가 Broker에서 거부됐습니다(SUBACK Reason Code 실패) "
+            "— Test Tool Credential의 Read 권한을 확인하세요"
+        )
 
     # Broker가 SUBSCRIBE를 실제로 반영할 시간을 약간 준다.
     time.sleep(0.3)
@@ -174,7 +214,7 @@ def check_connect_only(
     try:
         accepted = _connect_and_wait(client, outcome, host, port)
     except RuntimeError as exc:
-        return CheckResult(name, description, expected, "ERROR", str(exc))
+        return CheckResult(name, description, expected, ERROR, str(exc))
     finally:
         client.loop_stop()
         try:
@@ -201,17 +241,31 @@ def check_publish_delivery(
     observer_credential: Credential,
     publish_topic: str,
     watch_topic: str,
-    payload: str,
     expected: str,
 ) -> CheckResult:
+    """Publisher가 publish_topic에 보낸 메시지가 watch_topic Observer에게 실제로
+    전달되는지로 PASS/DENY를 판정한다.
+
+    Publisher의 CONNECT 자체가 실패하면(Credential 문제) 이를 DENY로 오판하지
+    않고 AUTH_FAILED로 별도 보고한다 — 이 Check들은 모두 "Publisher Credential은
+    유효하고, ACL만 특정 Topic을 막는지"를 확인하려는 목적이므로 CONNECT 실패는
+    그 자체로 이상 신호다.
+    """
+    nonce = uuid.uuid4().hex[:12]
+    payload = f'{{"device_id":"acl_test_probe","nonce":"{nonce}"}}'
+
+    publish_state: dict[str, object] = {"connected": None, "publish_rc": None}
+
     def do_publish() -> None:
         publisher, publisher_outcome = _build_client(f"acl_test_{name}_pub", publisher_credential)
         try:
-            if not _connect_and_wait(publisher, publisher_outcome, host, port):
-                # 연결 자체가 거부되면 당연히 전달되지 않는다 — publish 시도하지 않는다.
+            connected = _connect_and_wait(publisher, publisher_outcome, host, port)
+            publish_state["connected"] = connected
+            if not connected:
                 return
             publisher.loop_start()
-            publisher.publish(publish_topic, payload, qos=0)
+            info = publisher.publish(publish_topic, payload, qos=0)
+            publish_state["publish_rc"] = info.rc
             time.sleep(0.2)
         finally:
             publisher.loop_stop()
@@ -222,13 +276,30 @@ def check_publish_delivery(
 
     try:
         delivered = _observe_delivery(
-            host, port, observer_credential, watch_topic, do_publish
+            host, port, observer_credential, watch_topic, do_publish, expected_nonce=nonce
         )
     except RuntimeError as exc:
-        return CheckResult(name, description, expected, "ERROR", str(exc))
+        return CheckResult(name, description, expected, ERROR, str(exc))
+
+    if publish_state["connected"] is False:
+        return CheckResult(
+            name,
+            description,
+            expected,
+            AUTH_FAILED,
+            "Publisher CONNECT가 거부됐습니다(Credential 인증 실패) — 이 Check가 "
+            "검증하려는 ACL 문제가 아니라 Credential 설정 문제입니다. Password를 "
+            "확인하세요.",
+        )
 
     observed = PASS if delivered else DENY
-    detail = "Observer가 메시지를 수신함" if delivered else "Observer가 시간 내 메시지를 받지 못함"
+    rc = publish_state["publish_rc"]
+    rc_detail = f", publish() rc={rc}" if rc is not None else ""
+    detail = (
+        "Observer가 일치하는 Nonce의 메시지를 수신함"
+        if delivered
+        else "Observer가 시간 내 일치하는 메시지를 받지 못함"
+    ) + rc_detail
     return CheckResult(name, description, expected, observed, detail)
 
 
@@ -245,7 +316,7 @@ def run_test_pack(
 
     results.append(
         check_publish_delivery(
-            "own_topic_pass",
+            "esp32_01_own_topic_pass",
             "ESP32 #1이 자기 Topic(iot/esp32_01/sensor)에 Publish → 전달돼야 함",
             host=host,
             port=port,
@@ -253,7 +324,20 @@ def run_test_pack(
             observer_credential=test_tool,
             publish_topic="iot/esp32_01/sensor",
             watch_topic="iot/esp32_01/sensor",
-            payload='{"device_id":"esp32_01"}',
+            expected=PASS,
+        )
+    )
+
+    results.append(
+        check_publish_delivery(
+            "esp32_02_own_topic_pass",
+            "ESP32 #2가 자기 Topic(iot/esp32_02/sensor)에 Publish → 전달돼야 함",
+            host=host,
+            port=port,
+            publisher_credential=esp32_02,
+            observer_credential=test_tool,
+            publish_topic="iot/esp32_02/sensor",
+            watch_topic="iot/esp32_02/sensor",
             expected=PASS,
         )
     )
@@ -268,7 +352,6 @@ def run_test_pack(
             observer_credential=test_tool,
             publish_topic="iot/esp32_01/sensor",
             watch_topic="iot/esp32_01/sensor",
-            payload='{"device_id":"esp32_02"}',
             expected=DENY,
         )
     )
@@ -305,7 +388,6 @@ def run_test_pack(
             observer_credential=edge_subscriber,
             publish_topic="iot/esp32_01/sensor",
             watch_topic="iot/+/sensor",
-            payload='{"device_id":"esp32_01"}',
             expected=PASS,
         )
     )
@@ -320,7 +402,6 @@ def run_test_pack(
             observer_credential=test_tool,
             publish_topic="iot/esp32_01/sensor",
             watch_topic="iot/esp32_01/sensor",
-            payload='{"device_id":"esp32_01"}',
             expected=DENY,
         )
     )
@@ -330,14 +411,14 @@ def run_test_pack(
 
 def print_report(results: list[CheckResult]) -> bool:
     all_ok = True
-    print(f"{'Check':<28} {'Expected':<9} {'Observed':<9} Detail")
-    print("-" * 78)
+    print(f"{'Check':<28} {'Expected':<9} {'Observed':<12} Detail")
+    print("-" * 90)
     for result in results:
         status = "OK" if result.ok else "MISMATCH"
         if not result.ok:
             all_ok = False
         print(
-            f"{result.name:<28} {result.expected:<9} {result.observed:<9} "
+            f"{result.name:<28} {result.expected:<9} {result.observed:<12} "
             f"[{status}] {result.detail}"
         )
     print()
@@ -358,18 +439,35 @@ def _credential_from_args(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Mosquitto Own Topic PASS / Cross Topic DENY / Wrong Password DENY / "
-        "Anonymous DENY Test Pack"
+        "Anonymous DENY Test Pack. Password는 --*-password 인자보다 환경 변수 사용을 "
+        "권장합니다(인자는 Shell History·프로세스 목록에 노출될 수 있습니다)."
     )
     parser.add_argument("--host", required=True, help="검증 대상 Broker Host")
     parser.add_argument("--port", type=int, required=True, help="검증 대상 Broker Port")
     parser.add_argument("--esp32-01-username", default="esp32_01")
-    parser.add_argument("--esp32-01-password", default=None)
+    parser.add_argument(
+        "--esp32-01-password",
+        default=None,
+        help="권장: MQTT_ACL_TEST_ESP32_01_PASSWORD 환경 변수 사용",
+    )
     parser.add_argument("--esp32-02-username", default="esp32_02")
-    parser.add_argument("--esp32-02-password", default=None)
+    parser.add_argument(
+        "--esp32-02-password",
+        default=None,
+        help="권장: MQTT_ACL_TEST_ESP32_02_PASSWORD 환경 변수 사용",
+    )
     parser.add_argument("--edge-subscriber-username", default="edge_subscriber")
-    parser.add_argument("--edge-subscriber-password", default=None)
+    parser.add_argument(
+        "--edge-subscriber-password",
+        default=None,
+        help="권장: MQTT_ACL_TEST_EDGE_SUBSCRIBER_PASSWORD 환경 변수 사용",
+    )
     parser.add_argument("--test-tool-username", default="mqtt_test_tool")
-    parser.add_argument("--test-tool-password", default=None)
+    parser.add_argument(
+        "--test-tool-password",
+        default=None,
+        help="권장: MQTT_ACL_TEST_TEST_TOOL_PASSWORD 환경 변수 사용",
+    )
     return parser.parse_args(argv)
 
 

@@ -16,6 +16,7 @@ import re
 
 MOSQUITTO_CONF = Path("infra/mosquitto/mosquitto.conf")
 MOSQUITTO_STRICT_CONF = Path("infra/mosquitto/mosquitto-strict.conf")
+MOSQUITTO_STRICT_TEST_CONF = Path("infra/mosquitto/mosquitto-strict-test.conf")
 ACL_FILE = Path("infra/mosquitto/aclfile.conf")
 PASSWD_EXAMPLE = Path("infra/mosquitto/passwd.example")
 README = Path("infra/mosquitto/README.md")
@@ -54,7 +55,9 @@ class TestTransitionalMosquittoConf:
 
 
 class TestStrictMosquittoConf:
-    """mosquitto-strict.conf는 Strict Test Listener이자 전환 후 목표 설정."""
+    """mosquitto-strict.conf는 검증 후 운영 mosquitto.conf를 교체할 최종 목표
+    설정이다(운영 Port 1883/9001 그대로 사용). Strict Test Listener 용도는
+    mosquitto-strict-test.conf가 별도로 담당한다."""
 
     def test_enforces_authentication_on_both_listeners(self) -> None:
         lines = _directive_lines(MOSQUITTO_STRICT_CONF.read_text(encoding="utf-8"))
@@ -69,6 +72,41 @@ class TestStrictMosquittoConf:
         lines = _directive_lines(MOSQUITTO_STRICT_CONF.read_text(encoding="utf-8"))
         assert "listener 1883" in lines
         assert "listener 9001" in lines
+
+
+class TestStrictTestMosquittoConf:
+    """mosquitto-strict-test.conf는 운영 Broker(1883/9001)와 Port가 겹치지
+    않는 전용 Strict Test Listener다 — 운영 Broker가 떠 있는 상태에서도
+    Port 충돌 없이 사전 검증할 수 있어야 한다."""
+
+    def test_uses_ports_that_do_not_collide_with_production(self) -> None:
+        strict_test_lines = _directive_lines(
+            MOSQUITTO_STRICT_TEST_CONF.read_text(encoding="utf-8")
+        )
+        production_lines = _directive_lines(MOSQUITTO_CONF.read_text(encoding="utf-8"))
+        strict_final_lines = _directive_lines(
+            MOSQUITTO_STRICT_CONF.read_text(encoding="utf-8")
+        )
+
+        production_ports = {line for line in production_lines if line.startswith("listener")}
+        strict_final_ports = {
+            line for line in strict_final_lines if line.startswith("listener")
+        }
+        strict_test_ports = {
+            line for line in strict_test_lines if line.startswith("listener")
+        }
+
+        assert strict_test_ports.isdisjoint(production_ports)
+        assert strict_test_ports.isdisjoint(strict_final_ports)
+
+    def test_enforces_authentication_on_both_listeners(self) -> None:
+        lines = _directive_lines(MOSQUITTO_STRICT_TEST_CONF.read_text(encoding="utf-8"))
+        assert lines.count("allow_anonymous false") == 2
+
+    def test_references_same_password_file_and_acl_file_as_final_config(self) -> None:
+        lines = _directive_lines(MOSQUITTO_STRICT_TEST_CONF.read_text(encoding="utf-8"))
+        assert lines.count("password_file /etc/mosquitto/passwd") == 2
+        assert lines.count("acl_file /etc/mosquitto/aclfile.conf") == 2
 
 
 class TestAclFile:
@@ -156,6 +194,7 @@ class TestMosquittoReadme:
         text = README.read_text(encoding="utf-8")
         for required in (
             "mosquitto-strict.conf",
+            "mosquitto-strict-test.conf",
             "aclfile.conf",
             "passwd.example",
             "edge.scripts.mqtt_acl_test_pack",
@@ -164,3 +203,19 @@ class TestMosquittoReadme:
             "통신 암호화",
         ):
             assert required in text
+
+    def test_recommends_env_vars_over_cli_password_args(self) -> None:
+        text = README.read_text(encoding="utf-8")
+        assert "MQTT_ACL_TEST_ESP32_01_PASSWORD" in text
+        assert "환경 변수" in text
+        assert "노출" in text
+
+    def test_mentions_phase5_normal_collector_credential_support(self) -> None:
+        text = README.read_text(encoding="utf-8")
+        assert "phase5_normal_collector" in text
+        assert "PHASE5_MQTT_PASSWORD" in text
+
+    def test_port_collision_rationale_is_documented(self) -> None:
+        text = README.read_text(encoding="utf-8")
+        assert "18831" in text
+        assert "겹치지" in text

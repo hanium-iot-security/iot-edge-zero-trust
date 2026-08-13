@@ -24,6 +24,14 @@ const char* DEVICE_ID = "esp32_02";
 #error "PHASE5_DEVICE_SLOT must be 1 or 2."
 #endif
 
+// MQTT Username은 DEVICE_ID를 그대로 사용한다.
+// 기존에 이미 만들어둔 로컬 phase5_firmware_config.h에 PHASE5_MQTT_PASSWORD가 없어도 컴파일이 깨지지 않도록 기본값(빈 문자열 = 익명 연결)을 둔다.
+#ifndef PHASE5_MQTT_PASSWORD
+#define PHASE5_MQTT_PASSWORD ""
+#endif
+const char* MQTT_USERNAME = DEVICE_ID;
+const char* MQTT_PASSWORD = PHASE5_MQTT_PASSWORD;
+
 const char* FIRMWARE_VERSION = "phase5-normal-pilot-v1";
 const char* PAYLOAD_SCHEMA_VERSION = "phase5-normal-payload-v1";
 
@@ -156,7 +164,9 @@ bool connectMqttOnce() {
 
   Serial.print("mqtt_connect_started client_id=");
   Serial.println(MQTT_CLIENT_ID);
-  bool connected = mqttClient.connect(MQTT_CLIENT_ID.c_str());
+  bool connected = (strlen(MQTT_PASSWORD) > 0)
+      ? mqttClient.connect(MQTT_CLIENT_ID.c_str(), MQTT_USERNAME, MQTT_PASSWORD)
+      : mqttClient.connect(MQTT_CLIENT_ID.c_str());
   if (!connected) {
     Serial.print("mqtt_connect_failed state=");
     Serial.println(mqttClient.state());

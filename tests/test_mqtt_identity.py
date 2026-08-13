@@ -1,3 +1,14 @@
+"""edge.mqtt.identity 공통 모듈 및 그 소비처(Subscriber last_seen_at, Feature
+Builder 집계) 검증. MQTT Device Identity 정합성 검증 Matrix를 그대로 테스트로 옮긴다.
+
+검증 Matrix:
+  입력                                     기대 결과
+  정상 Topic + 동일 등록 Device Payload      정상 저장·Feature 포함·Event 없음
+  정상 Topic + 다른 등록 Device Payload      DEVICE_ID_MISMATCH, 정상 last_seen 갱신 금지, 정상 Feature 제외
+  등록 Topic + 미등록 Payload Device         UNKNOWN_DEVICE, 등록 Device 정상 활동 귀속 금지
+  미등록 Topic + 등록 Payload                UNKNOWN_DEVICE, 등록 Device 정상 활동 귀속 금지
+"""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -33,11 +44,42 @@ class TestClassifyMqttIdentity:
         assert result.is_normal_telemetry is True
 
     def test_matched_when_only_payload_id_present_and_registered(self) -> None:
+        # Topic 형식이 비정상(iot/{id}/sensor 아님)이어도 Payload로 등록 기기가
+        # 명확히 식별되면 위조가 아니라 단순 비정상 Topic 사용이므로 MATCHED다
+        # (= is_attributable True, Feature 집계 대상). 하지만 정상 Topic이
+        # 아니므로 is_normal_telemetry는 False다 — last_seen_at은 갱신되지
+        # 않아야 한다(ABNORMAL_TOPIC Rule은 별도 차원에서 계속 탐지한다).
         result = classify_mqtt_identity(
             "admin/system/control", '{"device_id":"esp32_01"}', REGISTERED
         )
         assert result.status is IdentityStatus.MATCHED
         assert result.attributed_device_id == "esp32_01"
+        assert result.is_attributable is True
+        assert result.is_strict_topic is False
+        assert result.is_normal_telemetry is False
+
+    def test_matched_when_payload_is_malformed_but_topic_identifies_device(self) -> None:
+        # Topic은 정상 형식이고 등록 기기이지만, Payload가 JSON으로 파싱되지
+        # 않아 Device ID를 못 뽑은 경우. Topic만으로 등록 기기가 식별되므로
+        # MATCHED(is_attributable True)지만, Payload가 정상이 아니므로
+        # is_normal_telemetry는 False여야 한다 — last_seen_at을 갱신하면 안 된다.
+        result = classify_mqtt_identity(
+            "iot/esp32_01/sensor", "not-valid-json", REGISTERED
+        )
+        assert result.status is IdentityStatus.MATCHED
+        assert result.attributed_device_id == "esp32_01"
+        assert result.payload_device_id is None
+        assert result.is_attributable is True
+        assert result.is_strict_topic is True
+        assert result.is_normal_telemetry is False
+
+    def test_normal_telemetry_requires_strict_topic_and_matching_payload(self) -> None:
+        result = classify_mqtt_identity(
+            "iot/esp32_01/sensor", '{"device_id":"esp32_01"}', REGISTERED
+        )
+        assert result.is_strict_topic is True
+        assert result.is_attributable is True
+        assert result.is_normal_telemetry is True
 
     def test_device_id_mismatch_when_both_registered_but_different(self) -> None:
         result = classify_mqtt_identity(
@@ -47,6 +89,7 @@ class TestClassifyMqttIdentity:
         assert result.attributed_device_id is None
         assert result.topic_device_id == "esp32_01"
         assert result.payload_device_id == "esp32_02"
+        assert result.is_attributable is False
         assert result.is_normal_telemetry is False
 
     def test_unknown_device_when_topic_registered_payload_unregistered(self) -> None:
@@ -56,6 +99,8 @@ class TestClassifyMqttIdentity:
         assert result.status is IdentityStatus.UNKNOWN_DEVICE
         assert result.attributed_device_id is None
         assert result.unregistered_device_id == "rogue_device"
+        assert result.is_attributable is False
+        assert result.is_normal_telemetry is False
 
     def test_unknown_device_when_topic_unregistered_payload_registered(self) -> None:
         result = classify_mqtt_identity(
@@ -64,11 +109,14 @@ class TestClassifyMqttIdentity:
         assert result.status is IdentityStatus.UNKNOWN_DEVICE
         assert result.attributed_device_id is None
         assert result.unregistered_device_id == "rogue_device"
+        assert result.is_attributable is False
+        assert result.is_normal_telemetry is False
 
     def test_no_candidate_when_neither_topic_nor_payload_has_device_id(self) -> None:
         result = classify_mqtt_identity("cmd/exec", '{"temperature":25.3}', REGISTERED)
         assert result.status is IdentityStatus.NO_CANDIDATE
         assert result.attributed_device_id is None
+        assert result.is_attributable is False
         assert result.is_normal_telemetry is False
 
 
@@ -203,11 +251,40 @@ class TestInsertMqttLogLastSeenGate:
         finally:
             self._teardown_devices(db_session)
 
+    def test_abnormal_topic_with_valid_payload_does_not_update_last_seen_at(
+        self, db_session
+    ) -> None:
+        self._setup_devices(db_session)
+        try:
+            row = build_mqtt_log_row(
+                "iot/identity_esp32_a/cmd",
+                '{"device_id":"identity_esp32_a"}',
+                received_at=datetime(2026, 8, 10, 9, 0, 1, tzinfo=timezone.utc),
+            )
+            insert_mqtt_log(db_session, row)
+
+            assert _device_last_seen(db_session, "identity_esp32_a") is None
+        finally:
+            self._teardown_devices(db_session)
+
+    def test_valid_topic_with_malformed_payload_does_not_update_last_seen_at(
+        self, db_session
+    ) -> None:
+        self._setup_devices(db_session)
+        try:
+            row = build_mqtt_log_row(
+                "iot/identity_esp32_a/sensor",
+                "not-valid-json",
+                received_at=datetime(2026, 8, 10, 9, 0, 1, tzinfo=timezone.utc),
+            )
+            insert_mqtt_log(db_session, row)
+
+            assert _device_last_seen(db_session, "identity_esp32_a") is None
+        finally:
+            self._teardown_devices(db_session)
+
 
 # ── Feature Builder: Identity mismatch 메시지의 정상 Feature 집계 제외 ────────
-
-# produce_mqtt_features_until()은 detector_checkpoints 테이블(migration 002)이 필요하므로,
-# 001_init.sql만 적용하는 공용 conftest db_session 대신 전체 Migration을 적용한 전용 DB를 사용한다(test_mqtt_feature_builder_runtime.py와 동일한 패턴).
 
 
 @pytest.fixture
@@ -315,3 +392,51 @@ def test_unknown_device_excluded_from_feature_aggregation(FeatureSessionLocal) -
         feature_a = _feature_row(db, "identity_feat_a")
         assert feature_a is not None
         assert feature_a["publish_count"] == 1
+
+
+def test_abnormal_topic_and_malformed_payload_still_counted_as_rule_evidence(
+    FeatureSessionLocal,
+) -> None:
+    window_start = datetime(2026, 8, 10, 9, 0, 40, tzinfo=timezone.utc)
+    with FeatureSessionLocal() as db:
+        # 등록 기기로 식별되지만 Topic 형식이 비정상.
+        insert_mqtt_log(
+            db,
+            build_mqtt_log_row(
+                "iot/identity_feat_a/cmd",
+                '{"device_id":"identity_feat_a"}',
+                received_at=window_start + timedelta(seconds=1),
+            ),
+        )
+        # 등록 기기로 식별되지만 Payload가 JSON으로 파싱되지 않음.
+        insert_mqtt_log(
+            db,
+            build_mqtt_log_row(
+                "iot/identity_feat_a/sensor",
+                "not-valid-json",
+                received_at=window_start + timedelta(seconds=2),
+            ),
+        )
+        db.commit()
+
+        cutoff = window_start + timedelta(seconds=10)
+        with db.begin():
+            produce_mqtt_features_until(db, producer_cutoff=cutoff)
+
+        feature_a = db.execute(
+            text(
+                """
+                SELECT publish_count, abnormal_topic_count, malformed_payload_count
+                FROM feature_logs
+                WHERE device_id = :device_id
+                ORDER BY window_start
+                LIMIT 1
+                """
+            ),
+            {"device_id": "identity_feat_a"},
+        ).mappings().first()
+
+        assert feature_a is not None
+        assert feature_a["publish_count"] == 2
+        assert feature_a["abnormal_topic_count"] == 1
+        assert feature_a["malformed_payload_count"] == 1

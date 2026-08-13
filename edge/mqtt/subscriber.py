@@ -21,7 +21,6 @@ from backend.app.database import SessionLocal
 from edge.detection.phase4_time import format_db_utc
 from edge.features.feature_utils import extract_payload_device_id, payload_size
 from edge.mqtt.identity import (
-    IdentityStatus,
     classify_mqtt_identity,
     fetch_registered_device_ids,
 )
@@ -85,6 +84,21 @@ def build_mqtt_log_row(
 
 
 def insert_mqtt_log(db: Session, row: dict[str, Any]) -> int:
+    """mqtt_logs Raw 증적을 저장하고, 등록 Device의 정상 활동만 last_seen_at에 반영한다.
+
+    Raw 증적(topic, payload, device_id 후보, error_message 등)은 Identity 판정
+    결과와 무관하게 그대로 저장한다. `row["device_id"]`는 Topic 후보 또는 Payload
+    값으로 채워지는 "최선 추정 후보"일 뿐이며, 이 값이 등록 기기와 일치한다는
+    사실만으로 곧바로 그 기기의 정상 활동으로 신뢰하지 않는다.
+
+    last_seen_at 갱신은 `edge.mqtt.identity.classify_mqtt_identity`(공통 Helper)가
+    엄격한 정상 Telemetry(`MqttIdentityResult.is_normal_telemetry` — 정상 Topic +
+    정상 Payload + 동일 등록 Device)로 판정한 경우에만 수행한다. Topic 형식이
+    비정상이거나(예: `iot/esp32_01/cmd`) Payload가 손상돼 Device ID를 못 뽑은
+    경우는 등록 Device로 귀속은 가능(MATCHED)해도 last_seen_at은 갱신하지 않는다.
+    DEVICE_ID_MISMATCH·UNKNOWN_DEVICE 메시지는 Raw 증적으로는 남지만 등록 Device의
+    정상 last_seen_at을 갱신하지 않는다.
+    """
     result = db.execute(
         text(
             """
@@ -115,7 +129,7 @@ def insert_mqtt_log(db: Session, row: dict[str, Any]) -> int:
     if row["device_id"]:
         registered_devices = fetch_registered_device_ids(db)
         identity = classify_mqtt_identity(row["topic"], row["payload"], registered_devices)
-        if identity.status is IdentityStatus.MATCHED:
+        if identity.is_normal_telemetry:
             db.execute(
                 text(
                     """
@@ -143,8 +157,8 @@ def apply_mqtt_credentials(client: mqtt.Client, *, username: str, password: str)
     """설정된 경우에만 MQTT Username/Password 인증을 적용한다.
 
     Mosquitto가 아직 익명 접근을 허용하는 전환 기간에는 `MQTT_SUBSCRIBER_USERNAME`을
-    비워두면 기존처럼 익명 연결을 유지한다(Broker 강제 전 Credential 기반 정상
-    Client 연결 Smoke 전환 순서). Broker가 인증·ACL을 강제한 뒤에는 Username을 반드시 설정해야 Subscribe가 유지된다.
+    비워두면 기존처럼 익명 연결을 유지한다. Broker가 인증·ACL을 강제한 뒤에는 Username을
+    반드시 설정해야 Subscribe가 유지된다.
     """
     if username:
         client.username_pw_set(username, password or None)
