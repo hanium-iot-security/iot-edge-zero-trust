@@ -145,7 +145,6 @@ class TestRunTestPackComposition:
     def test_every_observer_credential_is_exercised_by_at_least_one_pass_check(
         self, monkeypatch
     ) -> None:
- 
         import edge.scripts.mqtt_acl_test_pack as pack
 
         recorded_publish_calls = []
