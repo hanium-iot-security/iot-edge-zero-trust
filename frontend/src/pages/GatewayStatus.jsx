@@ -91,13 +91,6 @@ function formatMetric(
   )}${unit}`;
 }
 
-/*
- * 시스템 자원은 Phase 6-A 표시 계약에 따라
- * 소수점 1자리로 고정해서 표시한다.
- *
- * MetricCard에서 unit을 별도로 출력하기 때문에
- * 여기서는 숫자 문자열만 반환한다.
- */
 function formatResourceValue(value) {
   return formatMetric(
     value,
@@ -181,25 +174,14 @@ function getGatewayStatus(
   hasMetric,
   hasApiError
 ) {
-  /*
-   * Metric을 한 번도 받지 못했고
-   * API 요청 자체도 실패했다면 API_ERROR.
-   */
   if (hasApiError && !hasMetric) {
     return "API_ERROR";
   }
 
-  /*
-   * API 요청은 성공했지만 저장된 Metric이 없는 상태.
-   */
   if (!hasMetric) {
     return "NO_DATA";
   }
 
-  /*
-   * Metric은 존재하지만 수집 시간이 없거나
-   * 잘못된 값이면 최신 상태를 보장할 수 없으므로 STALE.
-   */
   if (!collectedAt) {
     return "STALE";
   }
@@ -425,7 +407,9 @@ function InterfaceCard({
       </header>
 
       <div className="interface-name-row">
-        <span>Interface</span>
+        <span>
+          Interface:
+        </span>
 
         <strong>
           {interfaceData?.interface_name ||
@@ -689,14 +673,16 @@ export default function GatewayStatus() {
     latestMetric?.interface_metrics ??
     {};
 
+  /*
+   * Phase 6-A 실제 Backend 계약:
+   * internal_lan = eth0
+   * usb_lan = eth1
+   *
+   * wlan0 / wireless_lan은 운영 표시 대상에서 제외합니다.
+   */
   const internalLan =
     interfaces.internal_lan ??
     interfaces.eth0 ??
-    null;
-
-  const wirelessLan =
-    interfaces.wireless_lan ??
-    interfaces.wlan0 ??
     null;
 
   const usbLan =
@@ -715,13 +701,6 @@ export default function GatewayStatus() {
           data: internalLan,
         },
         {
-          key: "wireless_lan",
-          title: "Wireless LAN",
-          description:
-            "무선 연결 상태를 확인합니다.",
-          data: wirelessLan,
-        },
-        {
           key: "usb_lan",
           title: "USB LAN",
           description:
@@ -731,7 +710,6 @@ export default function GatewayStatus() {
       ],
       [
         internalLan,
-        wirelessLan,
         usbLan,
       ]
     );
@@ -1092,9 +1070,10 @@ export default function GatewayStatus() {
                 </h2>
 
                 <p className="panel-description">
-                  Interface 미인식과
-                  Interface DOWN 상태를
-                  구분해서 표시합니다.
+                  운영 Interface인
+                  internal_lan(eth0)과
+                  usb_lan(eth1)의 상태를
+                  확인합니다.
                 </p>
               </div>
 
