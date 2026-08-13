@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     isolation_threshold: int = 30
     api_allowed_origins: str = DEFAULT_API_ALLOWED_ORIGINS
     api_allow_credentials: bool = True
+    recovery_admin_api_key: str = ""
+    recovery_admin_principal: str = "recovery-admin"
+    recovery_artifact_dir: str = "data/recovery/baseline"
 
     # MQTT Feature Producer
     mqtt_feature_builder_interval_seconds: float = 5.0
