@@ -9,7 +9,12 @@ from edge.trust.firewall_runtime_snapshot import (
     capture_firewall_runtime_snapshot,
     verify_firewall_runtime_snapshot,
 )
-from edge.trust.firewall_worker import CommandResult, FirewallRuleSpec, LIST_RULES
+from edge.trust.firewall_worker import (
+    CommandResult,
+    FirewallRuleSpec,
+    FirewallTransientError,
+    LIST_RULES,
+)
 
 
 NOW = datetime(2026, 8, 14, 7, 30, 0, tzinfo=timezone.utc)
@@ -34,6 +39,15 @@ class ListingRunner:
             stdout=self.stdout,
             stderr=self.stderr,
         )
+
+
+class RaisingRunner:
+    def run_operation(
+        self, operation: str, spec: FirewallRuleSpec | None = None
+    ) -> CommandResult:
+        assert operation == LIST_RULES
+        assert spec is None
+        raise FirewallTransientError("firewall wrapper timed out")
 
 
 def _managed_rule(rule_id: int, source_ip: str) -> str:
@@ -98,6 +112,28 @@ def test_capture_marks_snapshot_unavailable_when_runtime_list_fails(tmp_path: Pa
     assert payload["available"] is False
     assert payload["managed_rules"] == []
     assert "iptables list failed" in payload["error"]
+    assert json.loads(snapshot.read_text(encoding="utf-8"))["available"] is False
+
+
+def test_capture_replaces_previous_success_when_runner_raises(tmp_path: Path) -> None:
+    snapshot = tmp_path / "firewall-runtime.json"
+    _write_snapshot(
+        snapshot,
+        {
+            "schema_version": SNAPSHOT_SCHEMA_VERSION,
+            "observed_at": "2026-08-14T07:29:59Z",
+            "available": True,
+            "managed_rules": [],
+            "error": None,
+        },
+    )
+
+    payload = capture_firewall_runtime_snapshot(
+        RaisingRunner(), snapshot_path=snapshot, observed_at=NOW
+    )
+
+    assert payload["available"] is False
+    assert "timed out" in payload["error"]
     assert json.loads(snapshot.read_text(encoding="utf-8"))["available"] is False
 
 
@@ -246,7 +282,7 @@ def test_verify_fails_closed_for_invalid_or_unavailable_snapshot(tmp_path: Path)
     assert "iptables list failed" in unavailable["details"]
 
 
-def test_verify_fails_closed_when_device_ip_is_missing_or_invalid(tmp_path: Path) -> None:
+def test_verify_fails_closed_when_device_ip_is_missing_invalid_or_public(tmp_path: Path) -> None:
     snapshot = tmp_path / "firewall-runtime.json"
     _write_snapshot(
         snapshot,
@@ -259,7 +295,7 @@ def test_verify_fails_closed_when_device_ip_is_missing_or_invalid(tmp_path: Path
         },
     )
 
-    for value in (None, "", "not-an-ip"):
+    for value in (None, "", "not-an-ip", "8.8.8.8"):
         result = verify_firewall_runtime_snapshot(
             _device(value), snapshot_path=snapshot, max_age_seconds=15, now=NOW
         )
