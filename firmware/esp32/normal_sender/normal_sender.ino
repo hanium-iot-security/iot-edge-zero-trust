@@ -1,6 +1,15 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 
+#if __has_include("mqtt_credentials.h")
+#include "mqtt_credentials.h"
+#else
+// Broker가 아직 익명 연결을 허용하는 전환 기간의 기본값이다.
+// Broker 인증을 강제한 뒤에는 mqtt_credentials.example.h를 mqtt_credentials.h로 복사해 실제 Password를 채운다(Git 제외 대상).
+#define MQTT_USERNAME ""
+#define MQTT_PASSWORD ""
+#endif
+
 const char* WIFI_SSID = "YOUR_WIFI_SSID";
 const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
@@ -58,7 +67,11 @@ void connectMQTT() {
     Serial.print("Attempting MQTT connection...");
     String clientId = String("normal_sender_") + DEVICE_ID;
 
-    if (mqttClient.connect(clientId.c_str())) {
+    bool connected = (strlen(MQTT_USERNAME) > 0)
+        ? mqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD)
+        : mqttClient.connect(clientId.c_str());
+
+    if (connected) {
       Serial.println(" connected");
     } else {
       Serial.print(" failed, rc=");

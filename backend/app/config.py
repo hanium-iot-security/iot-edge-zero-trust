@@ -14,12 +14,19 @@ class Settings(BaseSettings):
     mqtt_port: int = 1883
     mqtt_normal_topic: str = "iot/+/sensor"
     mqtt_subscribe_topic: str = "iot/+/sensor"
+    mqtt_subscriber_username: str = ""
+    mqtt_subscriber_password: str = ""
+    mqtt_test_tool_username: str = ""
+    mqtt_test_tool_password: str = ""
     capture_interface_ip: str = ""
     feature_window_seconds: int = 10
     initial_trust_score: int = 100
     isolation_threshold: int = 30
     api_allowed_origins: str = DEFAULT_API_ALLOWED_ORIGINS
     api_allow_credentials: bool = True
+    recovery_admin_api_key: str = ""
+    recovery_admin_principal: str = "recovery-admin"
+    recovery_artifact_dir: str = "data/recovery/baseline"
 
     # MQTT Feature Producer
     mqtt_feature_builder_interval_seconds: float = 5.0

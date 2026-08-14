@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <errno.h>
 
 #if __has_include("packet_rate_firmware_config.h")
 #include "packet_rate_firmware_config.h"
@@ -17,7 +18,7 @@ const char* EXPECTED_LOCAL_IP_TEXT = "192.168.0.5";
 const char* TARGET_IP_TEXT = "192.168.0.20";
 const uint16_t TARGET_UDP_PORT = 19999U;
 const uint16_t LOCAL_UDP_PORT = 42100U;
-const char* FIRMWARE_VERSION = "phase5-packet-rate-sender-v2";
+const char* FIRMWARE_VERSION = "phase6a-packet-rate-sender-diagnostics-v1";
 
 const unsigned long MIN_RATE_PPS = 1UL;
 const unsigned long MAX_RATE_PPS = 100UL;
@@ -51,6 +52,11 @@ unsigned long attackIntervalUs = 0UL;
 unsigned long nextPacketAtUs = 0UL;
 unsigned long sentPackets = 0UL;
 unsigned long failedPackets = 0UL;
+unsigned long beginPacketFailCount = 0UL;
+unsigned long shortWriteFailCount = 0UL;
+unsigned long endPacketFailCount = 0UL;
+unsigned long scheduleSkipCount = 0UL;
+int lastEndPacketErrno = 0;
 uint8_t payloadBuffer[MAX_PAYLOAD_BYTES];
 
 bool isPrivateIpv4(const IPAddress& address) {
@@ -218,6 +224,16 @@ void printStatus() {
   Serial.println(sentPackets);
   Serial.print("failed=");
   Serial.println(failedPackets);
+  Serial.print("begin_packet_fail=");
+  Serial.println(beginPacketFailCount);
+  Serial.print("short_write_fail=");
+  Serial.println(shortWriteFailCount);
+  Serial.print("end_packet_fail=");
+  Serial.println(endPacketFailCount);
+  Serial.print("last_end_packet_errno=");
+  Serial.println(lastEndPacketErrno);
+  Serial.print("schedule_skip_count=");
+  Serial.println(scheduleSkipCount);
   if (attackActive) {
     Serial.print("elapsed_ms=");
     Serial.println(millis() - attackStartedAtMs);
@@ -267,6 +283,16 @@ void finishAttack(const char* reason) {
   Serial.println(failedPackets);
   Serial.print("attempted=");
   Serial.println(sentPackets + failedPackets);
+  Serial.print("begin_packet_fail=");
+  Serial.println(beginPacketFailCount);
+  Serial.print("short_write_fail=");
+  Serial.println(shortWriteFailCount);
+  Serial.print("end_packet_fail=");
+  Serial.println(endPacketFailCount);
+  Serial.print("last_end_packet_errno=");
+  Serial.println(lastEndPacketErrno);
+  Serial.print("schedule_skip_count=");
+  Serial.println(scheduleSkipCount);
   Serial.print("elapsed_ms=");
   Serial.println(elapsedMs);
   Serial.print("average_pps=");
@@ -362,6 +388,11 @@ void startAttack(
   nextPacketAtUs = micros();
   sentPackets = 0UL;
   failedPackets = 0UL;
+  beginPacketFailCount = 0UL;
+  shortWriteFailCount = 0UL;
+  endPacketFailCount = 0UL;
+  scheduleSkipCount = 0UL;
+  lastEndPacketErrno = 0;
   attackActive = true;
 
   Serial.println("packet_rate_attack_started");
@@ -388,12 +419,22 @@ void startAttack(
 void sendScheduledPacket() {
   const int beginResult = udp.beginPacket(targetIp, TARGET_UDP_PORT);
   if (beginResult != 1) {
+    beginPacketFailCount++;
     failedPackets++;
     return;
   }
 
   const size_t written = udp.write(payloadBuffer, attackPayloadBytes);
   const int endResult = udp.endPacket();
+  const int endErrno = errno;
+
+  if (written != attackPayloadBytes) {
+    shortWriteFailCount++;
+  }
+  if (endResult != 1) {
+    endPacketFailCount++;
+    lastEndPacketErrno = endErrno;
+  }
 
   if (written == attackPayloadBytes && endResult == 1) {
     sentPackets++;
@@ -436,6 +477,9 @@ void updateAttack() {
   nextPacketAtUs += attackIntervalUs;
   const unsigned long afterSendUs = micros();
   if (static_cast<int32_t>(afterSendUs - nextPacketAtUs) >= 0) {
+    const unsigned long skippedSlots =
+        (afterSendUs - nextPacketAtUs) / attackIntervalUs + 1UL;
+    scheduleSkipCount += skippedSlots;
     nextPacketAtUs = afterSendUs + attackIntervalUs;
   }
 }

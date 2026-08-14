@@ -29,6 +29,10 @@ from edge.detection.phase4_time import (
     parse_db_utc,
     require_utc_window_boundary,
 )
+from edge.mqtt.identity import (
+    classify_mqtt_identity,
+    fetch_registered_device_ids,
+)
 
 
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -183,6 +187,8 @@ def collect_feature_windows(
     if not registered_devices:
         return 0
 
+    all_registered_devices = fetch_registered_device_ids(db)
+
     rows = db.execute(
         text(
             """
@@ -190,6 +196,7 @@ def collect_feature_windows(
                 id,
                 device_id,
                 topic,
+                payload,
                 payload_size,
                 received_at,
                 is_json_valid,
@@ -205,7 +212,10 @@ def collect_feature_windows(
 
     grouped: dict[tuple[str, datetime, datetime], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        device_id = str(row["device_id"])
+        identity = classify_mqtt_identity(row["topic"], row["payload"], all_registered_devices)
+        if not identity.is_attributable:
+            continue
+        device_id = identity.attributed_device_id
         if device_id not in registered_devices:
             continue
 
@@ -256,6 +266,7 @@ def produce_mqtt_features_until(
         raise ValueError("existing MQTT feature checkpoint exceeds producer_cutoff")
 
     registered_devices = registered_feature_devices(db)
+    all_registered_devices = fetch_registered_device_ids(db)
     source_rows = _fetch_mqtt_sources_after_checkpoint(
         db,
         last_processed_id=last_processed_before,
@@ -292,7 +303,10 @@ def produce_mqtt_features_until(
             continue
         if window_end > cutoff:
             continue
-        device_id = str(source["device_id"]) if source["device_id"] is not None else ""
+        identity = classify_mqtt_identity(source["topic"], source["payload"], all_registered_devices)
+        if not identity.is_attributable:
+            continue
+        device_id = identity.attributed_device_id
         if device_id not in registered_devices:
             continue
         grouped[(device_id, window_start, window_end)].append(source)
@@ -345,6 +359,7 @@ def _fetch_mqtt_sources_after_checkpoint(
                 id,
                 device_id,
                 topic,
+                payload,
                 payload_size,
                 received_at,
                 is_json_valid,

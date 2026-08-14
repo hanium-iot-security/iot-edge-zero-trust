@@ -65,6 +65,7 @@ def SessionLocal(tmp_path: Path):
 
 
 def _insert_mqtt_log(db, *, received_at: datetime, device_id: str = DEVICE_ID) -> int:
+    payload = f'{{"device_id":"{device_id}"}}'
     result = db.execute(
         text(
             """
@@ -73,7 +74,7 @@ def _insert_mqtt_log(db, *, received_at: datetime, device_id: str = DEVICE_ID) -
                 received_at, is_json_valid, is_topic_valid
             )
             VALUES (
-                :device_id, :topic, '{"device_id":"esp32_01"}', 26,
+                :device_id, :topic, :payload, :payload_size,
                 :received_at, 1, 1
             )
             """
@@ -81,6 +82,8 @@ def _insert_mqtt_log(db, *, received_at: datetime, device_id: str = DEVICE_ID) -
         {
             "device_id": device_id,
             "topic": f"iot/{device_id}/sensor",
+            "payload": payload,
+            "payload_size": len(payload),
             "received_at": format_db_utc(received_at),
         },
     )

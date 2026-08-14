@@ -17,9 +17,7 @@ import random
 import string
 import time
 
-import paho.mqtt.client as mqtt
-
-from attacks.config import BROKER_HOST, BROKER_PORT, KEEPALIVE, REGISTERED_DEVICES
+from attacks.config import build_mqtt_client, BROKER_HOST, BROKER_PORT, KEEPALIVE, REGISTERED_DEVICES
 
 # subscriber의 is_telemetry_topic() 기준으로 False가 되는 topic 패턴
 # publish topic에 wildcard(#, +)는 subscribe filter 전용이므로 제외
@@ -66,7 +64,7 @@ def main() -> None:
     args      = parse_args()
     device_id = args.device_id
 
-    client = mqtt.Client(client_id=f"attacker_topic_{_rand_str()}")
+    client = build_mqtt_client(client_id=f"attacker_topic_{_rand_str()}")
     client.connect(args.host, args.port, KEEPALIVE)
     client.loop_start()
 

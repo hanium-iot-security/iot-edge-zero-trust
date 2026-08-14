@@ -2,8 +2,7 @@
 
 from typing import Any
 
-from edge.features.feature_utils import extract_payload_device_id
-from edge.mqtt.topic_utils import extract_device_id_candidate_from_topic
+from edge.mqtt.identity import IdentityStatus, classify_mqtt_identity
 
 DETECTOR_RULE = "RULE"
 DETECTOR_AI = "AI"
@@ -78,37 +77,35 @@ def detect_mqtt_rules(
 ) -> list[dict[str, Any]]:
     """mqtt_logs row에서 Rule 이벤트 목록을 반환합니다. DB 접근 없음.
 
-    판정 우선순위:
+    Topic Device ID·Payload Device ID·등록 Device 여부 판정 자체는
+    `edge.mqtt.identity.classify_mqtt_identity`(공통 Helper) 한 곳에서만
+    수행하며, 이 함수는 그 판정 결과를 Rule Event 형태로 변환하기만 한다.
+
+    판정 우선순위(공통 모듈 계약):
     1. topic_id / payload_id 중 하나라도 미등록 → UNKNOWN_DEVICE
     2. 둘 다 등록 기기이지만 서로 다름 → DEVICE_ID_MISMATCH
-    3. 둘 다 추출 불가 → 이벤트 미생성
+    3. 둘 다 추출 불가, 또는 정상 판정(MATCHED) → 이벤트 미생성
     """
-    topic_id = extract_device_id_candidate_from_topic(mqtt_row["topic"])
-    payload_id = extract_payload_device_id(mqtt_row["payload"])
+    identity = classify_mqtt_identity(
+        mqtt_row["topic"], mqtt_row["payload"], registered_devices
+    )
 
-    if topic_id is None and payload_id is None:
-        return []
-
-    topic_registered = topic_id in registered_devices if topic_id else None
-    payload_registered = payload_id in registered_devices if payload_id else None
-
-    if topic_registered is False or payload_registered is False:
-        unregistered_id = (topic_id if topic_registered is False else payload_id)
+    if identity.status is IdentityStatus.UNKNOWN_DEVICE:
         return [{
             "event_type": UNKNOWN_DEVICE,
             "severity": _MQTT_SEVERITY[UNKNOWN_DEVICE],
-            "device_id": unregistered_id,
-            "topic_id": topic_id,
-            "payload_id": payload_id,
+            "device_id": identity.unregistered_device_id,
+            "topic_id": identity.topic_device_id,
+            "payload_id": identity.payload_device_id,
         }]
 
-    if topic_id and payload_id and topic_id != payload_id:
+    if identity.status is IdentityStatus.DEVICE_ID_MISMATCH:
         return [{
             "event_type": DEVICE_ID_MISMATCH,
             "severity": _MQTT_SEVERITY[DEVICE_ID_MISMATCH],
-            "device_id": topic_id,
-            "topic_id": topic_id,
-            "payload_id": payload_id,
+            "device_id": identity.topic_device_id,
+            "topic_id": identity.topic_device_id,
+            "payload_id": identity.payload_device_id,
         }]
 
     return []

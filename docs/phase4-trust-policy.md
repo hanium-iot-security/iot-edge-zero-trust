@@ -14,6 +14,10 @@ Candidate events:
 - `analysis_window_end <= cycle_cutoff` when analysis window metadata exists
 - legacy rows without analysis windows may fall back to `detected_at < cycle_cutoff`
 
+Eligible events are applied in chronological analysis-window order. Events in the
+same window use ascending Event ID as the deterministic tie-break. Legacy rows
+derive their window from `detected_at` under the existing fallback contract.
+
 Events before the current cycle range are processed without score changes:
 
 - `LEGACY_MIGRATION`: events explicitly marked by the cutover process

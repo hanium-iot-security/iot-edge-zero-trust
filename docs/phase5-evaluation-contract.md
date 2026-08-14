@@ -40,3 +40,36 @@ This means the `source_commit` value is an explicit CLI input and is not yet
 verified against local Git `HEAD` or dirty worktree state. The official runner
 must add HEAD and dirty-worktree verification before using this field as a fully
 verified provenance guarantee.
+
+## Phase 6-A Recovery Evidence Reuse
+
+Phase 6-A does not introduce a separate evaluation schema for Recovery. Official
+E2E runs continue to use the Phase 5 `RunManifest`, Scenario Result JSONL,
+artifact references, and read-only SQLite evaluator.
+
+Recovery evidence is attached through existing provenance fields:
+
+- `artifacts[]` may include the normalized Baseline Recovery JSON artifact and
+  its SHA256.
+- `external_observations` or Scenario Result rows may record externally observed
+  timestamps such as firewall release verification, recovery completion, and
+  normal publish resumption when the Scenario Runner owns those observations.
+- Detection, Trust, Firewall, and Block matching remain based on session/source
+  identity, target device, source IP, observation window, and expected event type.
+
+The evaluator must not infer these facts from similar timestamps alone:
+
+- actual iptables rule existence
+- actual MQTT TCP 1883 block
+- official Firewall Release
+- Baseline Recovery success
+- normal MQTT publish resumption after Recovery
+
+If Recovery evidence is missing or ambiguous, the official E2E result should
+remain `HOLD`, `NOT_EVALUATED`, or another existing non-success status rather
+than adding Phase 6-only pass/fail constants.
+
+Offline Packet IF Dataset v2 provenance remains frozen. The official Phase 6-A
+FULL_E2E run must use a new `run_id` and capture `session_id`; production code
+must not hard-code specific historical session numbers such as the offline test
+session.

@@ -42,8 +42,8 @@ def test_attack_sender_has_separate_bounded_isolation_observation_contract() -> 
     assert "void runBoundedIsolationObservation()" in source
     assert "observationProbeCount < MAX_OBSERVATION_PROBES" in source
     assert "mqttClient.setSocketTimeout(OBSERVATION_CONNECT_TIMEOUT_SECONDS);" in source
-    assert "mqttClient.connect(\"phase4_observation_esp32_02\")" in source
-    assert source.count('mqttClient.connect("phase4_observation_esp32_02")') == 1
+    assert "mqttConnectWithCredentials(\"phase4_observation_esp32_02\")" in source
+    assert source.count('mqttConnectWithCredentials("phase4_observation_esp32_02")') == 1
     setup_body = source[source.index("void setup()") : source.index("void loop()")]
     assert setup_body.count("runBoundedFloodTest();") == 1
     assert setup_body.count("runBoundedIsolationObservation();") == 1
@@ -80,7 +80,7 @@ def test_attack_sender_has_bounded_connection_attempts_and_no_restart_loop() -> 
     ]
     assert connect_body.index(
         "mqttClient.setSocketTimeout(MQTT_CONNECT_SOCKET_TIMEOUT_SECONDS);"
-    ) < connect_body.index('mqttClient.connect("phase4_attack_esp32_02")')
+    ) < connect_body.index('mqttConnectWithCredentials("phase4_attack_esp32_02")')
     assert "mqttConnectAttempt < MQTT_CONNECT_MAX_ATTEMPTS" in connect_body
     assert "while (true)" not in source
     assert "ESP.restart()" not in source

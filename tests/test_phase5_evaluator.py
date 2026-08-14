@@ -477,6 +477,45 @@ def test_trust_score_delta_and_firewall_state_are_recorded(db_path: Path) -> Non
     assert row["block"]["block_confirmed"] is True
 
 
+def test_phase6a_recovery_evidence_uses_existing_artifact_contract(
+    db_path: Path,
+) -> None:
+    with _connect(db_path) as conn:
+        _seed_success(conn)
+
+    manifest = _manifest(
+        external_observations={
+            "recovery_completed_at": "2026-08-01T01:00:55Z",
+            "normal_publish_resumed_at": "2026-08-01T01:00:58Z",
+        },
+        artifacts=[
+            {
+                "artifact_type": "baseline_recovery_audit",
+                "relative_path": "recovery/baseline-recovery-run-001.json",
+                "size_bytes": 512,
+                "sha256": "a" * 64,
+            }
+        ],
+    )
+
+    row = _evaluate(db_path, manifest=manifest)
+
+    assert row["artifacts"] == [
+        {
+            "artifact_type": "baseline_recovery_audit",
+            "relative_path": "recovery/baseline-recovery-run-001.json",
+            "size_bytes": 512,
+            "sha256": "a" * 64,
+        }
+    ]
+    assert row["external_observations"]["recovery_completed_at"] == (
+        "2026-08-01T01:00:55Z"
+    )
+    assert row["external_observations"]["normal_publish_resumed_at"] == (
+        "2026-08-01T01:00:58Z"
+    )
+
+
 def test_db_latency_and_external_observation_delay_are_separate(db_path: Path) -> None:
     with _connect(db_path) as conn:
         _seed_success(conn)

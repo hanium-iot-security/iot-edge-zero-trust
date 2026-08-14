@@ -13,6 +13,7 @@ from .routers import (
     isolation,
     mqtt_logs,
     packet_feature_logs,
+    recovery,
     trust_score,
 )
 
@@ -40,3 +41,4 @@ app.include_router(firewall_rules.router, prefix="/api")
 app.include_router(detection_events.router, prefix="/api")
 app.include_router(trust_score.router, prefix="/api")
 app.include_router(isolation.router, prefix="/api")
+app.include_router(recovery.router, prefix="/api")

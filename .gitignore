@@ -20,6 +20,8 @@ frontend/dist/
 .env.*
 !.env.example
 firmware/esp32/phase5_normal_collector/phase5_firmware_config.h
+firmware/esp32/normal_sender/mqtt_credentials.h
+firmware/esp32/attack_sender/mqtt_credentials.h
 
 # Database and logs
 *.db
