@@ -36,7 +36,7 @@ function createWindow(
     window_end:
       new Date(
         startTime +
-          durationSeconds * 1000
+        durationSeconds * 1000
       ).toISOString(),
   };
 }
@@ -1085,19 +1085,19 @@ const packetFeatureItems =
         isUnmapped
           ? null
           : REGISTERED_DEVICE_IDS[
-              index %
-                REGISTERED_DEVICE_IDS.length
-            ];
+          index %
+          REGISTERED_DEVICE_IDS.length
+          ];
 
       const peerIp =
         isUnmapped
           ? UNMAPPED_PEER_IPS[
-              index %
-                UNMAPPED_PEER_IPS.length
-            ]
+          index %
+          UNMAPPED_PEER_IPS.length
+          ]
           : REGISTERED_DEVICE_IPS[
-              deviceId
-            ];
+          deviceId
+          ];
 
       const direction =
         index % 2 === 0
@@ -1123,20 +1123,20 @@ const packetFeatureItems =
           : isLegacy
             ? null
             : Number(
-                (
-                  9 +
-                  (index % 10) * 0.1
-                ).toFixed(1)
-              );
+              (
+                9 +
+                (index % 10) * 0.1
+              ).toFixed(1)
+            );
 
       const coverageRatio =
         capturedDuration === null
           ? null
           : Number(
-              (
-                capturedDuration / 10
-              ).toFixed(2)
-            );
+            (
+              capturedDuration / 10
+            ).toFixed(2)
+          );
 
       const nominalPacketsPerSecond =
         packetCount / 10;
@@ -1146,24 +1146,24 @@ const packetFeatureItems =
 
       const effectivePacketsPerSecond =
         capturedDuration &&
-        capturedDuration > 0
+          capturedDuration > 0
           ? Number(
-              (
-                packetCount /
-                capturedDuration
-              ).toFixed(2)
-            )
+            (
+              packetCount /
+              capturedDuration
+            ).toFixed(2)
+          )
           : null;
 
       const effectiveBytesPerSecond =
         capturedDuration &&
-        capturedDuration > 0
+          capturedDuration > 0
           ? Number(
-              (
-                totalBytes /
-                capturedDuration
-              ).toFixed(2)
-            )
+            (
+              totalBytes /
+              capturedDuration
+            ).toFixed(2)
+          )
           : null;
 
       const captureEligible =
@@ -1486,10 +1486,12 @@ export const mockFirewallRules = {
       source_ip: "192.168.0.5",
 
       protocol: "TCP",
-      destination_port: 1883,
+      dest_port: 1883,
       action: "DROP",
 
       status: "APPLIED",
+
+      trigger_event_id: 12,
 
       reason:
         "Trust Score가 30 미만으로 하락하여 MQTT 통신 차단이 요청되었습니다.",
@@ -1525,10 +1527,12 @@ export const mockFirewallRules = {
       source_ip: "192.168.0.6",
 
       protocol: "TCP",
-      destination_port: 1883,
+      dest_port: 1883,
       action: "DROP",
 
       status: "PENDING",
+
+      trigger_event_id: 14,
 
       reason:
         "Firewall Worker의 차단 적용을 기다리고 있습니다.",
@@ -1564,10 +1568,12 @@ export const mockFirewallRules = {
       source_ip: "192.168.0.7",
 
       protocol: "TCP",
-      destination_port: 1883,
+      dest_port: 1883,
       action: "DROP",
 
       status: "FAILED",
+
+      trigger_event_id: null,
 
       reason:
         "Firewall Rule 적용에 실패했습니다.",
@@ -1602,10 +1608,12 @@ export const mockFirewallRules = {
       source_ip: "192.168.0.4",
 
       protocol: "TCP",
-      destination_port: 1883,
+      dest_port: 1883,
       action: "DROP",
 
       status: "REMOVED",
+
+      trigger_event_id: null,
 
       reason:
         "관리자 확인 후 기존 Firewall Rule을 해제했습니다.",

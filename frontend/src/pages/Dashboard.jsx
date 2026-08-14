@@ -196,7 +196,6 @@ function getSeverityStatus(severity) {
       .toLowerCase();
 
   if (
-    normalized === "critical" ||
     normalized === "high" ||
     normalized === "medium" ||
     normalized === "low"
@@ -314,13 +313,10 @@ function getGatewayStatusTheme(status) {
     "unknown"
   );
 }
-
 function getHealthStatus(health) {
   const rawStatus =
     String(
-      health?.status ||
-      health?.overall_status ||
-      ""
+      health?.status || ""
     ).toUpperCase();
 
   if (
@@ -422,6 +418,30 @@ function getFeatureChartData(features) {
         item.window_start
       ),
   }));
+}
+
+function formatResourceValue(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ""
+  ) {
+    return "-";
+  }
+
+  const number = Number(value);
+
+  if (!Number.isFinite(number)) {
+    return "-";
+  }
+
+  return number.toLocaleString(
+    "ko-KR",
+    {
+      minimumFractionDigits: 1,
+      maximumFractionDigits: 1,
+    }
+  );
 }
 
 export default function Dashboard() {
@@ -1277,15 +1297,14 @@ export default function Dashboard() {
             <SummaryCard
               title="격리"
               value={formatNumber(
-                summary?.isolated_devices ??
-                0
+                summary?.isolated_devices ?? 0
               )}
               description="Trust Score 30 미만"
               status={
                 Number(
                   summary?.isolated_devices
                 ) > 0
-                  ? "danger"
+                  ? "isolated"
                   : "default"
               }
             />
@@ -1357,9 +1376,9 @@ export default function Dashboard() {
                 <div className="metric-card-grid">
                   <MetricCard
                     label="CPU"
-                    value={
+                    value={formatResourceValue(
                       gatewayMetric.cpu_percent
-                    }
+                    )}
                     unit="%"
                     percentage={
                       gatewayMetric.cpu_percent
@@ -1369,9 +1388,9 @@ export default function Dashboard() {
 
                   <MetricCard
                     label="Memory"
-                    value={
+                    value={formatResourceValue(
                       gatewayMetric.memory_percent
-                    }
+                    )}
                     unit="%"
                     percentage={
                       gatewayMetric.memory_percent
@@ -1381,9 +1400,9 @@ export default function Dashboard() {
 
                   <MetricCard
                     label="Disk"
-                    value={
+                    value={formatResourceValue(
                       gatewayMetric.disk_percent
-                    }
+                    )}
                     unit="%"
                     percentage={
                       gatewayMetric.disk_percent
@@ -1393,9 +1412,9 @@ export default function Dashboard() {
 
                   <MetricCard
                     label="Temperature"
-                    value={
+                    value={formatResourceValue(
                       gatewayMetric.temperature_c
-                    }
+                    )}
                     unit="℃"
                     description="CPU 온도"
                   />
@@ -1510,13 +1529,11 @@ export default function Dashboard() {
           <section className="panel">
             <div className="panel-header">
               <div>
-                <h2>
-                  API Health
-                </h2>
+                <h2>API Health</h2>
 
                 <p className="panel-description">
-                  Backend 및 주요 Runtime
-                  Component의 상태입니다.
+                  Backend API와 Database 연결 상태를
+                  확인합니다.
                 </p>
               </div>
 
@@ -1534,13 +1551,11 @@ export default function Dashboard() {
               <div className="health-detail-grid">
                 <div className="health-detail-item">
                   <span>
-                    Overall Status
+                    API Status
                   </span>
 
                   <strong>
-                    {health.status ||
-                      health.overall_status ||
-                      "-"}
+                    {health.status || "-"}
                   </strong>
                 </div>
 
@@ -1550,57 +1565,42 @@ export default function Dashboard() {
                   </span>
 
                   <strong>
-                    {health.database_status ||
-                      health.database ||
-                      "-"}
+                    {health.database || "-"}
                   </strong>
                 </div>
 
                 <div className="health-detail-item">
                   <span>
-                    MQTT
+                    DB Connection
                   </span>
 
-                  <strong>
-                    {health.mqtt_status ||
-                      health.mqtt ||
-                      "-"}
-                  </strong>
+                  <StatusBadge
+                    status={
+                      normalizeBoolean(
+                        health.db_connected
+                      )
+                        ? "connected"
+                        : "failed"
+                    }
+                    label={
+                      normalizeBoolean(
+                        health.db_connected
+                      )
+                        ? "연결됨"
+                        : "연결 실패"
+                    }
+                    size="small"
+                  />
                 </div>
 
                 <div className="health-detail-item">
                   <span>
-                    Packet Capture
-                  </span>
-
-                  <strong>
-                    {health.packet_capture_status ||
-                      health.packet_capture ||
-                      "-"}
-                  </strong>
-                </div>
-
-                <div className="health-detail-item">
-                  <span>
-                    Detection Worker
-                  </span>
-
-                  <strong>
-                    {health.detection_status ||
-                      health.detection ||
-                      "-"}
-                  </strong>
-                </div>
-
-                <div className="health-detail-item">
-                  <span>
-                    Checked At
+                    Server Time
                   </span>
 
                   <strong>
                     {formatKST(
-                      health.checked_at ||
-                      health.timestamp
+                      health.server_time
                     )}
                   </strong>
                 </div>
@@ -1617,13 +1617,10 @@ export default function Dashboard() {
           <section className="panel packet-table-panel">
             <div className="panel-header">
               <div>
-                <h2>
-                  Trust Score Summary
-                </h2>
+                <h2>Trust Score Summary</h2>
 
                 <p className="panel-description">
-                  Device별 현재 Trust
-                  상태와 Firewall 적용
+                  Device별 현재 Trust 상태와 Firewall 적용
                   상태입니다.
                 </p>
               </div>
@@ -1849,12 +1846,7 @@ export default function Dashboard() {
                   if (
                     String(
                       event.severity
-                    ).toLowerCase() ===
-                    "high" ||
-                    String(
-                      event.severity
-                    ).toLowerCase() ===
-                    "critical"
+                    ).toLowerCase() === "high"
                   ) {
                     return "table-row-danger";
                   }

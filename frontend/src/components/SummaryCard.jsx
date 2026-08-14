@@ -1,3 +1,11 @@
+function normalizeStatus(status) {
+  return String(status || "default")
+    .trim()
+    .toLowerCase()
+    .replaceAll(" ", "_")
+    .replaceAll("-", "_");
+}
+
 export default function SummaryCard({
   title,
   value,
@@ -9,6 +17,9 @@ export default function SummaryCard({
 }) {
   const interactive =
     typeof onClick === "function";
+
+  const normalizedStatus =
+    normalizeStatus(status);
 
   const Element = interactive
     ? "button"
@@ -23,7 +34,7 @@ export default function SummaryCard({
       }
       className={[
         "summary-card",
-        `summary-card-${status}`,
+        `summary-card-${normalizedStatus}`,
         interactive
           ? "summary-card-clickable"
           : "",

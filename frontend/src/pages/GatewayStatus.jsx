@@ -26,13 +26,15 @@ const ONLINE_THRESHOLD_SECONDS =
   ONLINE_THRESHOLD_MULTIPLIER;
 
 const POLLING_INTERVAL_MS =
-  COLLECTION_INTERVAL_SECONDS *
-  1_000;
+  COLLECTION_INTERVAL_SECONDS * 1_000;
 
-const STATUS_UPDATE_INTERVAL_MS =
-  1_000;
+const STATUS_UPDATE_INTERVAL_MS = 1_000;
 
 const IS_DEV = import.meta.env.DEV;
+
+/* =========================================================
+   Formatting
+   ========================================================= */
 
 function formatKST(dateString) {
   if (!dateString) {
@@ -63,7 +65,8 @@ function formatKST(dateString) {
 function formatMetric(
   value,
   unit = "",
-  maximumFractionDigits = 2
+  maximumFractionDigits = 2,
+  minimumFractionDigits = 0
 ) {
   if (
     value === null ||
@@ -82,9 +85,19 @@ function formatMetric(
   return `${number.toLocaleString(
     "ko-KR",
     {
+      minimumFractionDigits,
       maximumFractionDigits,
     }
   )}${unit}`;
+}
+
+function formatResourceValue(value) {
+  return formatMetric(
+    value,
+    "",
+    1,
+    1
+  );
 }
 
 function formatInteger(value) {
@@ -151,6 +164,10 @@ function formatElapsedTime(dateString) {
 
   return `${elapsedHours}시간 전`;
 }
+
+/* =========================================================
+   Gateway Status
+   ========================================================= */
 
 function getGatewayStatus(
   collectedAt,
@@ -225,6 +242,10 @@ function getGatewayStatusTheme(
   );
 }
 
+/* =========================================================
+   Resource Status
+   ========================================================= */
+
 function getResourceStatus(value) {
   const number = Number(value);
 
@@ -260,6 +281,10 @@ function getTemperatureStatus(value) {
 
   return "normal";
 }
+
+/* =========================================================
+   Network Interface
+   ========================================================= */
 
 function getInterfaceStatus(
   interfaceData
@@ -383,7 +408,7 @@ function InterfaceCard({
 
       <div className="interface-name-row">
         <span>
-          Interface
+          Interface:
         </span>
 
         <strong>
@@ -439,7 +464,8 @@ function InterfaceCard({
           >
             {formatMetric(
               rxRate,
-              " B/s"
+              " B/s",
+              2
             )}
           </strong>
         </div>
@@ -457,7 +483,8 @@ function InterfaceCard({
           >
             {formatMetric(
               txRate,
-              " B/s"
+              " B/s",
+              2
             )}
           </strong>
         </div>
@@ -485,6 +512,10 @@ function InterfaceCard({
     </article>
   );
 }
+
+/* =========================================================
+   Gateway Status Page
+   ========================================================= */
 
 export default function GatewayStatus() {
   const [
@@ -642,14 +673,16 @@ export default function GatewayStatus() {
     latestMetric?.interface_metrics ??
     {};
 
+  /*
+   * Phase 6-A 실제 Backend 계약:
+   * internal_lan = eth0
+   * usb_lan = eth1
+   *
+   * wlan0 / wireless_lan은 운영 표시 대상에서 제외합니다.
+   */
   const internalLan =
     interfaces.internal_lan ??
     interfaces.eth0 ??
-    null;
-
-  const wirelessLan =
-    interfaces.wireless_lan ??
-    interfaces.wlan0 ??
     null;
 
   const usbLan =
@@ -668,13 +701,6 @@ export default function GatewayStatus() {
           data: internalLan,
         },
         {
-          key: "wireless_lan",
-          title: "Wireless LAN",
-          description:
-            "무선 연결 상태를 확인합니다.",
-          data: wirelessLan,
-        },
-        {
           key: "usb_lan",
           title: "USB LAN",
           description:
@@ -684,7 +710,6 @@ export default function GatewayStatus() {
       ],
       [
         internalLan,
-        wirelessLan,
         usbLan,
       ]
     );
@@ -735,6 +760,13 @@ export default function GatewayStatus() {
       gatewayStatus
     );
 
+  const interfaceSummaryStatus =
+    interfaceSummary.down > 0 ||
+    interfaceSummary.missing > 0 ||
+    interfaceSummary.unknown > 0
+      ? "warning"
+      : "normal";
+
   return (
     <div className="page-container">
       <PageHeader
@@ -762,11 +794,9 @@ export default function GatewayStatus() {
             </strong>
 
             <p>
-              {pollWarning}
-              {" "}
-              마지막으로 수신한
-              Gateway Metric을 계속
-              표시합니다.
+              {pollWarning} 마지막으로
+              수신한 Gateway Metric을
+              계속 표시합니다.
             </p>
           </div>
 
@@ -811,6 +841,12 @@ export default function GatewayStatus() {
               value="NO DATA"
               description="API 요청은 성공했지만 Metric이 없습니다."
               status="unknown"
+              footer={
+                <StatusBadge
+                  status="NO_DATA"
+                  size="small"
+                />
+              }
             />
           </section>
 
@@ -838,9 +874,7 @@ export default function GatewayStatus() {
               status={gatewayTheme}
               footer={
                 <StatusBadge
-                  status={
-                    gatewayStatus
-                  }
+                  status={gatewayStatus}
                   size="small"
                 />
               }
@@ -854,19 +888,15 @@ export default function GatewayStatus() {
               description={formatKST(
                 latestMetric.collected_at
               )}
-              status={
-                gatewayStatus ===
-                "ONLINE"
-                  ? "normal"
-                  : "warning"
-              }
+              status={gatewayTheme}
             />
 
             <SummaryCard
               title="실제 수집 간격"
               value={formatMetric(
                 latestMetric.sample_interval_seconds,
-                "초"
+                "초",
+                2
               )}
               description={`기준 수집 주기 ${COLLECTION_INTERVAL_SECONDS}초`}
             />
@@ -876,13 +906,17 @@ export default function GatewayStatus() {
               value={
                 interfaceSummary.connected
               }
-              description={`DOWN ${interfaceSummary.down} · 미인식 ${interfaceSummary.missing}`}
+              description={[
+                `DOWN ${interfaceSummary.down}`,
+                `미인식 ${interfaceSummary.missing}`,
+                interfaceSummary.unknown > 0
+                  ? `미확인 ${interfaceSummary.unknown}`
+                  : null,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
               status={
-                interfaceSummary.down > 0 ||
-                interfaceSummary.missing >
-                  0
-                  ? "warning"
-                  : "normal"
+                interfaceSummaryStatus
               }
             />
           </section>
@@ -927,9 +961,7 @@ export default function GatewayStatus() {
 
             <div className="gateway-overview-detail">
               <div>
-                <span>
-                  Metric ID
-                </span>
+                <span>Metric ID</span>
 
                 <strong>
                   {formatInteger(
@@ -955,9 +987,7 @@ export default function GatewayStatus() {
           <section>
             <div className="section-heading">
               <div>
-                <h2>
-                  시스템 자원
-                </h2>
+                <h2>시스템 자원</h2>
 
                 <p>
                   Raspberry Pi의 현재
@@ -971,9 +1001,9 @@ export default function GatewayStatus() {
             <div className="metric-card-grid">
               <MetricCard
                 label="CPU"
-                value={
+                value={formatResourceValue(
                   latestMetric.cpu_percent
-                }
+                )}
                 unit="%"
                 percentage={
                   latestMetric.cpu_percent
@@ -986,9 +1016,9 @@ export default function GatewayStatus() {
 
               <MetricCard
                 label="Memory"
-                value={
+                value={formatResourceValue(
                   latestMetric.memory_percent
-                }
+                )}
                 unit="%"
                 percentage={
                   latestMetric.memory_percent
@@ -1001,9 +1031,9 @@ export default function GatewayStatus() {
 
               <MetricCard
                 label="Disk"
-                value={
+                value={formatResourceValue(
                   latestMetric.disk_percent
-                }
+                )}
                 unit="%"
                 percentage={
                   latestMetric.disk_percent
@@ -1013,15 +1043,16 @@ export default function GatewayStatus() {
                 )}
                 description={`사용량 ${formatMetric(
                   latestMetric.disk_used_mb,
-                  " MB"
+                  " MB",
+                  1
                 )}`}
               />
 
               <MetricCard
                 label="Temperature"
-                value={
+                value={formatResourceValue(
                   latestMetric.temperature_c
-                }
+                )}
                 unit="℃"
                 status={getTemperatureStatus(
                   latestMetric.temperature_c
@@ -1039,9 +1070,10 @@ export default function GatewayStatus() {
                 </h2>
 
                 <p className="panel-description">
-                  Interface 미인식과
-                  Interface DOWN 상태를
-                  구분해서 표시합니다.
+                  운영 Interface인
+                  internal_lan(eth0)과
+                  usb_lan(eth1)의 상태를
+                  확인합니다.
                 </p>
               </div>
 
@@ -1063,6 +1095,15 @@ export default function GatewayStatus() {
                   label={`미인식 ${interfaceSummary.missing}`}
                   size="small"
                 />
+
+                {interfaceSummary.unknown >
+                  0 && (
+                  <StatusBadge
+                    status="unknown"
+                    label={`미확인 ${interfaceSummary.unknown}`}
+                    size="small"
+                  />
+                )}
               </div>
             </div>
 

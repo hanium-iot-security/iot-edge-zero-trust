@@ -43,6 +43,28 @@ const STATUS_LABELS = {
   unknown: "UNKNOWN",
 };
 
+const DOT_STATUSES = new Set([
+  "normal",
+  "warning",
+  "danger",
+  "isolated",
+
+  "online",
+  "stale",
+  "offline",
+  "no_data",
+  "api_error",
+
+  "pending",
+  "applied",
+  "failed",
+  "removed",
+
+  "connected",
+  "down",
+  "missing",
+]);
+
 function normalizeStatus(status) {
   return String(status || "unknown")
     .trim()
@@ -62,10 +84,11 @@ export default function StatusBadge({
 
   const displayLabel =
     label ||
-    STATUS_LABELS[
-      normalizedStatus
-    ] ||
+    STATUS_LABELS[normalizedStatus] ||
     String(status || "UNKNOWN");
+
+  const showDot =
+    DOT_STATUSES.has(normalizedStatus);
 
   return (
     <span
@@ -76,10 +99,12 @@ export default function StatusBadge({
       ].join(" ")}
       title={title}
     >
-      <span
-        className="status-badge-dot"
-        aria-hidden="true"
-      />
+      {showDot && (
+        <span
+          className="status-badge-dot"
+          aria-hidden="true"
+        />
+      )}
 
       <span>{displayLabel}</span>
     </span>

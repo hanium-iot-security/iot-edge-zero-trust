@@ -573,24 +573,20 @@ p {
   content: "";
 }
 
-.summary-card.status-normal::before,
-.summary-card.normal::before {
+.summary-card.summary-card-normal::before {
   background: var(--color-success);
 }
 
-.summary-card.status-warning::before,
-.summary-card.warning::before,
-.warning-card::before {
+.summary-card.summary-card-warning::before {
   background: var(--color-warning);
 }
 
-.summary-card.status-danger::before,
-.summary-card.danger::before,
-.card.danger::before {
+.summary-card.summary-card-danger::before,
+.summary-card.summary-card-isolated::before {
   background: var(--color-danger);
 }
 
-.summary-card.status-info::before {
+.summary-card.summary-card-info::before {
   background: var(--color-primary);
 }
 
@@ -640,13 +636,12 @@ p {
   line-height: 1.5;
 }
 
-.warning-card strong,
-.summary-card.status-warning .summary-card-value {
+.summary-card.summary-card-warning .summary-card-value {
   color: var(--color-warning);
 }
 
-.summary-card.status-danger .summary-card-value,
-.card.danger strong {
+.summary-card.summary-card-danger .summary-card-value,
+.summary-card.summary-card-isolated .summary-card-value {
   color: var(--color-danger);
 }
 
@@ -698,11 +693,15 @@ p {
 .badge,
 .status-badge {
   display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
   align-items: center;
   justify-content: center;
+  align-self: flex-start;
   min-height: 25px;
+  gap: 6px;
   padding: 4px 9px;
-  border-radius: var(--radius-pill);
+  border-radius: 6px;
   background: var(--color-slate-100);
   color: var(--color-slate-600);
   font-size: 11px;
@@ -711,79 +710,152 @@ p {
   white-space: nowrap;
 }
 
-.status-badge.size-small,
+/* StatusBadge.jsx의 size class와 일치 */
+.status-badge.status-badge-small,
 .badge.small {
   min-height: 22px;
   padding: 3px 8px;
   font-size: 10px;
 }
 
-.status-badge.size-large,
+.status-badge.status-badge-medium {
+  min-height: 25px;
+  padding: 4px 9px;
+  font-size: 11px;
+}
+
+.status-badge.status-badge-large,
 .badge.large {
   min-height: 31px;
   padding: 6px 12px;
   font-size: 12px;
 }
 
+/* 운영 상태를 빠르게 확인하기 위한 Dot */
+.status-badge-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* =========================================================
+   Success / Normal
+   ========================================================= */
+
 .badge.normal,
-.status-badge.normal,
-.status-badge.online,
-.status-badge.connected,
-.status-badge.applied,
-.status-badge.eligible,
-.status-badge.processed,
-.status-badge.captured,
-.status-badge.scored,
-.status-badge.inbound,
-.status-badge.low {
+.status-badge.status-normal,
+.status-badge.status-online,
+.status-badge.status-connected,
+.status-badge.status-applied,
+.status-badge.status-eligible,
+.status-badge.status-processed,
+.status-badge.status-captured,
+.status-badge.status-scored {
   background: var(--color-success-soft);
   color: var(--color-success-dark);
 }
 
+/* =========================================================
+   Warning
+   ========================================================= */
+
 .badge.warning,
-.status-badge.warning,
-.status-badge.stale,
-.status-badge.pending,
-.status-badge.excluded,
-.status-badge.medium,
-.status-badge.degraded {
+.status-badge.status-warning,
+.status-badge.status-stale,
+.status-badge.status-pending,
+.status-badge.status-excluded,
+.status-badge.status-medium,
+.status-badge.status-degraded {
   background: var(--color-warning-soft);
   color: var(--color-warning-dark);
 }
 
+/* =========================================================
+   Danger
+   ========================================================= */
+
 .badge.danger,
-.status-badge.danger,
-.status-badge.failed,
-.status-badge.offline,
-.status-badge.down,
-.status-badge.high,
-.status-badge.critical {
+.status-badge.status-danger,
+.status-badge.status-failed,
+.status-badge.status-offline,
+.status-badge.status-api_error,
+.status-badge.status-down,
+.status-badge.status-high,
+.status-badge.status-critical {
   background: var(--color-danger-soft);
   color: var(--color-danger-dark);
 }
 
+/* =========================================================
+   Isolated
+   ========================================================= */
+
 .badge.isolated,
-.status-badge.isolated {
+.status-badge.status-isolated {
   background: var(--color-slate-900);
   color: #ffffff;
 }
 
-.status-badge.removed,
-.status-badge.unscored,
-.status-badge.unknown,
-.status-badge.missing {
+/* =========================================================
+   Unknown / No Data / Removed
+   ========================================================= */
+
+.status-badge.status-removed,
+.status-badge.status-unscored,
+.status-badge.status-unknown,
+.status-badge.status-no_data,
+.status-badge.status-missing {
   background: var(--color-slate-200);
   color: var(--color-slate-600);
 }
 
-.status-badge.ai {
+/* =========================================================
+   Detector
+   ========================================================= */
+
+.status-badge.status-rule {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.status-badge.status-ai {
   background: var(--color-purple-soft);
   color: #5b21b6;
 }
 
-.status-badge.rule,
-.badge.mapped,
+/* =========================================================
+   Severity LOW
+   LOW는 정상 상태가 아니므로 Green으로 표현하지 않음
+   ========================================================= */
+
+.status-badge.status-low {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+/* =========================================================
+   Direction
+   ========================================================= */
+
+.status-badge.status-inbound,
 .badge.direction-inbound {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.status-badge.status-outbound,
+.badge.direction-outbound {
+  background: #dcfce7;
+  color: #166534;
+}
+
+/* =========================================================
+   Legacy / Packet Mapping Badge
+   ========================================================= */
+
+.badge.mapped {
   background: #dbeafe;
   color: #1e40af;
 }
@@ -792,12 +864,6 @@ p {
 .badge.direction-unknown {
   background: var(--color-warning-soft);
   color: var(--color-warning-dark);
-}
-
-.badge.direction-outbound,
-.status-badge.outbound {
-  background: #dcfce7;
-  color: #166534;
 }
 
 /* =========================================================
@@ -1412,6 +1478,12 @@ tbody tr:hover {
   text-align: center;
 }
 
+.interface-name-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .gateway-empty h2 {
   margin: 18px 0 8px;
 }
@@ -1698,10 +1770,14 @@ tbody tr:hover {
 
 .payload-preview {
   display: block;
-  min-width: 0;
-  flex: 1;
+  max-width: 320px;
   overflow: hidden;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family:
+    ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Consolas,
+    monospace;
   font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
