@@ -1,0 +1,21 @@
+[Unit]
+Description=IoT Edge read-only firewall runtime snapshot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/iot-edge-zero-trust
+EnvironmentFile=/home/pi/iot-edge-zero-trust/.env
+ExecStart=/home/pi/iot-edge-zero-trust/venv/bin/python -m edge.trust.run_firewall_runtime_snapshot
+# sudo uses the same narrow root-owned firewall wrapper as Firewall Worker.
+# This service code only invokes the wrapper's read-only `list` operation.
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=firewall-runtime-snapshot
