@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh IoT Edge firewall runtime snapshot every 5 seconds
+
+[Timer]
+OnBootSec=2s
+OnUnitActiveSec=5s
+AccuracySec=1s
+Unit=firewall-runtime-snapshot.service
+
+[Install]
+WantedBy=timers.target

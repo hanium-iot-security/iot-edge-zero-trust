@@ -16,6 +16,13 @@ from .routers import (
     recovery,
     trust_score,
 )
+from .services import recovery_command_service
+from .services.firewall_runtime_verifier import verify_runtime_firewall
+
+# Application composition root: Recovery keeps a fail-closed UNAVAILABLE default
+# when imported by itself, while the actual FastAPI app wires the read-only
+# runtime snapshot verifier. The API process never invokes sudo/iptables.
+recovery_command_service.firewall_runtime_verifier = verify_runtime_firewall
 
 app = FastAPI(title="IoT Edge Zero Trust API")
 
