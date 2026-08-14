@@ -86,6 +86,10 @@ class Settings(BaseSettings):
     firewall_command_timeout_seconds: float = 10.0
     firewall_lock_path: str = ""
     firewall_lock_wait_seconds: float = 15.0
+    # Worker가 실제 iptables를 읽고 기록하는 read-only Recovery 검증 Snapshot.
+    # API는 NoNewPrivileges=true를 유지하며 sudo/iptables를 직접 실행하지 않는다.
+    firewall_runtime_snapshot_path: str = "data/runtime/firewall-runtime.json"
+    firewall_runtime_snapshot_max_age_seconds: float = 15.0
 
     model_config = SettingsConfigDict(env_file=(".env", "../.env"), env_file_encoding="utf-8")
 
