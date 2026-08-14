@@ -292,8 +292,18 @@ def check_publish_delivery(
             "확인하세요.",
         )
 
-    observed = PASS if delivered else DENY
     rc = publish_state["publish_rc"]
+    if rc is not None and rc != mqtt.MQTT_ERR_SUCCESS:
+        return CheckResult(
+            name,
+            description,
+            expected,
+            ERROR,
+            f"Publisher publish()가 Client 단계에서 실패했습니다(rc={rc}) — "
+            "ACL DENY로 판정하지 않습니다.",
+        )
+
+    observed = PASS if delivered else DENY
     rc_detail = f", publish() rc={rc}" if rc is not None else ""
     detail = (
         "Observer가 일치하는 Nonce의 메시지를 수신함"

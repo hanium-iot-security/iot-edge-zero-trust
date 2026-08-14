@@ -46,6 +46,58 @@ class TestCheckResult:
         assert CheckResult("x", "desc", DENY, AUTH_FAILED, "d").ok is False
 
 
+class TestCheckPublishDelivery:
+    def test_publish_failure_is_not_reported_as_acl_deny_pass(self, monkeypatch) -> None:
+        import edge.scripts.mqtt_acl_test_pack as pack
+
+        class FakePublishInfo:
+            rc = pack.mqtt.MQTT_ERR_NO_CONN
+
+        class FakePublisher:
+            def loop_start(self) -> None:
+                pass
+
+            def publish(self, _topic, _payload, qos=0):
+                return FakePublishInfo()
+
+            def loop_stop(self) -> None:
+                pass
+
+            def disconnect(self) -> None:
+                pass
+
+        def fake_observe_delivery(
+            _host,
+            _port,
+            _credential,
+            _topic,
+            publish_fn,
+            *,
+            expected_nonce,
+        ) -> bool:
+            publish_fn()
+            return False
+
+        monkeypatch.setattr(pack, "_build_client", lambda *_args: (FakePublisher(), object()))
+        monkeypatch.setattr(pack, "_connect_and_wait", lambda *_args: True)
+        monkeypatch.setattr(pack, "_observe_delivery", fake_observe_delivery)
+
+        result = pack.check_publish_delivery(
+            "cross_topic_deny",
+            "cross-topic publish must be denied",
+            host="localhost",
+            port=1883,
+            publisher_credential=Credential("esp32_01", "pw"),
+            observer_credential=Credential("mqtt_test_tool", "pw"),
+            publish_topic="iot/esp32_02/sensor",
+            watch_topic="iot/esp32_02/sensor",
+            expected=DENY,
+        )
+
+        assert result.observed == ERROR
+        assert result.ok is False
+
+
 class TestSubscribeReasonCodesFailed:
     class _FakeReasonCode:
         def __init__(self, is_failure: bool) -> None:
