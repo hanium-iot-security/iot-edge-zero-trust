@@ -1,0 +1,53 @@
+# Mosquitto Password File 안내
+
+# 이 저장소에는 실제 비밀번호나 해시를 절대 커밋하지 않는다(Credential 관리 원칙: Git·Notion·PR·로그·스크린샷에 평문 저장하지 않음).
+# 이 파일은 형식과 생성 명령만 안내하는 예시 문서다.
+# 실제 `passwd` 파일은 Raspberry Pi에서 `mosquitto_passwd`로 직접 생성해 `/etc/mosquitto/passwd`에 둔다.
+
+# ── Credential 대상(4개 Principal) ────────────────────────────────────────────
+#   - esp32_01           : ESP32 #1 전용
+#   - esp32_02           : ESP32 #2 전용
+#   - edge_subscriber    : Edge MQTT Subscriber(edge/mqtt/subscriber.py) 전용
+#   - mqtt_test_tool     : 공식 MQTT Scenario/Test Tool(attacks/*) 전용
+
+# ── 생성 절차 (Raspberry Pi, mosquitto-clients 패키지 필요) ──────────────────
+#   sudo apt install -y mosquitto-clients   # 이미 설치돼 있으면 생략
+
+#   # 새 파일을 만들며 첫 계정 추가 (-c는 최초 1회만 사용 — 기존 파일을 덮어씀)
+#   mosquitto_passwd -c /etc/mosquitto/passwd esp32_01
+#   # 이후 계정은 -c 없이 추가
+#   mosquitto_passwd /etc/mosquitto/passwd esp32_02
+#   mosquitto_passwd /etc/mosquitto/passwd edge_subscriber
+#   mosquitto_passwd /etc/mosquitto/passwd mqtt_test_tool
+
+#   sudo chown mosquitto:mosquitto /etc/mosquitto/passwd
+#   sudo chmod 0600 /etc/mosquitto/passwd
+
+# 각 명령은 비밀번호를 대화식으로 입력받는다(터미널에 노출되지 않음).
+# 비대화식 자동화가 필요하면 `-b username password` 형식을 쓸 수 있지만,
+# 이 경우 Shell History·CI 로그에 평문이 남을 수 있으므로 로컬 1회성 설정에서만 사용하고 즉시 History를 정리한다.
+
+# ── 생성된 파일의 형식 ────────────────────────────────────────────────────────
+# 실제로 생성하면 아래와 같이 `username:$7$<iterations>$<salt>$<hash>` 형식의
+# 줄이 계정 수만큼 생긴다(PBKDF2-SHA512, mosquitto 2.x 기본 형식).
+# 아래 값은 형식을 보여주기 위한 예시일 뿐이며 실제 비밀번호로 사용하거나 그대로 배포하지 않는다.
+
+#   esp32_01:$7$101$<salt-placeholder>$<hash-placeholder>
+#   esp32_02:$7$101$<salt-placeholder>$<hash-placeholder>
+#   edge_subscriber:$7$101$<salt-placeholder>$<hash-placeholder>
+#   mqtt_test_tool:$7$101$<salt-placeholder>$<hash-placeholder>
+
+# ── ESP32 Credential 반영 ─────────────────────────────────────────────────────
+# ESP32는 별도 Python `.env` 대신 Firmware Credential Header에 Credential을 넣는다.
+# 아래 두 파일을 각각 같은 디렉터리의 `mqtt_credentials.h`로 복사한 뒤(Git 제외 대상) MQTT_PASSWORD 값을 채운다:
+#   firmware/esp32/normal_sender/mqtt_credentials.example.h   (esp32_01)
+#   firmware/esp32/attack_sender/mqtt_credentials.example.h   (esp32_02)
+# 값 자체는 이 Password File과 반드시 일치해야 하며, 파일 두 곳(passwd, irmware Credential Header)이 어긋나면 CONNACK reason code 5(Not Authorized)로 연결이 거부된다.
+
+# ── Rollback ──────────────────────────────────────────────────────────────
+# 실제 배포 전 기존 설정을 Backup한다.
+#   sudo cp -a /etc/mosquitto/mosquitto.conf \
+#       "/etc/mosquitto/mosquitto.conf.$(date -u +%Y%m%dT%H%M%SZ).bak"
+# 문제가 발생하면 Backup으로 되돌리고 mosquitto를 재시작한다.
+#   sudo cp -a "<backup 경로>" /etc/mosquitto/mosquitto.conf
+#   sudo systemctl restart mosquitto

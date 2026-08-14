@@ -29,6 +29,33 @@ from attacks.device_id_mismatch_attack import _default_mismatch_pair
 from edge.mqtt.topic_utils import is_telemetry_topic
 
 
+# ── build_mqtt_client (공식 MQTT Scenario/Test Tool Credential) ────────────────
+
+class TestBuildMqttClient:
+    def test_no_username_configured_leaves_client_anonymous(self, monkeypatch):
+        """BROKER_USERNAME이 비어 있으면(전환 기간) 익명 연결을 유지해야 합니다."""
+        import attacks.config as attacks_config
+
+        monkeypatch.setattr(attacks_config, "BROKER_USERNAME", "")
+        monkeypatch.setattr(attacks_config, "BROKER_PASSWORD", "")
+
+        client = attacks_config.build_mqtt_client("test_client_anon")
+
+        assert client._username is None
+
+    def test_username_configured_applies_credentials(self, monkeypatch):
+        """BROKER_USERNAME이 설정되면 Client에 Username/Password가 적용돼야 합니다."""
+        import attacks.config as attacks_config
+
+        monkeypatch.setattr(attacks_config, "BROKER_USERNAME", "test_tool_principal")
+        monkeypatch.setattr(attacks_config, "BROKER_PASSWORD", "test_tool_secret")
+
+        client = attacks_config.build_mqtt_client("test_client_auth")
+
+        assert client._username == b"test_tool_principal"
+        assert client._password == b"test_tool_secret"
+
+
 # ── config ────────────────────────────────────────────────────────────────────
 
 class TestConfig:

@@ -1,6 +1,15 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 
+#if __has_include("mqtt_credentials.h")
+#include "mqtt_credentials.h"
+#else
+// Broker가 아직 익명 연결을 허용하는 전환 기간의 기본값이다.
+// Broker 인증을 강제한 뒤에는 mqtt_credentials.example.h를 mqtt_credentials.h로 복사해 실제 Password를 채운다(Git 제외 대상).
+#define MQTT_USERNAME ""
+#define MQTT_PASSWORD ""
+#endif
+
 const char* WIFI_SSID = "YOUR_WIFI_SSID";
 const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
@@ -43,6 +52,13 @@ bool isPrivateBrokerAddress() {
          (first == 192 && second == 168);
 }
 
+bool mqttConnectWithCredentials(const char* clientId) {
+  if (strlen(MQTT_USERNAME) > 0) {
+    return mqttClient.connect(clientId, MQTT_USERNAME, MQTT_PASSWORD);
+  }
+  return mqttClient.connect(clientId);
+}
+
 bool connectWiFiWithTimeout() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -74,7 +90,7 @@ bool connectMqttWithTimeout() {
          millis() - startedAt < MQTT_CONNECT_TIMEOUT_MS &&
          mqttConnectAttempt < MQTT_CONNECT_MAX_ATTEMPTS) {
     mqttConnectAttempt++;
-    mqttClient.connect("phase4_attack_esp32_02");
+    mqttConnectWithCredentials("phase4_attack_esp32_02");
     if (!mqttClient.connected()) {
       delay(500);
     }
@@ -252,7 +268,7 @@ void runBoundedIsolationObservation() {
 
   mqttClient.setSocketTimeout(OBSERVATION_CONNECT_TIMEOUT_SECONDS);
   const bool reconnectResult =
-      mqttClient.connect("phase4_observation_esp32_02");
+      mqttConnectWithCredentials("phase4_observation_esp32_02");
   Serial.print("[OBSERVE] reconnect_run_elapsed_ms=");
   Serial.print(millis() - runStartedAt);
   Serial.print(", observation_elapsed_ms=");

@@ -20,9 +20,7 @@ import random
 import string
 import time
 
-import paho.mqtt.client as mqtt
-
-from attacks.config import BROKER_HOST, BROKER_PORT, KEEPALIVE, REGISTERED_DEVICES, NORMAL_TOPIC_TPL
+from attacks.config import build_mqtt_client, BROKER_HOST, BROKER_PORT, KEEPALIVE, REGISTERED_DEVICES, NORMAL_TOPIC_TPL
 
 _VENDOR_DEFAULT_IDS = [
     "ESP_XXXXXX", "ESP32_DEV", "Arduino_001", "RPi_Node_01",
@@ -81,7 +79,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    client = mqtt.Client(client_id=f"attacker_unknown_{_rand_str()}")
+    client = build_mqtt_client(client_id=f"attacker_unknown_{_rand_str()}")
     client.connect(args.host, args.port, KEEPALIVE)
     client.loop_start()
 

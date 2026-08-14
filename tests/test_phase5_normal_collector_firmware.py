@@ -91,3 +91,41 @@ def test_profile_three_logs_the_pilot_approval_gate() -> None:
 
     assert "PHASE5_NORMAL_PROFILE == 3" in source
     assert "profile_3_requires_profile_1_and_2_pilot_approval" in source
+
+
+def test_mqtt_username_is_derived_from_device_id_not_separately_configured() -> None:
+    # PHASE5_DEVICE_SLOT이 이미 DEVICE_ID(esp32_01/esp32_02)를 결정하므로
+    # Username을 별도 Config 값으로 중복 관리하지 않는다.
+    source = _source()
+    assert "const char* MQTT_USERNAME = DEVICE_ID;" in source
+
+
+def test_mqtt_password_has_backward_compatible_fallback_default() -> None:
+    # 이미 배포된 로컬 phase5_firmware_config.h에 PHASE5_MQTT_PASSWORD가 없어도
+    # 컴파일이 깨지지 않아야 한다(기존 실기기 호환).
+    source = _source()
+    assert "#ifndef PHASE5_MQTT_PASSWORD" in source
+    assert '#define PHASE5_MQTT_PASSWORD ""' in source
+
+
+def test_connect_falls_back_to_anonymous_when_password_not_configured() -> None:
+    source = _source()
+    connect_body = source[
+        source.index("bool connectMqttOnce()") : source.index("bool publishNormalTelemetry()")
+    ]
+    assert "strlen(MQTT_PASSWORD) > 0" in connect_body
+    assert "strlen(MQTT_USERNAME)" not in connect_body
+    assert (
+        "mqttClient.connect(MQTT_CLIENT_ID.c_str(), MQTT_USERNAME, MQTT_PASSWORD)"
+        in connect_body
+    )
+    # 완전한 익명 연결(Username/Password 없이) 경로도 여전히 남아 있어야 한다.
+    assert "mqttClient.connect(MQTT_CLIENT_ID.c_str());" in connect_body
+
+
+def test_example_config_documents_mqtt_password_with_safe_empty_default() -> None:
+    config = EXAMPLE_CONFIG.read_text(encoding="utf-8")
+    # 기본값이 비어 있어야 전환 기간에 실수로 잘못된 Credential을 보내지 않는다.
+    assert '#define PHASE5_MQTT_PASSWORD ""' in config
+    # Username은 예제에서 별도로 정의하지 않는다(DEVICE_ID에서 파생).
+    assert "PHASE5_MQTT_USERNAME" not in config
