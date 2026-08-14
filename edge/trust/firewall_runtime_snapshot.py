@@ -1,9 +1,10 @@
 """Read-only runtime firewall snapshot contract for Recovery preflight.
 
 The FastAPI service deliberately runs with ``NoNewPrivileges=true`` and must not
-invoke sudo/iptables directly. The privileged Firewall Worker already owns the
-narrow root wrapper boundary, so it periodically records what it actually sees
-in the INPUT chain. Recovery reads only this short-lived JSON snapshot.
+invoke sudo/iptables directly. A dedicated privileged observer uses the same
+narrow root-owned wrapper boundary as Firewall Worker, but only its ``list``
+operation, and records what it actually sees in the INPUT chain. Recovery reads
+only this short-lived JSON snapshot.
 
 This module never inserts, deletes, or changes firewall rules. Any missing,
 stale, malformed, or unavailable observation fails closed as ``UNAVAILABLE``.
@@ -27,6 +28,8 @@ from edge.trust.firewall_worker import (
     DEST_PORT,
     LIST_RULES,
     PROTOCOL,
+    RFC1918_NETWORKS,
+    FirewallTransientError,
     IptablesRunner,
 )
 
@@ -67,7 +70,7 @@ def capture_firewall_runtime_snapshot(
             "managed_rules": managed_rules,
             "error": None,
         }
-    except (FirewallRuntimeSnapshotError, OSError, ValueError) as exc:
+    except (FirewallRuntimeSnapshotError, FirewallTransientError, OSError, ValueError) as exc:
         payload = {
             "schema_version": SNAPSHOT_SCHEMA_VERSION,
             "observed_at": _format_utc(observed),
@@ -90,15 +93,17 @@ def verify_firewall_runtime_snapshot(
     """Verify that no managed runtime DROP rule remains for ``device``.
 
     The returned shape matches ``RecoveryCommandService.RuntimeFirewallVerifier``.
-    A PASS is possible only from a fresh, schema-valid, successful Worker
+    A PASS is possible only from a fresh, schema-valid, successful runtime
     observation. Everything else is fail-closed ``UNAVAILABLE``.
     """
     if max_age_seconds <= 0:
         return _unavailable("Runtime firewall snapshot max age must be positive.")
 
-    target_ip = _normalize_device_ip(device.get("ip_address"))
+    target_ip = _normalize_private_device_ip(device.get("ip_address"))
     if target_ip is None:
-        return _unavailable("Device has no valid IPv4 address for runtime firewall verification.")
+        return _unavailable(
+            "Device has no valid RFC1918 IPv4 address for runtime firewall verification."
+        )
 
     path = Path(snapshot_path)
     try:
@@ -124,7 +129,7 @@ def verify_firewall_runtime_snapshot(
             )
         if not normalized["available"]:
             raise FirewallRuntimeSnapshotError(
-                str(normalized["error"] or "Firewall Worker runtime observation unavailable.")
+                str(normalized["error"] or "Runtime firewall observation unavailable.")
             )
     except FirewallRuntimeSnapshotError as exc:
         return _unavailable(str(exc))
@@ -206,12 +211,12 @@ def _parse_managed_rule_line(line: str) -> dict[str, Any]:
         )
 
     rule_id_text = comment.removeprefix(COMMENT_PREFIX)
-    if not rule_id_text.isdigit():
+    if not rule_id_text.isdigit() or int(rule_id_text) <= 0:
         raise FirewallRuntimeSnapshotError(
             f"Managed firewall rule has invalid rule id: {line!r}"
         )
 
-    source_ip = _single_host_ipv4(source, line=line)
+    source_ip = _single_private_host_ipv4(source, line=line)
     return {"rule_id": int(rule_id_text), "source_ip": source_ip}
 
 
@@ -225,7 +230,7 @@ def _option_value(tokens: list[str], option: str) -> str | None:
     return tokens[index + 1]
 
 
-def _single_host_ipv4(value: str | None, *, line: str) -> str:
+def _single_private_host_ipv4(value: str | None, *, line: str) -> str:
     if not value:
         raise FirewallRuntimeSnapshotError(
             f"Managed firewall rule has no source IP: {line!r}"
@@ -240,7 +245,12 @@ def _single_host_ipv4(value: str | None, *, line: str) -> str:
         raise FirewallRuntimeSnapshotError(
             f"Managed firewall rule source must be a single IPv4 host: {line!r}"
         )
-    return str(network.network_address)
+    address = network.network_address
+    if not any(address in private_network for private_network in RFC1918_NETWORKS):
+        raise FirewallRuntimeSnapshotError(
+            f"Managed firewall rule source must be RFC1918 private IPv4: {line!r}"
+        )
+    return str(address)
 
 
 def _validate_snapshot_payload(payload: Any) -> dict[str, Any]:
@@ -269,8 +279,8 @@ def _validate_snapshot_payload(payload: Any) -> dict[str, Any]:
         if not isinstance(item, dict):
             raise FirewallRuntimeSnapshotError("Runtime firewall snapshot contains invalid rule data.")
         rule_id = item.get("rule_id")
-        source_ip = _normalize_device_ip(item.get("source_ip"))
-        if isinstance(rule_id, bool) or not isinstance(rule_id, int) or rule_id < 0:
+        source_ip = _normalize_private_device_ip(item.get("source_ip"))
+        if isinstance(rule_id, bool) or not isinstance(rule_id, int) or rule_id <= 0:
             raise FirewallRuntimeSnapshotError("Runtime firewall snapshot contains invalid rule_id.")
         if source_ip is None:
             raise FirewallRuntimeSnapshotError("Runtime firewall snapshot contains invalid source_ip.")
@@ -289,7 +299,7 @@ def _validate_snapshot_payload(payload: Any) -> dict[str, Any]:
     }
 
 
-def _normalize_device_ip(value: Any) -> str | None:
+def _normalize_private_device_ip(value: Any) -> str | None:
     if value is None:
         return None
     try:
@@ -297,6 +307,8 @@ def _normalize_device_ip(value: Any) -> str | None:
     except ValueError:
         return None
     if not isinstance(address, ipaddress.IPv4Address):
+        return None
+    if not any(address in private_network for private_network in RFC1918_NETWORKS):
         return None
     return str(address)
 
