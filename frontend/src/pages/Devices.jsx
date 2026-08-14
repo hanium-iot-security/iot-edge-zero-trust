@@ -1299,7 +1299,7 @@ export default function Devices() {
                     <dt>Port</dt>
 
                     <dd>
-                      {selectedDevice.firewallRule?.dest_port ?? "-"}
+                      {selectedDevice.firewall_rule.dest_port ?? "-"}
                     </dd>
                   </div>
 

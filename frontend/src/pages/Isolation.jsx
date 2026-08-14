@@ -415,6 +415,15 @@ function getRecoveryUiStatus(device) {
     };
   }
 
+  if (firewallStatus === "APPLIED") {
+    return {
+      status: "warning",
+      label: "차단 해제 필요",
+      description:
+        "적용 중인 Firewall Rule을 해제한 뒤 Backend Preflight를 확인해야 합니다.",
+    };
+  }
+
   if (!firewallStatus) {
     return {
       status: "unknown",
