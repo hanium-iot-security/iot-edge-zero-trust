@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 
+import pytest
+
 from edge.trust.firewall_runtime_snapshot import (
     SNAPSHOT_SCHEMA_VERSION,
     capture_firewall_runtime_snapshot,
@@ -253,6 +255,38 @@ def test_verify_fails_closed_when_snapshot_is_stale(tmp_path: Path) -> None:
     assert result["passed"] is False
     assert result["status"] == "UNAVAILABLE"
     assert "stale" in result["details"]
+
+
+@pytest.mark.parametrize(
+    "max_age_seconds",
+    [float("nan"), float("inf"), float("-inf"), 0, -1],
+)
+def test_verify_fails_closed_when_snapshot_max_age_is_not_finite_positive(
+    tmp_path: Path,
+    max_age_seconds: float,
+) -> None:
+    snapshot = tmp_path / "firewall-runtime.json"
+    _write_snapshot(
+        snapshot,
+        {
+            "schema_version": SNAPSHOT_SCHEMA_VERSION,
+            "observed_at": "2000-01-01T00:00:00Z",
+            "available": True,
+            "managed_rules": [],
+            "error": None,
+        },
+    )
+
+    result = verify_firewall_runtime_snapshot(
+        _device(),
+        snapshot_path=snapshot,
+        max_age_seconds=max_age_seconds,
+        now=NOW,
+    )
+
+    assert result["available"] is False
+    assert result["passed"] is False
+    assert result["status"] == "UNAVAILABLE"
 
 
 def test_verify_fails_closed_for_invalid_or_unavailable_snapshot(tmp_path: Path) -> None:

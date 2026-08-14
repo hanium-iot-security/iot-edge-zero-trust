@@ -15,6 +15,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import shlex
@@ -96,7 +97,7 @@ def verify_firewall_runtime_snapshot(
     A PASS is possible only from a fresh, schema-valid, successful runtime
     observation. Everything else is fail-closed ``UNAVAILABLE``.
     """
-    if max_age_seconds <= 0:
+    if not math.isfinite(max_age_seconds) or max_age_seconds <= 0:
         return _unavailable("Runtime firewall snapshot max age must be positive.")
 
     target_ip = _normalize_private_device_ip(device.get("ip_address"))
