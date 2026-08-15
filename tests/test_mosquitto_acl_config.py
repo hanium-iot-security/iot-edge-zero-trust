@@ -63,6 +63,13 @@ class TestStrictMosquittoConf:
         lines = _directive_lines(MOSQUITTO_STRICT_CONF.read_text(encoding="utf-8"))
         assert lines.count("allow_anonymous false") == 2
 
+    def test_enables_per_listener_settings_before_first_listener(self) -> None:
+        lines = _directive_lines(MOSQUITTO_STRICT_CONF.read_text(encoding="utf-8"))
+        assert lines.count("per_listener_settings true") == 1
+        assert lines.index("per_listener_settings true") < next(
+            index for index, line in enumerate(lines) if line.startswith("listener ")
+        )
+
     def test_references_password_file_and_acl_file_on_both_listeners(self) -> None:
         lines = _directive_lines(MOSQUITTO_STRICT_CONF.read_text(encoding="utf-8"))
         assert lines.count("password_file /etc/mosquitto/passwd") == 2
@@ -102,6 +109,13 @@ class TestStrictTestMosquittoConf:
     def test_enforces_authentication_on_both_listeners(self) -> None:
         lines = _directive_lines(MOSQUITTO_STRICT_TEST_CONF.read_text(encoding="utf-8"))
         assert lines.count("allow_anonymous false") == 2
+
+    def test_enables_per_listener_settings_before_first_listener(self) -> None:
+        lines = _directive_lines(MOSQUITTO_STRICT_TEST_CONF.read_text(encoding="utf-8"))
+        assert lines.count("per_listener_settings true") == 1
+        assert lines.index("per_listener_settings true") < next(
+            index for index, line in enumerate(lines) if line.startswith("listener ")
+        )
 
     def test_references_same_password_file_and_acl_file_as_final_config(self) -> None:
         lines = _directive_lines(MOSQUITTO_STRICT_TEST_CONF.read_text(encoding="utf-8"))
