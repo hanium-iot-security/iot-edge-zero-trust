@@ -6,7 +6,9 @@ Phase 6-A의 핵심 실기기 흐름을 Raspberry Pi와 ESP32 2대로 검증했�
 
 MQTT Principal별 인증·ACL, Application Identity mismatch 탐지, Trust Score 하락, Device Isolation, 실제 iptables DROP, 차단 대상 MQTT 실패, 승인된 Firewall Release, Runtime Firewall Snapshot 검증, Recovery Preflight/Execute, DB Backup 무결성 검증, 정상 MQTT/Feature 재개까지 하나의 신규 E2E Session에서 확인했다.
 
-Phase 6-A P0 흐름은 완료로 판정한다. 단, `esp32_02`의 정상 sparse cadence가 현재 Packet IF 임계값을 근소하게 초과한 사례는 Runtime 결함이 아닌 모델 보정 후속 작업으로 확인했으며 Phase 6-B로 이관한다. 이 보정 전까지 Packet Capture 상시 운영은 활성화하지 않는다.
+Phase 6-A 핵심 실기기 P0 동작 흐름은 PASS로 판정한다. 다만 Session 59는 수동 실기기 실행으로 공식 `run-manifest.json`, `scenario-result.jsonl`, Evaluation Export가 생성되지 않았으므로 전체 문서 Exit Gate는 `HOLD`로 남긴다. 존재하지 않는 공식 평가 산출물을 사후에 만들어낸 것처럼 기록하지 않는다.
+
+또한 `esp32_02`의 정상 sparse cadence가 현재 Packet IF 임계값을 근소하게 초과한 사례는 Runtime 결함이 아닌 모델 보정 후속 작업으로 확인했으며 Phase 6-B로 이관한다. 이 보정 전까지 Packet Capture 상시 운영은 활성화하지 않는다.
 
 ## 2. 검증 기준
 
@@ -21,7 +23,7 @@ Phase 6-A P0 흐름은 완료로 판정한다. 단, `esp32_02`의 정상 sparse 
 - Processed windows: `19/19`
 - Window range: `2026-08-15T14:34:50Z` ~ `2026-08-15T14:38:00Z`
 
-Session 53은 재사용하지 않았으며, Phase 6-A 공식 검증을 위한 신규 Session 59만 사용했다.
+Session 53은 재사용하지 않았으며 신규 Session 59만 사용했다. 단, Session 59는 자동 Scenario Runner가 생성한 공식 평가 Run이 아니라 승인된 수동 실기기 E2E다.
 
 ## 3. MQTT Identity 및 ACL
 
@@ -196,3 +198,11 @@ Session 59 재계산 결과는 다음과 같다.
 - PR #65: Mosquitto listener별 인증 설정 보완
 
 이 문서는 위 구현 PR을 변경하지 않고 실제 통합 배포·검증 결과와 남은 후속 작업을 고정한다.
+
+## 11. Exit Gate에 남은 항목
+
+- 공식 Scenario Runner 기반 신규 Run Manifest, Scenario Result 및 Evaluation Export 연결
+- 위 산출물의 SHA256과 Session/Detection/Trust/Firewall/Recovery provenance 검증
+- `esp32_02` 정상 sparse cadence 보정 전 Packet Capture 상시 운영 보류
+
+Session 59의 DB·Runtime·Dashboard 증적은 삭제하거나 PASS로 과장하지 않고 수동 E2E 근거로 유지한다. 공식 평가 산출물이 필요한 경우 기존 Session 59를 사후 포장하지 않고, 계약을 따르는 신규 Run을 별도로 수행한다.
