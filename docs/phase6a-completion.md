@@ -56,10 +56,12 @@ Broker ACL과 Application Detection은 서로 다른 계층으로 검증했다. 
 
 ## 4. Trust, Isolation 및 Firewall Enforcement
 
-Session 59에서 확인한 Trust 변화는 다음과 같다.
+Session 59에서 확인한 Trust 결과는 다음과 같다.
 
-- `esp32_01`: `100 → 75 → 50 → 25`
+- `esp32_01`: Recovery 직전 최종 `25`; `DEVICE_ID_MISMATCH` Event `35`, `36`의 확인된 감점은 각 `-25`로 합계 `-50`
 - `esp32_02`: `100 → 85 → 70`
+
+기존에 기재했던 `esp32_01`의 전체 경로 `100 → 75 → 50 → 25`는 세 번의 `-25` 감점을 뜻하지만, 현재 보존된 완료 증적에는 Event `35`, `36` 두 건과 Trust History ID `19`만 식별돼 있다. 따라서 확인되지 않은 나머지 한 번의 감점 근거를 추정해 연결하지 않고, 전체 점수 경로는 Trust History의 `previous_score`, `new_score`, `actual_delta`, `representative_event_ids`를 다시 조회해 provenance를 보완할 때까지 `HOLD`로 둔다.
 
 `esp32_01`은 Trust Score가 격리 기준 미만으로 내려가 격리됐다.
 
@@ -104,7 +106,7 @@ Writer 복구 후 다음 신규 데이터가 생성됐다.
 
 ## 6. Dashboard 실제 화면 검증
 
-Frontend는 Mock이 아닌 실제 Raspberry Pi API를 사용해 `http://localhost:5173`에서 확인했다.
+Frontend는 `http://localhost:5173`에서 실제 Raspberry Pi의 read-only API 데이터를 사용해 기본 화면 Smoke를 수행했다. 아래 항목은 조회·표시 범위의 PASS이며, 모든 Frontend–Backend API 연결과 통합 검증이 완료됐다는 의미는 아니다.
 
 - Dashboard 요약: 전체 2, 정상 1, 주의 1, 격리 0, Firewall 적용 0
 - API Health: API `ok`, Database `ok`, DB 연결됨
@@ -121,6 +123,8 @@ Frontend는 Mock이 아닌 실제 Raspberry Pi API를 사용해 `http://localhos
 - Browser console error/warning 없음
 
 현재 격리 Device가 없기 때문에 Recovery Execute Panel이 표시되지 않는 것은 정상이다. 완료된 Recovery operation은 Backend History API로 확인했다.
+
+미수행 범위는 Detection Severity·Incident Family Filter 전체 조합, Dashboard에서의 Recovery Preflight/Execute 명령 호출, 완료 Recovery Audit 전용 History UI를 포함한 전체 API 통합 검증이다. 따라서 **실제 Pi read-only API 기반 기본 화면 Smoke는 PASS**, **Filter·Recovery 명령을 포함한 전체 Frontend–Backend 통합 검증은 HOLD**로 구분한다.
 
 ## 7. 최종 Runtime 상태
 
@@ -203,6 +207,8 @@ Session 59 재계산 결과는 다음과 같다.
 
 - 공식 Scenario Runner 기반 신규 Run Manifest, Scenario Result 및 Evaluation Export 연결
 - 위 산출물의 SHA256과 Session/Detection/Trust/Firewall/Recovery provenance 검증
+- `esp32_01`의 전체 `100 → 25` 경로 중 현재 Event `35`, `36`으로 설명되지 않는 25점 구간의 Trust History·대표 Event·Delta provenance 확인
+- Dashboard Filter Matrix, Recovery 명령 API 및 완료 Recovery Audit 전용 History UI 통합 검증
 - `esp32_02` 정상 sparse cadence 보정 전 Packet Capture 상시 운영 보류
 
 Session 59의 DB·Runtime·Dashboard 증적은 삭제하거나 PASS로 과장하지 않고 수동 E2E 근거로 유지한다. 공식 평가 산출물이 필요한 경우 기존 Session 59를 사후 포장하지 않고, 계약을 따르는 신규 Run을 별도로 수행한다.
