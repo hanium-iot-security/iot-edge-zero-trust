@@ -34,7 +34,9 @@ def test_packet_feature_extractor_timer_contract() -> None:
 
     timer = TIMER_PATH.read_text(encoding="utf-8")
 
-    assert "OnBootSec=5s" in timer
+    # 첫 실행은 timer 활성화 5초 뒤로 고정하여 수동 Cutover에서도 즉시 실행되지 않는다.
+    assert "OnActiveSec=5s" in timer
+    assert "OnBootSec=" not in timer
     assert "OnUnitActiveSec=5s" in timer
     assert "AccuracySec=1s" in timer
     assert "Unit=packet-feature-extractor.service" in timer
