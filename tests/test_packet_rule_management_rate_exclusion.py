@@ -5,7 +5,10 @@ from types import SimpleNamespace
 import pytest
 
 from backend.app import config
+from backend.app.config import Settings
 from edge.detection.packet_rule_detector import PacketRulePolicy, detect_packet_rules
+from edge.orchestration.packet_stage_readiness import PacketFeatureReadyStage
+from edge.orchestration.stage_registry import PACKET_RULE, build_stage_registry
 
 
 def _policy_with_management_peer(peer_ip: str) -> PacketRulePolicy:
@@ -109,3 +112,24 @@ def test_from_env_rejects_invalid_packet_rate_excluded_peer_ip(
 
     with pytest.raises(ValueError, match="packet_rate_excluded_peer_ips"):
         PacketRulePolicy.from_env()
+
+
+def test_orchestrator_packet_rule_stage_receives_packet_rate_exclusion() -> None:
+    app_settings = Settings(
+        orchestrator_enabled_stages=PACKET_RULE,
+        orchestrator_required_stages=PACKET_RULE,
+        packet_rule_packet_rate_excluded_peer_ips="192.168.0.3",
+        packet_rule_policy_version="packet-rule-policy-v2",
+    )
+
+    registry = build_stage_registry(
+        enabled=(PACKET_RULE,),
+        required=(PACKET_RULE,),
+        app_settings=app_settings,
+    )
+
+    configured = registry.stages[0]
+    assert isinstance(configured.stage, PacketFeatureReadyStage)
+    assert configured.stage.delegate.rule_policy.packet_rate_excluded_peer_ips == frozenset(
+        {"192.168.0.3"}
+    )
