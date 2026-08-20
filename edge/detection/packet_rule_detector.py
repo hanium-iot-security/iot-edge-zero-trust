@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from ipaddress import ip_address
 import logging
 from math import isfinite
 from typing import Any
@@ -97,7 +98,37 @@ class PacketRulePolicy:
             broker_dos_tcp_syn_threshold=settings.packet_rule_broker_dos_tcp_syn_threshold,
             broker_dos_mqtt_packet_threshold=settings.packet_rule_broker_dos_mqtt_packet_threshold,
             version=settings.packet_rule_policy_version,
+            packet_rate_excluded_peer_ips=_parse_packet_rate_excluded_peer_ips(
+                settings.packet_rule_packet_rate_excluded_peer_ips
+            ),
         )
+
+
+def _parse_packet_rate_excluded_peer_ips(raw_value: str) -> frozenset[str]:
+    """쉼표로 구분된 Packet Rate 제외 Peer IP를 검증·정규화한다.
+
+    빈 값은 기존 Packet Rule 동작을 유지하기 위해 빈 집합으로 처리한다.
+    잘못된 IP는 탐지 예외가 조용히 잘못 적용되지 않도록 fail-fast 한다.
+    """
+    normalized: set[str] = set()
+
+    for part in raw_value.split(","):
+        candidate = part.strip()
+
+        if not candidate:
+            continue
+
+        try:
+            parsed = ip_address(candidate)
+        except ValueError as exc:
+            raise ValueError(
+                "packet_rate_excluded_peer_ips contains invalid IP address: "
+                f"{candidate!r}"
+            ) from exc
+
+        normalized.add(str(parsed))
+
+    return frozenset(normalized)
 
 
 DEFAULT_PACKET_RULE_POLICY = PacketRulePolicy(
