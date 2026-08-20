@@ -34,7 +34,7 @@ from backend.app.database import SessionLocal
 from edge.features.collect_feature_logs import parse_db_datetime
 from edge.features.packet_feature_repository import (
     fetch_ready_segments,
-    get_segment_status_by_file_name,
+    get_reconcilable_segment_statuses_by_file_names,
     insert_packet_feature_rows,
     load_ip_device_map,
     update_capture_segment_status,
@@ -143,22 +143,31 @@ def reconcile_orphaned_files(
     *,
     session_id: str | None = None,
 ) -> int:
-    """ready_dir 안 파일 중 DB 상태가 READY가 아닌 것을 올바른 디렉터리로 이동합니다.
+    """ready_dir의 terminal DB 상태 파일을 올바른 디렉터리로 이동합니다.
 
-    이전 실행에서 DB 커밋 후 파일 이동이 실패한 경우를 복구합니다.
+    이전 실행에서 DB commit 후 파일 이동이 실패한 경우를 복구합니다. ready/의
+    파일명 목록은 한 번 스캔하지만 DB 상태는 파일마다 조회하지 않고 batch 조회합니다.
+    READY 또는 DB에 없는 파일은 그대로 둡니다.
     반환값: 실제로 이동한 파일 수.
     """
     if not ready_dir.exists():
         return 0
+
+    pcap_files = sorted(ready_dir.glob("*.pcap"))
+    if not pcap_files:
+        return 0
+
+    statuses = get_reconcilable_segment_statuses_by_file_names(
+        db,
+        file_names=[pcap_file.name for pcap_file in pcap_files],
+        session_id=session_id,
+    )
+
     moved = 0
-    for pcap_file in sorted(ready_dir.glob("*.pcap")):
-        status = get_segment_status_by_file_name(
-            db,
-            file_name=pcap_file.name,
-            session_id=session_id,
-        )
+    for pcap_file in pcap_files:
+        status = statuses.get(pcap_file.name)
         if status is None:
-            continue  # DB에 없는 파일: 무시
+            continue
         try:
             if status in ("PROCESSED", "EMPTY"):
                 _move_pcap(pcap_file, processed_dir)
@@ -168,7 +177,6 @@ def reconcile_orphaned_files(
                 _move_pcap(pcap_file, failed_dir)
                 moved += 1
                 logger.info("reconcile: %s → failed/", pcap_file.name)
-            # READY: 건드리지 않음
         except FileExistsError:
             logger.error(
                 "reconcile: %s 충돌 — 동명 파일의 내용이 다릅니다. "
@@ -323,7 +331,6 @@ def process_segment(
     feature_rows = build_packet_features(packets, pi_ip, window_start, window_end)
 
     if not feature_rows:
-        # 패킷이 존재하지만 모두 window 범위 밖: 잘못된 pcap 파일 할당
         if packet_count > 0 and not _any_in_window(packets, window_start, window_end):
             _update_segment(
                 db, segment_id,
@@ -334,7 +341,6 @@ def process_segment(
             db.commit()
             logger.warning("WINDOW_MISMATCH segment_id=%d file=%s", segment_id, pcap_path)
             return "FAILED"
-        # window 내 패킷이 없거나 Pi 관련 트래픽 없음
         _update_segment(db, segment_id, status="EMPTY", packet_count=packet_count)
         db.commit()
         return "EMPTY"
@@ -374,7 +380,6 @@ def extract_packet_features(
                 )
             else:
                 _require_completed_capture_session(db, selected_session_id)
-            # 이전 실행에서 커밋 후 이동 실패한 파일을 먼저 복구
             reconcile_orphaned_files(
                 db,
                 ready_dir,
@@ -393,7 +398,6 @@ def extract_packet_features(
         for segment in segments:
             pcap_path = ready_dir / segment["file_name"]
 
-            # DB 처리 예외와 파일 이동 예외를 분리
             try:
                 with SessionLocal() as db:
                     status = process_segment(
@@ -402,18 +406,15 @@ def extract_packet_features(
             except OperationalError as exc:
                 err_lower = str(exc).lower()
                 if "locked" in err_lower or "busy" in err_lower:
-                    # SQLite database is locked/busy: 일시적 경합, READY 유지 후 재시도
                     logger.exception(
                         "DB 잠금/연결 오류로 segment_id=%d 처리 실패, READY 유지", segment["id"]
                     )
                     continue
-                # 테이블 누락, 디스크 오류 등 복구 불가능한 OperationalError: 상위로 전파
                 logger.exception(
                     "복구 불가능한 OperationalError로 segment_id=%d 처리 중단", segment["id"]
                 )
                 raise
             except SQLAlchemyError:
-                # IntegrityError, ProgrammingError 등 구조적 DB 오류: 상위로 전파
                 logger.exception(
                     "복구 불가능한 DB 오류로 segment_id=%d 처리 중단", segment["id"]
                 )
@@ -424,7 +425,6 @@ def extract_packet_features(
                 )
                 raise
 
-            # DB 커밋 성공 후 파일 이동 실패는 별도 로그 (다음 실행 시 reconcile이 복구)
             try:
                 if status in ("PROCESSED", "EMPTY") and pcap_path.exists():
                     _move_pcap(pcap_path, processed_dir)
