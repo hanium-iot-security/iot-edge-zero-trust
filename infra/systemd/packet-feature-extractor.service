@@ -1,0 +1,20 @@
+[Unit]
+Description=IoT Edge Zero Trust - Packet Feature Extractor
+After=network-online.target systemd-time-wait-sync.service
+Wants=network-online.target systemd-time-wait-sync.service
+
+[Service]
+Type=oneshot
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/iot-edge-zero-trust
+EnvironmentFile=/home/pi/iot-edge-zero-trust/.env
+ExecStart=/home/pi/iot-edge-zero-trust/venv/bin/python -m edge.features.run_packet_feature_extractor --limit 20
+
+TimeoutStartSec=120
+TimeoutStopSec=15
+NoNewPrivileges=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=packet-feature-extractor

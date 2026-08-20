@@ -5,12 +5,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 from edge.packet.pcap_naming import format_utc_iso
 
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+RECONCILIATION_STATUS_BATCH_SIZE = 500
 
 
 def load_ip_device_map(db: Session) -> dict[str, str]:
@@ -80,6 +81,48 @@ def get_segment_status_by_file_name(
         {"file_name": file_name, "session_id": session_id},
     ).first()
     return str(row[0]) if row is not None else None
+
+
+def get_reconcilable_segment_statuses_by_file_names(
+    db: Session,
+    *,
+    file_names: list[str],
+    session_id: str | None = None,
+    batch_size: int = RECONCILIATION_STATUS_BATCH_SIZE,
+) -> dict[str, str]:
+    """ready/ 파일 중 terminal DB 상태만 batch 조회합니다.
+
+    READY 또는 DB에 없는 파일은 Reconciliation 이동 대상이 아니므로 결과에서
+    제외합니다. SQLite host parameter 수를 안정적으로 제한하기 위해 file_names를
+    고정 크기 batch로 나눕니다.
+    """
+    if not file_names:
+        return {}
+    if batch_size < 1:
+        raise ValueError(f"batch_size는 1 이상이어야 합니다: {batch_size}")
+
+    statement = text(
+        """
+        SELECT pcsg.file_name, pcsg.status
+        FROM packet_capture_segments pcsg
+        JOIN packet_capture_sessions pcs
+            ON pcs.id = pcsg.capture_session_id
+        WHERE pcsg.file_name IN :file_names
+          AND pcsg.status IN ('PROCESSED', 'EMPTY', 'FAILED')
+          AND (:session_id IS NULL OR pcs.session_id = :session_id)
+        """
+    ).bindparams(bindparam("file_names", expanding=True))
+
+    statuses: dict[str, str] = {}
+    for start in range(0, len(file_names), batch_size):
+        chunk = file_names[start : start + batch_size]
+        rows = db.execute(
+            statement,
+            {"file_names": chunk, "session_id": session_id},
+        ).mappings()
+        for row in rows:
+            statuses[str(row["file_name"])] = str(row["status"])
+    return statuses
 
 
 def update_capture_segment_status(
