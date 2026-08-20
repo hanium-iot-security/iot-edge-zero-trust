@@ -54,21 +54,7 @@ def _capture_policy(app_settings: Settings) -> CapturePolicy:
 
 
 def _packet_rule_policy(app_settings: Settings) -> PacketRulePolicy:
-    return PacketRulePolicy(
-        packet_rate_threshold=app_settings.packet_rule_packet_rate_threshold,
-        byte_rate_threshold=app_settings.packet_rule_byte_rate_threshold,
-        port_scan_distinct_port_threshold=(
-            app_settings.packet_rule_port_scan_distinct_port_threshold
-        ),
-        port_scan_syn_threshold=app_settings.packet_rule_port_scan_syn_threshold,
-        broker_dos_tcp_syn_threshold=(
-            app_settings.packet_rule_broker_dos_tcp_syn_threshold
-        ),
-        broker_dos_mqtt_packet_threshold=(
-            app_settings.packet_rule_broker_dos_mqtt_packet_threshold
-        ),
-        version=app_settings.packet_rule_policy_version,
-    )
+    return PacketRulePolicy.from_settings(app_settings)
 
 
 def _build_packet_rule(app_settings: Settings) -> DetectorStage:
