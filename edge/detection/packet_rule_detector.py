@@ -87,21 +87,36 @@ class PacketRulePolicy:
             raise ValueError("version must be a non-empty Packet Rule Policy Version string")
 
     @classmethod
+    def from_settings(cls, app_settings: Any) -> "PacketRulePolicy":
+        """Settings-like object에서 동일한 Packet Rule Policy를 생성한다.
+
+        단독 Detector 실행과 Orchestrator가 반드시 이 경로를 공유해서
+        임계값·탐지 예외·Policy Version이 서로 달라지지 않게 한다.
+        """
+        return cls(
+            packet_rate_threshold=app_settings.packet_rule_packet_rate_threshold,
+            byte_rate_threshold=app_settings.packet_rule_byte_rate_threshold,
+            port_scan_distinct_port_threshold=(
+                app_settings.packet_rule_port_scan_distinct_port_threshold
+            ),
+            port_scan_syn_threshold=app_settings.packet_rule_port_scan_syn_threshold,
+            broker_dos_tcp_syn_threshold=(
+                app_settings.packet_rule_broker_dos_tcp_syn_threshold
+            ),
+            broker_dos_mqtt_packet_threshold=(
+                app_settings.packet_rule_broker_dos_mqtt_packet_threshold
+            ),
+            version=app_settings.packet_rule_policy_version,
+            packet_rate_excluded_peer_ips=_parse_packet_rate_excluded_peer_ips(
+                app_settings.packet_rule_packet_rate_excluded_peer_ips
+            ),
+        )
+
+    @classmethod
     def from_env(cls) -> "PacketRulePolicy":
         from backend.app.config import settings
 
-        return cls(
-            packet_rate_threshold=settings.packet_rule_packet_rate_threshold,
-            byte_rate_threshold=settings.packet_rule_byte_rate_threshold,
-            port_scan_distinct_port_threshold=settings.packet_rule_port_scan_distinct_port_threshold,
-            port_scan_syn_threshold=settings.packet_rule_port_scan_syn_threshold,
-            broker_dos_tcp_syn_threshold=settings.packet_rule_broker_dos_tcp_syn_threshold,
-            broker_dos_mqtt_packet_threshold=settings.packet_rule_broker_dos_mqtt_packet_threshold,
-            version=settings.packet_rule_policy_version,
-            packet_rate_excluded_peer_ips=_parse_packet_rate_excluded_peer_ips(
-                settings.packet_rule_packet_rate_excluded_peer_ips
-            ),
-        )
+        return cls.from_settings(settings)
 
 
 def _parse_packet_rate_excluded_peer_ips(raw_value: str) -> frozenset[str]:
