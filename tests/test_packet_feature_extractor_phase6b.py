@@ -12,8 +12,6 @@ from sqlalchemy.orm import sessionmaker
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
 from edge.detection import runtime_checkpoint_repository as checkpoints
 from edge.detection.phase4_time import format_db_utc
-from edge.detection.rule_detector import DETECTOR_RULE
-from edge.features.collect_feature_logs import MQTT_FEATURE_BUILDER, MQTT_LOGS_SOURCE
 from edge.features.run_mqtt_feature_builder import (
     bootstrap_producer_checkpoint,
     run_producer_cycle,
@@ -78,7 +76,7 @@ def _insert_capture_session(db, *, status: str = "COMPLETED") -> int:
             "session_id": FAILED_SESSION_ID,
             "started_at": format_db_utc(BASE),
             "first_window_start": format_db_utc(BASE),
-            "ended_at": format_db_utc(BASE + timedelta(seconds=20)),
+            "ended_at": format_db_utc(BASE + timedelta(seconds=30)),
             "status": status,
         },
     )
@@ -120,7 +118,7 @@ def _insert_segment(
 
 
 def test_reconciliation_uses_one_batched_segment_status_query(tmp_path: Path) -> None:
-    """ready 파일 수만큼 DB SELECT를 반복하지 않는다."""
+    """소량 ready 파일은 파일마다 SELECT하지 않고 한 번에 상태를 조회한다."""
     from edge.features.run_packet_feature_extractor import reconcile_orphaned_files
 
     db_path = tmp_path / "reconcile.db"
@@ -249,13 +247,11 @@ def test_global_mode_processes_ready_child_of_failed_parent_without_skipping_fai
     engine.dispose()
     assert count == 1
     assert ready_status == "PROCESSED"
-    assert failed_row == ("FAILED", "LATE_CAPTURE")
+    assert tuple(failed_row) == ("FAILED", "LATE_CAPTURE")
 
 
 def test_failed_parent_segment_blocks_packet_and_trust_checkpoints(tmp_path: Path) -> None:
     """FAILED Capture Session의 실패 Window를 Packet/Trust가 건너뛰지 않는다."""
-    from edge.features.run_mqtt_feature_builder import run_producer_cycle
-
     db_path = tmp_path / "failed-parent-gate.db"
     apply_migrations(db_path, MIGRATIONS_DIR)
     SessionLocal, engine = _make_test_session_factory(db_path)
@@ -271,7 +267,7 @@ def test_failed_parent_segment_blocks_packet_and_trust_checkpoints(tmp_path: Pat
             {"ip": ESP_IP},
         )
         bootstrap_producer_checkpoint(db, now=BASE)
-        for second in range(10):
+        for message_index in range(20):
             db.execute(
                 text(
                     """
@@ -286,7 +282,11 @@ def test_failed_parent_segment_blocks_packet_and_trust_checkpoints(tmp_path: Pat
                     )
                     """
                 ),
-                {"received_at": format_db_utc(BASE + timedelta(seconds=second))},
+                {
+                    "received_at": format_db_utc(
+                        BASE + timedelta(seconds=message_index % 10)
+                    )
+                },
             )
         session_pk = _insert_capture_session(db, status="FAILED")
         _insert_segment(
@@ -314,7 +314,7 @@ def test_failed_parent_segment_blocks_packet_and_trust_checkpoints(tmp_path: Pat
     with SessionLocal() as db:
         assert checkpoints.get_completed_window_end(
             db,
-            detector_name=DETECTOR_RULE,
+            detector_name=PACKET_RULE,
             source_table="packet_feature_logs",
         ) is None
         assert checkpoints.get_completed_window_end(
