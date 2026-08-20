@@ -66,6 +66,7 @@ class PacketRulePolicy:
     broker_dos_tcp_syn_threshold: int
     broker_dos_mqtt_packet_threshold: int
     version: str
+    packet_rate_excluded_peer_ips: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         for name in ("packet_rate_threshold", "byte_rate_threshold"):
@@ -144,7 +145,11 @@ def detect_packet_rules(
     duration = float(row["captured_duration_seconds"])
 
     packets_per_second = effective_packets_per_second(float(row["packet_count"]), duration)
-    if packets_per_second > policy.packet_rate_threshold:
+    peer_ip = str(row.get("peer_ip") or "")
+    if (
+        packets_per_second > policy.packet_rate_threshold
+        and peer_ip not in policy.packet_rate_excluded_peer_ips
+    ):
         events.append(
             {
                 "event_type": PACKET_RATE_ANOMALY,
