@@ -2,7 +2,7 @@
 Description=IoT Edge Zero Trust - Packet Feature Extractor Timer
 
 [Timer]
-OnActiveSec=5s
+OnActiveSec=10s
 OnUnitActiveSec=5s
 AccuracySec=1s
 Unit=packet-feature-extractor.service
