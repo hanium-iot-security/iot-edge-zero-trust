@@ -23,6 +23,8 @@ def test_packet_feature_extractor_service_contract() -> None:
         "-m edge.features.run_packet_feature_extractor --limit 20"
     ) in unit
     assert "--session-id" not in unit
+    assert "TimeoutStartSec=120" in unit
+    assert "TimeoutStopSec=15" in unit
     assert "NoNewPrivileges=true" in unit
     assert "StandardOutput=journal" in unit
     assert "StandardError=journal" in unit
@@ -34,8 +36,9 @@ def test_packet_feature_extractor_timer_contract() -> None:
 
     timer = TIMER_PATH.read_text(encoding="utf-8")
 
-    # 첫 실행은 timer 활성화 5초 뒤로 고정하여 수동 Cutover에서도 즉시 실행되지 않는다.
-    assert "OnActiveSec=5s" in timer
+    # 최초 실행은 timer 활성화 10초 뒤, 이후에는 service activation 기준 5초 주기다.
+    assert "OnActiveSec=10s" in timer
+    assert "OnActiveSec=5s" not in timer
     assert "OnBootSec=" not in timer
     assert "OnUnitActiveSec=5s" in timer
     assert "AccuracySec=1s" in timer
@@ -49,8 +52,14 @@ def test_packet_feature_runbook_documents_systemd_cutover_contract() -> None:
     assert "packet-feature-extractor.service" in runbook
     assert "packet-feature-extractor.timer" in runbook
     assert "--limit 20" in runbook
-    assert "5초" in runbook
+    assert "OnActiveSec=10s" in runbook
+    assert "OnUnitActiveSec=5s" in runbook
+    assert "TimeoutStartSec=120" in runbook
     assert "ORCHESTRATOR_ENABLED_STAGES=mqtt_feature_rule,mqtt_message_rule" in runbook
     assert "sudo systemctl enable --now packet-feature-extractor.timer" in runbook
     assert "sudo systemctl disable --now packet-feature-extractor.timer" in runbook
+    assert "sudo systemctl stop packet-feature-extractor.service" in runbook
     assert "READY Backlog" in runbook
+    assert "Steady-state Cutover Gate" in runbook
+    assert "READY Backlog = 0" in runbook
+    assert "packet-capture.service = inactive" in runbook
