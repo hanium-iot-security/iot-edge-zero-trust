@@ -138,7 +138,7 @@ DEFAULT_PACKET_RULE_POLICY = PacketRulePolicy(
     port_scan_syn_threshold=15,
     broker_dos_tcp_syn_threshold=30,
     broker_dos_mqtt_packet_threshold=100,
-    version="packet-rule-policy-v1",
+    version="packet-rule-policy-v2",
 )
 
 
