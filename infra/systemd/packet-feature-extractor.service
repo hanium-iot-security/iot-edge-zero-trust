@@ -11,6 +11,8 @@ WorkingDirectory=/home/pi/iot-edge-zero-trust
 EnvironmentFile=/home/pi/iot-edge-zero-trust/.env
 ExecStart=/home/pi/iot-edge-zero-trust/venv/bin/python -m edge.features.run_packet_feature_extractor --limit 20
 
+TimeoutStartSec=120
+TimeoutStopSec=15
 NoNewPrivileges=true
 
 StandardOutput=journal
