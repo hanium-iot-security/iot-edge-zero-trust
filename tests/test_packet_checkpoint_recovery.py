@@ -260,21 +260,26 @@ def _build_plan(
     detector_name: str = "packet_rule",
     current_session_id: str = CURRENT_SESSION,
     target_session_id: str = TARGET_SESSION,
+    mode: str | None = None,
 ) -> dict[str, object]:
     database_path = Path(
         connection.execute("PRAGMA database_list").fetchone()["file"]
     ).resolve()
-    return build_recovery_plan(
-        connection,
-        repository_state=_repository_state_for_plan(tmp_path),
-        database_path=database_path,
-        detector_name=detector_name,
-        current_session_id=current_session_id,
-        target_session_id=target_session_id,
-        approved_by="operator@example.com",
-        reason="recover capture-session gap",
-        lock_entries=({"path": str(tmp_path / "recovery.lock"), "roles": ["test"]},),
-    )
+    arguments = {
+        "repository_state": _repository_state_for_plan(tmp_path),
+        "database_path": database_path,
+        "detector_name": detector_name,
+        "current_session_id": current_session_id,
+        "target_session_id": target_session_id,
+        "approved_by": "operator@example.com",
+        "reason": "recover capture-session gap",
+        "lock_entries": (
+            {"path": str(tmp_path / "recovery.lock"), "roles": ["test"]},
+        ),
+    }
+    if mode is not None:
+        arguments["mode"] = mode
+    return build_recovery_plan(connection, **arguments)
 
 
 def _blocking_codes(plan: dict[str, object]) -> set[str]:
@@ -583,6 +588,115 @@ def test_verify_plan_sha256_rejects_bound_field_tampering() -> None:
 
     with pytest.raises(PacketCheckpointRecoveryError, match="plan SHA256"):
         verify_plan_sha256(plan)
+
+
+def test_plan_sha_binds_recovery_mode_and_live_resume_fields() -> None:
+    gap = attach_plan_sha256(
+        {
+            "mode": "gap-recovery",
+            "target_session": {
+                "status": "COMPLETED",
+                "first_window_start": _db_utc(TARGET_FIRST),
+            },
+        },
+        generated_at=UTC_A,
+    )
+    live = attach_plan_sha256(
+        {
+            "mode": "live-resume",
+            "target_session": {
+                "status": "RUNNING",
+                "first_window_start": _db_utc(TARGET_FIRST),
+            },
+        },
+        generated_at=UTC_A,
+    )
+
+    assert gap["plan_sha256"] != live["plan_sha256"]
+    live["target_session"]["first_window_start"] = _db_utc(
+        TARGET_FIRST + timedelta(seconds=10)
+    )
+    with pytest.raises(PacketCheckpointRecoveryError, match="plan SHA256"):
+        verify_plan_sha256(live)
+
+
+def test_live_resume_requires_distinct_execute_confirmation(tmp_path: Path) -> None:
+    connection = _seed_valid_recovery_database(tmp_path / "live-confirm.db")
+    try:
+        connection.execute(
+            "UPDATE packet_capture_sessions SET status = 'RUNNING', ended_at = NULL "
+            "WHERE session_id = ?",
+            (TARGET_SESSION,),
+        )
+        connection.commit()
+        plan = attach_plan_sha256(
+            _build_plan(connection, tmp_path=tmp_path, mode="live-resume"),
+            generated_at=UTC_A,
+        )
+
+        packet_checkpoint_recovery.require_execute_confirmations(
+            plan,
+            confirm="APPLY-PACKET-LIVE-RESUME",
+            confirm_skip_processable=None,
+        )
+        with pytest.raises(
+            PacketCheckpointRecoveryError, match="execute confirmation mismatch"
+        ):
+            packet_checkpoint_recovery.require_execute_confirmations(
+                plan,
+                confirm="APPLY-PACKET-CHECKPOINT-GAP-RECOVERY",
+                confirm_skip_processable=None,
+            )
+    finally:
+        connection.close()
+
+
+def test_live_resume_reuses_processable_skip_confirmation(tmp_path: Path) -> None:
+    connection = _seed_valid_recovery_database(tmp_path / "live-skip-confirm.db")
+    try:
+        connection.execute(
+            "UPDATE packet_capture_sessions SET status = 'RUNNING', ended_at = NULL "
+            "WHERE session_id = ?",
+            (TARGET_SESSION,),
+        )
+        skipped_first = CURRENT_READY_THROUGH + timedelta(seconds=10)
+        skipped_pk = _insert_capture_session(
+            connection,
+            session_id=PROCESSABLE_SKIP_SESSION,
+            capture_interface="eth-live-skipped",
+            first_window_start=skipped_first,
+        )
+        _insert_capture_segment(
+            connection,
+            session_pk=skipped_pk,
+            capture_interface="eth-live-skipped",
+            window_start=skipped_first,
+            status="EMPTY",
+        )
+        connection.commit()
+        plan = attach_plan_sha256(
+            _build_plan(connection, tmp_path=tmp_path, mode="live-resume"),
+            generated_at=UTC_A,
+        )
+        confirmation = f"SKIP-PROCESSABLE-SESSIONS:{plan['plan_sha256']}"
+
+        assert plan["summary"]["skips_processable_sessions"] is True
+        packet_checkpoint_recovery.require_execute_confirmations(
+            plan,
+            confirm="APPLY-PACKET-LIVE-RESUME",
+            confirm_skip_processable=confirmation,
+        )
+        with pytest.raises(
+            PacketCheckpointRecoveryError,
+            match="processable-session confirmation mismatch",
+        ):
+            packet_checkpoint_recovery.require_execute_confirmations(
+                plan,
+                confirm="APPLY-PACKET-LIVE-RESUME",
+                confirm_skip_processable=None,
+            )
+    finally:
+        connection.close()
 
 
 def test_canonical_plan_sha_changes_when_resolved_database_path_changes(
@@ -1034,6 +1148,306 @@ def test_plan_requires_existing_completed_current_and_target_sessions(
         connection.close()
 
 
+def test_gap_recovery_still_rejects_running_target(tmp_path: Path) -> None:
+    connection = _seed_valid_recovery_database(tmp_path / "gap-running-target.db")
+    try:
+        connection.execute(
+            "UPDATE packet_capture_sessions SET status = 'RUNNING', ended_at = NULL "
+            "WHERE session_id = ?",
+            (TARGET_SESSION,),
+        )
+        connection.commit()
+
+        plan = _build_plan(connection, tmp_path=tmp_path)
+
+        assert plan["mode"] == "gap-recovery"
+        assert "TARGET_SESSION_NOT_COMPLETED" in _blocking_codes(plan)
+        assert "RUNNING_CAPTURE_SESSIONS" in _blocking_codes(plan)
+        assert plan["can_execute"] is False
+    finally:
+        connection.close()
+
+
+def test_live_resume_allows_one_running_target_with_terminal_prefix(
+    tmp_path: Path,
+) -> None:
+    connection = _seed_valid_recovery_database(tmp_path / "live-running-target.db")
+    try:
+        connection.execute(
+            "UPDATE packet_capture_sessions SET status = 'RUNNING', ended_at = NULL "
+            "WHERE session_id = ?",
+            (TARGET_SESSION,),
+        )
+        connection.commit()
+
+        plan = _build_plan(connection, tmp_path=tmp_path, mode="live-resume")
+
+        assert plan["mode"] == "live-resume"
+        assert plan["can_execute"] is True
+        assert plan["blocking_reasons"] == []
+        assert plan["target_session"]["status"] == "RUNNING"
+        assert plan["target_session"]["first_window_start"] == _db_utc(TARGET_FIRST)
+        assert plan["target_session"]["packet_feature_ready_through"] == _db_utc(
+            TARGET_READY_THROUGH
+        )
+        assert plan["summary"]["running_sessions"] == [
+            {
+                "classification": "LIVE_RESUME_TARGET",
+                "session_id": TARGET_SESSION,
+                "started_at": _db_utc(TARGET_FIRST - timedelta(seconds=10)),
+            }
+        ]
+        assert plan["checkpoint"]["after"] == {
+            "detector_name": "packet_rule",
+            "source_table": "packet_feature_logs",
+            "last_processed_id": 42,
+            "last_completed_window_end": _db_utc(TARGET_FIRST),
+        }
+    finally:
+        connection.close()
+
+
+def test_live_resume_rejects_completed_target(tmp_path: Path) -> None:
+    connection = _seed_valid_recovery_database(tmp_path / "live-completed-target.db")
+    try:
+        plan = _build_plan(connection, tmp_path=tmp_path, mode="live-resume")
+
+        assert "TARGET_SESSION_NOT_RUNNING" in _blocking_codes(plan)
+        assert "LIVE_RESUME_RUNNING_SESSION_MISMATCH" in _blocking_codes(plan)
+        assert plan["can_execute"] is False
+    finally:
+        connection.close()
+
+
+def test_live_resume_is_packet_rule_only(tmp_path: Path) -> None:
+    connection = _seed_valid_recovery_database(tmp_path / "live-packet-if.db")
+    try:
+        with pytest.raises(
+            PacketCheckpointRecoveryError,
+            match="supported only for packet_rule",
+        ):
+            _build_plan(
+                connection,
+                tmp_path=tmp_path,
+                detector_name="packet_if",
+                mode="live-resume",
+            )
+    finally:
+        connection.close()
+
+
+def test_live_resume_rejects_another_running_session(tmp_path: Path) -> None:
+    connection = _seed_valid_recovery_database(tmp_path / "live-two-running.db")
+    try:
+        connection.execute(
+            "UPDATE packet_capture_sessions SET status = 'RUNNING', ended_at = NULL "
+            "WHERE session_id = ?",
+            (TARGET_SESSION,),
+        )
+        _insert_capture_session(
+            connection,
+            session_id=RUNNING_SESSION_A,
+            capture_interface="eth-other-running",
+            first_window_start=TARGET_READY_THROUGH + timedelta(seconds=10),
+            status="RUNNING",
+        )
+        connection.commit()
+
+        plan = _build_plan(connection, tmp_path=tmp_path, mode="live-resume")
+
+        assert "LIVE_RESUME_RUNNING_SESSION_MISMATCH" in _blocking_codes(plan)
+        assert plan["can_execute"] is False
+    finally:
+        connection.close()
+
+
+def test_live_resume_rejects_missing_first_window_start(tmp_path: Path) -> None:
+    connection = _seed_valid_recovery_database(tmp_path / "live-no-first.db")
+    try:
+        connection.execute(
+            "UPDATE packet_capture_sessions "
+            "SET status = 'RUNNING', ended_at = NULL, first_window_start = NULL "
+            "WHERE session_id = ?",
+            (TARGET_SESSION,),
+        )
+        connection.commit()
+
+        plan = _build_plan(connection, tmp_path=tmp_path, mode="live-resume")
+
+        assert "TARGET_SESSION_READY_PREFIX_MISSING" in _blocking_codes(plan)
+        assert "TARGET_SESSION_READINESS_BLOCKED" in _blocking_codes(plan)
+        assert plan["can_execute"] is False
+    finally:
+        connection.close()
+
+
+def test_live_resume_rejects_running_target_without_terminal_prefix(
+    tmp_path: Path,
+) -> None:
+    connection = _seed_valid_recovery_database(tmp_path / "live-no-prefix.db")
+    try:
+        connection.execute(
+            "UPDATE packet_capture_sessions SET status = 'RUNNING', ended_at = NULL "
+            "WHERE session_id = ?",
+            (TARGET_SESSION,),
+        )
+        connection.execute(
+            """
+            UPDATE packet_capture_segments
+            SET status = 'READY'
+            WHERE capture_session_id = (
+                SELECT id FROM packet_capture_sessions WHERE session_id = ?
+            )
+            """,
+            (TARGET_SESSION,),
+        )
+        connection.commit()
+
+        plan = _build_plan(connection, tmp_path=tmp_path, mode="live-resume")
+
+        assert "TARGET_SESSION_READY_PREFIX_MISSING" in _blocking_codes(plan)
+        assert plan["can_execute"] is False
+    finally:
+        connection.close()
+
+
+def test_live_resume_allows_trailing_ready_after_terminal_prefix(
+    tmp_path: Path,
+) -> None:
+    connection = _seed_valid_recovery_database(tmp_path / "live-ready-tail.db")
+    try:
+        connection.execute(
+            "UPDATE packet_capture_sessions SET status = 'RUNNING', ended_at = NULL "
+            "WHERE session_id = ?",
+            (TARGET_SESSION,),
+        )
+        target_pk = int(
+            connection.execute(
+                "SELECT id FROM packet_capture_sessions WHERE session_id = ?",
+                (TARGET_SESSION,),
+            ).fetchone()[0]
+        )
+        _insert_capture_segment(
+            connection,
+            session_pk=target_pk,
+            capture_interface="eth-target",
+            window_start=TARGET_READY_THROUGH,
+            status="READY",
+        )
+        connection.commit()
+
+        plan = _build_plan(connection, tmp_path=tmp_path, mode="live-resume")
+
+        assert plan["can_execute"] is True
+        assert plan["blocking_reasons"] == []
+        assert plan["target_session"]["packet_feature_ready_through"] == _db_utc(
+            TARGET_READY_THROUGH
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "live_reason"),
+    (
+        ("failed", "FAILED_OR_EXTRACTOR_ERROR"),
+        ("extractor_error", "FAILED_OR_EXTRACTOR_ERROR"),
+        ("missing_window", "MISSING_WINDOW"),
+        ("processed_without_feature", "FEATURE_COUNT_MISMATCH"),
+    ),
+)
+def test_live_resume_rejects_failed_error_or_broken_continuity(
+    tmp_path: Path,
+    mutation: str,
+    live_reason: str,
+) -> None:
+    connection = _seed_valid_recovery_database(tmp_path / f"live-{mutation}.db")
+    try:
+        connection.execute(
+            "UPDATE packet_capture_sessions SET status = 'RUNNING', ended_at = NULL "
+            "WHERE session_id = ?",
+            (TARGET_SESSION,),
+        )
+        rows = connection.execute(
+            """
+            SELECT pcsg.id
+            FROM packet_capture_segments pcsg
+            JOIN packet_capture_sessions pcs ON pcs.id = pcsg.capture_session_id
+            WHERE pcs.session_id = ?
+            ORDER BY pcsg.window_start
+            """,
+            (TARGET_SESSION,),
+        ).fetchall()
+        second_id = int(rows[1]["id"])
+        if mutation == "failed":
+            connection.execute(
+                "UPDATE packet_capture_segments SET status = 'FAILED' WHERE id = ?",
+                (second_id,),
+            )
+        elif mutation == "extractor_error":
+            connection.execute(
+                "UPDATE packet_capture_segments SET error_code = 'EXTRACTOR_ERROR' "
+                "WHERE id = ?",
+                (second_id,),
+            )
+        elif mutation == "missing_window":
+            connection.execute(
+                """
+                UPDATE packet_capture_segments
+                SET window_start = ?, window_end = ?
+                WHERE id = ?
+                """,
+                (
+                    _db_utc(TARGET_FIRST + timedelta(seconds=20)),
+                    _db_utc(TARGET_FIRST + timedelta(seconds=30)),
+                    second_id,
+                ),
+            )
+        else:
+            connection.execute(
+                "UPDATE packet_capture_segments SET status = 'PROCESSED' WHERE id = ?",
+                (second_id,),
+            )
+        connection.commit()
+
+        plan = _build_plan(connection, tmp_path=tmp_path, mode="live-resume")
+
+        assert "TARGET_SESSION_READINESS_BLOCKED" in _blocking_codes(plan)
+        assert live_reason in plan["target_session"]["live_resume_blocking_reasons"]
+        assert plan["can_execute"] is False
+    finally:
+        connection.close()
+
+
+def test_live_resume_rejects_checkpoint_at_or_after_target_first(
+    tmp_path: Path,
+) -> None:
+    connection = _seed_valid_recovery_database(tmp_path / "live-no-advance.db")
+    try:
+        connection.execute(
+            "UPDATE packet_capture_sessions SET status = 'RUNNING', ended_at = NULL "
+            "WHERE session_id = ?",
+            (TARGET_SESSION,),
+        )
+        connection.execute(
+            """
+            UPDATE detector_checkpoints
+            SET last_completed_window_end = ?
+            WHERE detector_name = 'packet_rule'
+              AND source_table = 'packet_feature_logs'
+            """,
+            (_db_utc(TARGET_FIRST),),
+        )
+        connection.commit()
+
+        plan = _build_plan(connection, tmp_path=tmp_path, mode="live-resume")
+
+        assert "CHECKPOINT_WOULD_NOT_ADVANCE" in _blocking_codes(plan)
+        assert plan["can_execute"] is False
+    finally:
+        connection.close()
+
+
 def test_plan_requires_current_checkpoint_at_current_ready_through(
     tmp_path: Path,
 ) -> None:
@@ -1452,8 +1866,9 @@ def _dry_run_arguments(
     database: Path,
     repository_root: Path,
     plan_output: Path,
+    mode: str | None = None,
 ) -> dict[str, object]:
-    return {
+    arguments: dict[str, object] = {
         "db_path": database,
         "repository_root": repository_root,
         "detector_name": "packet_rule",
@@ -1466,6 +1881,9 @@ def _dry_run_arguments(
         "manual_lock_path": tmp_path / "locks" / "manual.lock",
         "extractor_lock_path": tmp_path / "locks" / "extractor.lock",
     }
+    if mode is not None:
+        arguments["mode"] = mode
+    return arguments
 
 
 def test_dry_run_writes_canonical_plan_atomically_after_all_gates_pass(
@@ -1931,6 +2349,51 @@ def test_dry_run_cli_returns_two_for_precommit_validation_error(
     assert not plan_output.exists()
 
 
+def test_dry_run_cli_forwards_explicit_live_resume_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = importlib.import_module("edge.detection.run_packet_checkpoint_recovery")
+    captured: dict[str, object] = {}
+
+    def record_inspect(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"mode": kwargs["mode"], "can_execute": True}
+
+    monkeypatch.setattr(cli, "inspect_packet_checkpoint_recovery", record_inspect)
+    exit_code = cli.main(
+        [
+            "dry-run",
+            "--mode",
+            "live-resume",
+            "--db-path",
+            str(tmp_path / "iot.db"),
+            "--repository-root",
+            str(tmp_path),
+            "--detector",
+            "packet_rule",
+            "--current-session-id",
+            CURRENT_SESSION,
+            "--target-session-id",
+            TARGET_SESSION,
+            "--approved-by",
+            "operator@example.com",
+            "--reason",
+            "resume packet rule at live capture",
+            "--plan-output",
+            str(tmp_path / "plan.json"),
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["mode"] == "live-resume"
+    assert json.loads(capsys.readouterr().out) == {
+        "can_execute": True,
+        "mode": "live-resume",
+    }
+
+
 def _execute_fixture(tmp_path: Path) -> dict[str, object]:
     repository_root = _repository(tmp_path)
     database = tmp_path / "execute.db"
@@ -1955,12 +2418,51 @@ def _execute_fixture(tmp_path: Path) -> dict[str, object]:
     }
 
 
+def _live_execute_fixture(tmp_path: Path) -> dict[str, object]:
+    repository_root = _repository(tmp_path)
+    database = tmp_path / "live-execute.db"
+    connection = _seed_valid_recovery_database(database)
+    try:
+        connection.execute(
+            "UPDATE packet_capture_sessions SET status = 'RUNNING', ended_at = NULL "
+            "WHERE session_id = ?",
+            (TARGET_SESSION,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    plan_output = tmp_path / "live-execute-plan.json"
+    plan = packet_checkpoint_recovery.inspect_packet_checkpoint_recovery(
+        **_dry_run_arguments(
+            tmp_path,
+            database=database,
+            repository_root=repository_root,
+            plan_output=plan_output,
+            mode="live-resume",
+        )
+    )
+    artifact_dir = tmp_path / "live-artifacts"
+    artifact_dir.mkdir()
+    return {
+        "repository_root": repository_root,
+        "database": database,
+        "plan_output": plan_output,
+        "plan": plan,
+        "artifact_dir": artifact_dir,
+    }
+
+
 def _valid_execute_kwargs(fixture: dict[str, object]) -> dict[str, object]:
+    confirmation = (
+        packet_checkpoint_recovery.LIVE_RESUME_CONFIRMATION
+        if fixture["plan"].get("mode") == "live-resume"
+        else packet_checkpoint_recovery.EXECUTE_CONFIRMATION
+    )
     return {
         "plan_file": fixture["plan_output"],
         "db_path": fixture["database"],
         "artifact_dir": fixture["artifact_dir"],
-        "confirm": packet_checkpoint_recovery.EXECUTE_CONFIRMATION,
+        "confirm": confirmation,
     }
 
 
@@ -2130,6 +2632,154 @@ def test_execute_keeps_last_processed_id_and_advances_only_time_boundary(
     assert after["last_processed_id"] == before["last_processed_id"] == 42
     assert after["last_completed_window_end"] == _db_utc(TARGET_FIRST)
     assert after["updated_at"] != before["updated_at"]
+
+
+def test_live_resume_execute_preserves_target_features_and_advances_to_first_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _live_execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    with sqlite3.connect(fixture["database"]) as connection:
+        features_before = tuple(
+            connection.execute(
+                """
+                SELECT pfl.*
+                FROM packet_feature_logs pfl
+                JOIN packet_capture_segments pcsg
+                    ON pcsg.id = pfl.capture_segment_id
+                JOIN packet_capture_sessions pcs
+                    ON pcs.id = pcsg.capture_session_id
+                WHERE pcs.session_id = ?
+                ORDER BY pfl.id
+                """,
+                (TARGET_SESSION,),
+            )
+        )
+
+    execute_packet_checkpoint_recovery(**_valid_execute_kwargs(fixture))
+
+    after = dict(_checkpoint(fixture["database"]))
+    with sqlite3.connect(fixture["database"]) as connection:
+        features_after = tuple(
+            connection.execute(
+                """
+                SELECT pfl.*
+                FROM packet_feature_logs pfl
+                JOIN packet_capture_segments pcsg
+                    ON pcsg.id = pfl.capture_segment_id
+                JOIN packet_capture_sessions pcs
+                    ON pcs.id = pcsg.capture_session_id
+                WHERE pcs.session_id = ?
+                ORDER BY pfl.id
+                """,
+                (TARGET_SESSION,),
+            )
+        )
+        plan_json = connection.execute(
+            "SELECT plan_json FROM packet_checkpoint_recoveries"
+        ).fetchone()[0]
+    assert after["last_processed_id"] == 42
+    assert after["last_completed_window_end"] == _db_utc(TARGET_FIRST)
+    assert features_after == features_before
+    assert json.loads(plan_json)["mode"] == "live-resume"
+
+
+def test_live_resume_execute_allows_benign_growing_ready_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _live_execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    with sqlite3.connect(fixture["database"]) as connection:
+        target_pk = int(
+            connection.execute(
+                "SELECT id FROM packet_capture_sessions WHERE session_id = ?",
+                (TARGET_SESSION,),
+            ).fetchone()[0]
+        )
+        _insert_capture_segment(
+            connection,
+            session_pk=target_pk,
+            capture_interface="eth-target",
+            window_start=TARGET_READY_THROUGH,
+            status="READY",
+        )
+        connection.commit()
+
+    result = execute_packet_checkpoint_recovery(**_valid_execute_kwargs(fixture))
+
+    assert result["database_committed"] is True
+    assert dict(_checkpoint(fixture["database"]))["last_completed_window_end"] == _db_utc(
+        TARGET_FIRST
+    )
+
+
+@pytest.mark.parametrize("stale_mutation", ("status", "first_window", "readiness"))
+def test_live_resume_execute_rejects_stale_target_before_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stale_mutation: str,
+) -> None:
+    fixture = _live_execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    with sqlite3.connect(fixture["database"]) as connection:
+        if stale_mutation == "status":
+            connection.execute(
+                """
+                UPDATE packet_capture_sessions
+                SET status = 'COMPLETED', ended_at = ?
+                WHERE session_id = ?
+                """,
+                (_db_utc(TARGET_READY_THROUGH), TARGET_SESSION),
+            )
+        elif stale_mutation == "first_window":
+            connection.execute(
+                "UPDATE packet_capture_sessions SET first_window_start = ? "
+                "WHERE session_id = ?",
+                (_db_utc(TARGET_FIRST + timedelta(seconds=10)), TARGET_SESSION),
+            )
+        else:
+            second_id = int(
+                connection.execute(
+                    """
+                    SELECT pcsg.id
+                    FROM packet_capture_segments pcsg
+                    JOIN packet_capture_sessions pcs
+                        ON pcs.id = pcsg.capture_session_id
+                    WHERE pcs.session_id = ?
+                    ORDER BY pcsg.window_start
+                    LIMIT 1 OFFSET 1
+                    """,
+                    (TARGET_SESSION,),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                "UPDATE packet_capture_segments SET status = 'READY' WHERE id = ?",
+                (second_id,),
+            )
+        connection.commit()
+    monkeypatch.setattr(
+        packet_checkpoint_recovery,
+        "create_sqlite_backup",
+        lambda *args, **kwargs: pytest.fail("backup must not start"),
+    )
+
+    with pytest.raises(PacketCheckpointRecoveryError, match="canonical plan changed"):
+        execute_packet_checkpoint_recovery(**_valid_execute_kwargs(fixture))
+
+
+def test_live_resume_replay_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fixture = _live_execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    kwargs = _valid_execute_kwargs(fixture)
+
+    execute_packet_checkpoint_recovery(**kwargs)
+    with pytest.raises(PacketCheckpointRecoveryError):
+        execute_packet_checkpoint_recovery(**kwargs)
+
+    with sqlite3.connect(fixture["database"]) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM packet_checkpoint_recoveries"
+        ).fetchone()[0] == 1
 
 
 def test_execute_inserts_exactly_one_audit_row_in_same_transaction(
