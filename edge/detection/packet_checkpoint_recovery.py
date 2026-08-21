@@ -33,13 +33,17 @@ from edge.scripts.phase4_cutover_storage import (
 
 
 PLAN_SCHEMA_VERSION = "packet-checkpoint-gap-recovery-plan-v1"
+GAP_RECOVERY_MODE = "gap-recovery"
+LIVE_RESUME_MODE = "live-resume"
+RECOVERY_MODES = frozenset({GAP_RECOVERY_MODE, LIVE_RESUME_MODE})
 EXECUTE_CONFIRMATION = "APPLY-PACKET-CHECKPOINT-GAP-RECOVERY"
+LIVE_RESUME_CONFIRMATION = "APPLY-PACKET-LIVE-RESUME"
 PROCESSABLE_SKIP_PREFIX = "SKIP-PROCESSABLE-SESSIONS:"
 _MIGRATION_005_SCHEMA_SHA256 = (
     "a4237ba4405a99a62c533e89fc75d68c76c09bfdc77e73587027022ac326bc0d"
 )
 _VOLATILE_PLAN_KEYS = frozenset({
-    "plan_sha256", "generated_at", "executed_at", "operation_id", "mode",
+    "plan_sha256", "generated_at", "executed_at", "operation_id",
     "plan_path", "artifact_dir", "backup_path", "result_path", "backup_sha256",
     "execute_command", "repository_branch", "file_mtime_ns", "data_version",
     "process_id", "lock_acquired_at", "post_commit_verified_at",
@@ -145,8 +149,10 @@ def acquire_recovery_locks(
 def _readiness_summary(
     session: sqlite3.Row,
     readiness: recovery_repository.RecoverySessionReadiness,
+    *,
+    include_live_resume: bool = False,
 ) -> dict[str, object]:
-    return {
+    summary: dict[str, object] = {
         "session_id": readiness.session_id,
         "status": str(session["status"]),
         "first_window_start": (
@@ -164,6 +170,14 @@ def _readiness_summary(
         "full_ready": readiness.full_ready,
         "blocking_reasons": list(readiness.blocking_reasons),
     }
+    if include_live_resume:
+        summary["blocking_reasons"] = list(
+            readiness.live_resume_blocking_reasons
+        )
+        summary["live_resume_blocking_reasons"] = list(
+            readiness.live_resume_blocking_reasons
+        )
+    return summary
 
 
 def classify_skipped_sessions(
@@ -220,7 +234,12 @@ def require_execute_confirmations(
     confirm: str,
     confirm_skip_processable: str | None,
 ) -> None:
-    if confirm != EXECUTE_CONFIRMATION:
+    expected_confirmation = (
+        LIVE_RESUME_CONFIRMATION
+        if plan.get("mode", GAP_RECOVERY_MODE) == LIVE_RESUME_MODE
+        else EXECUTE_CONFIRMATION
+    )
+    if confirm != expected_confirmation:
         raise PacketCheckpointRecoveryError("execute confirmation mismatch")
     expected = f"{PROCESSABLE_SKIP_PREFIX}{plan['plan_sha256']}"
     skips = bool(plan["summary"]["skips_processable_sessions"])
@@ -241,7 +260,14 @@ def build_recovery_plan(
     approved_by: str,
     reason: str,
     lock_entries: Sequence[Mapping[str, object]],
+    mode: str = GAP_RECOVERY_MODE,
 ) -> dict[str, object]:
+    if mode not in RECOVERY_MODES:
+        raise PacketCheckpointRecoveryError(f"unsupported recovery mode: {mode}")
+    if mode == LIVE_RESUME_MODE and detector_name != "packet_rule":
+        raise PacketCheckpointRecoveryError(
+            "live-resume is supported only for packet_rule"
+        )
     source_table = recovery_repository.SUPPORTED_DETECTORS.get(detector_name)
     if source_table is None:
         raise PacketCheckpointRecoveryError(
@@ -273,8 +299,10 @@ def build_recovery_plan(
         blocking_reasons.append("CURRENT_SESSION_NOT_COMPLETED")
     if target_session is None:
         blocking_reasons.append("TARGET_SESSION_NOT_FOUND")
-    elif target_session["status"] != "COMPLETED":
+    elif mode == GAP_RECOVERY_MODE and target_session["status"] != "COMPLETED":
         blocking_reasons.append("TARGET_SESSION_NOT_COMPLETED")
+    elif mode == LIVE_RESUME_MODE and target_session["status"] != "RUNNING":
+        blocking_reasons.append("TARGET_SESSION_NOT_RUNNING")
     if current_session_id == target_session_id:
         blocking_reasons.append("CURRENT_AND_TARGET_SESSION_MATCH")
 
@@ -306,8 +334,17 @@ def build_recovery_plan(
             blocking_reasons.append("TARGET_SESSION_READINESS_MISSING")
     else:
         target_first = target_readiness.first_window_start
-        if not target_readiness.full_ready:
+        if mode == GAP_RECOVERY_MODE and not target_readiness.full_ready:
             blocking_reasons.append("TARGET_SESSION_NOT_FULL_READY")
+        elif mode == LIVE_RESUME_MODE:
+            if (
+                target_first is None
+                or target_readiness.packet_feature_ready_through is None
+                or target_readiness.packet_feature_ready_through <= target_first
+            ):
+                blocking_reasons.append("TARGET_SESSION_READY_PREFIX_MISSING")
+            if target_readiness.live_resume_blocking_reasons:
+                blocking_reasons.append("TARGET_SESSION_READINESS_BLOCKED")
     if checkpoint_window is not None and target_first is not None:
         if target_first <= checkpoint_window:
             blocking_reasons.append("CHECKPOINT_WOULD_NOT_ADVANCE")
@@ -317,8 +354,13 @@ def build_recovery_plan(
         {"session_id": str(row["session_id"]), "started_at": str(row["started_at"])}
         for row in running_rows
     ]
-    if running_sessions:
+    if mode == GAP_RECOVERY_MODE and running_sessions:
         blocking_reasons.append("RUNNING_CAPTURE_SESSIONS")
+    elif mode == LIVE_RESUME_MODE and (
+        len(running_sessions) != 1
+        or running_sessions[0]["session_id"] != target_session_id
+    ):
+        blocking_reasons.append("LIVE_RESUME_RUNNING_SESSION_MISMATCH")
 
     existing_recovery = recovery_repository.get_existing_recovery(
         connection,
@@ -367,6 +409,7 @@ def build_recovery_plan(
 
     return {
         "plan_schema_version": PLAN_SCHEMA_VERSION,
+        "mode": mode,
         "repository_root": repository_state.get("repository_root"),
         "repository_commit": repository_state.get("repository_commit"),
         "repository_state": dict(repository_state),
@@ -384,7 +427,11 @@ def build_recovery_plan(
             else None
         ),
         "target_session": (
-            _readiness_summary(target_session, target_readiness)
+            _readiness_summary(
+                target_session,
+                target_readiness,
+                include_live_resume=mode == LIVE_RESUME_MODE,
+            )
             if target_session is not None and target_readiness is not None
             else None
         ),
@@ -400,13 +447,31 @@ def build_recovery_plan(
             ),
             "skipped_sessions": sessions_between,
             "running_sessions": [
-                {"classification": "BLOCKING_RUNNING", **session}
+                {
+                    "classification": (
+                        "LIVE_RESUME_TARGET"
+                        if mode == LIVE_RESUME_MODE
+                        and session["session_id"] == target_session_id
+                        else "BLOCKING_RUNNING"
+                    ),
+                    **session,
+                }
                 for session in running_sessions
             ],
             "target_session_classification": (
-                "TARGET_FULL_READY_COMPLETED"
-                if target_readiness is not None and target_readiness.full_ready
-                else None
+                "TARGET_LIVE_READY_PREFIX"
+                if mode == LIVE_RESUME_MODE
+                and target_readiness is not None
+                and target_readiness.first_window_start is not None
+                and target_readiness.packet_feature_ready_through is not None
+                and target_readiness.packet_feature_ready_through
+                > target_readiness.first_window_start
+                and not target_readiness.live_resume_blocking_reasons
+                else (
+                    "TARGET_FULL_READY_COMPLETED"
+                    if target_readiness is not None and target_readiness.full_ready
+                    else None
+                )
             ),
             "skips_processable_sessions": skips_processable_sessions,
             "warning_codes": warning_codes,
@@ -475,7 +540,11 @@ def _execute_command(
         "--artifact-dir",
         "<ARTIFACT_DIR>",
         "--confirm",
-        EXECUTE_CONFIRMATION,
+        (
+            LIVE_RESUME_CONFIRMATION
+            if plan.get("mode", GAP_RECOVERY_MODE) == LIVE_RESUME_MODE
+            else EXECUTE_CONFIRMATION
+        ),
     ]
     if plan["summary"]["skips_processable_sessions"]:
         command.extend(
@@ -520,6 +589,7 @@ def inspect_packet_checkpoint_recovery(
     approved_by: str,
     reason: str,
     plan_output: str | Path,
+    mode: str = GAP_RECOVERY_MODE,
     orchestrator_lock_path: Path | None = None,
     manual_lock_path: Path | None = None,
     extractor_lock_path: Path | None = None,
@@ -562,6 +632,7 @@ def inspect_packet_checkpoint_recovery(
             approved_by=approved_by,
             reason=reason,
             lock_entries=serialize_resolved_locks(locks),
+            mode=mode,
         )
 
     plan = attach_plan_sha256(
@@ -639,22 +710,56 @@ def _rebuild_execute_plan(
         approved_by=str(plan["approved_by"]),
         reason=str(plan["reason"]),
         lock_entries=serialize_resolved_locks(locks),
+        mode=str(plan.get("mode", GAP_RECOVERY_MODE)),
     )
 
 
 def _require_same_canonical_plan(
     plan: Mapping[str, object], rebuilt: Mapping[str, object]
 ) -> None:
-    if canonical_plan_binding(plan) != canonical_plan_binding(rebuilt):
-        reasons = rebuilt.get("blocking_reasons")
-        detail = ",".join(str(reason) for reason in reasons) if reasons else "changed"
-        raise PacketCheckpointRecoveryError(f"canonical plan changed: {detail}")
     if not rebuilt.get("can_execute"):
         reasons = rebuilt.get("blocking_reasons", ())
         raise PacketCheckpointRecoveryError(
-            "recovery plan cannot execute: "
+            "canonical plan changed: "
             + ",".join(str(reason) for reason in reasons)
         )
+
+    planned_binding = canonical_plan_binding(plan)
+    rebuilt_binding = canonical_plan_binding(rebuilt)
+    if plan.get("mode", GAP_RECOVERY_MODE) == LIVE_RESUME_MODE:
+        planned_target = plan.get("target_session")
+        rebuilt_target = rebuilt.get("target_session")
+        if not isinstance(planned_target, Mapping) or not isinstance(
+            rebuilt_target, Mapping
+        ):
+            raise PacketCheckpointRecoveryError("canonical plan changed: target")
+        planned_ready = planned_target.get("packet_feature_ready_through")
+        rebuilt_ready = rebuilt_target.get("packet_feature_ready_through")
+        if not isinstance(planned_ready, str) or not isinstance(rebuilt_ready, str):
+            raise PacketCheckpointRecoveryError("canonical plan changed: readiness")
+        if parse_db_utc(rebuilt_ready, "packet_feature_ready_through") < parse_db_utc(
+            planned_ready, "packet_feature_ready_through"
+        ):
+            raise PacketCheckpointRecoveryError(
+                "canonical plan changed: readiness regressed"
+            )
+        for binding in (planned_binding, rebuilt_binding):
+            target = binding.get("target_session")
+            if not isinstance(target, dict):
+                raise PacketCheckpointRecoveryError("canonical plan changed: target")
+            for key in (
+                "packet_feature_ready_through",
+                "segment_count",
+                "feature_row_count",
+                "blocking_reasons",
+                "live_resume_blocking_reasons",
+            ):
+                target.pop(key, None)
+
+    if planned_binding != rebuilt_binding:
+        reasons = rebuilt.get("blocking_reasons")
+        detail = ",".join(str(reason) for reason in reasons) if reasons else "changed"
+        raise PacketCheckpointRecoveryError(f"canonical plan changed: {detail}")
 
 
 def _other_checkpoint_rows(

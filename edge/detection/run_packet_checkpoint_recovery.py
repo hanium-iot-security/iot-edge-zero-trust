@@ -10,6 +10,8 @@ import subprocess
 from typing import Sequence
 
 from edge.detection.packet_checkpoint_recovery import (
+    GAP_RECOVERY_MODE,
+    LIVE_RESUME_MODE,
     PacketCheckpointRecoveryCommittedArtifactError,
     PacketCheckpointRecoveryError,
     execute_packet_checkpoint_recovery,
@@ -29,6 +31,11 @@ def build_parser() -> argparse.ArgumentParser:
     dry_run.add_argument("--approved-by", required=True)
     dry_run.add_argument("--reason", required=True)
     dry_run.add_argument("--plan-output", required=True)
+    dry_run.add_argument(
+        "--mode",
+        choices=(GAP_RECOVERY_MODE, LIVE_RESUME_MODE),
+        default=GAP_RECOVERY_MODE,
+    )
     dry_run.add_argument("--orchestrator-lock-path", type=Path)
     dry_run.add_argument("--manual-lock-path", type=Path)
     dry_run.add_argument("--extractor-lock-path", type=Path)
@@ -52,6 +59,7 @@ def _run_command(args: argparse.Namespace) -> dict[str, object]:
             approved_by=args.approved_by,
             reason=args.reason,
             plan_output=args.plan_output,
+            mode=args.mode,
             orchestrator_lock_path=args.orchestrator_lock_path,
             manual_lock_path=args.manual_lock_path,
             extractor_lock_path=args.extractor_lock_path,

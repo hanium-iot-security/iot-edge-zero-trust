@@ -38,6 +38,7 @@ class RecoverySessionReadiness:
     feature_row_count: int
     full_ready: bool
     blocking_reasons: tuple[str, ...]
+    live_resume_blocking_reasons: tuple[str, ...] = ()
 
 
 def get_checkpoint(
@@ -293,6 +294,48 @@ def _last_segment_window_end(rows: Sequence[sqlite3.Row]) -> datetime | None:
     return max(parse_db_utc(row["window_end"], "window_end") for row in rows)
 
 
+def _live_resume_blocking_reasons(
+    rows: Sequence[sqlite3.Row], first_window_start: datetime
+) -> tuple[str, ...]:
+    """Validate the complete observed RUNNING-session shape.
+
+    A trailing READY suffix is an expected extractor backlog. Every observed
+    window must still be contiguous and well formed, and terminal segments may
+    not appear after that suffix has started.
+    """
+    expected = first_window_start
+    ready_tail_started = False
+    reasons: list[str] = []
+    for row in rows:
+        start = parse_db_utc(row["window_start"], "window_start")
+        end = parse_db_utc(row["window_end"], "window_end")
+        if start < expected:
+            reasons.append("SEGMENT_BEFORE_OR_OVERLAPPING_PREFIX")
+        elif start > expected:
+            reasons.append("MISSING_WINDOW")
+        if end != start + timedelta(seconds=10):
+            reasons.append("INVALID_WINDOW_DURATION")
+
+        status = str(row["status"])
+        feature_count = int(row["feature_count"])
+        if status == "FAILED" or row["error_code"] is not None:
+            reasons.append("FAILED_OR_EXTRACTOR_ERROR")
+        elif status in {"PROCESSED", "EMPTY"}:
+            if ready_tail_started:
+                reasons.append("TERMINAL_AFTER_READY_TAIL")
+            if (status == "PROCESSED" and feature_count == 0) or (
+                status == "EMPTY" and feature_count != 0
+            ):
+                reasons.append("FEATURE_COUNT_MISMATCH")
+        elif status == "READY":
+            ready_tail_started = True
+            if feature_count != 0:
+                reasons.append("FEATURE_COUNT_MISMATCH")
+
+        expected = end
+    return tuple(dict.fromkeys(reasons))
+
+
 def calculate_packet_feature_readiness(
     connection: sqlite3.Connection,
     session_id: str,
@@ -303,7 +346,14 @@ def calculate_packet_feature_readiness(
     raw_first = session["first_window_start"]
     if raw_first is None:
         return RecoverySessionReadiness(
-            session_id, None, None, 0, 0, False, ("NO_FIRST_WINDOW",)
+            session_id,
+            None,
+            None,
+            0,
+            0,
+            False,
+            ("NO_FIRST_WINDOW",),
+            ("NO_FIRST_WINDOW",),
         )
 
     first = parse_db_utc(raw_first, "first_window_start")
@@ -353,6 +403,7 @@ def calculate_packet_feature_readiness(
         and len(consumed_segment_ids) == len(set(consumed_segment_ids))
         and not blocking_reasons
     )
+    live_resume_reasons = _live_resume_blocking_reasons(rows, first)
     return RecoverySessionReadiness(
         session_id,
         first,
@@ -361,4 +412,5 @@ def calculate_packet_feature_readiness(
         feature_row_count,
         full_ready,
         tuple(blocking_reasons),
+        live_resume_reasons,
     )
