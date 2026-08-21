@@ -858,6 +858,13 @@ def _execute_locked_recovery(
 
         try:
             connection.execute("BEGIN IMMEDIATE")
+            transaction_data_version = int(
+                connection.execute("PRAGMA data_version").fetchone()[0]
+            )
+            if transaction_data_version != data_version_after:
+                raise PacketCheckpointRecoveryError(
+                    "database changed after backup before transaction"
+                )
             current_plan_path, transaction_plan = _load_plan(plan_path)
             if current_plan_path != plan_path or transaction_plan != plan:
                 raise PacketCheckpointRecoveryError("plan file changed before mutation")

@@ -1353,6 +1353,9 @@ def test_live_resume_allows_trailing_ready_after_terminal_prefix(
         ("failed", "FAILED_OR_EXTRACTOR_ERROR"),
         ("extractor_error", "FAILED_OR_EXTRACTOR_ERROR"),
         ("missing_window", "MISSING_WINDOW"),
+        ("overlapping_window", "SEGMENT_BEFORE_OR_OVERLAPPING_PREFIX"),
+        ("invalid_window_duration", "INVALID_WINDOW_DURATION"),
+        ("terminal_after_ready", "TERMINAL_AFTER_READY_TAIL"),
         ("processed_without_feature", "FEATURE_COUNT_MISMATCH"),
     ),
 )
@@ -1402,6 +1405,46 @@ def test_live_resume_rejects_failed_error_or_broken_continuity(
                     _db_utc(TARGET_FIRST + timedelta(seconds=30)),
                     second_id,
                 ),
+            )
+        elif mutation == "overlapping_window":
+            connection.execute(
+                """
+                UPDATE packet_capture_segments
+                SET window_start = ?, window_end = ?
+                WHERE id = ?
+                """,
+                (
+                    _db_utc(TARGET_FIRST + timedelta(seconds=5)),
+                    _db_utc(TARGET_FIRST + timedelta(seconds=15)),
+                    second_id,
+                ),
+            )
+        elif mutation == "invalid_window_duration":
+            connection.execute("PRAGMA ignore_check_constraints = ON")
+            connection.execute(
+                "UPDATE packet_capture_segments SET window_end = ? WHERE id = ?",
+                (_db_utc(TARGET_READY_THROUGH + timedelta(seconds=1)), second_id),
+            )
+            connection.commit()
+            connection.execute("PRAGMA ignore_check_constraints = OFF")
+        elif mutation == "terminal_after_ready":
+            connection.execute(
+                "UPDATE packet_capture_segments SET status = 'READY' WHERE id = ?",
+                (second_id,),
+            )
+            target_pk = int(
+                connection.execute(
+                    "SELECT id FROM packet_capture_sessions WHERE session_id = ?",
+                    (TARGET_SESSION,),
+                ).fetchone()[0]
+            )
+            _insert_capture_segment(
+                connection,
+                session_pk=target_pk,
+                capture_interface="eth-target",
+                window_start=TARGET_READY_THROUGH,
+                status="PROCESSED",
+                feature_count=1,
             )
         else:
             connection.execute(
@@ -2713,7 +2756,116 @@ def test_live_resume_execute_allows_benign_growing_ready_tail(
     )
 
 
-@pytest.mark.parametrize("stale_mutation", ("status", "first_window", "readiness"))
+def test_live_resume_execute_rejects_external_write_after_backup_before_begin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _live_execute_fixture(tmp_path)
+    _allow_execute_on_test_platform(monkeypatch)
+    database = Path(fixture["database"])
+    checkpoint_before = dict(_checkpoint(database))
+    real_connect = sqlite3.connect
+    with real_connect(database) as connection:
+        target_segments_before = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM packet_capture_segments pcsg
+                JOIN packet_capture_sessions pcs
+                    ON pcs.id = pcsg.capture_session_id
+                WHERE pcs.session_id = ?
+                """,
+                (TARGET_SESSION,),
+            ).fetchone()[0]
+        )
+    injected = False
+
+    class BeginRaceConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            object.__setattr__(self, "_connection", connection)
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._connection, name)
+
+        def __setattr__(self, name: str, value: object) -> None:
+            setattr(self._connection, name, value)
+
+        def __enter__(self) -> "BeginRaceConnection":
+            self._connection.__enter__()
+            return self
+
+        def __exit__(self, *args: object) -> object:
+            return self._connection.__exit__(*args)
+
+        def execute(self, sql: str, *args: object) -> sqlite3.Cursor:
+            nonlocal injected
+            if sql.strip().upper() == "BEGIN IMMEDIATE" and not injected:
+                with real_connect(database) as writer:
+                    target_pk = int(
+                        writer.execute(
+                            "SELECT id FROM packet_capture_sessions WHERE session_id = ?",
+                            (TARGET_SESSION,),
+                        ).fetchone()[0]
+                    )
+                    _insert_capture_segment(
+                        writer,
+                        session_pk=target_pk,
+                        capture_interface="eth-target",
+                        window_start=TARGET_READY_THROUGH,
+                        status="READY",
+                    )
+                injected = True
+            return self._connection.execute(sql, *args)
+
+    def connect_with_begin_race(*args: object, **kwargs: object) -> object:
+        connection = real_connect(*args, **kwargs)
+        if kwargs.get("isolation_level") is None and Path(args[0]) == database:
+            return BeginRaceConnection(connection)
+        return connection
+
+    monkeypatch.setattr(
+        packet_checkpoint_recovery.sqlite3, "connect", connect_with_begin_race
+    )
+
+    with pytest.raises(
+        PacketCheckpointRecoveryError,
+        match="database changed after backup before transaction",
+    ):
+        execute_packet_checkpoint_recovery(**_valid_execute_kwargs(fixture))
+
+    assert injected is True
+    assert dict(_checkpoint(database)) == checkpoint_before
+    with real_connect(database) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM packet_checkpoint_recoveries"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM packet_capture_segments pcsg
+            JOIN packet_capture_sessions pcs
+                ON pcs.id = pcsg.capture_session_id
+            WHERE pcs.session_id = ?
+            """,
+            (TARGET_SESSION,),
+        ).fetchone()[0] == target_segments_before + 1
+    operation_dirs = list(Path(fixture["artifact_dir"]).iterdir())
+    assert len(operation_dirs) == 1
+    with real_connect(operation_dirs[0] / "database.backup.db") as backup:
+        assert backup.execute(
+            """
+            SELECT COUNT(*)
+            FROM packet_capture_segments pcsg
+            JOIN packet_capture_sessions pcs
+                ON pcs.id = pcsg.capture_session_id
+            WHERE pcs.session_id = ?
+            """,
+            (TARGET_SESSION,),
+        ).fetchone()[0] == target_segments_before
+
+
+@pytest.mark.parametrize(
+    "stale_mutation", ("status", "first_window", "readiness", "other_running")
+)
 def test_live_resume_execute_rejects_stale_target_before_backup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2737,7 +2889,7 @@ def test_live_resume_execute_rejects_stale_target_before_backup(
                 "WHERE session_id = ?",
                 (_db_utc(TARGET_FIRST + timedelta(seconds=10)), TARGET_SESSION),
             )
-        else:
+        elif stale_mutation == "readiness":
             second_id = int(
                 connection.execute(
                     """
@@ -2755,6 +2907,14 @@ def test_live_resume_execute_rejects_stale_target_before_backup(
             connection.execute(
                 "UPDATE packet_capture_segments SET status = 'READY' WHERE id = ?",
                 (second_id,),
+            )
+        else:
+            _insert_capture_session(
+                connection,
+                session_id=RUNNING_SESSION_A,
+                capture_interface="eth-running",
+                first_window_start=TARGET_READY_THROUGH + timedelta(seconds=10),
+                status="RUNNING",
             )
         connection.commit()
     monkeypatch.setattr(
