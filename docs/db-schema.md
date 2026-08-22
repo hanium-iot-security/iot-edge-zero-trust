@@ -20,6 +20,8 @@ PRAGMA busy_timeout = 5000;
 ## schema_migrations
 
 Migration 005 (`packet_checkpoint_recovery`)는 운영 적용과 Recovery Execute를 분리한다.
+Migration 006 (`firewall_release_requests`)는 관리자 승인 Firewall Release 요청을
+DB queue로 저장하고 Worker가 실제 iptables release를 처리하도록 분리한다.
 
 ## packet_checkpoint_recoveries
 
@@ -316,7 +318,7 @@ Event와 Source Trust History를 수정하지 않고, 어떤 감점을 어떤 Ba
 
 ## firewall_rules
 
-Phase 4용 firewall 요청/상태 테이블입니다. 이번 PR은 DB repository와 조회 API만 구현합니다. 격리 진입 시 Trust Score v2 transaction에서 `PENDING` row를 만들 수 있지만, 실제 iptables 실행과 worker reconciliation은 다른 담당 범위입니다. Repository는 `PENDING -> APPLIED`, `PENDING -> PENDING/FAILED`, `APPLIED -> REMOVED`, 관리자 재시도용 `FAILED -> PENDING`만 허용합니다.
+Phase 4용 firewall 요청/상태 테이블입니다. 격리 진입 시 Trust Score v2 transaction에서 `PENDING` row를 만들 수 있고, Firewall Worker가 실제 iptables 적용·해제와 reconciliation을 담당합니다. Repository는 `PENDING -> APPLIED`, `PENDING -> PENDING/FAILED`, `APPLIED -> REMOVED`, 관리자 재시도용 `FAILED -> PENDING`만 허용합니다.
 
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |
@@ -340,6 +342,31 @@ Phase 4용 firewall 요청/상태 테이블입니다. 이번 PR은 DB repository
 
 `PENDING`, `APPLIED` 상태에서는 `(source_ip, protocol, dest_port)` 조합이 중복될 수 없습니다.
 
+## firewall_release_requests
+
+Phase 6-B용 관리자 승인 Firewall Release 요청 queue입니다. Backend API는 이 테이블에
+`PENDING` 요청을 생성할 뿐 sudo/iptables를 실행하지 않습니다. Firewall Worker가 공유
+lock 아래에서 `release_rule()`을 호출하고 요청을 `SUCCEEDED` 또는 `FAILED`로 종료합니다.
+Recovery Preflight는 대상 Device/IP에 연결된 `PENDING` 또는 `FAILED` release request가
+있으면 Baseline Recovery를 거부합니다.
+
+| 컬럼 | 타입 | 설명 |
+| --- | --- | --- |
+| id | INTEGER | primary key autoincrement |
+| firewall_rule_id | INTEGER | 대상 `firewall_rules.id`, `ON DELETE RESTRICT` |
+| status | TEXT | `PENDING`, `SUCCEEDED`, `FAILED` |
+| requested_by | TEXT | 인증된 관리자 principal |
+| reason | TEXT | 요청 사유 |
+| requested_at | TEXT | 요청 시각, UTC `Z` |
+| processed_at | TEXT | Worker 처리 완료 시각 |
+| last_error | TEXT | 실패 사유. `FAILED`일 때 필수 |
+| created_at | TEXT | 생성 시각 |
+| updated_at | TEXT | 수정 시각 |
+
+동일 `firewall_rule_id`에는 `status = 'PENDING'` 요청이 하나만 존재할 수 있습니다.
+`SUCCEEDED` 또는 `FAILED`로 종료된 뒤에는 새 요청을 만들 수 있습니다. `PENDING`은
+`processed_at`과 `last_error`가 없어야 하며, `SUCCEEDED`는 `last_error`가 없어야 합니다.
+
 ## 주요 Index
 
 002 migration은 다음 조회를 위해 index를 추가합니다.
@@ -361,3 +388,5 @@ Phase 4용 firewall 요청/상태 테이블입니다. 이번 PR은 DB repository
 | `idx_firewall_rules_status` | firewall status 조회 |
 | `idx_firewall_rules_source_ip` | source IP별 firewall rule 조회 |
 | `idx_firewall_rules_active_unique` | 활성 firewall rule 중복 방지 |
+| `uq_firewall_release_requests_pending_rule` | Rule별 PENDING release request 중복 방지 |
+| `idx_firewall_release_requests_status_requested` | Worker의 PENDING release request 조회 |

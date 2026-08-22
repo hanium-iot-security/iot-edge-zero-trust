@@ -29,6 +29,7 @@ from edge.trust.firewall_worker import (
     ReconcileResult,
     WrapperIptablesRunner,
     plan_pending_rules,
+    process_pending_release_requests,
     process_pending_rules,
     reconcile,
     release_rule,
@@ -114,7 +115,21 @@ def run_worker_cycle(
     now: datetime,
     with_reconcile: bool,
 ) -> tuple[PendingCycleResult, ReconcileResult | None]:
-    """Reconciliation(선택) 후 PENDING Batch를 처리하는 한 Cycle입니다."""
+    """Release requests, Reconciliation(선택), PENDING Batch를 처리하는 한 Cycle입니다."""
+    release_result = process_pending_release_requests(
+        db,
+        runner=runner,
+        policy=policy,
+        now=now,
+    )
+    if release_result.processed_count:
+        logger.info(
+            "Firewall release request batch done (succeeded=%d, already_removed=%d, failed=%d)",
+            len(release_result.succeeded),
+            len(release_result.already_removed),
+            len(release_result.failed),
+        )
+
     reconcile_result = None
     if with_reconcile:
         reconcile_result = reconcile(db, runner=runner, policy=policy, now=now)

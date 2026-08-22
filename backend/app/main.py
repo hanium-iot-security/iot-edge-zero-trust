@@ -7,6 +7,7 @@ from .routers import (
     detection_events,
     devices,
     feature_logs,
+    firewall_release_requests,
     firewall_rules,
     gateway_metrics,
     health,
@@ -45,6 +46,7 @@ app.include_router(feature_logs.router, prefix="/api")
 app.include_router(packet_feature_logs.router, prefix="/api")
 app.include_router(gateway_metrics.router, prefix="/api")
 app.include_router(firewall_rules.router, prefix="/api")
+app.include_router(firewall_release_requests.router, prefix="/api")
 app.include_router(detection_events.router, prefix="/api")
 app.include_router(trust_score.router, prefix="/api")
 app.include_router(isolation.router, prefix="/api")

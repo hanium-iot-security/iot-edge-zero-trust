@@ -279,6 +279,7 @@ class MatchedResultIds:
     detection_event_ids: tuple[int, ...] | None = None
     trust_score_history_ids: tuple[int, ...] | None = None
     firewall_rule_ids: tuple[int, ...] | None = None
+    firewall_release_request_ids: tuple[int, ...] | None = None
     trigger_event_ids: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
@@ -298,6 +299,7 @@ class MatchedResultIds:
             detection_event_ids=payload.get("detection_event_ids"),
             trust_score_history_ids=payload.get("trust_score_history_ids"),
             firewall_rule_ids=payload.get("firewall_rule_ids"),
+            firewall_release_request_ids=payload.get("firewall_release_request_ids"),
             trigger_event_ids=payload.get("trigger_event_ids"),
         )
 
@@ -915,6 +917,7 @@ _MATCHED_ID_FIELDS = (
     "detection_event_ids",
     "trust_score_history_ids",
     "firewall_rule_ids",
+    "firewall_release_request_ids",
     "trigger_event_ids",
 )
 

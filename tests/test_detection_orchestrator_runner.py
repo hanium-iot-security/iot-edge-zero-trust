@@ -448,6 +448,54 @@ def test_required_packet_stage_skips_when_capture_session_is_not_ready(SessionLo
         assert _completed(db, TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE) is None
 
 
+def test_required_packet_stage_blocks_failed_packet_segment(SessionLocal):
+    session_id = "12345678-1234-4234-8234-1234567890af"
+    with SessionLocal() as db:
+        _flood_window(db, window_index=0)
+        session_pk = capture_sessions.create_session(
+            db,
+            session_id=session_id,
+            capture_interface="eth0",
+            started_at=BASE,
+        )
+        capture_sessions.set_first_window_start(db, session_pk, BASE)
+        segment_id = capture_sessions.insert_ready_segment(
+            db,
+            capture_session_pk=session_pk,
+            file_name=f"capture_{session_id}_eth0_failed.pcap",
+            capture_interface="eth0",
+            window_start=BASE,
+            window_end=BASE + timedelta(seconds=10),
+        )
+        db.execute(
+            text(
+                """
+                UPDATE packet_capture_segments
+                SET status = 'FAILED'
+                WHERE id = :segment_id
+                """
+            ),
+            {"segment_id": segment_id},
+        )
+        db.commit()
+
+    run_producer_cycle(session_factory=SessionLocal, now=BASE + timedelta(seconds=11))
+    packet_registry = build_stage_registry(
+        enabled=[PACKET_RULE],
+        required=[PACKET_RULE],
+    )
+
+    outcome = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=packet_registry,
+    )
+
+    assert outcome.status == CYCLE_SKIPPED_PACKET_NOT_READY
+    with SessionLocal() as db:
+        assert _completed(db, "packet_rule", "packet_feature_logs") is None
+        assert _completed(db, TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE) is None
+
+
 def test_required_packet_stage_retries_after_ready_prefix_is_completed(SessionLocal):
     session_id = "12345678-1234-4234-8234-1234567890aa"
     with SessionLocal() as db:

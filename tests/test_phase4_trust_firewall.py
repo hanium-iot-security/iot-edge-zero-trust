@@ -708,6 +708,43 @@ def test_trust_v2_marks_unmapped_and_already_isolated_without_score_change(
         assert db.execute(text("SELECT COUNT(*) FROM trust_score_history")).scalar_one() == 0
 
 
+def test_trust_v2_ignores_unregistered_packet_source_without_side_effects(
+    SessionLocal,
+) -> None:
+    with SessionLocal() as db:
+        packet_event = _insert_event(
+            db,
+            None,
+            "PACKET_RATE_ANOMALY",
+            incident_family="FLOODING",
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            apply_trust_score_v2_until(
+                db,
+                cycle_range_start=CYCLE_START,
+                cycle_cutoff=CUTOFF,
+            )
+
+        event = db.execute(
+            text(
+                """
+                SELECT id, processing_reason, applied_to_score
+                FROM detection_events
+                WHERE id = :id
+                """
+            ),
+            {"id": packet_event},
+        ).mappings().one()
+        assert event["processing_reason"] == PROCESSING_UNMAPPED_DEVICE
+        assert event["applied_to_score"] == 0
+        assert db.execute(text("SELECT COUNT(*) FROM trust_score_history")).scalar_one() == 0
+        assert db.execute(text("SELECT COUNT(*) FROM isolation_history")).scalar_one() == 0
+        assert db.execute(text("SELECT COUNT(*) FROM firewall_rules")).scalar_one() == 0
+
+
 def test_trust_v2_rolls_back_when_isolation_firewall_ip_is_missing(SessionLocal) -> None:
     with SessionLocal() as db:
         _insert_device(db, "esp32_01", trust_score=55, ip_address=None)
@@ -876,7 +913,7 @@ def _insert_device(
 
 def _insert_event(
     db,
-    device_id: str,
+    device_id: str | None,
     event_type: str,
     *,
     event_id: int | None = None,

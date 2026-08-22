@@ -16,7 +16,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
-from edge.trust import firewall_repository
+from edge.trust import firewall_release_repository, firewall_repository
 from edge.trust.firewall_worker import (
     CHAIN,
     CHECK,
@@ -33,6 +33,7 @@ from edge.trust.firewall_worker import (
     build_rule_args,
     list_managed_rule_ids,
     plan_pending_rules,
+    process_pending_release_requests,
     process_pending_rules,
     reconcile,
     release_rule,
@@ -162,6 +163,30 @@ def _rule_row(db, rule_id: int) -> dict:
         .first()
     )
     return dict(row)
+
+
+def _release_request_row(db, request_id: int) -> dict:
+    row = (
+        db.execute(
+            text("SELECT * FROM firewall_release_requests WHERE id = :id"),
+            {"id": request_id},
+        )
+        .mappings()
+        .first()
+    )
+    return dict(row)
+
+
+def _create_release_request(db, *, rule_id: int) -> int:
+    request_id = firewall_release_repository.create_release_request(
+        db,
+        firewall_rule_id=rule_id,
+        requested_by="operator@example",
+        reason="official release approved",
+        requested_at=NOW,
+    )
+    db.commit()
+    return request_id
 
 
 # --- Match Specification ---------------------------------------------------
@@ -441,6 +466,135 @@ def test_release_rule_rejects_non_applied_rule(SessionLocal, policy):
             release_rule(
                 db, rule_id=rule_id, runner=FakeIptablesRunner(), policy=policy, now=NOW
             )
+
+
+def test_process_release_request_releases_applied_rule_and_marks_succeeded(
+    SessionLocal,
+    policy,
+):
+    with SessionLocal() as db:
+        _seed_device(db)
+        rule_id = _create_pending(db)
+        runner = FakeIptablesRunner()
+        process_pending_rules(db, runner=runner, policy=policy, now=NOW)
+        request_id = _create_release_request(db, rule_id=rule_id)
+
+        result = process_pending_release_requests(
+            db,
+            runner=runner,
+            policy=policy,
+            now=NOW + timedelta(minutes=5),
+        )
+
+        assert result.succeeded == [request_id]
+        assert runner.installed == []
+        assert _rule_row(db, rule_id)["status"] == "REMOVED"
+        request = _release_request_row(db, request_id)
+        assert request["status"] == "SUCCEEDED"
+        assert request["processed_at"] == "2026-07-25T12:05:00Z"
+        assert request["last_error"] is None
+
+
+def test_process_release_request_failure_does_not_mark_rule_removed(
+    SessionLocal,
+    policy,
+):
+    with SessionLocal() as db:
+        _seed_device(db)
+        rule_id = _create_pending(db)
+        runner = FakeIptablesRunner()
+        process_pending_rules(db, runner=runner, policy=policy, now=NOW)
+        request_id = _create_release_request(db, rule_id=rule_id)
+        runner.fail_operations[DELETE] = 1
+
+        result = process_pending_release_requests(
+            db,
+            runner=runner,
+            policy=policy,
+            now=NOW + timedelta(minutes=5),
+        )
+
+        assert result.failed == [request_id]
+        assert _rule_row(db, rule_id)["status"] == "APPLIED"
+        request = _release_request_row(db, request_id)
+        assert request["status"] == "FAILED"
+        assert "delete failed" in request["last_error"]
+
+
+def test_pending_release_request_converges_after_crash_when_runtime_rule_absent(
+    SessionLocal,
+    policy,
+):
+    with SessionLocal() as db:
+        _seed_device(db)
+        rule_id = _create_pending(db)
+        runner = FakeIptablesRunner()
+        process_pending_rules(db, runner=runner, policy=policy, now=NOW)
+        request_id = _create_release_request(db, rule_id=rule_id)
+        runner.installed.clear()
+        firewall_repository.mark_removed(
+            db,
+            rule_id=rule_id,
+            released_at=NOW + timedelta(minutes=4),
+        )
+        db.commit()
+
+        result = process_pending_release_requests(
+            db,
+            runner=runner,
+            policy=policy,
+            now=NOW + timedelta(minutes=5),
+        )
+
+        assert result.already_removed == [request_id]
+        assert _release_request_row(db, request_id)["status"] == "SUCCEEDED"
+
+
+def test_pending_release_request_fails_if_removed_rule_still_exists_at_runtime(
+    SessionLocal,
+    policy,
+):
+    with SessionLocal() as db:
+        _seed_device(db)
+        rule_id = _create_pending(db)
+        runner = FakeIptablesRunner()
+        process_pending_rules(db, runner=runner, policy=policy, now=NOW)
+        request_id = _create_release_request(db, rule_id=rule_id)
+        firewall_repository.mark_removed(
+            db,
+            rule_id=rule_id,
+            released_at=NOW + timedelta(minutes=4),
+        )
+        db.commit()
+
+        result = process_pending_release_requests(
+            db,
+            runner=runner,
+            policy=policy,
+            now=NOW + timedelta(minutes=5),
+        )
+
+        assert result.failed == [request_id]
+        assert _release_request_row(db, request_id)["status"] == "FAILED"
+
+
+def test_reconcile_does_not_restore_applied_rule_with_pending_release_request(
+    SessionLocal,
+    policy,
+):
+    with SessionLocal() as db:
+        _seed_device(db)
+        rule_id = _create_pending(db)
+        runner = FakeIptablesRunner()
+        process_pending_rules(db, runner=runner, policy=policy, now=NOW)
+        _create_release_request(db, rule_id=rule_id)
+        runner.installed.clear()
+
+        result = reconcile(db, runner=runner, policy=policy, now=NOW)
+
+        assert result.restored == []
+        assert runner.installed == []
+        assert _rule_row(db, rule_id)["status"] == "APPLIED"
 
 
 # --- Reconciliation --------------------------------------------------------

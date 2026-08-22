@@ -7,8 +7,8 @@ Phase 4 세부계획 §2.6 / P4-6-01 기준. Trust Score가 격리를 결정하�
 
 | 구분 | 담당 | 내용 |
 |---|---|---|
-| DB 상태·Repository | 정현수 | `firewall_rules` 상태 전이, `create_pending_rule_for_device`, 조회 API |
-| iptables Worker·운영 | 원우민 | 실제 Rule 적용·해제·Reconciliation, sudoers, systemd, 실기기 검증 |
+| DB 상태·Repository | 정현수 | `firewall_rules` 상태 전이, `firewall_release_requests` queue, 조회/요청 API |
+| iptables Worker·운영 | 원우민 | 실제 Rule 적용·해제·Release Request 처리·Reconciliation, sudoers, systemd, 실기기 검증 |
 
 **`devices.status=isolated`는 Trust 정책의 격리 "결정" 상태이고,
 `firewall_rules.status=APPLIED`가 실제 네트워크 차단 "적용" 상태다.**
@@ -108,6 +108,11 @@ journalctl -u firewall-worker -f
 - **일시 오류**(iptables 실행 실패·Timeout)는 `retry_count`를 올리며 최대 **3회**까지만
   자동 재시도하고, 그 뒤에는 자동 재시도하지 않는다. `next_retry_at` 이전에는 다시
   집어가지 않는다.
+- Phase 6-B부터 공식 Release는 Backend API가 `firewall_release_requests`에
+  `PENDING` 요청을 만들고, Worker가 해당 요청을 처리해 `SUCCEEDED` 또는 `FAILED`로
+  종료하는 흐름을 사용한다. Backend API는 sudo/iptables를 직접 실행하지 않는다.
+  Worker Reconciliation은 `PENDING` Release Request가 있는 `APPLIED` Rule을 복구하지
+  않는다.
 
 ## 5. 수동 Smoke Test
 
