@@ -21,7 +21,9 @@ Dataset Manifest는 Run Manifest를 `run_manifest_ref`로 참조하며 공통 �
 - 공식 Phase 5 Export·학습·평가: `packet-if-dataset-v2`
 - 기존 Local Fixture 읽기: `packet-if-dataset-v1`
 - Exporter 신규 출력: 항상 v2
-- Holdout: Dataset Split에 포함하지 않고 외부 수집 계획에서 별도 보존
+- Phase 5 Holdout: Dataset Split에 포함하지 않고 외부 수집 계획에서 별도 보존
+- Phase 6-B `packet-if-v2-calib-002` 정상 Holdout: 호환 가능한 `test` Split으로
+  명시하되 Model fitting·Threshold 선택에서는 제외
 
 ## Session 필수 항목
 
@@ -86,7 +88,13 @@ Capture Session을 확인한 뒤 그 `session_id`를 Scenario Runner의 `--sessi
 - Train·Validation은 서로 다른 정상 Session만 사용합니다.
 - Test에는 정상·공격 Session을 모두 포함합니다.
 - Test는 Threshold 산정에 사용하지 않습니다.
-- Holdout은 Train·Validation·Test CSV와 Manifest에 포함하지 않습니다.
+- Phase 5에서 외부 보존하기로 한 Holdout은 Train·Validation·Test CSV와
+  Manifest에 포함하지 않습니다.
+- `packet-if-v2-calib-002`의 명시적으로 승인된 정상 Holdout 2 Session은
+  Dataset 형식상 `test`에 포함합니다. Train만 Model fitting에 사용하고 정상
+  Validation만 Threshold 선택에 사용합니다. Model과 Threshold를 고정한 뒤에만
+  이 Holdout을 평가하며, 결과를 보고 같은 Artifact의 Threshold를 다시 조정하지
+  않습니다.
 - 부적격 Session은 같은 Slot의 새 Session·Run ID로 재수집하며 기존 결과를
   다른 Split으로 이동하지 않습니다.
 
