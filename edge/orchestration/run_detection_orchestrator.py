@@ -30,7 +30,8 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import json
 import logging
 from pathlib import Path
 import signal
@@ -55,6 +56,7 @@ from edge.orchestration.packet_stage_readiness import (
     get_packet_feature_readiness_for_range_start,
 )
 from edge.orchestration.stage_registry import (
+    PACKET_RULE,
     PACKET_STAGE_NAMES,
     StageRegistry,
     load_stage_registry,
@@ -85,6 +87,13 @@ class CycleOutcome:
     cutoff: datetime | None = None
     stage_results: list[DetectorRunResult] = field(default_factory=list)
     trust_result: TrustScoreV2RunResult | None = None
+
+
+@dataclass(frozen=True)
+class PacketLiveResumeTransition:
+    boundary: datetime
+    target_session_id: str
+    plan_sha256: str
 
 
 class UtcFormatter(logging.Formatter):
@@ -249,6 +258,173 @@ def resolve_initial_packet_activation_boundary(
     return parse_db_utc(first_window_start, "first_window_start")
 
 
+def _target_has_live_resume_ready_shape(
+    db: Session,
+    *,
+    session_id: str,
+    first_window_start: datetime,
+    status: str,
+) -> bool:
+    rows = db.execute(
+        text(
+            """
+            SELECT pcsg.window_start, pcsg.window_end, pcsg.status,
+                   pcsg.error_code, COUNT(pfl.id) AS feature_count
+            FROM packet_capture_segments pcsg
+            LEFT JOIN packet_feature_logs pfl
+                ON pfl.capture_segment_id = pcsg.id
+            JOIN packet_capture_sessions pcs
+                ON pcs.id = pcsg.capture_session_id
+            WHERE pcs.session_id = :session_id
+            GROUP BY pcsg.id, pcsg.window_start, pcsg.window_end,
+                     pcsg.status, pcsg.error_code
+            ORDER BY pcsg.window_start ASC, pcsg.id ASC
+            """
+        ),
+        {"session_id": session_id},
+    ).mappings()
+
+    expected = first_window_start
+    ready_through: datetime | None = None
+    ready_tail_started = False
+    for row in rows:
+        window_start = parse_db_utc(row["window_start"], "window_start")
+        window_end = parse_db_utc(row["window_end"], "window_end")
+        if window_start != expected or window_end != window_start + timedelta(seconds=10):
+            return False
+
+        segment_status = str(row["status"])
+        feature_count = int(row["feature_count"])
+        if segment_status == "FAILED" or row["error_code"] is not None:
+            return False
+        if segment_status in {"PROCESSED", "EMPTY"}:
+            if ready_tail_started:
+                return False
+            if (segment_status == "PROCESSED" and feature_count == 0) or (
+                segment_status == "EMPTY" and feature_count != 0
+            ):
+                return False
+            ready_through = window_end
+        elif segment_status == "READY":
+            if feature_count != 0:
+                return False
+            ready_tail_started = True
+        else:
+            return False
+        expected = window_end
+
+    if ready_through is None or ready_through <= first_window_start:
+        return False
+    if status == "COMPLETED":
+        return not ready_tail_started
+    return status == "RUNNING"
+
+
+def resolve_packet_live_resume_transition(
+    db: Session,
+    *,
+    registry: StageRegistry,
+    range_start: datetime,
+    cutoff: datetime,
+) -> PacketLiveResumeTransition | None:
+    required_packet_stages = tuple(
+        configured
+        for configured in registry.required_stages
+        if configured.name in PACKET_STAGE_NAMES
+    )
+    packet_rule_stage = next(
+        (
+            configured
+            for configured in required_packet_stages
+            if configured.name == PACKET_RULE
+        ),
+        None,
+    )
+    if packet_rule_stage is None:
+        return None
+
+    packet_checkpoints: list[dict[str, object]] = []
+    boundaries: list[datetime] = []
+    for configured in required_packet_stages:
+        checkpoint = checkpoints.get_detector_checkpoint(
+            db,
+            detector_name=configured.stage.detector_name,
+            source_table=configured.stage.source_table,
+        )
+        if checkpoint is None or checkpoint["last_completed_window_end"] is None:
+            return None
+        packet_checkpoints.append(checkpoint)
+        boundaries.append(
+            parse_db_utc(
+                checkpoint["last_completed_window_end"],
+                "last_completed_window_end",
+            )
+        )
+
+    boundary = boundaries[0]
+    if any(candidate != boundary for candidate in boundaries[1:]):
+        return None
+    if not range_start < boundary <= cutoff:
+        return None
+
+    packet_rule_index = required_packet_stages.index(packet_rule_stage)
+    packet_rule_checkpoint = packet_checkpoints[packet_rule_index]
+    candidates = db.execute(
+        text(
+            """
+            SELECT pcr.target_capture_session_id, pcr.plan_sha256,
+                   pcr.plan_json, pcs.status
+            FROM packet_checkpoint_recoveries pcr
+            JOIN packet_capture_sessions pcs
+                ON pcs.session_id = pcr.target_capture_session_id
+            WHERE pcr.detector_name = :detector_name
+              AND pcr.source_table = :source_table
+              AND pcr.last_completed_window_end_after = :boundary
+              AND pcr.last_processed_id_before IS :last_processed_id
+              AND pcr.last_processed_id_after IS :last_processed_id
+              AND pcs.first_window_start = :boundary
+              AND pcs.status IN ('RUNNING', 'COMPLETED')
+            ORDER BY pcr.id DESC
+            """
+        ),
+        {
+            "detector_name": packet_rule_stage.stage.detector_name,
+            "source_table": packet_rule_stage.stage.source_table,
+            "boundary": format_db_utc(boundary),
+            "last_processed_id": packet_rule_checkpoint["last_processed_id"],
+        },
+    ).mappings()
+
+    valid: list[PacketLiveResumeTransition] = []
+    for candidate in candidates:
+        try:
+            plan = json.loads(str(candidate["plan_json"]))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if (
+            not isinstance(plan, dict)
+            or plan.get("mode") != "live-resume"
+            or plan.get("plan_sha256") != candidate["plan_sha256"]
+        ):
+            continue
+        target_session_id = str(candidate["target_capture_session_id"])
+        if not _target_has_live_resume_ready_shape(
+            db,
+            session_id=target_session_id,
+            first_window_start=boundary,
+            status=str(candidate["status"]),
+        ):
+            continue
+        valid.append(
+            PacketLiveResumeTransition(
+                boundary=boundary,
+                target_session_id=target_session_id,
+                plan_sha256=str(candidate["plan_sha256"]),
+            )
+        )
+    return valid[0] if len(valid) == 1 else None
+
+
 def run_orchestration_cycle(
     *,
     session_factory: SessionFactory = SessionLocal,
@@ -272,59 +448,77 @@ def run_orchestration_cycle(
             return CycleOutcome(status=CYCLE_SKIPPED_NO_WATERMARK)
         range_start = resolve_cycle_range_start(db, registry=registry, cutoff=cutoff)
         packet_activation_boundary: datetime | None = None
+        packet_resume_transition: PacketLiveResumeTransition | None = None
         if registry.packet_layer_required:
-            packet_readiness = get_packet_feature_readiness_for_range_start(
+            packet_resume_transition = resolve_packet_live_resume_transition(
                 db,
+                registry=registry,
                 range_start=range_start,
+                cutoff=cutoff,
             )
-            if (
-                packet_readiness is None
-                or packet_readiness.first_window_start is None
-            ):
-                packet_activation_boundary = (
-                    resolve_initial_packet_activation_boundary(
-                        db,
-                        registry=registry,
-                        range_start=range_start,
-                        cutoff=cutoff,
-                    )
-                )
-                if packet_activation_boundary is None:
-                    logger.info(
-                        "event=CYCLE_SKIPPED reason=PACKET_NOT_READY "
-                        "detail=NO_CAPTURE_SESSION range_start=%s cutoff=%s",
-                        format_db_utc(range_start),
-                        format_db_utc(cutoff),
-                    )
-                    return CycleOutcome(
-                        status=CYCLE_SKIPPED_PACKET_NOT_READY,
-                        range_start=range_start,
-                        cutoff=cutoff,
-                    )
-                cutoff = packet_activation_boundary
+            if packet_resume_transition is not None:
+                cutoff = packet_resume_transition.boundary
                 logger.info(
-                    "event=PACKET_INITIAL_ACTIVATION range_start=%s "
-                    "activation_boundary=%s",
+                    "event=PACKET_LIVE_RESUME_CATCHUP range_start=%s "
+                    "resume_boundary=%s target_session_id=%s plan_sha256=%s",
                     format_db_utc(range_start),
-                    format_db_utc(packet_activation_boundary),
+                    format_db_utc(packet_resume_transition.boundary),
+                    packet_resume_transition.target_session_id,
+                    packet_resume_transition.plan_sha256,
                 )
             else:
-                packet_ready_through = packet_readiness.packet_feature_ready_through
-                if packet_ready_through is None:
+                packet_readiness = get_packet_feature_readiness_for_range_start(
+                    db,
+                    range_start=range_start,
+                )
+                if (
+                    packet_readiness is None
+                    or packet_readiness.first_window_start is None
+                ):
+                    packet_activation_boundary = (
+                        resolve_initial_packet_activation_boundary(
+                            db,
+                            registry=registry,
+                            range_start=range_start,
+                            cutoff=cutoff,
+                        )
+                    )
+                    if packet_activation_boundary is None:
+                        logger.info(
+                            "event=CYCLE_SKIPPED reason=PACKET_NOT_READY "
+                            "detail=NO_CAPTURE_SESSION range_start=%s cutoff=%s",
+                            format_db_utc(range_start),
+                            format_db_utc(cutoff),
+                        )
+                        return CycleOutcome(
+                            status=CYCLE_SKIPPED_PACKET_NOT_READY,
+                            range_start=range_start,
+                            cutoff=cutoff,
+                        )
+                    cutoff = packet_activation_boundary
                     logger.info(
-                        "event=CYCLE_SKIPPED reason=PACKET_NOT_READY "
-                        "detail=NO_CONTIGUOUS_PREFIX session_id=%s "
-                        "range_start=%s cutoff=%s",
-                        packet_readiness.session_id,
+                        "event=PACKET_INITIAL_ACTIVATION range_start=%s "
+                        "activation_boundary=%s",
                         format_db_utc(range_start),
-                        format_db_utc(cutoff),
+                        format_db_utc(packet_activation_boundary),
                     )
-                    return CycleOutcome(
-                        status=CYCLE_SKIPPED_PACKET_NOT_READY,
-                        range_start=range_start,
-                        cutoff=cutoff,
-                    )
-                cutoff = min(cutoff, packet_ready_through)
+                else:
+                    packet_ready_through = packet_readiness.packet_feature_ready_through
+                    if packet_ready_through is None:
+                        logger.info(
+                            "event=CYCLE_SKIPPED reason=PACKET_NOT_READY "
+                            "detail=NO_CONTIGUOUS_PREFIX session_id=%s "
+                            "range_start=%s cutoff=%s",
+                            packet_readiness.session_id,
+                            format_db_utc(range_start),
+                            format_db_utc(cutoff),
+                        )
+                        return CycleOutcome(
+                            status=CYCLE_SKIPPED_PACKET_NOT_READY,
+                            range_start=range_start,
+                            cutoff=cutoff,
+                        )
+                    cutoff = min(cutoff, packet_ready_through)
 
     if range_start >= cutoff:
         logger.debug(
@@ -347,17 +541,26 @@ def run_orchestration_cycle(
     )
 
     stage_results: list[DetectorRunResult] = []
+    packet_transition_boundary = (
+        packet_activation_boundary
+        if packet_activation_boundary is not None
+        else (
+            packet_resume_transition.boundary
+            if packet_resume_transition is not None
+            else None
+        )
+    )
     stages = (
         tuple(
             configured
             for configured in registry.stages
             if configured.name not in PACKET_STAGE_NAMES
         )
-        if packet_activation_boundary is not None
+        if packet_transition_boundary is not None
         else registry.stages
     )
     for configured in stages:
-        if packet_activation_boundary is not None:
+        if packet_transition_boundary is not None:
             with session_factory() as db:
                 completed = checkpoints.get_completed_window_end(
                     db,
