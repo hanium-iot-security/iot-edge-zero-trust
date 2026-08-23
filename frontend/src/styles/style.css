@@ -2093,3 +2093,104 @@ tbody tr:hover {
 .packet-table-scroll>* {
   max-width: none;
 }
+
+
+/* =========================================================
+   Phase 6-B Firewall Release / Recovery
+   ========================================================= */
+
+.recovery-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.recovery-form-grid .filter-item:only-child {
+  grid-column: 1 / -1;
+}
+
+.recovery-help-text {
+  display: block;
+  margin-top: 6px;
+  color: var(--color-slate-500);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.recovery-action-row {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 14px;
+  flex-wrap: wrap;
+}
+
+.recovery-inline-error {
+  margin: 12px 0 0;
+  padding: 11px 13px;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  background: #fef2f2;
+  color: var(--color-danger-dark);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.recovery-result-list {
+  margin-top: 14px;
+}
+
+.recovery-success-box {
+  margin-top: 14px;
+  padding: 15px;
+  border: 1px solid #bbf7d0;
+  border-radius: 10px;
+  background: #f0fdf4;
+}
+
+.recovery-success-box > strong {
+  display: block;
+  margin-bottom: 12px;
+  color: var(--color-success-dark);
+}
+
+.recovery-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.recovery-history-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 13px;
+  border: 1px solid var(--border-color);
+  border-radius: 9px;
+  background: var(--color-slate-50);
+}
+
+.recovery-history-item span,
+.recovery-history-item small {
+  color: var(--color-slate-500);
+  font-size: 11px;
+}
+
+@media (max-width: 760px) {
+  .recovery-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .recovery-history-item {
+    grid-template-columns: 1fr;
+  }
+
+  .recovery-action-row {
+    justify-content: stretch;
+  }
+
+  .recovery-action-row .button {
+    width: 100%;
+  }
+}
