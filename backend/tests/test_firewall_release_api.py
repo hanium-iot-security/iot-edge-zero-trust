@@ -108,6 +108,23 @@ def test_release_request_requires_rule_bound_confirmation(api_client) -> None:
     assert _release_request_count(db_path) == 0
 
 
+def test_release_request_rejects_blank_reason_as_validation_error(api_client) -> None:
+    client, db_path = api_client
+    rule_id = _seed_rule(db_path, status="APPLIED")
+
+    response = client.post(
+        f"/api/firewall-rules/{rule_id}/release-requests",
+        json={
+            "reason": "   ",
+            "confirm": release_confirmation_for_rule(rule_id),
+        },
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 422
+    assert _release_request_count(db_path) == 0
+
+
 @pytest.mark.parametrize("status", ["PENDING", "FAILED", "REMOVED"])
 def test_release_request_rejects_non_applied_rule(api_client, status: str) -> None:
     client, db_path = api_client

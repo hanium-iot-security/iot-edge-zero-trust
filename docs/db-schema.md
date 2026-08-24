@@ -347,8 +347,10 @@ Phase 4용 firewall 요청/상태 테이블입니다. 격리 진입 시 Trust Sc
 Phase 6-B용 관리자 승인 Firewall Release 요청 queue입니다. Backend API는 이 테이블에
 `PENDING` 요청을 생성할 뿐 sudo/iptables를 실행하지 않습니다. Firewall Worker가 공유
 lock 아래에서 `release_rule()`을 호출하고 요청을 `SUCCEEDED` 또는 `FAILED`로 종료합니다.
-Recovery Preflight는 대상 Device/IP에 연결된 `PENDING` 또는 `FAILED` release request가
-있으면 Baseline Recovery를 거부합니다.
+Recovery Preflight는 대상 Device/IP에 연결된 `PENDING` release request가 있으면
+Baseline Recovery를 거부합니다. `FAILED` release request는 감사 이력으로 보존하며,
+실제 Recovery 가능 여부는 Firewall Rule의 `REMOVED` 상태와 runtime
+`VERIFIED_RELEASED` 기준으로 판단합니다.
 
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |

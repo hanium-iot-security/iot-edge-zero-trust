@@ -105,11 +105,7 @@ def build_recovery_preflight(
     device_report = dict(core["devices"][0])
     current = dict(device_report["current"])
     firewall_db_state = _firewall_db_state(core)
-    firewall_release_request_state = _firewall_release_request_state(
-        db,
-        device_id=device_id,
-        source_ip=device_report.get("ip_address"),
-    )
+    firewall_release_request_state = _firewall_release_request_state(core)
     pending_event_check = dict(core["pending_trust_event_check"])
     runtime = _normalize_runtime_verification(
         firewall_runtime_verifier(
@@ -332,6 +328,7 @@ def _missing_or_core_error_preflight(
                 "passed": False,
                 "count": None,
                 "statuses": [],
+                "request_ids": [],
                 "requests": [],
             },
             "firewall_runtime_verification": _runtime_verification_unavailable({}),
@@ -352,6 +349,7 @@ def _missing_or_core_error_preflight(
             "passed": False,
             "count": None,
             "statuses": [],
+            "request_ids": [],
             "requests": [],
         },
         "firewall_runtime_verification": _runtime_verification_unavailable({}),
@@ -373,41 +371,14 @@ def _firewall_db_state(core: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _firewall_release_request_state(
-    db: Session,
-    *,
-    device_id: str,
-    source_ip: Any,
-) -> dict[str, Any]:
-    rows = db.execute(
-        text(
-            """
-            SELECT
-                request.id,
-                request.firewall_rule_id,
-                request.status,
-                request.requested_at,
-                request.processed_at,
-                request.last_error,
-                rule.status AS firewall_rule_status
-            FROM firewall_release_requests AS request
-            JOIN firewall_rules AS rule
-              ON rule.id = request.firewall_rule_id
-            WHERE request.status IN ('PENDING', 'FAILED')
-              AND (
-                    rule.device_id = :device_id
-                    OR (:source_ip IS NOT NULL AND rule.source_ip = :source_ip)
-                  )
-            ORDER BY request.id ASC
-            """
-        ),
-        {"device_id": device_id, "source_ip": source_ip},
-    ).mappings()
-    requests = [dict(row) for row in rows]
+def _firewall_release_request_state(core: Mapping[str, Any]) -> dict[str, Any]:
+    check = dict(core["pending_firewall_release_request_check"])
+    requests = list(check.get("requests", []))
     return {
-        "passed": len(requests) == 0,
-        "count": len(requests),
-        "statuses": sorted({str(row["status"]) for row in requests}),
+        "passed": bool(check["passed"]),
+        "count": int(check["count"]),
+        "statuses": list(check.get("statuses", [])),
+        "request_ids": list(check.get("request_ids", [])),
         "requests": requests,
     }
 
@@ -464,6 +435,8 @@ def _select_failure(
             return "INVALID_DEVICE_STATUS", reason, "DENIED"
         if "Trust Score" in reason:
             return "TRUST_SCORE_MISMATCH", reason, "DENIED"
+        if "Firewall Release Request" in reason:
+            return "ACTIVE_FIREWALL_RELEASE_REQUEST", reason, "DENIED"
         if "Firewall" in reason:
             return "ACTIVE_FIREWALL_RULE", reason, "DENIED"
         return "PREFLIGHT_DENIED", reason, "DENIED"

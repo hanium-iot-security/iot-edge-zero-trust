@@ -397,7 +397,7 @@ Preflight는 읽기 전용이며 Recovery artifact나 backup을 생성하지 않
 - 현재 `devices.status='isolated'`
 - 현재 Trust Score와 `expected_trust_score` 일치
 - DB의 `PENDING`/`APPLIED` Firewall Rule 0건
-- DB의 `PENDING`/`FAILED` Firewall Release Request 0건
+- DB의 `PENDING` Firewall Release Request 0건
 - Runtime Firewall verification
 - `processed_at IS NULL` Detection Event 0건
 - Backup artifact 경로 사용 가능성
@@ -426,6 +426,7 @@ Response:
     "passed": true,
     "count": 0,
     "statuses": [],
+    "request_ids": [],
     "requests": []
   },
   "firewall_runtime_verification": {

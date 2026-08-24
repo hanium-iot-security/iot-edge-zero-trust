@@ -185,10 +185,8 @@ def test_recovery_preflight_rejects_active_firewall_db_state(
     assert body["firewall_db_state"]["rules"][0]["status"] == status
 
 
-@pytest.mark.parametrize("request_status", ["PENDING", "FAILED"])
-def test_recovery_preflight_rejects_unresolved_firewall_release_request(
+def test_recovery_preflight_rejects_pending_firewall_release_request(
     api_client,
-    request_status: str,
 ) -> None:
     client, db_path, _ = api_client
     with sqlite3.connect(db_path) as connection:
@@ -211,13 +209,11 @@ def test_recovery_preflight_rejects_unresolved_firewall_release_request(
                 requested_at, processed_at, last_error
             )
             VALUES (
-                ?, ?, 'operator@example', 'official release',
-                '2026-08-10T00:00:01Z',
-                CASE WHEN ? = 'FAILED' THEN '2026-08-10T00:00:02Z' ELSE NULL END,
-                CASE WHEN ? = 'FAILED' THEN 'runtime check failed' ELSE NULL END
+                ?, 'PENDING', 'operator@example', 'official release',
+                '2026-08-10T00:00:01Z', NULL, NULL
             )
             """,
-            (rule_id, request_status, request_status, request_status),
+            (rule_id,),
         )
         connection.commit()
 
@@ -229,7 +225,51 @@ def test_recovery_preflight_rejects_unresolved_firewall_release_request(
     assert body["failure_code"] == "ACTIVE_FIREWALL_RELEASE_REQUEST"
     assert body["firewall_db_state"]["passed"] is True
     assert body["firewall_release_request_state"]["passed"] is False
-    assert body["firewall_release_request_state"]["statuses"] == [request_status]
+    assert body["firewall_release_request_state"]["statuses"] == ["PENDING"]
+
+
+def test_recovery_preflight_allows_failed_release_request_history(
+    api_client,
+) -> None:
+    client, db_path, _ = api_client
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        rule_id = connection.execute(
+            """
+            INSERT INTO firewall_rules (
+                device_id, source_ip, status, applied_at, released_at
+            )
+            VALUES (
+                'esp32_01', '192.168.0.21', 'REMOVED',
+                '2026-08-10T00:00:00Z', '2026-08-10T00:00:10Z'
+            )
+            """
+        ).lastrowid
+        connection.execute(
+            """
+            INSERT INTO firewall_release_requests (
+                firewall_rule_id, status, requested_by, reason,
+                requested_at, processed_at, last_error
+            )
+            VALUES (
+                ?, 'FAILED', 'operator@example', 'official release',
+                '2026-08-10T00:00:01Z', '2026-08-10T00:00:02Z',
+                'runtime check failed'
+            )
+            """,
+            (rule_id,),
+        )
+        connection.commit()
+
+    response = _post_preflight(client)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["can_execute"] is True
+    assert body["failure_code"] is None
+    assert body["firewall_db_state"]["passed"] is True
+    assert body["firewall_release_request_state"]["passed"] is True
+    assert body["firewall_release_request_state"]["count"] == 0
 
 
 def test_recovery_preflight_fails_closed_when_runtime_firewall_unavailable(

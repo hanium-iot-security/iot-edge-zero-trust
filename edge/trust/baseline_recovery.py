@@ -93,6 +93,11 @@ def inspect_baseline_recovery(
                 device_ids=device_ids,
                 source_ips=[row["ip_address"] for row in devices.values()],
             )
+            pending_release_requests = _fetch_pending_firewall_release_requests(
+                connection,
+                device_ids=device_ids,
+                source_ips=[row["ip_address"] for row in devices.values()],
+            )
             pending_events = _fetch_pending_trust_events(connection, device_ids)
     except sqlite3.DatabaseError as exc:
         raise BaselineRecoveryError(f"Database 사전 검증 실패: {exc}") from exc
@@ -106,6 +111,12 @@ def inspect_baseline_recovery(
         preflight_errors.append(
             "대상 Device 또는 IP에 활성 Firewall Rule이 있습니다: "
             f"rule_ids={rule_ids}"
+        )
+    if pending_release_requests:
+        request_ids = [int(request["id"]) for request in pending_release_requests]
+        preflight_errors.append(
+            "대상 Device 또는 IP에 처리 중인 Firewall Release Request가 있습니다: "
+            f"request_ids={request_ids}"
         )
     if pending_events:
         event_ids = [int(event["id"]) for event in pending_events]
@@ -145,6 +156,22 @@ def inspect_baseline_recovery(
             }
             for rule in active_rules
         ]
+    release_request_check: dict[str, object] = {
+        "passed": not pending_release_requests,
+        "count": len(pending_release_requests),
+        "statuses": ["PENDING"],
+        "request_ids": [int(request["id"]) for request in pending_release_requests],
+        "requests": [
+            {
+                "id": int(request["id"]),
+                "firewall_rule_id": int(request["firewall_rule_id"]),
+                "status": str(request["status"]),
+                "firewall_rule_status": str(request["firewall_rule_status"]),
+                "requested_at": request["requested_at"],
+            }
+            for request in pending_release_requests
+        ],
+    }
     pending_event_check: dict[str, object] = {
         "passed": not pending_events,
         "count": len(pending_events),
@@ -160,6 +187,7 @@ def inspect_baseline_recovery(
         "preflight_errors": preflight_errors,
         "devices": device_report,
         "active_firewall_rule_check": firewall_check,
+        "pending_firewall_release_request_check": release_request_check,
         "pending_trust_event_check": pending_event_check,
         "execute_command": _build_execute_command(
             database=database,
@@ -221,6 +249,17 @@ def execute_baseline_recovery(
             raise BaselineRecoveryError(
                 "대상 Device 또는 IP에 활성 Firewall Rule이 있습니다: "
                 f"rule_ids={rule_ids}"
+            )
+        pending_release_requests = _fetch_pending_firewall_release_requests(
+            connection,
+            device_ids=device_ids,
+            source_ips=[row["ip_address"] for row in previous_devices.values()],
+        )
+        if pending_release_requests:
+            request_ids = [int(request["id"]) for request in pending_release_requests]
+            raise BaselineRecoveryError(
+                "대상 Device 또는 IP에 처리 중인 Firewall Release Request가 있습니다: "
+                f"request_ids={request_ids}"
             )
         pending_events = _fetch_pending_trust_events(connection, device_ids)
         if pending_events:
@@ -580,6 +619,39 @@ def _fetch_active_firewall_rules(
         WHERE status IN ('PENDING', 'APPLIED')
           AND ({' OR '.join(match_clauses)})
         ORDER BY id
+        """,
+        tuple(parameters),
+    ).fetchall()
+
+
+def _fetch_pending_firewall_release_requests(
+    connection: sqlite3.Connection,
+    *,
+    device_ids: Sequence[str],
+    source_ips: Sequence[str | None],
+) -> list[sqlite3.Row]:
+    non_null_ips = sorted({ip_address for ip_address in source_ips if ip_address})
+    device_placeholders = ", ".join("?" for _ in device_ids)
+    parameters: list[object] = [*device_ids]
+    match_clauses = [f"rule.device_id IN ({device_placeholders})"]
+    if non_null_ips:
+        ip_placeholders = ", ".join("?" for _ in non_null_ips)
+        match_clauses.append(f"rule.source_ip IN ({ip_placeholders})")
+        parameters.extend(non_null_ips)
+    return connection.execute(
+        f"""
+        SELECT
+            request.id,
+            request.firewall_rule_id,
+            request.status,
+            request.requested_at,
+            rule.status AS firewall_rule_status
+        FROM firewall_release_requests AS request
+        JOIN firewall_rules AS rule
+          ON rule.id = request.firewall_rule_id
+        WHERE request.status = 'PENDING'
+          AND ({' OR '.join(match_clauses)})
+        ORDER BY request.id
         """,
         tuple(parameters),
     ).fetchall()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 FirewallReleaseStatus = Literal["PENDING", "SUCCEEDED", "FAILED"]
@@ -13,6 +13,14 @@ FirewallReleaseStatus = Literal["PENDING", "SUCCEEDED", "FAILED"]
 class FirewallReleaseRequestCreate(BaseModel):
     reason: str = Field(..., min_length=1)
     confirm: str = Field(..., min_length=1)
+
+    @field_validator("reason")
+    @classmethod
+    def reason_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("reason must not be blank")
+        return normalized
 
 
 class FirewallReleaseRequestItem(BaseModel):

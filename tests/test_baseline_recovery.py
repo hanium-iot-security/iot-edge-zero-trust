@@ -108,6 +108,47 @@ def _insert_detection_event(
     return int(event_id)
 
 
+def _insert_release_request(
+    database: Path,
+    *,
+    status: str,
+    device_id: str | None = "esp32_01",
+    source_ip: str = "192.168.0.4",
+) -> int:
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        rule_id = connection.execute(
+            """
+            INSERT INTO firewall_rules (
+                device_id, source_ip, status, applied_at, released_at
+            )
+            VALUES (
+                ?, ?, 'REMOVED',
+                '2026-08-03T00:00:00Z', '2026-08-03T00:00:10Z'
+            )
+            """,
+            (device_id, source_ip),
+        ).lastrowid
+        request_id = connection.execute(
+            """
+            INSERT INTO firewall_release_requests (
+                firewall_rule_id, status, requested_by, reason,
+                requested_at, processed_at, last_error
+            )
+            VALUES (
+                ?, ?, 'operator@example', 'official release',
+                '2026-08-03T00:00:01Z',
+                CASE WHEN ? = 'PENDING' THEN NULL ELSE '2026-08-03T00:00:02Z' END,
+                CASE WHEN ? = 'FAILED' THEN 'runtime check failed' ELSE NULL END
+            )
+            """,
+            (rule_id, status, status, status),
+        ).lastrowid
+        connection.commit()
+    assert request_id is not None
+    return int(request_id)
+
+
 def _seed_preserved_history(database: Path) -> tuple[str, ...]:
     preserved_tables = (
         "mqtt_logs",
@@ -496,6 +537,86 @@ def test_dry_run_rejects_active_firewall_rule_for_device_or_ip(
     assert result["active_firewall_rule_check"]["rules"][0]["status"] == status
     assert "Firewall" in result["preflight_errors"][0]
     assert _device_rows(db_path) == before
+
+
+def test_dry_run_rejects_pending_firewall_release_request(
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    core = _load_core()
+    request_id = _insert_release_request(db_path, status="PENDING")
+    before = _device_rows(db_path)
+
+    result = core.inspect_baseline_recovery(
+        db_path=db_path,
+        device_ids=["esp32_01"],
+        expected_trust_scores={"esp32_01": 20},
+        artifact_dir=tmp_path / "artifacts",
+    )
+
+    assert result["can_execute"] is False
+    assert result["pending_firewall_release_request_check"] == {
+        "passed": False,
+        "count": 1,
+        "statuses": ["PENDING"],
+        "request_ids": [request_id],
+        "requests": [
+            {
+                "id": request_id,
+                "firewall_rule_id": 1,
+                "status": "PENDING",
+                "firewall_rule_status": "REMOVED",
+                "requested_at": "2026-08-03T00:00:01Z",
+            }
+        ],
+    }
+    assert "Firewall Release Request" in result["preflight_errors"][0]
+    assert _device_rows(db_path) == before
+
+
+def test_dry_run_allows_failed_firewall_release_request_history(
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    core = _load_core()
+    _insert_release_request(db_path, status="FAILED")
+
+    result = core.inspect_baseline_recovery(
+        db_path=db_path,
+        device_ids=["esp32_01"],
+        expected_trust_scores={"esp32_01": 20},
+        artifact_dir=tmp_path / "artifacts",
+    )
+
+    assert result["can_execute"] is True
+    assert result["pending_firewall_release_request_check"] == {
+        "passed": True,
+        "count": 0,
+        "statuses": ["PENDING"],
+        "request_ids": [],
+        "requests": [],
+    }
+
+
+def test_execute_rejects_pending_firewall_release_request_without_state_change(
+    db_path: Path,
+    tmp_path: Path,
+) -> None:
+    core = _load_core()
+    request_id = _insert_release_request(db_path, status="PENDING")
+    before = _device_rows(db_path)
+
+    with pytest.raises(core.BaselineRecoveryError, match="Firewall Release Request"):
+        core.execute_baseline_recovery(
+            db_path=db_path,
+            device_ids=["esp32_01"],
+            expected_trust_scores={"esp32_01": 20},
+            artifact_dir=tmp_path / "artifacts",
+            confirm="RESET-TO-NORMAL-100",
+        )
+
+    assert _device_rows(db_path) == before
+    assert _table_rows(db_path, "firewall_release_requests")[0][0] == request_id
 
 
 def test_execute_recovers_two_isolated_devices_and_creates_verified_artifacts(
