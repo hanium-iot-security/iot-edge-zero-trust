@@ -54,9 +54,12 @@ _SEVERITY_BY_EVENT = {
 class PacketRulePolicy:
     """Versioned Packet Rule Policy.
 
-    정상 Train/Validation 분포로 보정한 임계값이다. 임계값 또는 탐지 예외 정책을
-    바꿀 때는 반드시 version도 함께 올려서 Evidence에 어떤 Policy Version으로
-    판정됐는지 남긴다 (Policy Version, Session, 표본 수, P95·P99, Commit을 기록한다).
+    Packet/Byte Rate 임계값은 Frozen Normal Train/Validation 통계를 중심으로
+    보정한다. Port Scan은 Zeek/Suricata IDS 근거와 10초 Window 정책으로,
+    Broker DoS는 MQTT 표준·DoS 연구·Threat Model로 설계한 뒤 동일 정상 모집단에서
+    FP=0을 검증한다. 임계값 또는 탐지 예외 정책을 바꿀 때는 반드시 version도 함께
+    올려서 Evidence에 어떤 Policy Version으로 판정됐는지 남긴다 (Policy Version,
+    Session, 표본 수, 정상 분포, 설계 근거, Commit을 기록한다).
 
     excluded_peer_ips는 명시적으로 설정한 Management/Infrastructure Peer를
     IoT Packet Rule 적용 Scope에서만 제외한다.

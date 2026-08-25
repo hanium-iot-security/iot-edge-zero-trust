@@ -137,11 +137,20 @@ def test_byte_only_scenario_is_unfragmented_and_crosses_only_byte_rate() -> None
     scenario = get_scenario("packet_byte_rate_flood")
     rate_pps = float(scenario.default_args["rate_pps"])
     payload_bytes = int(scenario.default_args["payload_bytes"])
+    detector_window_seconds = 10.0
 
     ipv4_header_bytes = 20
     udp_header_bytes = 8
     ipv4_packet_bytes = payload_bytes + udp_header_bytes + ipv4_header_bytes
     estimated_ipv4_bytes_per_second = rate_pps * ipv4_packet_bytes
+    detector_row = _row(
+        captured_duration_seconds=detector_window_seconds,
+        packet_count=int(rate_pps * detector_window_seconds),
+        total_bytes=int(
+            estimated_ipv4_bytes_per_second * detector_window_seconds
+        ),
+    )
+    detector_events = _event_types(detector_row)
 
     assert scenario.scenario_version == "v2"
     assert scenario.default_args == {
@@ -154,6 +163,8 @@ def test_byte_only_scenario_is_unfragmented_and_crosses_only_byte_rate() -> None
     assert rate_pps < DEFAULT_PACKET_RULE_POLICY.packet_rate_threshold
     assert estimated_ipv4_bytes_per_second == 4_912
     assert estimated_ipv4_bytes_per_second > DEFAULT_PACKET_RULE_POLICY.byte_rate_threshold
+    assert "BYTE_RATE_ANOMALY" in detector_events
+    assert "PACKET_RATE_ANOMALY" not in detector_events
 
 
 def test_generator_summary_distinguishes_payload_rate_from_detector_ip_rate() -> None:
