@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import argparse
 from dataclasses import replace
 
 import pytest
 
 import attacks.packet_rate_flood_attack as packet_rate_flood_attack
+import attacks.port_scan_attack as port_scan_attack
 from backend.app.config import Settings
 from edge.detection.packet_rule_detector import (
     DEFAULT_PACKET_RULE_POLICY,
@@ -166,3 +168,26 @@ def test_generator_summary_distinguishes_payload_rate_from_detector_ip_rate() ->
     assert "avg_payload_bps=4800" in summary
     assert "estimated_unfragmented_ipv4_bps=4912" in summary
     assert "avg_bps=" not in summary
+
+
+def test_port_scan_warns_when_range_cannot_cross_v3_threshold(capsys) -> None:
+    port_scan_attack._validate_args(
+        argparse.Namespace(start_port=1, end_port=5, timeout_ms=1)
+    )
+
+    assert "distinct_port_count > 5" in capsys.readouterr().out
+
+
+def test_port_scan_accepts_six_port_range_without_threshold_warning(capsys) -> None:
+    port_scan_attack._validate_args(
+        argparse.Namespace(start_port=1, end_port=6, timeout_ms=1)
+    )
+
+    assert "경고" not in capsys.readouterr().out
+
+
+def test_port_scan_runtime_summary_uses_v3_thresholds() -> None:
+    assert hasattr(port_scan_attack, "_format_policy_summary")
+    assert port_scan_attack._format_policy_summary() == (
+        "탐지 조건: distinct_port_count > 5 AND syn_count > 5 (기본 Policy)"
+    )

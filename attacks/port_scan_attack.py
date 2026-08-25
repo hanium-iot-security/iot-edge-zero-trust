@@ -8,7 +8,7 @@
   실제 edge/detection/packet_rule_detector.py의 판정 조건은 OR가 아니라 AND이므로,
   두 조건을 모두 만족하도록 포트 수·연결 시도 수를 함께 확보해야 한다
   (TCP Connect Scan은 성공/실패와 무관하게 SYN을 발생시키므로 포트 수만
-  16개 이상이면 일반적으로 두 조건을 함께 만족한다).
+  6개 이상이면 일반적으로 두 조건을 함께 만족한다).
 
 evaluation_scope=DETECTION_ONLY 시나리오다 (scenario_runner.catalog 참고).
 스캔 자체는 격리 대상 행위가 아니라 Packet Rule 탐지 검증이 목적이므로,
@@ -33,10 +33,12 @@ import time
 from attacks.config import BROKER_HOST
 
 # 기본 Runner Timeout(DEFAULT_COMMAND_TIMEOUT_SECONDS=120s)에 여유 있게 맞춘 기본 범위.
-# 16개 이상 포트를 스캔해야 distinct_port_count > 15 조건을 만족한다.
+# 6개 이상 포트를 스캔해야 distinct_port_count > 5 조건을 만족한다.
 DEFAULT_START_PORT = 1
 DEFAULT_END_PORT = 256
 DEFAULT_TIMEOUT_MS = 150
+DEFAULT_DISTINCT_PORT_THRESHOLD = 5
+DEFAULT_SYN_THRESHOLD = 5
 _SAFETY_MARGIN_SECONDS = 20.0
 _ASSUMED_RUNNER_TIMEOUT_SECONDS = 120.0
 
@@ -49,7 +51,7 @@ def parse_args() -> argparse.Namespace:
         "--end_port",
         default=DEFAULT_END_PORT,
         type=int,
-        help="distinct_port_count > 15를 만족하려면 최소 16개 이상 포트 필요",
+        help="distinct_port_count > 5를 만족하려면 최소 6개 이상 포트 필요",
     )
     p.add_argument("--timeout_ms", default=DEFAULT_TIMEOUT_MS, type=int, help="포트당 connect timeout(ms)")
     return p.parse_args()
@@ -73,11 +75,20 @@ def _validate_args(args: argparse.Namespace) -> None:
             f"({_ASSUMED_RUNNER_TIMEOUT_SECONDS:.0f}초)에 근접하거나 초과할 수 있습니다. "
             "--end_port를 줄이거나 --timeout_ms를 낮추세요."
         )
-    if port_count <= 15:
+    if port_count <= DEFAULT_DISTINCT_PORT_THRESHOLD:
         print(
-            f"[PortScan] 경고: port_count={port_count}로 distinct_port_count > 15 조건을 "
+            f"[PortScan] 경고: port_count={port_count}로 distinct_port_count > "
+            f"{DEFAULT_DISTINCT_PORT_THRESHOLD} 조건을 "
             "만족하지 못할 수 있습니다."
         )
+
+
+def _format_policy_summary() -> str:
+    return (
+        "탐지 조건: distinct_port_count > "
+        f"{DEFAULT_DISTINCT_PORT_THRESHOLD} AND syn_count > {DEFAULT_SYN_THRESHOLD} "
+        "(기본 Policy)"
+    )
 
 
 def main() -> None:
@@ -88,7 +99,7 @@ def main() -> None:
     port_count = len(list(ports))
 
     print(f"[PortScan] target={args.target} ports={args.start_port}-{args.end_port} ({port_count}개)")
-    print(f"  탐지 조건: distinct_port_count > 15 AND syn_count > 15 (기본 Policy)")
+    print(f"  {_format_policy_summary()}")
     print()
 
     open_ports: list[int] = []
