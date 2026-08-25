@@ -54,10 +54,9 @@ _SEVERITY_BY_EVENT = {
 class PacketRulePolicy:
     """Versioned Packet Rule Policy.
 
-    Pilot 실측 P95/P99가 나오기 전까지의 잠정 임계값이다. 실제 정상 분포가
-    확인되면 조정하되, 바꿀 때는 반드시 version도 함께 올려서 Evidence에 어떤
-    Policy Version으로 판정됐는지 남긴다 (Policy Version, Session,
-    표본 수, P95·P99, Commit을 기록한다).
+    정상 Train/Validation 분포로 보정한 임계값이다. 임계값 또는 탐지 예외 정책을
+    바꿀 때는 반드시 version도 함께 올려서 Evidence에 어떤 Policy Version으로
+    판정됐는지 남긴다 (Policy Version, Session, 표본 수, P95·P99, Commit을 기록한다).
 
     excluded_peer_ips는 명시적으로 설정한 Management/Infrastructure Peer를
     IoT Packet Rule 적용 Scope에서만 제외한다.
@@ -150,13 +149,13 @@ def _parse_excluded_peer_ips(raw_value: str) -> frozenset[str]:
 
 
 DEFAULT_PACKET_RULE_POLICY = PacketRulePolicy(
-    packet_rate_threshold=50.0,
-    byte_rate_threshold=100_000.0,
-    port_scan_distinct_port_threshold=15,
-    port_scan_syn_threshold=15,
-    broker_dos_tcp_syn_threshold=30,
-    broker_dos_mqtt_packet_threshold=100,
-    version="packet-rule-policy-v2",
+    packet_rate_threshold=10.0,
+    byte_rate_threshold=2_500.0,
+    port_scan_distinct_port_threshold=5,
+    port_scan_syn_threshold=5,
+    broker_dos_tcp_syn_threshold=10,
+    broker_dos_mqtt_packet_threshold=20,
+    version="packet-rule-policy-v3",
 )
 
 

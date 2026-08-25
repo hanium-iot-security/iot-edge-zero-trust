@@ -47,7 +47,7 @@ register(
         scenario_id="packet_rate_flood",
         series=SERIES_PACKET_ANOMALY,
         scenario_version="v1",
-        description="packets_per_second > packet_rate_threshold(기본 50.0)를 유발하는 패킷 폭주.",
+        description="packets_per_second > packet_rate_threshold(기본 10.0)를 유발하는 패킷 폭주.",
         module="attacks.packet_rate_flood_attack",
         default_args={"duration": "12", "rate_pps": "80", "payload_bytes": "64"},
         evaluation_scope=EvaluationScope.FULL_E2E.value,
@@ -73,16 +73,17 @@ register(
 )
 
 # --- 보조 (DETECTION_ONLY) — Byte Rate 단독 조건 -------------------------
-# packet_rate(45pps)는 threshold(50) 미만으로 유지하고 payload를 키워
-# bytes_per_second만 threshold(100,000)를 넘기도록 구성한다 (45*2400=108,000).
+# 표준 MTU 1500 기준 IPv4 단편화를 피하도록 UDP payload를 1200 bytes로 제한한다.
+# 추정 IPv4 계층 속도는 4pps * (1200 payload + 8 UDP + 20 IPv4) = 4912 B/s로,
+# packet rate threshold(10)는 넘지 않고 byte rate threshold(2500)는 여유 있게 넘는다.
 register(
     ScenarioDefinition(
         scenario_id="packet_byte_rate_flood",
         series=SERIES_PACKET_ANOMALY,
-        scenario_version="v1",
-        description="[보조: Byte Rate 단독 조건] packets_per_second는 threshold 미만으로 유지하면서 bytes_per_second만 threshold(기본 100000.0)를 초과시킨다.",
+        scenario_version="v2",
+        description="[보조: Byte Rate 단독 조건] IPv4 단편화 없이 packets_per_second는 threshold 미만으로 유지하면서 bytes_per_second만 threshold(기본 2500.0)를 초과시킨다.",
         module="attacks.packet_rate_flood_attack",
-        default_args={"duration": "12", "rate_pps": "45", "payload_bytes": "2400"},
+        default_args={"duration": "12", "rate_pps": "4", "payload_bytes": "1200"},
         evaluation_scope=EvaluationScope.DETECTION_ONLY.value,
         duration_seconds=12.0,
         intensity="medium",
@@ -113,8 +114,8 @@ register(
         series=SERIES_PACKET_ANOMALY,
         scenario_version="v1",
         description=(
-            "[보조] distinct_port_count > port_scan_distinct_port_threshold(기본 15) "
-            "그리고(AND) syn_count > port_scan_syn_threshold(기본 15)를 함께 유발하는 "
+            "[보조] distinct_port_count > port_scan_distinct_port_threshold(기본 5) "
+            "그리고(AND) syn_count > port_scan_syn_threshold(기본 5)를 함께 유발하는 "
             "TCP Connect Scan. 실제 판정 조건은 OR가 아니라 AND다."
             "스캔 자체는 격리 대상이 아니라 탐지 검증이 목적."
         ),

@@ -2,9 +2,9 @@
 
 저장되는 detection event_type은 PORT_SCAN을 사용해야 합니다.
 
-탐지 기준 (DEFAULT_PACKET_RULE_POLICY 기준, Pilot 이후 조정될 수 있음):
-  - distinct_port_count > port_scan_distinct_port_threshold (기본 15)
-  - 그리고(AND) syn_count > port_scan_syn_threshold (기본 15)
+탐지 기준 (DEFAULT_PACKET_RULE_POLICY 기준):
+  - distinct_port_count > port_scan_distinct_port_threshold (기본 5)
+  - 그리고(AND) syn_count > port_scan_syn_threshold (기본 5)
   실제 edge/detection/packet_rule_detector.py의 판정 조건은 OR가 아니라 AND이므로,
   두 조건을 모두 만족하도록 포트 수·연결 시도 수를 함께 확보해야 한다
   (TCP Connect Scan은 성공/실패와 무관하게 SYN을 발생시키므로 포트 수만
