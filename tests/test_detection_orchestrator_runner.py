@@ -42,6 +42,7 @@ from edge.orchestration.run_detection_orchestrator import (
     GracefulShutdown,
     resolve_cycle_cutoff,
     resolve_cycle_range_start,
+    resolve_packet_live_resume_transition,
     print_checkpoint_status,
     run_orchestration_cycle,
     run_orchestrator_loop,
@@ -268,6 +269,7 @@ def _insert_live_resume_recovery_audit(
     last_processed_id: int,
     boundary_before: datetime,
     boundary_after: datetime,
+    detector_name: str = "packet_rule",
     mode: str = "live-resume",
     plan_sha_matches: bool = True,
 ) -> None:
@@ -292,8 +294,8 @@ def _insert_live_resume_recovery_audit(
                 backup_path, backup_sha256
             )
             VALUES (
-                'orchestrator-live-resume-test', 'packet_rule',
-                'packet_feature_logs', :current_session_id, :target_session_id,
+                :operation_id, :detector_name, 'packet_feature_logs',
+                :current_session_id, :target_session_id,
                 :last_processed_id, :last_processed_id,
                 :boundary_before, :boundary_after,
                 :boundary_before, :boundary_after,
@@ -304,6 +306,8 @@ def _insert_live_resume_recovery_audit(
             """
         ),
         {
+            "operation_id": f"orchestrator-live-resume-test-{detector_name}",
+            "detector_name": detector_name,
             "current_session_id": current_session_id,
             "target_session_id": target_session_id,
             "last_processed_id": last_processed_id,
@@ -1056,6 +1060,188 @@ class PacketIfMustNotRunStage:
 
     def run_until(self, db, *, cycle_range_start, cycle_cutoff):
         raise AssertionError("mismatched required Packet IF must not run")
+
+
+def _with_required_packet_if(registry: StageRegistry) -> StageRegistry:
+    return StageRegistry(
+        stages=registry.stages
+        + (
+            ConfiguredStage(
+                name=PACKET_IF,
+                stage=PacketIfMustNotRunStage(),
+                required=True,
+            ),
+        )
+    )
+
+
+def _with_only_required_packet_if() -> StageRegistry:
+    return StageRegistry(
+        stages=(
+            ConfiguredStage(
+                name=PACKET_IF,
+                stage=PacketIfMustNotRunStage(),
+                required=True,
+            ),
+        )
+    )
+
+
+def _align_packet_if_and_add_audit(
+    db,
+    *,
+    state: dict[str, object],
+    audit_target: str = LIVE_RESUME_TARGET_SESSION_ID,
+    audit_boundary: datetime | None = None,
+) -> None:
+    resume_boundary = state["resume_boundary"]
+    previous_feature_id = state["previous_feature_id"]
+    assert isinstance(resume_boundary, datetime)
+    assert isinstance(previous_feature_id, int)
+    checkpoints.upsert_detector_checkpoint(
+        db,
+        detector_name=PACKET_IF,
+        source_table="packet_feature_logs",
+        last_processed_id=previous_feature_id,
+        last_completed_window_end=resume_boundary,
+        updated_at=resume_boundary,
+    )
+    _insert_live_resume_recovery_audit(
+        db,
+        detector_name=PACKET_IF,
+        current_session_id=PACKET_SESSION_ID,
+        target_session_id=audit_target,
+        last_processed_id=previous_feature_id,
+        boundary_before=state["boundary_before"],
+        boundary_after=audit_boundary or resume_boundary,
+    )
+
+
+def test_live_resume_transition_accepts_matching_audits_for_all_required_packet_stages(
+    SessionLocal,
+):
+    state = _seed_live_resume_orchestrator_state(
+        SessionLocal,
+        include_packet_if_checkpoint=True,
+    )
+    registry = _with_required_packet_if(state["registry"])
+    with SessionLocal() as db:
+        _align_packet_if_and_add_audit(db, state=state)
+        db.commit()
+
+        transition = resolve_packet_live_resume_transition(
+            db,
+            registry=registry,
+            range_start=state["boundary_before"],
+            cutoff=state["producer_cutoff"],
+        )
+
+    assert transition is not None
+    assert transition.boundary == state["resume_boundary"]
+    assert transition.target_session_id == LIVE_RESUME_TARGET_SESSION_ID
+
+
+def test_live_resume_transition_accepts_matching_packet_if_only_audit(SessionLocal):
+    state = _seed_live_resume_orchestrator_state(
+        SessionLocal,
+        include_packet_if_checkpoint=True,
+    )
+    registry = _with_only_required_packet_if()
+    with SessionLocal() as db:
+        _align_packet_if_and_add_audit(db, state=state)
+        db.commit()
+
+        transition = resolve_packet_live_resume_transition(
+            db,
+            registry=registry,
+            range_start=state["boundary_before"],
+            cutoff=state["producer_cutoff"],
+        )
+
+    assert transition is not None
+    assert transition.boundary == state["resume_boundary"]
+    assert transition.target_session_id == LIVE_RESUME_TARGET_SESSION_ID
+
+
+def test_live_resume_transition_rejects_missing_packet_if_audit(SessionLocal):
+    state = _seed_live_resume_orchestrator_state(
+        SessionLocal,
+        include_packet_if_checkpoint=True,
+    )
+    registry = _with_required_packet_if(state["registry"])
+    with SessionLocal() as db:
+        resume_boundary = state["resume_boundary"]
+        previous_feature_id = state["previous_feature_id"]
+        checkpoints.upsert_detector_checkpoint(
+            db,
+            detector_name=PACKET_IF,
+            source_table="packet_feature_logs",
+            last_processed_id=previous_feature_id,
+            last_completed_window_end=resume_boundary,
+            updated_at=resume_boundary,
+        )
+        db.commit()
+
+        transition = resolve_packet_live_resume_transition(
+            db,
+            registry=registry,
+            range_start=state["boundary_before"],
+            cutoff=state["producer_cutoff"],
+        )
+
+    assert transition is None
+
+
+def test_live_resume_transition_rejects_packet_if_audit_target_mismatch(
+    SessionLocal,
+):
+    state = _seed_live_resume_orchestrator_state(
+        SessionLocal,
+        include_packet_if_checkpoint=True,
+    )
+    registry = _with_required_packet_if(state["registry"])
+    with SessionLocal() as db:
+        _align_packet_if_and_add_audit(
+            db,
+            state=state,
+            audit_target=PACKET_SESSION_ID,
+        )
+        db.commit()
+
+        transition = resolve_packet_live_resume_transition(
+            db,
+            registry=registry,
+            range_start=state["boundary_before"],
+            cutoff=state["producer_cutoff"],
+        )
+
+    assert transition is None
+
+
+def test_live_resume_transition_rejects_packet_if_audit_boundary_mismatch(
+    SessionLocal,
+):
+    state = _seed_live_resume_orchestrator_state(
+        SessionLocal,
+        include_packet_if_checkpoint=True,
+    )
+    registry = _with_required_packet_if(state["registry"])
+    with SessionLocal() as db:
+        _align_packet_if_and_add_audit(
+            db,
+            state=state,
+            audit_boundary=state["resume_boundary"] + timedelta(seconds=10),
+        )
+        db.commit()
+
+        transition = resolve_packet_live_resume_transition(
+            db,
+            registry=registry,
+            range_start=state["boundary_before"],
+            cutoff=state["producer_cutoff"],
+        )
+
+    assert transition is None
 
 
 def test_live_resume_transition_rejects_required_packet_boundary_mismatch(SessionLocal):

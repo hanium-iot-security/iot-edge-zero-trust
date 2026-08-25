@@ -264,10 +264,6 @@ def build_recovery_plan(
 ) -> dict[str, object]:
     if mode not in RECOVERY_MODES:
         raise PacketCheckpointRecoveryError(f"unsupported recovery mode: {mode}")
-    if mode == LIVE_RESUME_MODE and detector_name != "packet_rule":
-        raise PacketCheckpointRecoveryError(
-            "live-resume is supported only for packet_rule"
-        )
     source_table = recovery_repository.SUPPORTED_DETECTORS.get(detector_name)
     if source_table is None:
         raise PacketCheckpointRecoveryError(

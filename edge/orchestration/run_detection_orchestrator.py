@@ -320,55 +320,14 @@ def _target_has_live_resume_ready_shape(
     return status == "RUNNING"
 
 
-def resolve_packet_live_resume_transition(
+def _resolve_packet_stage_live_resume_audit(
     db: Session,
     *,
-    registry: StageRegistry,
-    range_start: datetime,
-    cutoff: datetime,
+    detector_name: str,
+    source_table: str,
+    last_processed_id: object,
+    boundary: datetime,
 ) -> PacketLiveResumeTransition | None:
-    required_packet_stages = tuple(
-        configured
-        for configured in registry.required_stages
-        if configured.name in PACKET_STAGE_NAMES
-    )
-    packet_rule_stage = next(
-        (
-            configured
-            for configured in required_packet_stages
-            if configured.name == PACKET_RULE
-        ),
-        None,
-    )
-    if packet_rule_stage is None:
-        return None
-
-    packet_checkpoints: list[dict[str, object]] = []
-    boundaries: list[datetime] = []
-    for configured in required_packet_stages:
-        checkpoint = checkpoints.get_detector_checkpoint(
-            db,
-            detector_name=configured.stage.detector_name,
-            source_table=configured.stage.source_table,
-        )
-        if checkpoint is None or checkpoint["last_completed_window_end"] is None:
-            return None
-        packet_checkpoints.append(checkpoint)
-        boundaries.append(
-            parse_db_utc(
-                checkpoint["last_completed_window_end"],
-                "last_completed_window_end",
-            )
-        )
-
-    boundary = boundaries[0]
-    if any(candidate != boundary for candidate in boundaries[1:]):
-        return None
-    if not range_start < boundary <= cutoff:
-        return None
-
-    packet_rule_index = required_packet_stages.index(packet_rule_stage)
-    packet_rule_checkpoint = packet_checkpoints[packet_rule_index]
     candidates = db.execute(
         text(
             """
@@ -388,10 +347,10 @@ def resolve_packet_live_resume_transition(
             """
         ),
         {
-            "detector_name": packet_rule_stage.stage.detector_name,
-            "source_table": packet_rule_stage.stage.source_table,
+            "detector_name": detector_name,
+            "source_table": source_table,
             "boundary": format_db_utc(boundary),
-            "last_processed_id": packet_rule_checkpoint["last_processed_id"],
+            "last_processed_id": last_processed_id,
         },
     ).mappings()
 
@@ -423,6 +382,77 @@ def resolve_packet_live_resume_transition(
             )
         )
     return valid[0] if len(valid) == 1 else None
+
+
+def resolve_packet_live_resume_transition(
+    db: Session,
+    *,
+    registry: StageRegistry,
+    range_start: datetime,
+    cutoff: datetime,
+) -> PacketLiveResumeTransition | None:
+    required_packet_stages = tuple(
+        configured
+        for configured in registry.required_stages
+        if configured.name in PACKET_STAGE_NAMES
+    )
+    if not required_packet_stages:
+        return None
+
+    packet_checkpoints: list[dict[str, object]] = []
+    boundaries: list[datetime] = []
+    for configured in required_packet_stages:
+        checkpoint = checkpoints.get_detector_checkpoint(
+            db,
+            detector_name=configured.stage.detector_name,
+            source_table=configured.stage.source_table,
+        )
+        if checkpoint is None or checkpoint["last_completed_window_end"] is None:
+            return None
+        packet_checkpoints.append(checkpoint)
+        boundaries.append(
+            parse_db_utc(
+                checkpoint["last_completed_window_end"],
+                "last_completed_window_end",
+            )
+        )
+
+    boundary = boundaries[0]
+    if any(candidate != boundary for candidate in boundaries[1:]):
+        return None
+    if not range_start < boundary <= cutoff:
+        return None
+
+    audits: list[PacketLiveResumeTransition] = []
+    for configured, checkpoint in zip(
+        required_packet_stages,
+        packet_checkpoints,
+        strict=True,
+    ):
+        audit = _resolve_packet_stage_live_resume_audit(
+            db,
+            detector_name=configured.stage.detector_name,
+            source_table=configured.stage.source_table,
+            last_processed_id=checkpoint["last_processed_id"],
+            boundary=boundary,
+        )
+        if audit is None:
+            return None
+        audits.append(audit)
+
+    target_session_id = audits[0].target_session_id
+    if any(audit.target_session_id != target_session_id for audit in audits[1:]):
+        return None
+
+    packet_rule_index = next(
+        (
+            index
+            for index, configured in enumerate(required_packet_stages)
+            if configured.name == PACKET_RULE
+        ),
+        0,
+    )
+    return audits[packet_rule_index]
 
 
 def run_orchestration_cycle(
