@@ -85,6 +85,7 @@ def test_parser_accepts_scenario_registry_underscore_argument_names() -> None:
         ({"target_host": ""}, "target-host"),
         ({"target_host": "8.8.8.8"}, "private or loopback"),
         ({"target_port": 0}, "target-port"),
+        ({"target_port": 8883}, "target-port.*1883"),
         ({"target_port": 65536}, "target-port"),
         ({"count": 0}, "count"),
         ({"count": 101}, "count"),

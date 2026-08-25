@@ -40,8 +40,6 @@ DEFAULT_CONNECTION_COUNT = 24
 DEFAULT_RATE_CPS = 8.0
 DEFAULT_CONNECT_TIMEOUT_MS = 200
 
-MIN_PORT = 1
-MAX_PORT = 65535
 MIN_CONNECTION_COUNT = 1
 MAX_CONNECTION_COUNT = 100
 MIN_RATE_CPS = 0.1
@@ -113,8 +111,11 @@ def build_attack_plan(
         raise ValueError("--target-host must be non-empty")
     if not _is_private_or_loopback_ipv4(normalized_host):
         raise ValueError("--target-host must be a private or loopback IPv4 address")
-    if not MIN_PORT <= target_port <= MAX_PORT:
-        raise ValueError(f"--target-port must be in {MIN_PORT}..{MAX_PORT}")
+    if target_port != DEFAULT_TARGET_PORT:
+        raise ValueError(
+            f"--target-port must be {DEFAULT_TARGET_PORT} because "
+            "mqtt_related_packet_count only counts TCP port 1883"
+        )
     if not MIN_CONNECTION_COUNT <= count <= MAX_CONNECTION_COUNT:
         raise ValueError(
             f"--count must be in {MIN_CONNECTION_COUNT}..{MAX_CONNECTION_COUNT}"
