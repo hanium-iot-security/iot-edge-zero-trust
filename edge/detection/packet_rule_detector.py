@@ -58,6 +58,9 @@ class PacketRulePolicy:
     확인되면 조정하되, 바꿀 때는 반드시 version도 함께 올려서 Evidence에 어떤
     Policy Version으로 판정됐는지 남긴다 (Policy Version, Session,
     표본 수, P95·P99, Commit을 기록한다).
+
+    excluded_peer_ips는 명시적으로 설정한 Management/Infrastructure Peer를
+    IoT Packet Rule 적용 Scope에서만 제외한다.
     """
 
     packet_rate_threshold: float
@@ -67,7 +70,7 @@ class PacketRulePolicy:
     broker_dos_tcp_syn_threshold: int
     broker_dos_mqtt_packet_threshold: int
     version: str
-    packet_rate_excluded_peer_ips: frozenset[str] = frozenset()
+    excluded_peer_ips: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         for name in ("packet_rate_threshold", "byte_rate_threshold"):
@@ -107,8 +110,8 @@ class PacketRulePolicy:
                 app_settings.packet_rule_broker_dos_mqtt_packet_threshold
             ),
             version=app_settings.packet_rule_policy_version,
-            packet_rate_excluded_peer_ips=_parse_packet_rate_excluded_peer_ips(
-                app_settings.packet_rule_packet_rate_excluded_peer_ips
+            excluded_peer_ips=_parse_excluded_peer_ips(
+                app_settings.packet_rule_excluded_peer_ips
             ),
         )
 
@@ -119,8 +122,8 @@ class PacketRulePolicy:
         return cls.from_settings(settings)
 
 
-def _parse_packet_rate_excluded_peer_ips(raw_value: str) -> frozenset[str]:
-    """쉼표로 구분된 Packet Rate 제외 Peer IP를 검증·정규화한다.
+def _parse_excluded_peer_ips(raw_value: str) -> frozenset[str]:
+    """쉼표로 구분된 Management/Infrastructure 제외 Peer IP를 검증·정규화한다.
 
     빈 값은 기존 Packet Rule 동작을 유지하기 위해 빈 집합으로 처리한다.
     잘못된 IP는 탐지 예외가 조용히 잘못 적용되지 않도록 fail-fast 한다.
@@ -137,7 +140,7 @@ def _parse_packet_rate_excluded_peer_ips(raw_value: str) -> frozenset[str]:
             parsed = ip_address(candidate)
         except ValueError as exc:
             raise ValueError(
-                "packet_rate_excluded_peer_ips contains invalid IP address: "
+                "excluded_peer_ips contains invalid IP address: "
                 f"{candidate!r}"
             ) from exc
 
@@ -187,15 +190,15 @@ def detect_packet_rules(
     NON_MQTT_TRAFFIC은 목적지 Port 목록 Feature가 아직 없어 이 함수에서
     판정하지 않는다 (Phase 4 Required Rule에서는 비활성화한다).
     """
+    peer_ip = str(row.get("peer_ip") or "")
+    if peer_ip in policy.excluded_peer_ips:
+        return []
+
     events: list[dict[str, Any]] = []
     duration = float(row["captured_duration_seconds"])
 
     packets_per_second = effective_packets_per_second(float(row["packet_count"]), duration)
-    peer_ip = str(row.get("peer_ip") or "")
-    if (
-        packets_per_second > policy.packet_rate_threshold
-        and peer_ip not in policy.packet_rate_excluded_peer_ips
-    ):
+    if packets_per_second > policy.packet_rate_threshold:
         events.append(
             {
                 "event_type": PACKET_RATE_ANOMALY,
