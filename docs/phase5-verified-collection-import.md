@@ -5,9 +5,13 @@
 
 ## 1. 이 도구가 주장하는 것과 주장하지 않는 것
 
-정상 16 Session과 공격 Session 53은 Dataset v2 Run Manifest 계약이 생기기 전에
+Phase 5 정상 16 Session과 공격 Session 53은 Dataset v2 Run Manifest 계약이 생기기 전에
 ESP32로 수동 수집됐다. 그 시점에 Scenario Runner는 실행되지 않았고 Run Manifest도
 만들어지지 않았다.
+
+Phase 6-B의 `packet-if-v2-calib-002` 후보는 이 17 Session을 그대로 재사용하고,
+동일한 수동 수집·사후 검증 계약을 적용한 승인된 `esp32_02` 정상 6 Session만
+추가한다. 운영 DB와 PCAP을 입력으로만 사용한다는 안전 경계는 바뀌지 않는다.
 
 이 도구는 그 사실을 그대로 기록한다.
 
@@ -38,7 +42,7 @@ Runner 반복 평가는 Phase 6 선택 고도화로 이관한다.
 
 ## 3. 대상 Session
 
-**포함 — 총 17 Session (이번 공식 배치의 운영 계획)**
+**Phase 5 원본 Package 포함 — 총 17 Session**
 
 정상 Profile 4종을 각각 **Train 2 / Validation 1 / Test 1**로 맞춘다.
 
@@ -74,16 +78,49 @@ Importer가 실제로 강제하는 것은 아래 안전 규칙이며, 구성과 
 - 승인된 공격 Session(Session 53)만 허용
 - 세 Split이 모두 존재
 
-**제외 (Dataset 외부 보존)**
+**Phase 5 원본 Package에서 제외 (Dataset 외부 보존)**
 
 - `esp32_02` 정상 Holdout 2 Session
 - Session 51 (2-Burst Packet Rule·Event 통합 검증)
 - Session 52 (10초 Tumbling Window 경계 False Negative 분석)
 - Artifact 배포 후 새로 수집할 공식 E2E 공격 Holdout
 
-Import Spec에 실수로 넣어도 도구가 거부한다. 정상 Session은
-`collection_device_id=esp32_01`만 허용하고, 공격 Session은 검증 완료된 Session 53
-ID만 허용한다.
+기존 `packet-if-v2-verified-001`에서는 Import Spec에 실수로 넣어도 도구가
+거부한다. 정상 Session은 `collection_device_id=esp32_01`만 허용하고, 공격
+Session은 검증 완료된 Session 53 ID만 허용한다.
+
+### 3.1 Phase 6-B Calibration Candidate
+
+`packet-if-v2-calib-002`는 위 17 Session의 JSON 객체와 순서를 그대로 재사용하고,
+아래 6 Session을 추가한 **23 Session 전용 후보**다. 기존 Phase 5 Device 제한을
+전체적으로 완화하지 않는다. 아래 Session ID·Slot·Split·Scenario·Capture Group·
+수집 Commit이 모두 정확하고 6개가 한 Package에 함께 있을 때만 `esp32_02` 정상
+수집을 허용한다.
+
+| 의미 | Split | Scenario | Session ID | 적격 Row |
+| --- | --- | --- | --- | ---: |
+| Train P0 | `train` | `normal_stable` | `7134d811-df72-4b63-8cd6-b88ca769173f` | 104 |
+| Train P3 | `train` | `normal_combined_variation` | `e95d0562-05b9-4e95-87d3-a466eac9dfc4` | 94 |
+| Validation P0 | `validation` | `normal_stable` | `c326fdfe-35eb-49f7-bb4b-e6341d9223a4` | 100 |
+| Validation P3 | `validation` | `normal_combined_variation` | `078b8a30-f6cb-4835-9798-8ad7ca39326c` | 94 |
+| Holdout P0 | `test` | `normal_stable` | `2915ca75-c95d-41aa-a560-f3fb11287bd7` | 95 |
+| Holdout P3 | `test` | `normal_combined_variation` | `186b4f63-e62e-4cba-9f32-2d0ccc2cc9af` | 95 |
+| **합계** |  |  | **6 Session** | **582** |
+
+고정 Provenance는 다음과 같다.
+
+- Device/IP: `esp32_02` / `192.168.0.5`
+- Firmware/Payload: `phase5-normal-pilot-v1` / `phase5-normal-payload-v1`
+- Capture source commit: `5c0de2d6f19332d07ab5d966d247e7735689eebc`
+- Frozen DB: `/home/pi/p6b-calib-002-freeze/iot-security-p6b-calib-002.db`
+- Frozen DB SHA256: `495a2136b8a221b8ebe192b55cfed4e10e5949ebe2fffed977101bf2fdb2137d`
+- Import Spec: `docs/specs/packet-if-v2-calib-002-import-spec.json`
+
+최종 구성은 Train 10 / Validation 6 / Test 7이다. 신규 Test 2개는 파일 형식상
+`test`로 매핑하지만 의미상 **정상 Holdout**이다. Train만 Model fitting에 쓰고,
+정상 Validation만 Threshold 선택에 쓴다. Model과 Threshold를 고정한 뒤에만
+Holdout을 평가하며, 그 결과를 보고 같은 Artifact의 Threshold를 다시 조정하지
+않는다. `source_capture_group_id`는 Split을 넘을 수 없다.
 
 ## 4. 사전 준비 — DB Snapshot
 
@@ -232,12 +269,44 @@ Importer는 구성을 강제하지 않으므로 **이 확인은 운영자 책임
 }
 ```
 
+Phase 6-B 후보는 Pi에서 파일을 만들기 전에 아래 명령으로만 검증한다.
+
+```bash
+python -m edge.phase5.import_verified_collection \
+  --project-root /home/pi/iot-edge-zero-trust \
+  --db-snapshot /home/pi/p6b-calib-002-freeze/iot-security-p6b-calib-002.db \
+  --processed-pcap-dir /home/pi/iot-edge-zero-trust/data/pcap/processed \
+  --spec /home/pi/iot-edge-zero-trust/docs/specs/packet-if-v2-calib-002-import-spec.json \
+  --output-root /home/pi/iot-edge-zero-trust/data/exports \
+  --verification-commit-sha "$(git rev-parse HEAD)" \
+  --check-only
+```
+
+출력은 DB SHA256이 위 Frozen SHA와 같고, PCAP 누락 없이 신규 6 Session의
+`eligible_feature_row_count` 합계가 582이며, 구성이 아래와 정확히 같아야 한다.
+
+```json
+{
+  "dataset_package_id": "packet-if-v2-calib-002",
+  "session_count": 23,
+  "split_counts": { "train": 10, "validation": 6, "test": 7 },
+  "scenario_split_counts": {
+    "normal_stable":             { "train": 3, "validation": 2, "test": 2 },
+    "normal_interval_jitter":    { "train": 2, "validation": 1, "test": 1 },
+    "normal_payload_variation":  { "train": 2, "validation": 1, "test": 1 },
+    "normal_combined_variation": { "train": 3, "validation": 2, "test": 2 },
+    "packet_rate_flood":         { "test": 1 }
+  }
+}
+```
+
 하나라도 다르면 `--write`를 실행하지 않고 Import Spec을 먼저 고친다. 같은 값이
 게시된 Package의 `import-summary.json`에도 남으므로 사후에도 확인할 수 있다.
 
 ### 6.2 게시 (`--write`)
 
-`--check-only` 결과를 승인한 뒤에만 실행한다.
+`--check-only` 결과를 운영자가 별도로 승인한 뒤에만 실행한다. 검증 PASS 자체는
+게시 승인으로 간주하지 않는다.
 
 ```bash
 python -m edge.phase5.import_verified_collection \
@@ -295,6 +364,16 @@ python -m ai.export_packet_if_dataset \
 
 Dataset Manifest는 **Package Root에 둔다.** `run_manifest_ref.relative_path`가
 Manifest Directory 기준 상대경로이므로 다른 위치에 쓰면 참조가 풀리지 않는다.
+
+최종 Package를 Archive로 인계할 때 `.sha256` Sidecar에는 Pi 절대경로를 기록하지
+않는다. Archive가 있는 Directory에서 파일명만 기록해야 다른 환경에서도 그대로
+검증할 수 있다.
+
+```bash
+cd "$(dirname "$ARCHIVE")"
+sha256sum "$(basename "$ARCHIVE")" > "$(basename "$ARCHIVE").sha256"
+sha256sum -c "$(basename "$ARCHIVE").sha256"
+```
 
 `--db-snapshot`은 환경변수 편의 기능이 아니라 계약이다.
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -103,6 +104,56 @@ VERIFICATION_COMMIT = "b" * 40
 INTERFACE = "eth0"
 BASE_TIME = datetime(2026, 8, 3, 10, 0, 0, tzinfo=timezone.utc)
 
+PHASE6B_PACKAGE_ID = "packet-if-v2-calib-002"
+PHASE6B_CAPTURE_COMMIT = "5c0de2d6f19332d07ab5d966d247e7735689eebc"
+PHASE6B_NORMAL_SESSIONS = (
+    {
+        "session_id": "7134d811-df72-4b63-8cd6-b88ca769173f",
+        "source_capture_group_id": "60e14996-6ecb-46ab-85a8-12cb74ffbb92",
+        "slot": "phase6b-normal-stable-train-01",
+        "split": "train",
+        "scenario": "normal_stable",
+    },
+    {
+        "session_id": "e95d0562-05b9-4e95-87d3-a466eac9dfc4",
+        "source_capture_group_id": "bcd636dc-8b25-4070-95b6-d3c44c41429d",
+        "slot": "phase6b-normal-combined-variation-train-01",
+        "split": "train",
+        "scenario": "normal_combined_variation",
+    },
+    {
+        "session_id": "c326fdfe-35eb-49f7-bb4b-e6341d9223a4",
+        "source_capture_group_id": "590f851d-1af1-4f72-9144-fddd2ee12cb3",
+        "slot": "phase6b-normal-stable-validation-01",
+        "split": "validation",
+        "scenario": "normal_stable",
+    },
+    {
+        "session_id": "078b8a30-f6cb-4835-9798-8ad7ca39326c",
+        "source_capture_group_id": "dda7807c-9158-49b1-a18f-c788b2b5b562",
+        "slot": "phase6b-normal-combined-variation-validation-01",
+        "split": "validation",
+        "scenario": "normal_combined_variation",
+    },
+    {
+        "session_id": "2915ca75-c95d-41aa-a560-f3fb11287bd7",
+        "source_capture_group_id": "8b884392-60f4-4b43-8029-db0c8be077c3",
+        "slot": "phase6b-normal-stable-holdout-01",
+        "split": "test",
+        "scenario": "normal_stable",
+    },
+    {
+        "session_id": "186b4f63-e62e-4cba-9f32-2d0ccc2cc9af",
+        "source_capture_group_id": "0a60c148-1cf2-4fe5-8c78-c77472b5016d",
+        "slot": "phase6b-normal-combined-variation-holdout-01",
+        "split": "test",
+        "scenario": "normal_combined_variation",
+    },
+)
+LEGACY_17_SESSIONS_CANONICAL_SHA256 = (
+    "0a64ae5a735a7383e7c0f4d45a1f83299a1a198b8769a3ec80287266d8650b56"
+)
+
 
 def _iso(value: datetime) -> str:
     return value.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -165,6 +216,18 @@ class SnapshotBuilder:
 
     def dispose(self) -> None:
         self._engine.dispose()
+
+    def set_device_ip(self, device_id: str, ip_address: str) -> None:
+        self._dirty = True
+        with self._SessionLocal() as db:
+            db.execute(
+                text(
+                    "UPDATE devices SET ip_address = :ip_address "
+                    "WHERE device_id = :device_id"
+                ),
+                {"device_id": device_id, "ip_address": ip_address},
+            )
+            db.commit()
 
     def add_session(
         self,
@@ -427,6 +490,35 @@ def _attack_entry(**overrides) -> dict:
     return entry
 
 
+def _phase6b_normal_entry(item: dict, **overrides) -> dict:
+    entry = _session_entry(
+        item["session_id"],
+        slot=item["slot"],
+        split=item["split"],
+        scenario=item["scenario"],
+        device="esp32_02",
+        commit=PHASE6B_CAPTURE_COMMIT,
+        source_capture_group_id=item["source_capture_group_id"],
+    )
+    entry.update(overrides)
+    return entry
+
+
+def _phase6b_normal_entries() -> list[dict]:
+    return [_phase6b_normal_entry(item) for item in PHASE6B_NORMAL_SESSIONS]
+
+
+def _phase6b_23_session_spec() -> dict:
+    return _spec_payload(
+        [
+            *_official_normal_entries(),
+            _attack_entry(),
+            *_phase6b_normal_entries(),
+        ],
+        dataset_package_id=PHASE6B_PACKAGE_ID,
+    )
+
+
 def _add_attack_session(snapshot: SnapshotBuilder, **overrides) -> None:
     """Seed Session 53 with the gateway packet count the design pins."""
     kwargs = {
@@ -437,6 +529,18 @@ def _add_attack_session(snapshot: SnapshotBuilder, **overrides) -> None:
     }
     kwargs.update(overrides)
     snapshot.add_session(ATTACK_TEST_SESSION, **kwargs)
+
+
+def _seed_phase6b_23_session_batch(snapshot: SnapshotBuilder) -> None:
+    for item in OFFICIAL_NORMAL_SESSIONS:
+        snapshot.add_session(item["session_id"])
+    _add_attack_session(snapshot)
+    for item in PHASE6B_NORMAL_SESSIONS:
+        snapshot.add_session(
+            item["session_id"],
+            device_id="esp32_02",
+            peer_ip="192.168.0.5",
+        )
 
 
 def _spec_payload(sessions: list[dict], **overrides) -> dict:
@@ -982,6 +1086,92 @@ def test_spec_rejects_normal_session_from_esp32_02() -> None:
 
     with pytest.raises(ValueError, match="collection_device_id"):
         VerifiedCollectionImportSpec.from_json(json.dumps(payload))
+
+
+def test_spec_accepts_only_the_complete_phase6b_normal_session_approval_set() -> None:
+    spec = VerifiedCollectionImportSpec.from_json(
+        json.dumps(_phase6b_23_session_spec())
+    )
+
+    phase6b_sessions = [
+        session
+        for session in spec.sessions
+        if session.session_id
+        in {item["session_id"] for item in PHASE6B_NORMAL_SESSIONS}
+    ]
+    assert len(phase6b_sessions) == 6
+    assert {session.collection_device_id for session in phase6b_sessions} == {
+        "esp32_02"
+    }
+
+
+def test_spec_rejects_partial_phase6b_normal_session_approval_set() -> None:
+    payload = _phase6b_23_session_spec()
+    payload["sessions"].pop()
+
+    with pytest.raises(ValueError, match="all six approved Sessions"):
+        VerifiedCollectionImportSpec.from_json(json.dumps(payload))
+
+
+def test_spec_rejects_phase6b_normal_sessions_in_another_package() -> None:
+    payload = _phase6b_23_session_spec()
+    payload["dataset_package_id"] = "packet-if-v2-verified-002"
+
+    with pytest.raises(ValueError, match=PHASE6B_PACKAGE_ID):
+        VerifiedCollectionImportSpec.from_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("split", "validation"),
+        ("scenario", "normal_combined_variation"),
+        ("collection_slot_id", "phase6b-normal-stable-train-99"),
+        ("source_capture_group_id", "55555555-5555-4555-8555-555555555555"),
+        ("capture_source_commit_sha", "f" * 40),
+    ],
+)
+def test_spec_rejects_tampered_phase6b_normal_session_contract(
+    field: str,
+    value: str,
+) -> None:
+    payload = _phase6b_23_session_spec()
+    phase6b_entry = next(
+        session
+        for session in payload["sessions"]
+        if session["session_id"] == PHASE6B_NORMAL_SESSIONS[0]["session_id"]
+    )
+    phase6b_entry[field] = value
+
+    with pytest.raises(ValueError, match="approved Phase 6-B normal Session"):
+        VerifiedCollectionImportSpec.from_json(json.dumps(payload))
+
+
+def test_preflight_exports_only_the_approved_phase6b_device_rows(
+    snapshot: SnapshotBuilder,
+) -> None:
+    _seed_phase6b_23_session_batch(snapshot)
+
+    plan = _preflight(snapshot, _phase6b_23_session_spec())
+
+    for item in PHASE6B_NORMAL_SESSIONS:
+        session = plan.session_by_id(item["session_id"])
+        assert session.included_device_ids == ("esp32_02",)
+        assert session.device_ips == {"esp32_02": "192.168.0.5"}
+        assert session.eligible_row_count == 2
+
+
+def test_preflight_rejects_phase6b_device_registration_ip_mismatch(
+    snapshot: SnapshotBuilder,
+) -> None:
+    _seed_phase6b_23_session_batch(snapshot)
+    snapshot.set_device_ip("esp32_02", "192.168.0.6")
+
+    with pytest.raises(
+        VerifiedCollectionImportError,
+        match="Phase 6-B normal collection Device registration mismatch",
+    ):
+        _preflight(snapshot, _phase6b_23_session_spec())
 
 
 def test_spec_rejects_attack_session_other_than_the_verified_one() -> None:
@@ -2416,6 +2606,126 @@ def test_importer_accepts_the_official_17_session_composition(
             if spec.split == split and spec.traffic_label == "normal"
         }
         assert scenarios == set(NORMAL_PROFILES), split
+
+
+def test_phase6b_import_spec_reuses_the_existing_17_sessions_exactly() -> None:
+    spec_path = (
+        Path(__file__).resolve().parents[1]
+        / "docs"
+        / "specs"
+        / "packet-if-v2-calib-002-import-spec.json"
+    )
+    payload = json.loads(spec_path.read_text(encoding="utf-8"))
+    legacy_sessions = json.dumps(
+        payload["sessions"][:17],
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    assert payload["dataset_package_id"] == PHASE6B_PACKAGE_ID
+    assert len(payload["sessions"]) == 23
+    assert hashlib.sha256(legacy_sessions).hexdigest() == (
+        LEGACY_17_SESSIONS_CANONICAL_SHA256
+    )
+    spec = VerifiedCollectionImportSpec.from_json(json.dumps(payload))
+    assert len(spec.sessions) == 23
+    assert {session.session_id for session in spec.sessions[-6:]} == {
+        item["session_id"] for item in PHASE6B_NORMAL_SESSIONS
+    }
+
+
+def test_importer_accepts_the_phase6b_23_session_composition_end_to_end(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+) -> None:
+    _seed_phase6b_23_session_batch(snapshot)
+
+    package = _write_package(snapshot, tmp_path, _phase6b_23_session_spec())
+    result = _export_from_package(package, snapshot, tmp_path)
+    dataset = load_packet_if_dataset(result.output_path, result.manifest_path)
+
+    assert package.name == PHASE6B_PACKAGE_ID
+    assert len(dataset.manifest.sessions) == 23
+    assert len(dataset.session_ids("train")) == 10
+    assert len(dataset.session_ids("validation")) == 6
+    assert len(dataset.session_ids("test")) == 7
+
+    export_spec = _read_json(package / "packet-if-export-spec-v2.json")
+    expected_snapshot_sha256 = file_sha256(snapshot.db_path)
+    assert export_spec["db_snapshot_sha256"] == expected_snapshot_sha256
+    for entry in export_spec["sessions"]:
+        run_dir = package / Path(entry["run_manifest_path"]).parent
+        for filename in (
+            "run-manifest.json",
+            "run-manifest.json.sha256",
+            "verified-collection-manifest.json",
+            "verified-collection-manifest.json.sha256",
+        ):
+            assert (run_dir / filename).is_file()
+        collection = VerifiedCollectionManifest.from_json(
+            (run_dir / "verified-collection-manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert collection.db_snapshot_sha256 == expected_snapshot_sha256
+
+
+def test_phase6b_check_only_reports_the_23_session_candidate_shape(
+    snapshot: SnapshotBuilder,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    _seed_phase6b_23_session_batch(snapshot)
+    spec_path = tmp_path / "packet-if-v2-calib-002-import-spec.json"
+    spec_path.write_text(
+        json.dumps(_phase6b_23_session_spec()),
+        encoding="utf-8",
+    )
+    output_root = tmp_path / "exports"
+
+    exit_code = main(
+        [
+            "--project-root",
+            str(tmp_path),
+            "--db-snapshot",
+            str(snapshot.db_path),
+            "--processed-pcap-dir",
+            str(snapshot.pcap_dir),
+            "--spec",
+            str(spec_path),
+            "--output-root",
+            str(output_root),
+            "--verification-commit-sha",
+            VERIFICATION_COMMIT,
+            "--check-only",
+        ]
+    )
+
+    assert exit_code == 0
+    assert not output_root.exists()
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["dataset_package_id"] == PHASE6B_PACKAGE_ID
+    assert summary["session_count"] == 23
+    assert summary["split_counts"] == {
+        "test": 7,
+        "train": 10,
+        "validation": 6,
+    }
+    assert summary["scenario_split_counts"] == {
+        "normal_combined_variation": {
+            "test": 2,
+            "train": 3,
+            "validation": 2,
+        },
+        "normal_interval_jitter": {"test": 1, "train": 2, "validation": 1},
+        "normal_payload_variation": {
+            "test": 1,
+            "train": 2,
+            "validation": 1,
+        },
+        "normal_stable": {"test": 2, "train": 3, "validation": 2},
+        "packet_rate_flood": {"test": 1},
+    }
 
 
 def test_check_only_reports_scenario_split_breakdown_for_review(

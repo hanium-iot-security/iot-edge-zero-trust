@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -318,6 +319,74 @@ class TestDetectPacketRules:
         event_types = {e["event_type"] for e in events}
         assert event_types == {"PACKET_RATE_ANOMALY", "BYTE_RATE_ANOMALY", "PORT_SCAN"}
 
+    def test_excluded_management_peer_skips_all_packet_rules(self) -> None:
+        policy = replace(
+            TEST_POLICY,
+            excluded_peer_ips=frozenset({"192.168.0.3"}),
+        )
+        row = self._row(
+            device_id=None,
+            peer_ip="192.168.0.3",
+            packet_count=1_000,
+            total_bytes=2_000_000,
+            distinct_dest_port_count=20,
+            tcp_syn_count=40,
+            mqtt_related_packet_count=150,
+            captured_duration_seconds=10.0,
+        )
+
+        assert detect_packet_rules(row, policy) == []
+
+    def test_non_excluded_unregistered_peer_still_triggers_all_packet_rules(self) -> None:
+        policy = replace(
+            TEST_POLICY,
+            excluded_peer_ips=frozenset({"192.168.0.3"}),
+        )
+        row = self._row(
+            device_id=None,
+            peer_ip="192.168.0.30",
+            packet_count=1_000,
+            total_bytes=2_000_000,
+            distinct_dest_port_count=20,
+            tcp_syn_count=40,
+            mqtt_related_packet_count=150,
+            captured_duration_seconds=10.0,
+        )
+
+        event_types = {event["event_type"] for event in detect_packet_rules(row, policy)}
+
+        assert event_types == {
+            "PACKET_RATE_ANOMALY",
+            "BYTE_RATE_ANOMALY",
+            "PORT_SCAN",
+            "BROKER_DOS_SUSPECTED",
+        }
+
+    def test_non_excluded_registered_iot_peer_still_triggers_all_packet_rules(self) -> None:
+        policy = replace(
+            TEST_POLICY,
+            excluded_peer_ips=frozenset({"192.168.0.3"}),
+        )
+        row = self._row(
+            device_id="esp32_01",
+            peer_ip="192.168.0.4",
+            packet_count=1_000,
+            total_bytes=2_000_000,
+            distinct_dest_port_count=20,
+            tcp_syn_count=40,
+            mqtt_related_packet_count=150,
+            captured_duration_seconds=10.0,
+        )
+
+        event_types = {event["event_type"] for event in detect_packet_rules(row, policy)}
+
+        assert event_types == {
+            "PACKET_RATE_ANOMALY",
+            "BYTE_RATE_ANOMALY",
+            "PORT_SCAN",
+            "BROKER_DOS_SUSPECTED",
+        }
+
     def test_threshold_boundary_is_exclusive(self) -> None:
         # policy 기본값과 정확히 같은 값은 초과가 아니므로 이벤트가 없어야 한다.
         row = self._row(packet_count=int(50.0 * 10), captured_duration_seconds=10.0)  # 정확히 50pps
@@ -325,6 +394,57 @@ class TestDetectPacketRules:
 
 
 class TestPacketRuleDetectorStage:
+    def test_excluded_management_peer_advances_checkpoint_without_event(self, SessionLocal) -> None:
+        policy = replace(
+            TEST_POLICY,
+            excluded_peer_ips=frozenset({"192.168.0.3"}),
+        )
+        with SessionLocal() as db:
+            session_pk = _insert_capture_session(db)
+            _insert_packet_source(
+                db,
+                session_pk=session_pk,
+                feature_id=1,
+                segment_id=1,
+                device_id=None,
+                peer_ip="192.168.0.3",
+                duration=10.0,
+                packet_count=1_000,
+                total_bytes=2_000_000,
+                distinct_dest_port_count=20,
+                tcp_syn_count=40,
+                mqtt_related_packet_count=150,
+            )
+            db.commit()
+
+        stage = PacketRuleDetectorStage(
+            capture_policy=CapturePolicy(),
+            rule_policy=policy,
+        )
+        with SessionLocal() as db:
+            with db.begin():
+                result = stage.run_until(
+                    db,
+                    cycle_range_start=RANGE_START,
+                    cycle_cutoff=CUTOFF,
+                )
+
+        assert result.selected_count == 1
+        assert result.created_event_count == 0
+        assert result.last_processed_id_after == 1
+        assert result.completed_window_end_after == CUTOFF
+
+        with SessionLocal() as db:
+            assert db.execute(text("SELECT COUNT(*) FROM packet_feature_logs")).scalar_one() == 1
+            assert db.execute(text("SELECT COUNT(*) FROM detection_events")).scalar_one() == 0
+            checkpoint = get_detector_checkpoint(
+                db,
+                detector_name="packet_rule",
+                source_table="packet_feature_logs",
+            )
+            assert checkpoint["last_processed_id"] == 1
+            assert checkpoint["last_completed_window_end"] == "2026-07-26T10:00:10Z"
+
     def test_writes_event_checkpoint_in_one_transaction(self, SessionLocal) -> None:
         with SessionLocal() as db:
             _insert_device(db)

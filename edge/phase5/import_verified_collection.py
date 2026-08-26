@@ -1,8 +1,12 @@
-"""Read-only import of already-collected Phase 5 Packet Capture Sessions.
+"""Read-only import of already-collected Packet Capture Sessions.
 
 The 16 normal Sessions and attack Session 53 were collected manually with ESP32
 hardware before the Dataset v2 Run Manifest contract existed. Re-collecting them
 is not an option, and fabricating Scenario Runner Runs for them would be false.
+
+The Phase 6-B calibration candidate adds only six explicitly approved normal
+``esp32_02`` Sessions to that historical 17-Session batch. The same retrospective
+evidence and read-only verification contract applies to all 23 Sessions.
 
 This module verifies the preserved evidence instead: a consistent SQLite
 Snapshot, the processed PCAP files, the Packet Features, and the QC/Split
@@ -79,11 +83,16 @@ logger = logging.getLogger(__name__)
 IMPORT_SPEC_SCHEMA_VERSION = "phase5-verified-collection-import-spec-v1"
 
 # 설계 2.2 절에서 확정한 재사용 대상. 이 목록 밖의 공격 Session은 Dataset에
-# 넣지 않는다 (Session 51·52와 Holdout은 별도 목적으로 보존한다).
+# 넣지 않는다 (Session 51·52와 별도 E2E 공격 Holdout은 외부에 보존한다).
 VERIFIED_ATTACK_SESSION_IDS = frozenset({"23d5dc5b-1e73-44e4-80ed-1d0c12bda7f9"})
 NORMAL_COLLECTION_DEVICE_ID = "esp32_01"
 ATTACK_COLLECTION_DEVICE_ID = "esp32_02"
 ATTACK_TARGET_SOURCE_IP = "192.168.0.5"
+
+PHASE6B_DATASET_PACKAGE_ID = "packet-if-v2-calib-002"
+PHASE6B_NORMAL_COLLECTION_DEVICE_ID = "esp32_02"
+PHASE6B_NORMAL_COLLECTION_SOURCE_IP = "192.168.0.5"
+PHASE6B_CAPTURE_SOURCE_COMMIT_SHA = "5c0de2d6f19332d07ab5d966d247e7735689eebc"
 
 NORMAL_FIRMWARE_VERSION = "phase5-normal-pilot-v1"
 NORMAL_PAYLOAD_SCHEMA_VERSION = "phase5-normal-payload-v1"
@@ -104,6 +113,57 @@ SESSION_53_OBSERVATION_GAP_CAUSE = "UNRESOLVED"
 ELIGIBLE_SEGMENT_STATUSES = frozenset({"PROCESSED", "EMPTY"})
 NOMINAL_WINDOW_SECONDS = 10
 _RUN_ID_PREFIX = "verified-"
+
+
+@dataclass(frozen=True)
+class _ApprovedPhase6BNormalSession:
+    collection_slot_id: str
+    split: str
+    scenario: str
+    source_capture_group_id: str
+
+
+# Phase 5의 `esp32_01` 정상 수집 계약은 그대로 둔다. Phase 6-B에서 새로 수집한
+# `esp32_02` 정상 자료는 아래 Session identity와 provenance가 모두 일치하고 여섯
+# Session이 하나의 calib-002 Package에 함께 있을 때만 예외로 승인한다.
+_APPROVED_PHASE6B_NORMAL_SESSIONS = {
+    "7134d811-df72-4b63-8cd6-b88ca769173f": _ApprovedPhase6BNormalSession(
+        collection_slot_id="phase6b-normal-stable-train-01",
+        split="train",
+        scenario="normal_stable",
+        source_capture_group_id="60e14996-6ecb-46ab-85a8-12cb74ffbb92",
+    ),
+    "e95d0562-05b9-4e95-87d3-a466eac9dfc4": _ApprovedPhase6BNormalSession(
+        collection_slot_id="phase6b-normal-combined-variation-train-01",
+        split="train",
+        scenario="normal_combined_variation",
+        source_capture_group_id="bcd636dc-8b25-4070-95b6-d3c44c41429d",
+    ),
+    "c326fdfe-35eb-49f7-bb4b-e6341d9223a4": _ApprovedPhase6BNormalSession(
+        collection_slot_id="phase6b-normal-stable-validation-01",
+        split="validation",
+        scenario="normal_stable",
+        source_capture_group_id="590f851d-1af1-4f72-9144-fddd2ee12cb3",
+    ),
+    "078b8a30-f6cb-4835-9798-8ad7ca39326c": _ApprovedPhase6BNormalSession(
+        collection_slot_id="phase6b-normal-combined-variation-validation-01",
+        split="validation",
+        scenario="normal_combined_variation",
+        source_capture_group_id="dda7807c-9158-49b1-a18f-c788b2b5b562",
+    ),
+    "2915ca75-c95d-41aa-a560-f3fb11287bd7": _ApprovedPhase6BNormalSession(
+        collection_slot_id="phase6b-normal-stable-holdout-01",
+        split="test",
+        scenario="normal_stable",
+        source_capture_group_id="8b884392-60f4-4b43-8029-db0c8be077c3",
+    ),
+    "186b4f63-e62e-4cba-9f32-2d0ccc2cc9af": _ApprovedPhase6BNormalSession(
+        collection_slot_id="phase6b-normal-combined-variation-holdout-01",
+        split="test",
+        scenario="normal_combined_variation",
+        source_capture_group_id="0a60c148-1cf2-4fe5-8c78-c77472b5016d",
+    ),
+}
 
 
 class VerifiedCollectionImportError(RuntimeError):
@@ -302,12 +362,37 @@ class VerifiedCollectionSessionSpec:
                 raise ValueError(
                     f"normal Session scenario must be a normal profile: {self.scenario!r}"
                 )
-            if self.collection_device_id != NORMAL_COLLECTION_DEVICE_ID:
-                raise ValueError(
-                    "normal Session collection_device_id must be "
-                    f"{NORMAL_COLLECTION_DEVICE_ID!r}: "
-                    f"{self.collection_device_id!r}"
+            approval = _APPROVED_PHASE6B_NORMAL_SESSIONS.get(self.session_id)
+            if approval is None:
+                if self.collection_device_id != NORMAL_COLLECTION_DEVICE_ID:
+                    raise ValueError(
+                        "normal Session collection_device_id must be "
+                        f"{NORMAL_COLLECTION_DEVICE_ID!r} unless the Session is "
+                        "explicitly approved for Phase 6-B: "
+                        f"{self.collection_device_id!r}"
+                    )
+            else:
+                actual = (
+                    self.collection_device_id,
+                    self.collection_slot_id,
+                    self.split,
+                    self.scenario,
+                    self.source_capture_group_id,
+                    self.capture_source_commit_sha,
                 )
+                expected = (
+                    PHASE6B_NORMAL_COLLECTION_DEVICE_ID,
+                    approval.collection_slot_id,
+                    approval.split,
+                    approval.scenario,
+                    approval.source_capture_group_id,
+                    PHASE6B_CAPTURE_SOURCE_COMMIT_SHA,
+                )
+                if actual != expected:
+                    raise ValueError(
+                        "approved Phase 6-B normal Session metadata mismatch: "
+                        f"{self.session_id}"
+                    )
             if self.target_device_id is not None:
                 raise ValueError("normal Session must not declare target_device_id")
             if self.target_source_ip is not None:
@@ -513,6 +598,26 @@ class VerifiedCollectionImportSpec:
                     "train and validation splits accept normal Sessions only"
                 )
 
+        phase6b_session_ids = {
+            session.session_id
+            for session in self.sessions
+            if session.session_id in _APPROVED_PHASE6B_NORMAL_SESSIONS
+        }
+        if (
+            self.dataset_package_id == PHASE6B_DATASET_PACKAGE_ID
+            or phase6b_session_ids
+        ):
+            if self.dataset_package_id != PHASE6B_DATASET_PACKAGE_ID:
+                raise ValueError(
+                    "approved Phase 6-B normal Sessions may only be used in "
+                    f"{PHASE6B_DATASET_PACKAGE_ID!r}"
+                )
+            if phase6b_session_ids != set(_APPROVED_PHASE6B_NORMAL_SESSIONS):
+                raise ValueError(
+                    f"{PHASE6B_DATASET_PACKAGE_ID!r} must contain all six approved "
+                    "Sessions from the Phase 6-B normal collection"
+                )
+
     def session_by_id(self, session_id: str) -> VerifiedCollectionSessionSpec:
         for session in self.sessions:
             if session.session_id == session_id:
@@ -664,6 +769,7 @@ def preflight_verified_collection(
     try:
         _assert_snapshot_integrity(connection, snapshot_path)
         device_ips = _load_device_ips(connection)
+        _validate_phase6b_normal_collection_source(spec, device_ips)
         plans = tuple(
             _build_session_plan(
                 connection,
@@ -707,6 +813,25 @@ def _load_device_ips(connection: sqlite3.Connection) -> dict[str, str]:
         "SELECT device_id, ip_address FROM devices"
     ).fetchall()
     return {str(row["device_id"]): str(row["ip_address"]) for row in rows}
+
+
+def _validate_phase6b_normal_collection_source(
+    spec: VerifiedCollectionImportSpec,
+    device_ips: Mapping[str, str],
+) -> None:
+    if not any(
+        session.session_id in _APPROVED_PHASE6B_NORMAL_SESSIONS
+        for session in spec.sessions
+    ):
+        return
+    actual = device_ips.get(PHASE6B_NORMAL_COLLECTION_DEVICE_ID)
+    if actual != PHASE6B_NORMAL_COLLECTION_SOURCE_IP:
+        raise VerifiedCollectionImportError(
+            "Phase 6-B normal collection Device registration mismatch: "
+            f"device_id={PHASE6B_NORMAL_COLLECTION_DEVICE_ID!r}, "
+            f"expected_ip={PHASE6B_NORMAL_COLLECTION_SOURCE_IP!r}, "
+            f"actual_ip={actual!r}"
+        )
 
 
 def _build_session_plan(
@@ -1131,8 +1256,8 @@ def write_verified_collection_package(
     """Publish the whole batch atomically, or publish nothing at all.
 
     Every file is written into a temporary directory on the same filesystem and
-    only renamed into place once all 17 Sessions succeeded and every hash chain
-    reloaded. A partially verified batch must never become a Dataset input.
+    only renamed into place once every declared Session succeeded and every hash
+    chain reloaded. A partially verified batch must never become a Dataset input.
     """
     output_root = output_root.resolve()
     final_path = output_root / plan.spec.dataset_package_id
