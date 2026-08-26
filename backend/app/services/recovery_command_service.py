@@ -443,7 +443,7 @@ def _select_failure(
     if not release_request_state["passed"]:
         return (
             "ACTIVE_FIREWALL_RELEASE_REQUEST",
-            "Firewall release request is still PENDING or FAILED",
+            "Firewall release request is still PENDING",
             "DENIED",
         )
     if not runtime["passed"]:
