@@ -27,6 +27,8 @@ import {
   formatMqttTimestampKST,
 } from "../utils/mqttTimestamp";
 
+import "../styles/pages/Devices.scss"
+
 const DEFAULT_LIMIT = 20;
 const POLLING_INTERVAL_MS = 10_000;
 const IS_DEV = import.meta.env.DEV;
@@ -125,7 +127,7 @@ function getFirewallStatusLabel(status) {
       .toUpperCase()
     ] ||
     status ||
-    "규칙 없음"
+    "Firewall 기록 없음"
   );
 }
 
@@ -701,7 +703,7 @@ export default function Devices() {
       width: 150,
       render: (value) => (
         <strong
-          className="device-id-cell"
+          className="device-id"
           title={value || ""}
         >
           {value || "-"}
@@ -749,7 +751,7 @@ export default function Devices() {
           );
 
         return (
-          <div className="trust-score-cell">
+          <div className="score-cell">
             <strong>
               {formatNumber(
                 value,
@@ -757,9 +759,9 @@ export default function Devices() {
               )}
             </strong>
 
-            <div className="trust-score-bar">
+            <div className="score-bar">
               <div
-                className={`trust-score-bar-value trust-score-${trustStatus}`}
+                className={`score-fill score-${trustStatus}`}
                 style={{
                   width: `${Math.min(
                     Math.max(
@@ -805,7 +807,7 @@ export default function Devices() {
           getLastSeenStatus(value);
 
         return (
-          <div className="last-seen-cell">
+          <div className="last-seen">
             <StatusBadge
               status={
                 communicationStatus.status
@@ -832,7 +834,7 @@ export default function Devices() {
   ];
 
   return (
-    <div className="page-container">
+    <div className="devices-page">
       <PageHeader
         title="Devices"
         description="등록 기기의 Trust Score와 Trust 상태, 실제 Firewall 적용 상태를 함께 확인합니다."
@@ -1059,7 +1061,7 @@ export default function Devices() {
         </div>
       </section>
 
-      <section className="panel packet-table-panel">
+      <section className="panel table-panel">
         <div className="panel-header">
           <div>
             <h2>등록 기기 목록</h2>
@@ -1105,7 +1107,7 @@ export default function Devices() {
             }
           />
         ) : (
-          <div className="packet-table-scroll">
+          <div className="table-scroll">
             <DataTable
               columns={columns}
               rows={filteredDevices}
@@ -1122,14 +1124,14 @@ export default function Devices() {
                   device.firewall_status ===
                   "FAILED"
                 ) {
-                  return "table-row-danger";
+                  return "row-danger";
                 }
 
                 if (
                   device.status ===
                   "isolated"
                 ) {
-                  return "table-row-warning";
+                  return "row-warning";
                 }
 
                 return "";
@@ -1199,9 +1201,9 @@ export default function Devices() {
         }
       >
         {selectedDevice && (
-          <div className="device-detail">
-            <section className="device-detail-summary">
-              <div className="device-detail-item">
+          <div className="detail">
+            <section className="detail-grid">
+              <div className="detail-item">
                 <span>Device ID</span>
 
                 <strong>
@@ -1209,7 +1211,7 @@ export default function Devices() {
                 </strong>
               </div>
 
-              <div className="device-detail-item">
+              <div className="detail-item">
                 <span>IP Address</span>
 
                 <strong>
@@ -1218,7 +1220,7 @@ export default function Devices() {
                 </strong>
               </div>
 
-              <div className="device-detail-item">
+              <div className="detail-item">
                 <span>Trust 상태</span>
 
                 <StatusBadge
@@ -1237,7 +1239,7 @@ export default function Devices() {
                 />
               </div>
 
-              <div className="device-detail-item">
+              <div className="detail-item">
                 <span>현재 Trust Score</span>
 
                 <strong>
@@ -1248,7 +1250,7 @@ export default function Devices() {
                 </strong>
               </div>
 
-              <div className="device-detail-item">
+              <div className="detail-item">
                 <span>Firewall 상태</span>
 
                 <StatusBadge
@@ -1261,7 +1263,7 @@ export default function Devices() {
                 />
               </div>
 
-              <div className="device-detail-item">
+              <div className="detail-item">
                 <span>마지막 통신</span>
 
                 <strong>
@@ -1273,7 +1275,7 @@ export default function Devices() {
             </section>
 
             {selectedDevice.firewall_rule && (
-              <section className="device-detail-section">
+              <section className="detail-section">
                 <h3>Firewall Rule</h3>
 
                 <dl className="detail-list">
@@ -1334,7 +1336,7 @@ export default function Devices() {
               </section>
             )}
 
-            <section className="device-detail-section">
+            <section className="detail-section">
               <div className="section-heading">
                 <div>
                   <h3>
@@ -1375,14 +1377,14 @@ export default function Devices() {
                   compact
                 />
               ) : (
-                <div className="trust-history-list">
+                <div className="history-list">
                   {trustHistory.map(
                     (history) => (
                       <article
-                        className="trust-history-item"
+                        className="history-item"
                         key={history.id}
                       >
-                        <div className="trust-history-score-flow">
+                        <div className="history-score">
                           <strong>
                             {formatNumber(
                               history.previous_score,
@@ -1400,7 +1402,7 @@ export default function Devices() {
                           </strong>
                         </div>
 
-                        <div className="trust-history-meta">
+                        <div className="history-meta">
                           <StatusBadge
                             status={
                               Number(
@@ -1430,7 +1432,7 @@ export default function Devices() {
                           </span>
                         </div>
 
-                        <dl className="trust-history-detail">
+                        <dl className="history-info">
                           <div>
                             <dt>
                               계산 Delta

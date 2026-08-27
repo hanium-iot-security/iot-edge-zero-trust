@@ -21,6 +21,8 @@ import {
   formatMqttTimestampKST,
 } from "../utils/mqttTimestamp";
 
+import "../styles/pages/Logs.scss"
+
 const DEFAULT_LIMIT = 20;
 const POLLING_INTERVAL_MS = 10_000;
 const IS_DEV = import.meta.env.DEV;
@@ -473,7 +475,7 @@ export default function Logs() {
     width: 150,
     render: (value) => (
       <strong
-        className="device-id-cell"
+        className="device-id"
         title={value || ""}
       >
         {value || "미매핑"}
@@ -486,7 +488,7 @@ export default function Logs() {
     width: 280,
     render: (value) => (
       <span
-        className="topic-cell"
+        className="topic"
         title={value || ""}
       >
         {value || "-"}
@@ -499,7 +501,7 @@ export default function Logs() {
     width: 320,
     render: (value) => (
       <span
-        className="payload-preview"
+        className="payload"
         title={formatPayloadPreview(
           value
         )}
@@ -516,7 +518,7 @@ export default function Logs() {
     align: "right",
     width: 130,
     render: (value) => (
-      <div className="payload-size-cell">
+      <div className="payload-size">
         <strong>
           {value === null ||
           value === undefined
@@ -526,19 +528,6 @@ export default function Logs() {
               )} B`}
         </strong>
 
-        <StatusBadge
-          status={
-            getPayloadSizeStatus(
-              value
-            )
-          }
-          label={
-            getPayloadSizeLabel(
-              value
-            )
-          }
-          size="small"
-        />
       </div>
     ),
   },
@@ -590,7 +579,7 @@ export default function Logs() {
       <span
         className={
           value
-            ? "log-error-cell"
+            ? "log-error"
             : "text-muted"
         }
         title={value || ""}
@@ -609,7 +598,7 @@ export default function Logs() {
 ];
 
   return (
-    <div className="page-container">
+    <div className="logs-page">
       <PageHeader
         title="MQTT Logs"
         description="수신된 MQTT Topic과 Payload, JSON 및 Topic 유효성 검사 결과를 확인합니다."
@@ -850,7 +839,7 @@ export default function Logs() {
         </div>
       </section>
 
-      <section className="panel packet-table-panel">
+      <section className="panel table-panel">
         <div className="panel-header">
           <div>
             <h2>MQTT 로그 목록</h2>
@@ -884,7 +873,7 @@ export default function Logs() {
             }
           />
         ) : (
-          <div className="packet-table-scroll">
+          <div className="table-scroll">
             <DataTable
               columns={columns}
               rows={filteredLogs}
@@ -902,7 +891,7 @@ export default function Logs() {
                     log.is_json_valid
                   )
                 ) {
-                  return "table-row-danger";
+                  return "row-danger";
                 }
 
                 if (
@@ -913,7 +902,7 @@ export default function Logs() {
                     log.payload_size
                   ) > 5120
                 ) {
-                  return "table-row-warning";
+                  return "row-warning";
                 }
 
                 return "";
@@ -969,9 +958,9 @@ export default function Logs() {
         }
       >
         {selectedLog && (
-          <div className="log-detail">
-            <section className="log-detail-summary">
-              <div className="log-detail-item">
+          <div className="detail">
+            <section className="detail-grid">
+              <div className="detail-item">
                 <span>Device</span>
 
                 <strong>
@@ -980,7 +969,7 @@ export default function Logs() {
                 </strong>
               </div>
 
-              <div className="log-detail-item">
+              <div className="detail-item">
                 <span>Payload Size</span>
 
                 <strong>
@@ -995,7 +984,7 @@ export default function Logs() {
                 </strong>
               </div>
 
-              <div className="log-detail-item">
+              <div className="detail-item">
                 <span>JSON 검사</span>
 
                 <StatusBadge
@@ -1016,7 +1005,7 @@ export default function Logs() {
                 />
               </div>
 
-              <div className="log-detail-item">
+              <div className="detail-item">
                 <span>Topic 검사</span>
 
                 <StatusBadge
@@ -1037,7 +1026,7 @@ export default function Logs() {
                 />
               </div>
 
-              <div className="log-detail-item">
+              <div className="detail-item">
                 <span>Received At</span>
 
                 <strong>
@@ -1048,19 +1037,19 @@ export default function Logs() {
               </div>
             </section>
 
-            <section className="log-detail-section">
+            <section className="detail-section">
               <h3>Topic</h3>
 
-              <p className="break-word log-topic-detail">
+              <p className="break-word topic-detail">
                 {selectedLog.topic || "-"}
               </p>
             </section>
 
-            <section className="log-detail-section">
+            <section className="detail-section">
               <h3>검증 오류</h3>
 
               {selectedLog.error_message ? (
-                <div className="log-error-box">
+                <div className="error-box">
                   {selectedLog.error_message}
                 </div>
               ) : (
@@ -1070,7 +1059,7 @@ export default function Logs() {
               )}
             </section>
 
-            <section className="log-detail-section">
+            <section className="detail-section">
               <h3>Payload</h3>
 
               {parsePayload(
@@ -1082,7 +1071,7 @@ export default function Logs() {
                   )}
                 />
               ) : (
-                <pre className="raw-payload-viewer">
+                <pre className="raw-payload">
                   {formatPayloadPreview(
                     selectedLog.payload
                   )}

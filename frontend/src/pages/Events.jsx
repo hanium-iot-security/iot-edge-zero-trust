@@ -18,6 +18,7 @@ import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
 import StatusBadge from "../components/StatusBadge";
 import SummaryCard from "../components/SummaryCard";
+import "../styles/pages/Events.scss"
 
 const DEFAULT_LIMIT = 20;
 const POLLING_INTERVAL_MS = 10_000;
@@ -579,7 +580,7 @@ export default function Events() {
       header: "Device / Subject IP",
       width: 170,
       render: (value, event) => (
-        <div className="device-cell">
+        <div className="device-info">
           <span>
             {value || "미매핑"}
           </span>
@@ -617,7 +618,7 @@ export default function Events() {
       width: 210,
       render: (value) => (
         <span
-          className="event-type-cell"
+          className="event-name"
           title={value || ""}
         >
           {value || "-"}
@@ -669,7 +670,7 @@ export default function Events() {
         <span
           className={
             Number(value) < 0
-              ? "score-delta-negative"
+              ? "delta-negative"
               : ""
           }
         >
@@ -707,7 +708,7 @@ export default function Events() {
           className={
             value ===
               "CAPTURE_GAP_UNSCORED"
-              ? "processing-reason-warning"
+              ? "reason-warning"
               : ""
           }
           title={value || ""}
@@ -721,7 +722,7 @@ export default function Events() {
   ];
 
   return (
-    <div className="page-container">
+    <div className="events-page">
       <PageHeader
         title="Detection Events"
         description="Rule 및 AI 탐지 결과와 Trust Score 반영 여부, 근거 Evidence를 확인합니다."
@@ -802,6 +803,7 @@ export default function Events() {
                 0
               )}
               description="현재 페이지 Rule 기반 탐지"
+              status="rule"
             />
 
             <SummaryCard
@@ -811,6 +813,7 @@ export default function Events() {
                 0
               )}
               description="현재 페이지 AI 기반 이상치 탐지"
+              status="ai"
             />
 
             <SummaryCard
@@ -870,7 +873,7 @@ export default function Events() {
           </button>
         </div>
 
-        <div className="filter-grid event-filter-grid">
+        <div className="filter-grid filters">
           <div className="filter-item">
             <label htmlFor="event-search">
               이벤트 검색
@@ -1027,7 +1030,7 @@ export default function Events() {
         </div>
       </section>
 
-      <section className="panel packet-table-panel">
+      <section className="panel table-panel">
         <div className="panel-header">
           <div>
             <h2>
@@ -1064,7 +1067,7 @@ export default function Events() {
             }
           />
         ) : (
-          <div className="packet-table-scroll">
+          <div className="table-scroll">
             <DataTable
               columns={columns}
               rows={filteredEvents}
@@ -1081,7 +1084,7 @@ export default function Events() {
                   event.processing_reason ===
                   "CAPTURE_GAP_UNSCORED"
                 ) {
-                  return "table-row-warning";
+                  return "row-warning";
                 }
 
                 if (
@@ -1089,14 +1092,14 @@ export default function Events() {
                     event.severity
                   ).toLowerCase() === "high"
                 ) {
-                  return "table-row-danger";
+                  return "row-danger";
                 }
 
                 if (
                   getDetectorStatus(event) ===
                   "ai"
                 ) {
-                  return "table-row-ai";
+                  return "row-ai";
                 }
 
                 return "";
@@ -1162,9 +1165,9 @@ export default function Events() {
         }
       >
         {selectedEvent && (
-          <div className="event-detail">
-            <section className="event-detail-summary">
-              <div className="event-detail-item">
+          <div className="detail">
+            <section className="detail-grid">
+              <div className="detail-item">
                 <span>
                   Score Delta
                 </span>
@@ -1176,7 +1179,7 @@ export default function Events() {
                 </strong>
               </div>
 
-              <div className="event-detail-item">
+              <div className="detail-item">
                 <span>
                   Incident Family
                 </span>
@@ -1188,7 +1191,7 @@ export default function Events() {
                 </strong>
               </div>
 
-              <div className="event-detail-item">
+              <div className="detail-item">
                 <span>
                   Severity
                 </span>
@@ -1206,7 +1209,7 @@ export default function Events() {
                 />
               </div>
 
-              <div className="event-detail-item">
+              <div className="detail-item">
                 <span>
                   Trust Score
                 </span>
@@ -1218,7 +1221,7 @@ export default function Events() {
                 </strong>
               </div>
 
-              <div className="event-detail-item">
+              <div className="detail-item">
                 <span>
                   Score 반영
                 </span>
@@ -1237,7 +1240,7 @@ export default function Events() {
                 />
               </div>
 
-              <div className="event-detail-item">
+              <div className="detail-item">
                 <span>
                   Policy Version
                 </span>
@@ -1249,7 +1252,7 @@ export default function Events() {
               </div>
             </section>
 
-            <section className="event-detail-section">
+            <section className="detail-section">
               <h3>처리 정보</h3>
 
               <dl className="detail-list">
@@ -1313,10 +1316,10 @@ export default function Events() {
               </dl>
             </section>
 
-            <section className="event-detail-section">
+            <section className="detail-section">
               <h3>분석 Window</h3>
 
-              <div className="event-window-detail">
+              <div className="window">
                 <span>
                   {formatKST(
                     selectedEvent.analysis_window_start
@@ -1333,10 +1336,10 @@ export default function Events() {
               </div>
             </section>
 
-            <section className="event-detail-section">
+            <section className="detail-section">
               <h3>설명</h3>
 
-              <p className="event-description">
+              <p className="description">
                 {selectedEvent.description ||
                   "설명이 없습니다."}
               </p>
@@ -1345,7 +1348,7 @@ export default function Events() {
             {getDetectorStatus(
               selectedEvent
             ) === "ai" && (
-                <section className="event-detail-section">
+                <section className="detail-section">
                   <h3>AI 이상탐지 정보</h3>
 
                   <p className="text-muted">
@@ -1356,7 +1359,7 @@ export default function Events() {
                 </section>
               )}
 
-            <section className="event-detail-section">
+            <section className="detail-section">
               <h3>Detection Evidence</h3>
 
               <JsonViewer

@@ -25,6 +25,8 @@ import Pagination from "../components/Pagination";
 import StatusBadge from "../components/StatusBadge";
 import SummaryCard from "../components/SummaryCard";
 
+import "../styles/pages/Isolation.scss"
+
 const DEFAULT_LIMIT = 20;
 const POLLING_INTERVAL_MS = 10_000;
 const RELEASE_POLLING_INTERVAL_MS = 2_000;
@@ -181,7 +183,7 @@ function getFirewallStatusLabel(
   return (
     labels[normalized] ||
     status ||
-    "규칙 없음"
+    "Firewall 기록 없음"
   );
 }
 
@@ -2252,7 +2254,7 @@ export default function Isolation() {
       render:
         (value) => (
           <strong
-            className="device-id-cell"
+            className="device-id"
             title={
               value ||
               ""
@@ -2323,7 +2325,7 @@ export default function Isolation() {
         "Trust Score",
 
       align:
-        "right",
+        "center",
 
       width: 120,
 
@@ -2335,22 +2337,12 @@ export default function Isolation() {
             );
 
           return (
-            <div className="trust-score-cell">
+            <div className="trust-score">
               <strong>
                 {formatNumber(
                   value
                 )}
               </strong>
-
-              <StatusBadge
-                status={
-                  status
-                }
-                label={getTrustStatusLabel(
-                  status
-                )}
-                size="small"
-              />
             </div>
           );
         },
@@ -2390,7 +2382,7 @@ export default function Isolation() {
 
       render:
         (value) => (
-          <div className="last-seen-cell">
+          <div className="last-seen">
             <span>
               {formatElapsedTime(
                 value
@@ -2431,7 +2423,7 @@ export default function Isolation() {
       render:
         (value) => (
           <strong
-            className="device-id-cell"
+            className="device-id"
             title={
               value ||
               ""
@@ -2501,7 +2493,7 @@ export default function Isolation() {
       render:
         (value) => (
           <span
-            className="description-cell"
+            className="description"
             title={
               value ||
               ""
@@ -2685,7 +2677,7 @@ export default function Isolation() {
      ========================================================= */
 
   return (
-    <div className="page-container">
+    <div className="isolation-page">
       <PageHeader
         title="Isolation"
         description="Trust Score 기반 격리 판단과 실제 Firewall 차단 적용 상태를 함께 확인합니다."
@@ -2827,7 +2819,7 @@ export default function Isolation() {
           Current Isolated Devices
           ===================================================== */}
 
-      <section className="panel packet-table-panel">
+      <section className="panel table-panel">
         <div className="panel-header">
           <div>
             <h2>
@@ -2847,7 +2839,7 @@ export default function Isolation() {
           </span>
         </div>
 
-        <div className="packet-table-scroll">
+        <div className="table-scroll">
           <DataTable
             columns={
               isolatedDeviceColumns
@@ -2881,7 +2873,7 @@ export default function Isolation() {
                 device.firewall_status ===
                 "FAILED"
               ) {
-                return "table-row-danger";
+                return "row-danger";
               }
 
               if (
@@ -2889,7 +2881,7 @@ export default function Isolation() {
                 "PENDING" ||
                 !device.firewall_status
               ) {
-                return "table-row-warning";
+                return "row-warning";
               }
 
               return "";
@@ -2905,7 +2897,7 @@ export default function Isolation() {
           Isolation History
           ===================================================== */}
 
-      <section className="panel packet-table-panel">
+      <section className="panel table-panel">
         <div className="panel-header">
           <div>
             <h2>
@@ -3049,7 +3041,7 @@ export default function Isolation() {
             }
           />
         ) : (
-          <div className="packet-table-scroll">
+          <div className="table-scroll">
             <DataTable
               columns={
                 isolationHistoryColumns
@@ -3080,7 +3072,7 @@ export default function Isolation() {
                   item.firewall_status ===
                   "FAILED"
                 ) {
-                  return "table-row-danger";
+                  return "row-danger";
                 }
 
                 if (
@@ -3088,7 +3080,7 @@ export default function Isolation() {
                   "PENDING" ||
                   !item.firewall_status
                 ) {
-                  return "table-row-warning";
+                  return "row-warning";
                 }
 
                 return "";
@@ -3181,13 +3173,13 @@ export default function Isolation() {
         }
       >
         {selectedIsolatedDevice && (
-          <div className="isolation-detail">
+          <div className="detail">
             {/* ===============================================
                 Device Summary
                 =============================================== */}
 
-            <section className="isolation-detail-summary">
-              <div className="isolation-detail-item">
+            <section className="detail-grid">
+              <div className="detail-item">
                 <span>
                   Device ID
                 </span>
@@ -3199,7 +3191,7 @@ export default function Isolation() {
                 </strong>
               </div>
 
-              <div className="isolation-detail-item">
+              <div className="detail-item">
                 <span>
                   IP Address
                 </span>
@@ -3210,7 +3202,7 @@ export default function Isolation() {
                 </strong>
               </div>
 
-              <div className="isolation-detail-item">
+              <div className="detail-item">
                 <span>
                   현재 Trust Score
                 </span>
@@ -3222,7 +3214,7 @@ export default function Isolation() {
                 </strong>
               </div>
 
-              <div className="isolation-detail-item">
+              <div className="detail-item">
                 <span>
                   Trust 상태
                 </span>
@@ -3243,7 +3235,7 @@ export default function Isolation() {
                 />
               </div>
 
-              <div className="isolation-detail-item">
+              <div className="detail-item">
                 <span>
                   Firewall 상태
                 </span>
@@ -3258,7 +3250,7 @@ export default function Isolation() {
                 />
               </div>
 
-              <div className="isolation-detail-item">
+              <div className="detail-item">
                 <span>
                   마지막 통신
                 </span>
@@ -3275,12 +3267,12 @@ export default function Isolation() {
                 Admin Authentication
                 =============================================== */}
 
-            <section className="isolation-detail-section">
+            <section className="detail-section">
               <h3>
                 관리자 인증
               </h3>
 
-              <div className="recovery-form-grid">
+              <div className="recovery-form">
                 <div className="filter-item">
                   <label htmlFor="recovery-admin-key">
                     Admin Key
@@ -3305,7 +3297,7 @@ export default function Isolation() {
                     placeholder="관리자 Key 입력"
                   />
 
-                  <small className="recovery-help-text">
+                  <small className="help-text">
                     Admin Key는 이 Modal의 React 메모리에만 보관되며 닫기 또는 새로고침 시 폐기됩니다.
                   </small>
                 </div>
@@ -3316,7 +3308,7 @@ export default function Isolation() {
                 Recovery Status
                 =============================================== */}
 
-            <section className="isolation-detail-section">
+            <section className="detail-section">
               <h3>
                 Recovery 준비 상태
               </h3>
@@ -3422,7 +3414,7 @@ export default function Isolation() {
                 =============================================== */}
 
             {selectedRule && (
-              <section className="isolation-detail-section">
+              <section className="detail-section">
                 <h3>
                   현재 Firewall Rule
                 </h3>
@@ -3529,7 +3521,7 @@ export default function Isolation() {
                 Step 1 - Firewall Release
                 =============================================== */}
 
-            <section className="isolation-detail-section">
+            <section className="detail-section">
               <h3>
                 1. Firewall 해제 요청
               </h3>
@@ -3538,7 +3530,7 @@ export default function Isolation() {
                 APPLIED Firewall Rule에 대한 관리자 승인형 Release Request를 생성합니다. 실제 차단 해제는 Firewall Worker가 수행합니다.
               </p>
 
-              <div className="recovery-form-grid">
+              <div className="recovery-form">
                 <div className="filter-item">
                   <label htmlFor="firewall-release-reason">
                     Reason
@@ -3597,7 +3589,7 @@ export default function Isolation() {
                   />
 
                   {expectedReleaseConfirmation && (
-                    <small className="recovery-help-text">
+                    <small className="help-text">
                       확인 문구:{" "}
                       <strong>
                         {
@@ -3609,7 +3601,7 @@ export default function Isolation() {
                 </div>
               </div>
 
-              <div className="recovery-action-row">
+              <div className="action-row">
                 <button
                   type="button"
                   className="button button-danger"
@@ -3631,7 +3623,7 @@ export default function Isolation() {
 
               {releaseError && (
                 <p
-                  className="recovery-inline-error"
+                  className="inline-error"
                   role="alert"
                 >
                   {
@@ -3641,7 +3633,7 @@ export default function Isolation() {
               )}
 
               {releaseRequest && (
-                <dl className="detail-list recovery-result-list">
+                <dl className="detail-list result-list">
                   <div>
                     <dt>
                       Request ID
@@ -3725,7 +3717,7 @@ export default function Isolation() {
                 Step 2 - Recovery Preflight
                 =============================================== */}
 
-            <section className="isolation-detail-section">
+            <section className="detail-section">
               <h3>
                 2. Recovery Preflight
               </h3>
@@ -3734,7 +3726,7 @@ export default function Isolation() {
                 Firewall Rule이 REMOVED 상태가 된 뒤 Backend가 Runtime Firewall, 미처리 Detection, Release Request 및 Backup 경로를 다시 검사합니다.
               </p>
 
-              <div className="recovery-action-row">
+              <div className="action-row">
                 <button
                   type="button"
                   className="button button-secondary"
@@ -3755,7 +3747,7 @@ export default function Isolation() {
 
               {preflightError && (
                 <p
-                  className="recovery-inline-error"
+                  className="inline-error"
                   role="alert"
                 >
                   {
@@ -3766,7 +3758,7 @@ export default function Isolation() {
 
               {preflight && (
                 <>
-                  <dl className="detail-list recovery-result-list">
+                  <dl className="detail-list result-list">
                     <div>
                       <dt>
                         Result
@@ -3934,7 +3926,7 @@ export default function Isolation() {
                 Step 3 - Recovery Execute
                 =============================================== */}
 
-            <section className="isolation-detail-section">
+            <section className="detail-section">
               <h3>
                 3. Recovery 승인 및 실행
               </h3>
@@ -3943,7 +3935,7 @@ export default function Isolation() {
                 Preflight가 PASS이고 Runtime이 VERIFIED_RELEASED인 경우에만 Baseline Recovery를 실행할 수 있습니다.
               </p>
 
-              <div className="recovery-form-grid">
+              <div className="recovery-form">
                 <div className="filter-item">
                   <label htmlFor="recovery-reason">
                     Reason
@@ -3998,7 +3990,7 @@ export default function Isolation() {
                     }
                   />
 
-                  <small className="recovery-help-text">
+                  <small className="help-text">
                     확인 문구:{" "}
                     <strong>
                       {
@@ -4011,7 +4003,7 @@ export default function Isolation() {
 
               {recoveryError && (
                 <p
-                  className="recovery-inline-error"
+                  className="inline-error"
                   role="alert"
                 >
                   {
@@ -4021,7 +4013,7 @@ export default function Isolation() {
               )}
 
               {recoveryResult && (
-                <div className="recovery-success-box">
+                <div className="success-box">
                   <strong>
                     {getRecoveryResult(
                       recoveryResult
@@ -4129,7 +4121,7 @@ export default function Isolation() {
                 Recovery History
                 =============================================== */}
 
-            <section className="isolation-detail-section">
+            <section className="detail-section">
               <h3>
                 Recovery History
               </h3>
@@ -4140,7 +4132,7 @@ export default function Isolation() {
                 </p>
               ) : recoveryHistoryError ? (
                 <p
-                  className="recovery-inline-error"
+                  className="inline-error"
                   role="alert"
                 >
                   {
@@ -4153,14 +4145,14 @@ export default function Isolation() {
                   표시할 Recovery History가 없습니다.
                 </p>
               ) : (
-                <div className="recovery-history-list">
+                <div className="history-list">
                   {recoveryHistory.map(
                     (
                       item,
                       index
                     ) => (
                       <article
-                        className="recovery-history-item"
+                        className="history-item"
                         key={
                           item.operation_id ??
                           item.id ??
@@ -4232,9 +4224,9 @@ export default function Isolation() {
         }
       >
         {selectedHistory && (
-          <div className="isolation-detail">
-            <section className="isolation-detail-summary">
-              <div className="isolation-detail-item">
+          <div className="detail">
+            <section className="detail-grid">
+              <div className="detail-item">
                 <span>
                   Device
                 </span>
@@ -4245,7 +4237,7 @@ export default function Isolation() {
                 </strong>
               </div>
 
-              <div className="isolation-detail-item">
+              <div className="detail-item">
                 <span>
                   격리 Action
                 </span>
@@ -4260,7 +4252,7 @@ export default function Isolation() {
                 />
               </div>
 
-              <div className="isolation-detail-item">
+              <div className="detail-item">
                 <span>
                   Firewall 상태
                 </span>
@@ -4275,7 +4267,7 @@ export default function Isolation() {
                 />
               </div>
 
-              <div className="isolation-detail-item">
+              <div className="detail-item">
                 <span>
                   이전 Score
                 </span>
@@ -4288,7 +4280,7 @@ export default function Isolation() {
                 </strong>
               </div>
 
-              <div className="isolation-detail-item">
+              <div className="detail-item">
                 <span>
                   변경 Score
                 </span>
@@ -4301,7 +4293,7 @@ export default function Isolation() {
                 </strong>
               </div>
 
-              <div className="isolation-detail-item">
+              <div className="detail-item">
                 <span>
                   Created At
                 </span>
@@ -4314,7 +4306,7 @@ export default function Isolation() {
               </div>
             </section>
 
-            <section className="isolation-detail-section">
+            <section className="detail-section">
               <h3>
                 격리 근거
               </h3>
@@ -4355,7 +4347,7 @@ export default function Isolation() {
               </dl>
             </section>
 
-            <section className="isolation-detail-section">
+            <section className="detail-section">
               <h3>
                 Firewall Rule
               </h3>

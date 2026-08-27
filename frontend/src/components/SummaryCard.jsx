@@ -1,3 +1,5 @@
+import "../styles/components/SummaryCard.scss";
+
 function normalizeStatus(status) {
   return String(status || "default")
     .trim()
@@ -34,23 +36,23 @@ export default function SummaryCard({
       }
       className={[
         "summary-card",
-        `summary-card-${normalizedStatus}`,
+        `status-${normalizedStatus}`,
         interactive
-          ? "summary-card-clickable"
+          ? "clickable"
           : "",
       ]
         .filter(Boolean)
         .join(" ")}
       onClick={onClick}
     >
-      <div className="summary-card-header">
-        <span className="summary-card-title">
+      <div className="card-header">
+        <span className="card-title">
           {title}
         </span>
 
         {icon && (
           <span
-            className="summary-card-icon"
+            className="card-icon"
             aria-hidden="true"
           >
             {icon}
@@ -58,18 +60,18 @@ export default function SummaryCard({
         )}
       </div>
 
-      <strong className="summary-card-value">
+      <strong className="card-value">
         {value ?? "-"}
       </strong>
 
       {description && (
-        <p className="summary-card-description">
+        <p className="description">
           {description}
         </p>
       )}
 
       {footer && (
-        <div className="summary-card-footer">
+        <div className="footer">
           {footer}
         </div>
       )}

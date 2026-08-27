@@ -1,3 +1,5 @@
+import "../styles/components/LoadingState.scss";
+
 export default function LoadingState({
   title = "데이터를 불러오는 중입니다.",
   description = "잠시만 기다려 주세요.",
@@ -6,10 +8,9 @@ export default function LoadingState({
   return (
     <div
       className={[
-        "state-panel",
         "loading-state",
         compact
-          ? "state-panel-compact"
+          ? "compact"
           : "",
       ]
         .filter(Boolean)
@@ -18,17 +19,17 @@ export default function LoadingState({
       aria-live="polite"
     >
       <div
-        className="loading-spinner"
+        className="spinner"
         aria-hidden="true"
       />
 
-      <div className="state-panel-content">
-        <strong className="state-panel-title">
+      <div className="state-content">
+        <strong className="state-title">
           {title}
         </strong>
 
         {description && (
-          <p className="state-panel-description">
+          <p className="state-description">
             {description}
           </p>
         )}

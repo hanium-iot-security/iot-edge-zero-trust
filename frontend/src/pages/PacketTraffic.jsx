@@ -17,6 +17,8 @@ import Pagination from "../components/Pagination";
 import StatusBadge from "../components/StatusBadge";
 import SummaryCard from "../components/SummaryCard";
 
+import "../styles/pages/PacketTraffic.scss"
+
 const DEFAULT_LIMIT = 20;
 const POLLING_INTERVAL_MS = 10_000;
 const IS_DEV = import.meta.env.DEV;
@@ -591,7 +593,7 @@ export default function PacketTraffic() {
 
         return (
           <span
-            className="truncate-cell"
+            className="truncate"
             title={sessionId || ""}
           >
             {sessionId
@@ -614,7 +616,7 @@ export default function PacketTraffic() {
       header: "Device",
       width: 130,
       render: (value, item) => (
-        <div className="device-cell">
+        <div className="device">
           <StatusBadge
             status={
               value
@@ -658,7 +660,7 @@ export default function PacketTraffic() {
       header: "분석 Window",
       width: 210,
       render: (_, item) => (
-        <div className="window-cell">
+        <div className="window">
           <span>
             {formatKST(
               item.window_start
@@ -875,7 +877,7 @@ export default function PacketTraffic() {
   ];
 
   return (
-    <div className="page-container">
+    <div className="packet-page">
       <PageHeader
         title="Packet Traffic"
         description="Raspberry Pi에서 수집한 Packet Feature와 실제 Capture 품질을 확인합니다."
@@ -1025,7 +1027,7 @@ export default function PacketTraffic() {
           </section>
         )}
 
-      <section className="panel packet-table-panel">
+      <section className="panel table-panel">
         <div className="panel-header">
           <div>
             <h2>
@@ -1164,7 +1166,7 @@ export default function PacketTraffic() {
             onAction={() => setSearchText("")}
           />
         ) : (
-          <div className="packet-table-scroll">
+          <div className="table-scroll">
             <DataTable
               columns={columns}
               rows={filteredItems}
@@ -1178,11 +1180,11 @@ export default function PacketTraffic() {
               emptyDescription="Packet Capture와 Feature Extractor가 정상적으로 실행 중인지 확인해 주세요."
               rowClassName={(item) => {
                 if (item.segment_status === "FAILED") {
-                  return "table-row-danger";
+                  return "row-danger";
                 }
 
                 if (item.capture_eligible === false) {
-                  return "table-row-warning";
+                  return "row-warning";
                 }
 
                 return "";

@@ -1,0 +1,185 @@
+.packet-page {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+
+  margin: 0 auto;
+
+
+  /* =========================================================
+     Table
+     ========================================================= */
+
+  .table-panel {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+
+    overflow: hidden;
+  }
+
+  .table-scroll {
+    display: block;
+
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+
+    overflow-x: auto;
+    overflow-y: hidden;
+
+    box-sizing: border-box;
+
+    -webkit-overflow-scrolling: touch;
+
+    > * {
+      max-width: none;
+    }
+  }
+
+
+  /* =========================================================
+     Table Cells
+     ========================================================= */
+
+  .truncate {
+    display: block;
+
+    max-width: 110px;
+
+    overflow: hidden;
+
+    font-family:
+      ui-monospace,
+      SFMono-Regular,
+      Menlo,
+      Consolas,
+      monospace;
+
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .device {
+    display: flex;
+
+    flex-direction: column;
+    align-items: flex-start;
+
+    gap: 5px;
+
+    small {
+      color: var(--color-slate-500);
+    }
+  }
+
+  .window {
+    display: flex;
+
+    min-width: 185px;
+
+    flex-direction: column;
+
+    gap: 3px;
+
+    white-space: nowrap;
+  }
+
+  .window-separator {
+    color: var(--color-slate-400);
+
+    font-size: 11px;
+  }
+
+  .metric-highlight {
+    color: var(--color-primary-dark);
+
+    font-weight: 800;
+  }
+
+
+  /* =========================================================
+     Packet Quality
+     ========================================================= */
+
+  .capture-quality {
+    display: flex;
+
+    flex-direction: column;
+
+    gap: 6px;
+  }
+
+  .coverage {
+    display: flex;
+
+    min-width: 90px;
+
+    flex-direction: column;
+
+    gap: 6px;
+  }
+
+  .coverage-bar {
+    width: 100%;
+    height: 6px;
+
+    overflow: hidden;
+
+    border-radius: var(--radius-pill);
+
+    background: var(--color-slate-200);
+  }
+
+  .coverage-fill {
+    height: 100%;
+
+    border-radius: inherit;
+
+    background: var(--color-primary);
+  }
+
+  .rate {
+    display: flex;
+
+    flex-direction: column;
+
+    gap: 4px;
+
+    small {
+      color: var(--color-slate-500);
+    }
+  }
+
+
+  /* =========================================================
+     Row State
+     ========================================================= */
+
+  .row-warning {
+    background: #fffbeb;
+
+    &:hover {
+      background: #fef3c7;
+    }
+  }
+
+  .row-danger {
+    background: #fef2f2;
+
+    &:hover {
+      background: #fee2e2;
+    }
+  }
+
+
+  /* =========================================================
+     Responsive
+     ========================================================= */
+
+  @media (max-width: 760px) {
+    .window {
+      min-width: 160px;
+    }
+  }
+}

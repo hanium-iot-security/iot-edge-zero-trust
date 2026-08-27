@@ -11,7 +11,7 @@ import Events from "./pages/Events";
 import Isolation from "./pages/Isolation";
 import PacketTraffic from "./pages/PacketTraffic";
 import GatewayStatus from "./pages/GatewayStatus";
-import "../src/styles/style.css";
+
 
 export default function App() {
   return (
@@ -23,7 +23,7 @@ export default function App() {
           <NavLink to="/">Dashboard</NavLink>
           <NavLink to="/devices">Devices</NavLink>
           <NavLink to="/logs">MQTT Logs</NavLink>
-          <NavLink to="/events">Events</NavLink>
+          <NavLink to="/events">Detection Events</NavLink>
           <NavLink to="/isolation">Isolation</NavLink>
 
           <div className="sidebar-divider" />

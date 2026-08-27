@@ -35,7 +35,7 @@ import MetricCard from "../components/MetricCard";
 import PageHeader from "../components/PageHeader";
 import StatusBadge from "../components/StatusBadge";
 import SummaryCard from "../components/SummaryCard";
-
+import "../styles/pages/Dashboard.scss"
 const POLLING_INTERVAL_MS = 10_000;
 const ONLINE_THRESHOLD_SECONDS = 30;
 const IS_DEV = import.meta.env.DEV;
@@ -268,7 +268,7 @@ function getFirewallStatusLabel(status) {
   return (
     labels[normalized] ||
     status ||
-    "규칙 없음"
+    "Firewall 기록 없음"
   );
 }
 
@@ -884,14 +884,14 @@ export default function Dashboard() {
           );
 
         return (
-          <div className="trust-score-cell">
+          <div className="score-cell">
             <strong>
               {formatNumber(value)}
             </strong>
 
-            <div className="trust-score-bar">
+            <div className="score-bar">
               <div
-                className={`trust-score-bar-value trust-score-${status}`}
+                className={`score-fill score-${status}`}
                 style={{
                   width: `${Math.min(
                     Math.max(
@@ -993,7 +993,7 @@ export default function Dashboard() {
       width: 210,
       render: (value) => (
         <span
-          className="event-type-cell"
+          className="event-name"
           title={value || ""}
         >
           {value || "-"}
@@ -1025,7 +1025,7 @@ export default function Dashboard() {
         <span
           className={
             Number(value) < 0
-              ? "score-delta-negative"
+              ? "delta-negative"
               : ""
           }
         >
@@ -1090,7 +1090,7 @@ export default function Dashboard() {
       width: 260,
       render: (value) => (
         <span
-          className="description-cell"
+          className="topic-cell"
           title={value || ""}
         >
           {value || "-"}
@@ -1157,58 +1157,86 @@ export default function Dashboard() {
   ];
 
   return (
-    <div className="page-container">
-      <PageHeader
-        title="Dashboard"
-        description="IoT Gateway, Packet Capture, Detection, Trust Score, Firewall 상태를 한눈에 확인합니다."
-        updatedAt={
-          lastUpdated
-            ? formatKST(
-              lastUpdated
-            )
-            : undefined
-        }
-        onRefresh={() =>
-          loadData(true)
-        }
-        refreshing={refreshing}
-      />
+    <div className="dashboard-page">
+      <div className="page-container">
+        <PageHeader
+          title="Dashboard"
+          description="IoT Gateway, Packet Capture, Detection, Trust Score, Firewall 상태를 한눈에 확인합니다."
+          updatedAt={
+            lastUpdated
+              ? formatKST(
+                lastUpdated
+              )
+              : undefined
+          }
+          onRefresh={() =>
+            loadData(true)
+          }
+          refreshing={refreshing}
+        />
 
-      {partialWarnings.length >
-        0 && (
-          <div
-            className="page-warning-banner"
-            role="alert"
-          >
-            <div>
-              <strong>
-                일부 Dashboard 데이터
-                갱신 실패
-              </strong>
+        {partialWarnings.length >
+          0 && (
+            <div
+              className="page-warning-banner"
+              role="alert"
+            >
+              <div>
+                <strong>
+                  일부 Dashboard 데이터
+                  갱신 실패
+                </strong>
 
-              <p>
-                정상적으로 조회된 데이터는
-                계속 표시합니다.
-              </p>
+                <p>
+                  정상적으로 조회된 데이터는
+                  계속 표시합니다.
+                </p>
 
-              <ul className="warning-message-list">
-                {partialWarnings.map(
-                  (warning) => (
-                    <li key={warning}>
-                      {warning}
-                    </li>
-                  )
-                )}
-              </ul>
+                <ul className="warning-message-list">
+                  {partialWarnings.map(
+                    (warning) => (
+                      <li key={warning}>
+                        {warning}
+                      </li>
+                    )
+                  )}
+                </ul>
+              </div>
+
+              <div className="page-warning-actions">
+                <span>
+                  {POLLING_INTERVAL_MS /
+                    1000}
+                  초마다 자동으로 다시
+                  요청합니다.
+                </span>
+
+                <button
+                  type="button"
+                  className="button button-secondary"
+                  onClick={() =>
+                    loadData(true)
+                  }
+                  disabled={refreshing}
+                >
+                  지금 다시 시도
+                </button>
+              </div>
             </div>
+          )}
 
-            <div className="page-warning-actions">
-              <span>
-                {POLLING_INTERVAL_MS /
-                  1000}
-                초마다 자동으로 다시
-                요청합니다.
-              </span>
+        {error &&
+          !hasSuccessfulDataRef.current ? (
+          <section className="panel">
+            <div className="error-box">
+              <div>
+                <strong>
+                  Dashboard를 불러오지
+                  못했습니다.
+                </strong>
+
+                <p>{error}</p>
+              </div>
 
               <button
                 type="button"
@@ -1218,707 +1246,681 @@ export default function Dashboard() {
                 }
                 disabled={refreshing}
               >
-                지금 다시 시도
+                다시 시도
               </button>
             </div>
-          </div>
-        )}
-
-      {error &&
-        !hasSuccessfulDataRef.current ? (
-        <section className="panel">
-          <div className="error-box">
-            <div>
-              <strong>
-                Dashboard를 불러오지
-                못했습니다.
-              </strong>
-
-              <p>{error}</p>
-            </div>
-
-            <button
-              type="button"
-              className="button button-secondary"
-              onClick={() =>
-                loadData(true)
-              }
-              disabled={refreshing}
+          </section>
+        ) : (
+          <>
+            <section
+              className="summary-card-grid"
+              aria-label="전체 상태 요약"
             >
-              다시 시도
-            </button>
-          </div>
-        </section>
-      ) : (
-        <>
-          <section
-            className="summary-card-grid"
-            aria-label="전체 상태 요약"
-          >
-            <SummaryCard
-              title="전체 기기"
-              value={formatNumber(
-                summary?.total_devices ??
-                0
-              )}
-              description="등록된 IoT 기기"
-            />
-
-            <SummaryCard
-              title="정상"
-              value={formatNumber(
-                summary?.normal_devices ??
-                0
-              )}
-              description="Trust Score 80 이상"
-              status="normal"
-            />
-
-            <SummaryCard
-              title="주의"
-              value={formatNumber(
-                summary?.warning_devices ??
-                0
-              )}
-              description="Trust Score 60~79"
-              status="warning"
-            />
-
-            <SummaryCard
-              title="위험"
-              value={formatNumber(
-                summary?.danger_devices ??
-                0
-              )}
-              description="Trust Score 30~59"
-              status="danger"
-            />
-
-            <SummaryCard
-              title="격리"
-              value={formatNumber(
-                summary?.isolated_devices ?? 0
-              )}
-              description="Trust Score 30 미만"
-              status={
-                Number(
-                  summary?.isolated_devices
-                ) > 0
-                  ? "isolated"
-                  : "default"
-              }
-            />
-
-            <SummaryCard
-              title="Firewall 적용"
-              value={formatNumber(
-                summary?.firewall_applied ??
-                firewallSummary.applied
-              )}
-              description="실제 차단 규칙 적용"
-              status="normal"
-            />
-
-            <SummaryCard
-              title="Firewall 대기"
-              value={formatNumber(
-                summary?.firewall_pending ??
-                firewallSummary.pending
-              )}
-              description="차단 규칙 적용 대기"
-              status={
-                firewallSummary.pending >
+              <SummaryCard
+                title="전체 기기"
+                value={formatNumber(
+                  summary?.total_devices ??
                   0
-                  ? "warning"
-                  : "default"
-              }
-            />
+                )}
+                description="등록된 IoT 기기"
+              />
 
-            <SummaryCard
-              title="Firewall 실패"
-              value={formatNumber(
-                summary?.firewall_failed ??
-                firewallSummary.failed
-              )}
-              description="차단 규칙 적용 실패"
-              status={
-                firewallSummary.failed >
+              <SummaryCard
+                title="정상"
+                value={formatNumber(
+                  summary?.normal_devices ??
                   0
-                  ? "danger"
-                  : "default"
-              }
-            />
-          </section>
+                )}
+                description="Trust Score 80 이상"
+                status="normal"
+              />
 
-          <section className="dashboard-status-grid">
-            <article className="panel dashboard-status-panel">
-              <div className="panel-header">
-                <div>
-                  <h2>
-                    Gateway 상태
-                  </h2>
+              <SummaryCard
+                title="주의"
+                value={formatNumber(
+                  summary?.warning_devices ??
+                  0
+                )}
+                description="Trust Score 60~79"
+                status="warning"
+              />
 
-                  <p className="panel-description">
-                    Raspberry Pi의 마지막
-                    Metric 수집 상태입니다.
-                  </p>
-                </div>
+              <SummaryCard
+                title="위험"
+                value={formatNumber(
+                  summary?.danger_devices ??
+                  0
+                )}
+                description="Trust Score 30~59"
+                status="danger"
+              />
 
-                <StatusBadge
-                  status={getGatewayStatusTheme(
-                    gatewayStatus
-                  )}
-                  label={gatewayStatus}
-                />
-              </div>
-
-              {gatewayMetric ? (
-                <div className="metric-card-grid">
-                  <MetricCard
-                    label="CPU"
-                    value={formatResourceValue(
-                      gatewayMetric.cpu_percent
-                    )}
-                    unit="%"
-                    percentage={
-                      gatewayMetric.cpu_percent
-                    }
-                    description="현재 CPU 사용률"
-                  />
-
-                  <MetricCard
-                    label="Memory"
-                    value={formatResourceValue(
-                      gatewayMetric.memory_percent
-                    )}
-                    unit="%"
-                    percentage={
-                      gatewayMetric.memory_percent
-                    }
-                    description="현재 Memory 사용률"
-                  />
-
-                  <MetricCard
-                    label="Disk"
-                    value={formatResourceValue(
-                      gatewayMetric.disk_percent
-                    )}
-                    unit="%"
-                    percentage={
-                      gatewayMetric.disk_percent
-                    }
-                    description="현재 Disk 사용률"
-                  />
-
-                  <MetricCard
-                    label="Temperature"
-                    value={formatResourceValue(
-                      gatewayMetric.temperature_c
-                    )}
-                    unit="℃"
-                    description="CPU 온도"
-                  />
-                </div>
-              ) : (
-                <EmptyState
-                  title="Gateway Metric이 없습니다."
-                  description="Gateway Metrics Collector가 실행 중인지 확인해 주세요."
-                  compact
-                />
-              )}
-
-              {gatewayMetric && (
-                <p className="dashboard-status-footer">
-                  마지막 수집:{" "}
-                  {formatKST(
-                    gatewayMetric.collected_at
-                  )}
-                </p>
-              )}
-            </article>
-
-            <article className="panel dashboard-status-panel">
-              <div className="panel-header">
-                <div>
-                  <h2>
-                    Packet Capture
-                  </h2>
-
-                  <p className="panel-description">
-                    최근 Packet Feature의
-                    Capture 품질입니다.
-                  </p>
-                </div>
-
-                <StatusBadge
-                  status={
-                    captureSummary.failed >
-                      0 ||
-                      captureSummary.excluded >
-                      0
-                      ? "degraded"
-                      : "normal"
-                  }
-                  label={
-                    captureSummary.failed >
-                      0 ||
-                      captureSummary.excluded >
-                      0
-                      ? "DEGRADED"
-                      : "NORMAL"
-                  }
-                />
-              </div>
-
-              <div className="dashboard-mini-summary-grid">
-                <SummaryCard
-                  title="분석 가능"
-                  value={formatNumber(
-                    captureSummary.eligible
-                  )}
-                  description="Capture 품질 통과"
-                  status="normal"
-                />
-
-                <SummaryCard
-                  title="분석 제외"
-                  value={formatNumber(
-                    captureSummary.excluded
-                  )}
-                  description="Coverage 또는 Timing 문제"
-                  status={
-                    captureSummary.excluded >
-                      0
-                      ? "warning"
-                      : "default"
-                  }
-                />
-
-                <SummaryCard
-                  title="수집 실패"
-                  value={formatNumber(
-                    captureSummary.failed
-                  )}
-                  description="Segment 처리 실패"
-                  status={
-                    captureSummary.failed >
-                      0
-                      ? "danger"
-                      : "default"
-                  }
-                />
-
-                <SummaryCard
-                  title="평균 Coverage"
-                  value={
-                    captureSummary.averageCoverage ===
-                      null
-                      ? "계산 불가"
-                      : `${formatNumber(
-                        captureSummary.averageCoverage *
-                        100,
-                        1
-                      )}%`
-                  }
-                  description="최근 Packet Window"
-                />
-              </div>
-            </article>
-          </section>
-
-          <section className="panel">
-            <div className="panel-header">
-              <div>
-                <h2>API Health</h2>
-
-                <p className="panel-description">
-                  Backend API와 Database 연결 상태를
-                  확인합니다.
-                </p>
-              </div>
-
-              <StatusBadge
+              <SummaryCard
+                title="격리"
+                value={formatNumber(
+                  summary?.isolated_devices ?? 0
+                )}
+                description="Trust Score 30 미만"
                 status={
-                  healthStatus.status
-                }
-                label={
-                  healthStatus.label
+                  Number(
+                    summary?.isolated_devices
+                  ) > 0
+                    ? "isolated"
+                    : "default"
                 }
               />
-            </div>
 
-            {health ? (
-              <div className="health-detail-grid">
-                <div className="health-detail-item">
-                  <span>
-                    API Status
-                  </span>
+              <SummaryCard
+                title="Firewall 적용"
+                value={formatNumber(
+                  summary?.firewall_applied ??
+                  firewallSummary.applied
+                )}
+                description="실제 차단 규칙 적용"
+                status="normal"
+              />
 
-                  <strong>
-                    {health.status || "-"}
-                  </strong>
+              <SummaryCard
+                title="Firewall 대기"
+                value={formatNumber(
+                  summary?.firewall_pending ??
+                  firewallSummary.pending
+                )}
+                description="차단 규칙 적용 대기"
+                status={
+                  firewallSummary.pending >
+                    0
+                    ? "warning"
+                    : "default"
+                }
+              />
+
+              <SummaryCard
+                title="Firewall 실패"
+                value={formatNumber(
+                  summary?.firewall_failed ??
+                  firewallSummary.failed
+                )}
+                description="차단 규칙 적용 실패"
+                status={
+                  firewallSummary.failed >
+                    0
+                    ? "danger"
+                    : "default"
+                }
+              />
+            </section>
+
+            <section className="status-grid">
+              <article className="panel status-panel">
+                <div className="panel-header">
+                  <div>
+                    <h2>
+                      Gateway 상태
+                    </h2>
+
+                    <p className="panel-description">
+                      Raspberry Pi의 마지막
+                      Metric 수집 상태입니다.
+                    </p>
+                  </div>
+
+                  <StatusBadge
+                    status={getGatewayStatusTheme(
+                      gatewayStatus
+                    )}
+                    label={gatewayStatus}
+                  />
                 </div>
 
-                <div className="health-detail-item">
-                  <span>
-                    Database
-                  </span>
+                {gatewayMetric ? (
+                  <div className="metric-card-grid">
+                    <MetricCard
+                      label="CPU"
+                      value={formatResourceValue(
+                        gatewayMetric.cpu_percent
+                      )}
+                      unit="%"
+                      percentage={
+                        gatewayMetric.cpu_percent
+                      }
+                      description="현재 CPU 사용률"
+                    />
 
-                  <strong>
-                    {health.database || "-"}
-                  </strong>
-                </div>
+                    <MetricCard
+                      label="Memory"
+                      value={formatResourceValue(
+                        gatewayMetric.memory_percent
+                      )}
+                      unit="%"
+                      percentage={
+                        gatewayMetric.memory_percent
+                      }
+                      description="현재 Memory 사용률"
+                    />
 
-                <div className="health-detail-item">
-                  <span>
-                    DB Connection
-                  </span>
+                    <MetricCard
+                      label="Disk"
+                      value={formatResourceValue(
+                        gatewayMetric.disk_percent
+                      )}
+                      unit="%"
+                      percentage={
+                        gatewayMetric.disk_percent
+                      }
+                      description="현재 Disk 사용률"
+                    />
+
+                    <MetricCard
+                      label="Temperature"
+                      value={formatResourceValue(
+                        gatewayMetric.temperature_c
+                      )}
+                      unit="℃"
+                      description="CPU 온도"
+                    />
+                  </div>
+                ) : (
+                  <EmptyState
+                    title="Gateway Metric이 없습니다."
+                    description="Gateway Metrics Collector가 실행 중인지 확인해 주세요."
+                    compact
+                  />
+                )}
+
+                {gatewayMetric && (
+                  <p className="status-footer">
+                    마지막 수집:{" "}
+                    {formatKST(
+                      gatewayMetric.collected_at
+                    )}
+                  </p>
+                )}
+              </article>
+
+              <article className="panel status-panel">
+                <div className="panel-header">
+                  <div>
+                    <h2>
+                      Packet Capture
+                    </h2>
+
+                    <p className="panel-description">
+                      최근 Packet Feature의
+                      Capture 품질입니다.
+                    </p>
+                  </div>
 
                   <StatusBadge
                     status={
-                      normalizeBoolean(
-                        health.db_connected
-                      )
-                        ? "connected"
-                        : "failed"
+                      captureSummary.failed >
+                        0 ||
+                        captureSummary.excluded >
+                        0
+                        ? "degraded"
+                        : "normal"
                     }
                     label={
-                      normalizeBoolean(
-                        health.db_connected
-                      )
-                        ? "연결됨"
-                        : "연결 실패"
+                      captureSummary.failed >
+                        0 ||
+                        captureSummary.excluded >
+                        0
+                        ? "DEGRADED"
+                        : "NORMAL"
                     }
-                    size="small"
                   />
                 </div>
 
-                <div className="health-detail-item">
-                  <span>
-                    Server Time
-                  </span>
-
-                  <strong>
-                    {formatKST(
-                      health.server_time
+                <div className="mini-grid">
+                  <SummaryCard
+                    title="분석 가능"
+                    value={formatNumber(
+                      captureSummary.eligible
                     )}
-                  </strong>
-                </div>
-              </div>
-            ) : (
-              <EmptyState
-                title="Health 정보가 없습니다."
-                description="Health API가 정상적으로 응답하는지 확인해 주세요."
-                compact
-              />
-            )}
-          </section>
+                    description="Capture 품질 통과"
+                    status="normal"
+                  />
 
-          <section className="panel packet-table-panel">
-            <div className="panel-header">
-              <div>
-                <h2>Trust Score Summary</h2>
-
-                <p className="panel-description">
-                  Device별 현재 Trust 상태와 Firewall 적용
-                  상태입니다.
-                </p>
-              </div>
-
-              <span className="data-count">
-                {formatNumber(
-                  trustScores.length
-                )}
-                건
-              </span>
-            </div>
-
-            <div className="packet-table-scroll">
-              <DataTable
-                columns={trustColumns}
-                rows={trustScores}
-                loading={
-                  loading &&
-                  trustScores.length === 0
-                }
-                rowKey="device_id"
-                minWidth={850}
-                tableLabel="Trust Score 요약"
-                emptyTitle="표시할 Trust Score 데이터가 없습니다."
-                emptyDescription="기기 등록 및 Trust Score 계산 결과를 확인해 주세요."
-                rowClassName={(item) => {
-                  const status =
-                    getTrustStatus(
-                      item.trust_score,
-                      item.status
-                    );
-
-                  if (
-                    status === "isolated"
-                  ) {
-                    return "table-row-danger";
-                  }
-
-                  if (
-                    status === "danger" ||
-                    status === "warning"
-                  ) {
-                    return "table-row-warning";
-                  }
-
-                  return "";
-                }}
-              />
-            </div>
-          </section>
-
-          <section className="panel">
-            <div className="panel-header">
-              <div>
-                <h2>
-                  MQTT Feature Graph
-                </h2>
-
-                <p className="panel-description">
-                  10초 Window별 MQTT
-                  발행량, Payload 크기,
-                  메시지 간격을 표시합니다.
-                </p>
-              </div>
-
-              <span className="data-count">
-                {formatNumber(
-                  features.length
-                )}
-                개 Window
-              </span>
-            </div>
-
-            {loading &&
-              features.length === 0 ? (
-              <div className="chart-loading">
-                그래프 데이터를 불러오는
-                중입니다.
-              </div>
-            ) : features.length === 0 ? (
-              <EmptyState
-                title="표시할 Feature Log가 없습니다."
-                description="MQTT Feature Worker가 실행 중인지 확인해 주세요."
-                compact
-              />
-            ) : (
-              <div className="dashboard-chart-container">
-                <ResponsiveContainer
-                  width="100%"
-                  height={360}
-                >
-                  <LineChart
-                    data={
-                      featureChartData
+                  <SummaryCard
+                    title="분석 제외"
+                    value={formatNumber(
+                      captureSummary.excluded
+                    )}
+                    description="Coverage 또는 Timing 문제"
+                    status={
+                      captureSummary.excluded >
+                        0
+                        ? "warning"
+                        : "default"
                     }
-                    margin={{
-                      top: 10,
-                      right: 20,
-                      left: 0,
-                      bottom: 10,
-                    }}
-                  >
-                    <CartesianGrid
-                      strokeDasharray="3 3"
-                    />
+                  />
 
-                    <XAxis
-                      dataKey="chart_time"
-                      minTickGap={25}
-                    />
+                  <SummaryCard
+                    title="수집 실패"
+                    value={formatNumber(
+                      captureSummary.failed
+                    )}
+                    description="Segment 처리 실패"
+                    status={
+                      captureSummary.failed >
+                        0
+                        ? "danger"
+                        : "default"
+                    }
+                  />
 
-                    <YAxis />
+                  <SummaryCard
+                    title="평균 Coverage"
+                    value={
+                      captureSummary.averageCoverage ===
+                        null
+                        ? "계산 불가"
+                        : `${formatNumber(
+                          captureSummary.averageCoverage *
+                          100,
+                          1
+                        )}%`
+                    }
+                    description="최근 Packet Window"
+                  />
+                </div>
+              </article>
+            </section>
 
-                    <Tooltip
-                      labelFormatter={(
-                        _,
-                        payload
-                      ) =>
-                        formatKST(
-                          payload?.[0]
-                            ?.payload
-                            ?.window_start
+            <section className="panel">
+              <div className="panel-header">
+                <div>
+                  <h2>API Health</h2>
+
+                  <p className="panel-description">
+                    Backend API와 Database 연결 상태를
+                    확인합니다.
+                  </p>
+                </div>
+
+                <StatusBadge
+                  status={
+                    healthStatus.status
+                  }
+                  label={
+                    healthStatus.label
+                  }
+                />
+              </div>
+
+              {health ? (
+                <div className="health-grid">
+                  <div className="health-item">
+                    <span>
+                      API Status
+                    </span>
+
+                    <strong>
+                      {health.status || "-"}
+                    </strong>
+                  </div>
+
+                  <div className="health-item">
+                    <span>
+                      Database
+                    </span>
+
+                    <strong>
+                      {health.database || "-"}
+                    </strong>
+                  </div>
+
+                  <div className="health-item">
+                    <span>
+                      DB Connection
+                    </span>
+
+                    <StatusBadge
+                      status={
+                        normalizeBoolean(
+                          health.db_connected
                         )
+                          ? "connected"
+                          : "failed"
                       }
+                      label={
+                        normalizeBoolean(
+                          health.db_connected
+                        )
+                          ? "conneted"
+                          : "failed"
+                      }
+                      size="small"
                     />
+                  </div>
 
-                    <Legend />
+                  <div className="health-item">
+                    <span>
+                      Server Time
+                    </span>
 
-                    <Line
-                      type="monotone"
-                      dataKey="publish_count"
-                      stroke="#2563eb"
-                      strokeWidth={3}
-                      dot={false}
-                      name="Publish Count"
-                    />
+                    <strong>
+                      {formatKST(
+                        health.server_time
+                      )}
+                    </strong>
+                  </div>
+                </div>
+              ) : (
+                <EmptyState
+                  title="Health 정보가 없습니다."
+                  description="Health API가 정상적으로 응답하는지 확인해 주세요."
+                  compact
+                />
+              )}
+            </section>
 
-                    <Line
-                      type="monotone"
-                      dataKey="avg_payload_size"
-                      stroke="#16a34a"
-                      strokeWidth={2}
-                      dot={false}
-                      name="Avg Payload Size"
-                    />
+            <section className="panel table-panel">
+              <div className="panel-header">
+                <div>
+                  <h2>Trust Score Summary</h2>
 
-                    <Line
-                      type="monotone"
-                      dataKey="max_payload_size"
-                      stroke="#ef4444"
-                      strokeWidth={3}
-                      dot={false}
-                      name="Max Payload Size"
-                    />
+                  <p className="panel-description">
+                    Device별 현재 Trust 상태와 Firewall 적용
+                    상태입니다.
+                  </p>
+                </div>
 
-                    <Line
-                      type="monotone"
-                      dataKey="avg_message_interval"
-                      stroke="#9333ea"
-                      strokeWidth={2}
-                      dot={false}
-                      name="Avg Message Interval"
-                    />
-
-                    <Line
-                      type="monotone"
-                      dataKey="min_message_interval"
-                      stroke="#f97316"
-                      strokeWidth={2}
-                      dot={false}
-                      name="Min Message Interval"
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-            )}
-          </section>
-
-          <section className="panel packet-table-panel">
-            <div className="panel-header">
-              <div>
-                <h2>
-                  최근 탐지 이벤트
-                </h2>
-
-                <p className="panel-description">
-                  Rule 및 AI 탐지 결과와
-                  Trust Score 반영 여부를
-                  표시합니다.
-                </p>
+                <span className="data-count">
+                  {formatNumber(
+                    trustScores.length
+                  )}
+                  건
+                </span>
               </div>
 
-              <span className="data-count">
-                최근{" "}
-                {formatNumber(
-                  events.length
-                )}
-                건
-              </span>
-            </div>
-
-            <div className="packet-table-scroll">
-              <DataTable
-                columns={eventColumns}
-                rows={events}
-                loading={
-                  loading &&
-                  events.length === 0
-                }
-                rowKey="id"
-                minWidth={1100}
-                tableLabel="최근 탐지 이벤트"
-                emptyTitle="표시할 탐지 이벤트가 없습니다."
-                emptyDescription="아직 생성된 Rule 또는 AI 탐지 이벤트가 없습니다."
-                rowClassName={(event) => {
-                  if (
-                    event.processing_reason ===
-                    "CAPTURE_GAP_UNSCORED"
-                  ) {
-                    return "table-row-warning";
+              <div className="table-scroll">
+                <DataTable
+                  columns={trustColumns}
+                  rows={trustScores}
+                  loading={
+                    loading &&
+                    trustScores.length === 0
                   }
+                  rowKey="device_id"
+                  minWidth={850}
+                  tableLabel="Trust Score 요약"
+                  emptyTitle="표시할 Trust Score 데이터가 없습니다."
+                  emptyDescription="기기 등록 및 Trust Score 계산 결과를 확인해 주세요."
+                  rowClassName={(item) => {
+                    const status =
+                      getTrustStatus(
+                        item.trust_score,
+                        item.status
+                      );
 
-                  if (
-                    String(
-                      event.severity
-                    ).toLowerCase() === "high"
-                  ) {
-                    return "table-row-danger";
-                  }
+                    if (
+                      status === "isolated"
+                    ) {
+                      return "row-danger";
+                    }
 
-                  if (
-                    getDetectorStatus(
-                      event
-                    ) === "ai"
-                  ) {
-                    return "table-row-ai";
-                  }
+                    if (
+                      status === "danger" ||
+                      status === "warning"
+                    ) {
+                      return "row-warning";
+                    }
 
-                  return "";
-                }}
-              />
-            </div>
-          </section>
+                    return "";
+                  }}
+                />
+              </div>
+            </section>
 
-          <section className="panel packet-table-panel">
-            <div className="panel-header">
-              <div>
-                <h2>
-                  최근 MQTT 로그
-                </h2>
+            <section className="panel">
+              <div className="panel-header">
+                <div>
+                  <h2>
+                    MQTT Feature Graph
+                  </h2>
 
-                <p className="panel-description">
-                  최근 수신한 Topic과
-                  Payload 유효성입니다.
-                </p>
+                  <p className="panel-description">
+                    10초 Window별 MQTT
+                    발행량, Payload 크기,
+                    메시지 간격을 표시합니다.
+                  </p>
+                </div>
+
+                <span className="data-count">
+                  {formatNumber(
+                    features.length
+                  )}
+                  개 Window
+                </span>
               </div>
 
-              <span className="data-count">
-                최근{" "}
-                {formatNumber(
-                  logs.length
-                )}
-                건
-              </span>
-            </div>
+              {loading &&
+                features.length === 0 ? (
+                <div className="chart-loading">
+                  그래프 데이터를 불러오는
+                  중입니다.
+                </div>
+              ) : features.length === 0 ? (
+                <EmptyState
+                  title="표시할 Feature Log가 없습니다."
+                  description="MQTT Feature Worker가 실행 중인지 확인해 주세요."
+                  compact
+                />
+              ) : (
+                <div className="chart-wrap">
+                  <ResponsiveContainer
+                    width="100%"
+                    height={360}
+                  >
+                    <LineChart
+                      data={
+                        featureChartData
+                      }
+                      margin={{
+                        top: 10,
+                        right: 20,
+                        left: 0,
+                        bottom: 10,
+                      }}
+                    >
+                      <CartesianGrid
+                        strokeDasharray="3 3"
+                      />
 
-            <div className="packet-table-scroll">
-              <DataTable
-                columns={mqttColumns}
-                rows={logs}
-                loading={
-                  loading &&
-                  logs.length === 0
-                }
-                rowKey="id"
-                minWidth={950}
-                tableLabel="최근 MQTT 로그"
-                emptyTitle="표시할 MQTT 로그가 없습니다."
-                emptyDescription="MQTT Subscriber가 정상적으로 메시지를 수신하는지 확인해 주세요."
-                rowClassName={(log) => {
-                  if (
-                    !normalizeBoolean(
-                      log.is_json_valid
-                    ) ||
-                    !normalizeBoolean(
-                      log.is_topic_valid
-                    )
-                  ) {
-                    return "table-row-warning";
+                      <XAxis
+                        dataKey="chart_time"
+                        minTickGap={25}
+                      />
+
+                      <YAxis />
+
+                      <Tooltip
+                        labelFormatter={(
+                          _,
+                          payload
+                        ) =>
+                          formatKST(
+                            payload?.[0]
+                              ?.payload
+                              ?.window_start
+                          )
+                        }
+                      />
+
+                      <Legend />
+
+                      <Line
+                        type="monotone"
+                        dataKey="publish_count"
+                        stroke="#2563eb"
+                        strokeWidth={3}
+                        dot={false}
+                        name="Publish Count"
+                      />
+
+                      <Line
+                        type="monotone"
+                        dataKey="avg_payload_size"
+                        stroke="#16a34a"
+                        strokeWidth={2}
+                        dot={false}
+                        name="Avg Payload Size"
+                      />
+
+                      <Line
+                        type="monotone"
+                        dataKey="max_payload_size"
+                        stroke="#ef4444"
+                        strokeWidth={3}
+                        dot={false}
+                        name="Max Payload Size"
+                      />
+
+                      <Line
+                        type="monotone"
+                        dataKey="avg_message_interval"
+                        stroke="#9333ea"
+                        strokeWidth={2}
+                        dot={false}
+                        name="Avg Message Interval"
+                      />
+
+                      <Line
+                        type="monotone"
+                        dataKey="min_message_interval"
+                        stroke="#f97316"
+                        strokeWidth={2}
+                        dot={false}
+                        name="Min Message Interval"
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
+            </section>
+
+            <section className="panel table-panel">
+              <div className="panel-header">
+                <div>
+                  <h2>
+                    최근 탐지 이벤트
+                  </h2>
+
+                  <p className="panel-description">
+                    Rule 및 AI 탐지 결과와
+                    Trust Score 반영 여부를
+                    표시합니다.
+                  </p>
+                </div>
+
+                <span className="data-count">
+                  최근{" "}
+                  {formatNumber(
+                    events.length
+                  )}
+                  건
+                </span>
+              </div>
+
+              <div className="table-scroll">
+                <DataTable
+                  columns={eventColumns}
+                  rows={events}
+                  loading={
+                    loading &&
+                    events.length === 0
                   }
+                  rowKey="id"
+                  minWidth={1100}
+                  tableLabel="최근 탐지 이벤트"
+                  emptyTitle="표시할 탐지 이벤트가 없습니다."
+                  emptyDescription="아직 생성된 Rule 또는 AI 탐지 이벤트가 없습니다."
+                  rowClassName={(event) => {
+                    if (
+                      event.processing_reason ===
+                      "CAPTURE_GAP_UNSCORED"
+                    ) {
+                      return "row-warning";
+                    }
 
-                  return "";
-                }}
-              />
-            </div>
-          </section>
-        </>
-      )}
+                    if (
+                      String(
+                        event.severity
+                      ).toLowerCase() === "high"
+                    ) {
+                      return "row-danger";
+                    }
+
+                    if (
+                      getDetectorStatus(
+                        event
+                      ) === "ai"
+                    ) {
+                      return "row-ai";
+                    }
+
+                    return "";
+                  }}
+                />
+              </div>
+            </section>
+
+            <section className="panel table-panel">
+              <div className="panel-header">
+                <div>
+                  <h2>
+                    최근 MQTT 로그
+                  </h2>
+
+                  <p className="panel-description">
+                    최근 수신한 Topic과
+                    Payload 유효성입니다.
+                  </p>
+                </div>
+
+                <span className="data-count">
+                  최근{" "}
+                  {formatNumber(
+                    logs.length
+                  )}
+                  건
+                </span>
+              </div>
+
+              <div className="table-scroll">
+                <DataTable
+                  columns={mqttColumns}
+                  rows={logs}
+                  loading={
+                    loading &&
+                    logs.length === 0
+                  }
+                  rowKey="id"
+                  minWidth={950}
+                  tableLabel="최근 MQTT 로그"
+                  emptyTitle="표시할 MQTT 로그가 없습니다."
+                  emptyDescription="MQTT Subscriber가 정상적으로 메시지를 수신하는지 확인해 주세요."
+                  rowClassName={(log) => {
+                    if (
+                      !normalizeBoolean(
+                        log.is_json_valid
+                      ) ||
+                      !normalizeBoolean(
+                        log.is_topic_valid
+                      )
+                    ) {
+                      return "row-warning";
+                    }
+
+                    return "";
+                  }}
+                />
+              </div>
+            </section>
+          </>
+        )}
+      </div>
     </div>
   );
 }

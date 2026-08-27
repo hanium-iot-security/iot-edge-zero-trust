@@ -1,0 +1,114 @@
+.status-badge {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+
+  align-items: center;
+  justify-content: center;
+  align-self: flex-start;
+
+  min-height: 25px;
+  gap: 6px;
+  padding: 4px 9px;
+
+  border-radius: 6px;
+
+  background: var(--color-slate-100);
+  color: var(--color-slate-600);
+
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.2;
+  white-space: nowrap;
+
+  &.size-small {
+    min-height: 22px;
+    padding: 3px 8px;
+    font-size: 10px;
+  }
+
+  &.size-medium {
+    min-height: 25px;
+    padding: 4px 9px;
+    font-size: 11px;
+  }
+
+  &.size-large {
+    min-height: 31px;
+    padding: 6px 12px;
+    font-size: 12px;
+  }
+
+  .dot {
+    width: 7px;
+    height: 7px;
+    flex: 0 0 7px;
+
+    border-radius: 50%;
+    background: currentColor;
+  }
+
+  &.status-normal,
+  &.status-online,
+  &.status-connected,
+  &.status-applied,
+  &.status-eligible,
+  &.status-processed,
+  &.status-captured,
+  &.status-scored {
+    background: var(--color-success-soft);
+    color: var(--color-success-dark);
+  }
+
+  &.status-warning,
+  &.status-stale,
+  &.status-pending,
+  &.status-excluded,
+  &.status-medium,
+  &.status-degraded {
+    background: var(--color-warning-soft);
+    color: var(--color-warning-dark);
+  }
+
+  &.status-danger,
+  &.status-failed,
+  &.status-offline,
+  &.status-api_error,
+  &.status-down,
+  &.status-high,
+  &.status-critical {
+    background: var(--color-danger-soft);
+    color: var(--color-danger-dark);
+  }
+
+  &.status-isolated {
+    background: var(--color-slate-900);
+    color: #ffffff;
+  }
+
+  &.status-removed,
+  &.status-unscored,
+  &.status-unknown,
+  &.status-no_data,
+  &.status-missing {
+    background: var(--color-slate-200);
+    color: var(--color-slate-600);
+  }
+
+  &.status-rule,
+  &.status-low,
+  &.status-inbound {
+    background: #dbeafe;
+    color: #1e40af;
+  }
+
+  &.status-ai {
+    background: var(--color-purple-soft);
+    color: #5b21b6;
+  }
+
+  &.status-outbound {
+    background: #dcfce7;
+    color: #166534;
+  }
+}

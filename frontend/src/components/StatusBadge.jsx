@@ -1,3 +1,5 @@
+import "../styles/components/StatusBadge.scss";
+
 const STATUS_LABELS = {
   normal: "정상",
   warning: "주의",
@@ -57,10 +59,8 @@ const DOT_STATUSES = new Set([
 
   "pending",
   "applied",
-  "failed",
   "removed",
 
-  "connected",
   "down",
   "missing",
 ]);
@@ -95,13 +95,13 @@ export default function StatusBadge({
       className={[
         "status-badge",
         `status-${normalizedStatus}`,
-        `status-badge-${size}`,
+        `size-${size}`,
       ].join(" ")}
       title={title}
     >
       {showDot && (
         <span
-          className="status-badge-dot"
+          className="dot"
           aria-hidden="true"
         />
       )}
