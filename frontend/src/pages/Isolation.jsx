@@ -1350,8 +1350,8 @@ export default function Isolation() {
   ]);
 
   /* =========================================================
-     Release Request Polling
-     ========================================================= */
+   Release Request Polling
+   ========================================================= */
 
   const activeReleaseRequestId =
     getReleaseRequestId(
@@ -1382,7 +1382,8 @@ export default function Isolation() {
         try {
           const rawResponse =
             await getFirewallReleaseRequest(
-              activeReleaseRequestId
+              activeReleaseRequestId,
+              adminKey
             );
 
           if (
@@ -1451,6 +1452,7 @@ export default function Isolation() {
     activeReleaseRequestStatus,
     selectedIsolatedDevice,
     loadData,
+    adminKey,
   ]);
 
   /* =========================================================
@@ -1839,25 +1841,30 @@ export default function Isolation() {
     );
 
   /*
-   * Modal이 열리면 기존 Recovery History를 먼저 조회합니다.
-   *
-   * API 명세상 History는 조회 API이며,
-   * adminKey가 없어도 호출할 수 있도록 빈 값으로 전달합니다.
-   */
+  * Recovery History도 관리자 인증이 필요하므로
+  * Admin Key 입력 전에는 요청하지 않습니다.
+  *
+  * 입력된 동일 Admin Key를 사용해 History를 조회합니다.
+  */
   const selectedDeviceId =
     selectedIsolatedDevice?.device_id ??
     null;
 
   useEffect(() => {
-    if (!selectedDeviceId) {
+    if (
+      !selectedDeviceId ||
+      !adminKey.trim()
+    ) {
       return;
     }
 
     loadRecoveryHistory(
-      selectedDeviceId
+      selectedDeviceId,
+      adminKey
     );
   }, [
     selectedDeviceId,
+    adminKey,
     loadRecoveryHistory,
   ]);
 

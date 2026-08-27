@@ -1191,6 +1191,7 @@ export async function createFirewallReleaseRequest(
  */
 export function getFirewallReleaseRequest(
   requestId,
+  adminKey = "",
   options = {}
 ) {
   if (!requestId) {
@@ -1212,6 +1213,8 @@ export function getFirewallReleaseRequest(
     `/firewall-release-requests/${encodedRequestId}`,
 
     {
+      adminKey,
+
       signal:
         options.signal,
     }
