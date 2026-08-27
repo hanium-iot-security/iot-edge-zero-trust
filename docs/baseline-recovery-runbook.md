@@ -54,10 +54,14 @@ Recovery Execute를 허용하지 않는다.
 7. ESP32는 MQTT 전송을 중지하거나 네트워크 연결을 해제한다.
 8. 대상 Device의 모든 Firewall Rule이 공식 Release되어 DB 상태가 `REMOVED` 또는
    `FAILED`인지 확인한다.
-9. DB의 `REMOVED`만으로 실제 iptables 제거를 단정하지 않는다.
+9. 대상 Device 또는 IP에 연결된 `firewall_release_requests`가 `PENDING`으로 남아
+   있으면 Recovery를 진행하지 않는다. `FAILED` Release Request는 감사 이력으로
+   보존하며, Recovery 가능 여부는 Firewall Rule의 `REMOVED` 상태와 runtime
+   `VERIFIED_RELEASED` 기준으로 판단한다.
+10. DB의 `REMOVED`만으로 실제 iptables 제거를 단정하지 않는다.
    [`firewall-runbook.md`](firewall-runbook.md)에 따라 실제 Rule 제거를 별도로
    확인한다.
-10. 대상 Device의 `processed_at IS NULL` Detection Event가 0건인지 확인한다.
+11. 대상 Device의 `processed_at IS NULL` Detection Event가 0건인지 확인한다.
     `processed_at`은 현재 Trust Score v2의 처리 완료 계약이다. 대표 Event가 아닌
     처리 완료 Row는 `applied_to_score=0`일 수 있으므로 `applied_to_score`는 이 Gate에
     사용하지 않는다.
@@ -151,6 +155,7 @@ JSON에는 다음이 포함된다.
 - 운영자가 입력한 expected status·Trust Score
 - 변경 예정값 `normal`·`100`
 - Device ID 또는 IP에 연결된 `PENDING`·`APPLIED` Firewall Rule 확인 결과
+- Device ID 또는 IP에 연결된 `PENDING` Firewall Release Request 확인 결과
 - `processed_at IS NULL`인 대상 Device Detection Event의 개수·ID·상세와 Gate 결과
 - 동일 입력을 사용하는 실제 Execute 명령 예시
 - `can_execute`와 `preflight_errors`

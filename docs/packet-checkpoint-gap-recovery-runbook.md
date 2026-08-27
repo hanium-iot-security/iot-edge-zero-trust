@@ -3,7 +3,7 @@
 이 절차는 승인된 Checkpoint 하나를 다음 Capture Session 시작 경계로 전진시킨다. Orchestrator의 자동 Session Gap 통과를 허용하지 않으며, 운영 DB에서는 병합 후 별도 승인하에 수행한다.
 
 - `gap-recovery`(기본값): 기존 `packet_rule`/`packet_if` 절차다. Target은 `COMPLETED`이면서 전체 feature-ready여야 하고 RUNNING Session은 없어야 한다.
-- `live-resume`: `packet_rule` 전용 명시적 절차다. 종료 전 Checkpoint와 현재 유일한 RUNNING Target의 `first_window_start` 사이 downtime만 건너뛴다. Target의 `first_window_start` 이후 Packet Feature는 건너뛰지 않고 Packet Rule이 정상 소비한다.
+- `live-resume`: `packet_rule`/`packet_if`의 명시적 절차다. 종료 전 Checkpoint와 현재 유일한 RUNNING Target의 `first_window_start` 사이 downtime만 건너뛴다. Target의 `first_window_start` 이후 Packet Feature는 건너뛰지 않고 해당 Detector가 정상 소비한다. 두 Packet Stage가 모두 required이면 각 Detector에 대해 별도 Plan·Execute·Audit가 필요하며 Target과 After 경계가 같아야 한다.
 
 ## 1. Migration과 사전 격리
 
@@ -39,7 +39,7 @@ python -m edge.detection.run_packet_checkpoint_recovery dry-run \
 
 Plan의 DB 절대경로, SHA256, Lock, RUNNING Summary, skipped Session 분류를 검토한다. 처리 가능한 full-ready Session을 건너뛰면 Plan SHA에 바인딩된 `SKIP-PROCESSABLE-SESSIONS:<digest>` 확인값이 추가로 필요하다.
 
-### 3.2 Packet Rule Live Resume
+### 3.2 Packet Detector Live Resume
 
 Target은 현재 유일한 RUNNING Session이어야 한다. `first_window_start`가 존재하고, 그 시점부터 시작하는 연속 terminal `PROCESSED`/`EMPTY` prefix가 최소 한 Window 있어야 한다. 연속 prefix 뒤의 정상 `READY` tail은 허용하지만 FAILED/Extractor error, Window 누락·겹침, 잘못된 Feature 수는 HOLD 조건이다.
 
@@ -48,15 +48,17 @@ python -m edge.detection.run_packet_checkpoint_recovery dry-run \
   --mode live-resume \
   --db-path /absolute/path/iot.db \
   --repository-root /absolute/path/iot-edge-zero-trust \
-  --detector packet_rule \
+  --detector DETECTOR_NAME \
   --current-session-id CURRENT_COMPLETED_UUID \
   --target-session-id CURRENT_RUNNING_UUID \
   --approved-by OPERATOR \
-  --reason "approved live packet-rule resume" \
-  --plan-output /ignored/existing/live-resume-plan.json
+  --reason "approved live packet detector resume" \
+  --plan-output /ignored/existing/live-resume-DETECTOR_NAME-plan.json
 ```
 
-Plan의 `checkpoint.after.last_processed_id`가 Before와 같고, `last_completed_window_end`가 Target의 `first_window_start`와 정확히 같은지 확인한다. Target의 현재 `packet_feature_ready_through`로 점프하면 안 된다.
+`DETECTOR_NAME`에는 `packet_rule` 또는 `packet_if`만 사용한다. Plan의 `checkpoint.after.last_processed_id`가 Before와 같고, `last_completed_window_end`가 Target의 `first_window_start`와 정확히 같은지 확인한다. Target의 현재 `packet_feature_ready_through`로 점프하면 안 된다.
+
+Orchestrator에서 `packet_rule`과 `packet_if`가 모두 required이면 같은 Target을 대상으로 각 Detector의 Dry-run과 Execute를 별도로 수행한다. 두 Plan의 After 경계가 동일한 Target `first_window_start`인지 확인하고, Execute 후에는 Detector별 Recovery Audit가 정확히 하나씩 생성됐는지 확인한다. 어느 한 Audit라도 없거나 Target/경계가 다르면 Orchestrator는 fail-closed로 catch-up을 거부한다.
 
 ## 4. Execute와 결과
 
@@ -74,7 +76,7 @@ Live Resume:
 
 ```bash
 python -m edge.detection.run_packet_checkpoint_recovery execute \
-  --plan-file /ignored/existing/live-resume-plan.json \
+  --plan-file /ignored/existing/live-resume-DETECTOR_NAME-plan.json \
   --db-path /absolute/path/iot.db \
   --artifact-dir /ignored/existing/artifacts \
   --confirm "APPLY-PACKET-LIVE-RESUME"
@@ -86,6 +88,6 @@ Exit Code 2는 Commit 전 거부다. Exit Code 3은 DB Commit 뒤 검증 또는 
 
 ## 5. 후속 검증
 
-승인한 Target Session에 대해 해당 Detector의 Manual Runner만 실행한다. Recovery 전 active였던 서비스만 원복한다. Live Resume에서는 Packet Rule이 Target `first_window_start` 이후의 기존 Feature부터 처리하는지 확인한다. 공식 Trust/Firewall E2E는 새 Holdout Session에서 별도로 수행한다.
+승인한 Target Session에 대해 해당 Detector의 Manual Runner만 실행한다. Recovery 전 active였던 서비스만 원복한다. Live Resume에서는 required인 모든 Packet Detector에 유효한 공식 Audit가 있고, 각 Detector가 Target `first_window_start` 이후의 기존 Feature부터 처리하는지 확인한다. 공식 Trust/Firewall E2E는 새 Holdout Session에서 별도로 수행한다.
 
 이 문서는 코드 경로를 설명한다. 실제 Raspberry Pi의 systemd/lock/capture 동시 동작 Cutover 검증은 코드 PR과 별도로 수행하고 증거를 기록해야 한다.

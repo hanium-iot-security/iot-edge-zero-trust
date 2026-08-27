@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,7 @@ from edge.orchestration.run_detection_orchestrator import (
     GracefulShutdown,
     resolve_cycle_cutoff,
     resolve_cycle_range_start,
+    resolve_packet_live_resume_transition,
     print_checkpoint_status,
     run_orchestration_cycle,
     run_orchestrator_loop,
@@ -155,9 +157,13 @@ def _insert_processed_packet_window(
     db,
     *,
     session_id: str = PACKET_SESSION_ID,
+    window_start: datetime = BASE,
+    session_status: str = "COMPLETED",
+    terminal_end_offset: timedelta = timedelta(0),
     packet_count: int = 980,
     total_bytes: int = 9800,
 ) -> int:
+    window_end = window_start + timedelta(seconds=10)
     session_result = db.execute(
         text(
             """
@@ -167,14 +173,19 @@ def _insert_processed_packet_window(
             )
             VALUES (
                 :session_id, 'eth0', :window_start,
-                :window_start, :window_end, 'COMPLETED'
+                :window_start, :ended_at, :status
             )
             """
         ),
         {
             "session_id": session_id,
-            "window_start": format_db_utc(BASE),
-            "window_end": format_db_utc(BASE + timedelta(seconds=10)),
+            "window_start": format_db_utc(window_start),
+            "ended_at": (
+                format_db_utc(window_end + terminal_end_offset)
+                if session_status != "RUNNING"
+                else None
+            ),
+            "status": session_status,
         },
     )
     session_pk = int(session_result.lastrowid)
@@ -199,12 +210,18 @@ def _insert_processed_packet_window(
         {
             "session_pk": session_pk,
             "file_name": f"capture_{session_id}_eth0_packet-stage-e2e.pcap",
-            "window_start": format_db_utc(BASE),
-            "window_end": format_db_utc(BASE + timedelta(seconds=10)),
+            "window_start": format_db_utc(window_start),
+            "window_end": format_db_utc(window_end),
             "packet_count": packet_count,
-            "actual_start": "2026-07-25T12:00:00.200000Z",
-            "stop_requested_at": "2026-07-25T12:00:10.000000Z",
-            "process_exited_at": "2026-07-25T12:00:10.050000Z",
+            "actual_start": (
+                window_start + timedelta(milliseconds=200)
+            ).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            "stop_requested_at": window_end.isoformat(
+                timespec="microseconds"
+            ).replace("+00:00", "Z"),
+            "process_exited_at": (
+                window_end + timedelta(milliseconds=50)
+            ).isoformat(timespec="microseconds").replace("+00:00", "Z"),
         },
     )
     segment_id = int(segment_result.lastrowid)
@@ -232,13 +249,192 @@ def _insert_processed_packet_window(
             "segment_id": segment_id,
             "device_id": DEVICE_ID,
             "peer_ip": DEVICE_IP,
-            "window_start": format_db_utc(BASE),
-            "window_end": format_db_utc(BASE + timedelta(seconds=10)),
+            "window_start": format_db_utc(window_start),
+            "window_end": format_db_utc(window_end),
             "packet_count": packet_count,
             "total_bytes": total_bytes,
         },
     )
     return int(feature_result.lastrowid)
+
+
+LIVE_RESUME_TARGET_SESSION_ID = "44444444-4444-4444-8444-444444444444"
+
+
+def _insert_live_resume_recovery_audit(
+    db,
+    *,
+    current_session_id: str,
+    target_session_id: str,
+    last_processed_id: int,
+    boundary_before: datetime,
+    boundary_after: datetime,
+    detector_name: str = "packet_rule",
+    mode: str = "live-resume",
+    plan_sha_matches: bool = True,
+) -> None:
+    plan_sha256 = "a" * 64
+    plan = {
+        "mode": mode,
+        "plan_sha256": plan_sha256 if plan_sha_matches else "d" * 64,
+    }
+    db.execute(
+        text(
+            """
+            INSERT INTO packet_checkpoint_recoveries (
+                operation_id, detector_name, source_table,
+                current_capture_session_id, target_capture_session_id,
+                last_processed_id_before, last_processed_id_after,
+                last_completed_window_end_before,
+                last_completed_window_end_after,
+                updated_at_before, updated_at_after,
+                plan_sha256, plan_json,
+                skipped_session_count, skipped_processable_session_count,
+                approved_by, reason, repository_commit, database_path,
+                backup_path, backup_sha256
+            )
+            VALUES (
+                :operation_id, :detector_name, 'packet_feature_logs',
+                :current_session_id, :target_session_id,
+                :last_processed_id, :last_processed_id,
+                :boundary_before, :boundary_after,
+                :boundary_before, :boundary_after,
+                :plan_sha256, :plan_json, 0, 0,
+                'operator@example.com', 'approved live resume',
+                :repository_commit, 'test.db', 'test.backup.db', :backup_sha256
+            )
+            """
+        ),
+        {
+            "operation_id": f"orchestrator-live-resume-test-{detector_name}",
+            "detector_name": detector_name,
+            "current_session_id": current_session_id,
+            "target_session_id": target_session_id,
+            "last_processed_id": last_processed_id,
+            "boundary_before": format_db_utc(boundary_before),
+            "boundary_after": format_db_utc(boundary_after),
+            "plan_sha256": plan_sha256,
+            "plan_json": json.dumps(plan, sort_keys=True),
+            "repository_commit": "b" * 40,
+            "backup_sha256": "c" * 64,
+        },
+    )
+
+
+def _seed_live_resume_orchestrator_state(
+    SessionLocal,
+    *,
+    audit_kind: str = "matching",
+    target_status: str = "RUNNING",
+    include_packet_if_checkpoint: bool = False,
+) -> dict[str, object]:
+    boundary_before = BASE + timedelta(seconds=10)
+    resume_boundary = BASE + timedelta(seconds=30)
+    producer_cutoff = resume_boundary + timedelta(seconds=10)
+    registry = build_stage_registry(
+        enabled=[MQTT_FEATURE_RULE, MQTT_MESSAGE_RULE, PACKET_RULE],
+        required=[MQTT_FEATURE_RULE, MQTT_MESSAGE_RULE, PACKET_RULE],
+    )
+
+    with SessionLocal() as db:
+        for window_index in range(4):
+            _insert_mqtt_log(
+                db,
+                received_at=BASE + timedelta(seconds=10 * window_index + 1),
+            )
+        previous_feature_id = _insert_processed_packet_window(
+            db,
+            packet_count=10,
+            total_bytes=100,
+        )
+        target_feature_id = _insert_processed_packet_window(
+            db,
+            session_id=LIVE_RESUME_TARGET_SESSION_ID,
+            window_start=resume_boundary,
+            session_status=target_status,
+            terminal_end_offset=(
+                timedelta(seconds=1)
+                if target_status == "COMPLETED"
+                else timedelta(0)
+            ),
+            packet_count=980,
+            total_bytes=9800,
+        )
+        db.commit()
+
+    run_producer_cycle(
+        session_factory=SessionLocal,
+        now=producer_cutoff + timedelta(seconds=1),
+    )
+    initial = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=registry,
+    )
+    assert initial.status == CYCLE_COMPLETED
+    assert initial.cutoff == boundary_before
+
+    with SessionLocal() as db:
+        packet_checkpoint = checkpoints.get_detector_checkpoint(
+            db,
+            detector_name=PACKET_RULE,
+            source_table="packet_feature_logs",
+        )
+        assert packet_checkpoint is not None
+        assert packet_checkpoint["last_processed_id"] == previous_feature_id
+        checkpoints.upsert_detector_checkpoint(
+            db,
+            detector_name=PACKET_RULE,
+            source_table="packet_feature_logs",
+            last_processed_id=previous_feature_id,
+            last_completed_window_end=resume_boundary,
+            updated_at=resume_boundary,
+        )
+        if include_packet_if_checkpoint:
+            checkpoints.upsert_detector_checkpoint(
+                db,
+                detector_name=PACKET_IF,
+                source_table="packet_feature_logs",
+                last_processed_id=previous_feature_id,
+                last_completed_window_end=boundary_before,
+                updated_at=boundary_before,
+            )
+
+        if audit_kind != "missing":
+            audit_target = (
+                PACKET_SESSION_ID
+                if audit_kind == "target_mismatch"
+                else LIVE_RESUME_TARGET_SESSION_ID
+            )
+            audit_boundary = (
+                resume_boundary + timedelta(seconds=10)
+                if audit_kind == "boundary_mismatch"
+                else resume_boundary
+            )
+            audit_mode = "gap-recovery" if audit_kind == "mode_mismatch" else "live-resume"
+            _insert_live_resume_recovery_audit(
+                db,
+                current_session_id=PACKET_SESSION_ID,
+                target_session_id=audit_target,
+                last_processed_id=(
+                    previous_feature_id + 100
+                    if audit_kind == "id_mismatch"
+                    else previous_feature_id
+                ),
+                boundary_before=boundary_before,
+                boundary_after=audit_boundary,
+                mode=audit_mode,
+                plan_sha_matches=audit_kind != "plan_sha_mismatch",
+            )
+        db.commit()
+
+    return {
+        "registry": registry,
+        "boundary_before": boundary_before,
+        "resume_boundary": resume_boundary,
+        "producer_cutoff": producer_cutoff,
+        "previous_feature_id": previous_feature_id,
+        "target_feature_id": target_feature_id,
+    }
 
 
 # --- Stage 구성 ------------------------------------------------------------
@@ -443,6 +639,54 @@ def test_required_packet_stage_skips_when_capture_session_is_not_ready(SessionLo
     assert outcome.status == CYCLE_SKIPPED_PACKET_NOT_READY
     assert outcome.range_start == BASE
     assert outcome.cutoff == BASE + timedelta(seconds=10)
+    with SessionLocal() as db:
+        assert _completed(db, "packet_rule", "packet_feature_logs") is None
+        assert _completed(db, TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE) is None
+
+
+def test_required_packet_stage_blocks_failed_packet_segment(SessionLocal):
+    session_id = "12345678-1234-4234-8234-1234567890af"
+    with SessionLocal() as db:
+        _flood_window(db, window_index=0)
+        session_pk = capture_sessions.create_session(
+            db,
+            session_id=session_id,
+            capture_interface="eth0",
+            started_at=BASE,
+        )
+        capture_sessions.set_first_window_start(db, session_pk, BASE)
+        segment_id = capture_sessions.insert_ready_segment(
+            db,
+            capture_session_pk=session_pk,
+            file_name=f"capture_{session_id}_eth0_failed.pcap",
+            capture_interface="eth0",
+            window_start=BASE,
+            window_end=BASE + timedelta(seconds=10),
+        )
+        db.execute(
+            text(
+                """
+                UPDATE packet_capture_segments
+                SET status = 'FAILED'
+                WHERE id = :segment_id
+                """
+            ),
+            {"segment_id": segment_id},
+        )
+        db.commit()
+
+    run_producer_cycle(session_factory=SessionLocal, now=BASE + timedelta(seconds=11))
+    packet_registry = build_stage_registry(
+        enabled=[PACKET_RULE],
+        required=[PACKET_RULE],
+    )
+
+    outcome = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=packet_registry,
+    )
+
+    assert outcome.status == CYCLE_SKIPPED_PACKET_NOT_READY
     with SessionLocal() as db:
         assert _completed(db, "packet_rule", "packet_feature_logs") is None
         assert _completed(db, TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE) is None
@@ -726,6 +970,384 @@ def test_packet_activation_does_not_bridge_a_later_capture_session_gap(SessionLo
             TRUST_DETECTOR_NAME,
             TRUST_SOURCE_TABLE,
         ) == first_capture_start + timedelta(seconds=10)
+
+
+@pytest.mark.parametrize("target_status", ("RUNNING", "COMPLETED"))
+def test_live_resume_transition_catches_up_non_packet_and_trust_before_target_packet_session(
+    SessionLocal,
+    target_status: str,
+):
+    state = _seed_live_resume_orchestrator_state(
+        SessionLocal,
+        target_status=target_status,
+    )
+    registry = state["registry"]
+    resume_boundary = state["resume_boundary"]
+
+    catch_up = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=registry,
+    )
+
+    assert catch_up.status == CYCLE_COMPLETED
+    assert catch_up.cutoff == resume_boundary
+    assert {result.detector_name for result in catch_up.stage_results} == {
+        MQTT_FEATURE_RULE,
+        MQTT_MESSAGE_RULE,
+    }
+    with SessionLocal() as db:
+        packet_after_catch_up = checkpoints.get_detector_checkpoint(
+            db,
+            detector_name=PACKET_RULE,
+            source_table="packet_feature_logs",
+        )
+        assert packet_after_catch_up is not None
+        assert packet_after_catch_up["last_processed_id"] == state["previous_feature_id"]
+        assert packet_after_catch_up["last_completed_window_end"] == format_db_utc(
+            resume_boundary
+        )
+        assert _completed(db, MQTT_FEATURE_RULE, "feature_logs") == resume_boundary
+        assert _completed(db, MQTT_MESSAGE_RULE, "mqtt_logs") == resume_boundary
+        assert _completed(
+            db,
+            TRUST_DETECTOR_NAME,
+            TRUST_SOURCE_TABLE,
+        ) == resume_boundary
+
+    resumed = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=registry,
+    )
+
+    assert resumed.status == CYCLE_COMPLETED
+    assert resumed.range_start == resume_boundary
+    packet_result = next(
+        result
+        for result in resumed.stage_results
+        if result.detector_name == PACKET_RULE
+    )
+    assert packet_result.capture_session_id == LIVE_RESUME_TARGET_SESSION_ID
+    with SessionLocal() as db:
+        packet_after_resume = checkpoints.get_detector_checkpoint(
+            db,
+            detector_name=PACKET_RULE,
+            source_table="packet_feature_logs",
+        )
+        assert packet_after_resume is not None
+        assert packet_after_resume["last_processed_id"] == state["target_feature_id"]
+        assert _completed(
+            db,
+            PACKET_RULE,
+            "packet_feature_logs",
+        ) > resume_boundary
+
+
+def test_live_resume_transition_requires_matching_recovery_audit(SessionLocal):
+    state = _seed_live_resume_orchestrator_state(
+        SessionLocal,
+        audit_kind="missing",
+    )
+
+    outcome = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=state["registry"],
+    )
+
+    assert outcome.status == CYCLE_SKIPPED_NO_NEW_WINDOW
+    with SessionLocal() as db:
+        assert _completed(db, MQTT_FEATURE_RULE, "feature_logs") == state[
+            "boundary_before"
+        ]
+        assert _completed(
+            db,
+            TRUST_DETECTOR_NAME,
+            TRUST_SOURCE_TABLE,
+        ) == state["boundary_before"]
+
+
+@pytest.mark.parametrize(
+    "audit_kind",
+    (
+        "target_mismatch",
+        "boundary_mismatch",
+        "mode_mismatch",
+        "id_mismatch",
+        "plan_sha_mismatch",
+    ),
+)
+def test_live_resume_transition_rejects_mismatched_recovery_audit(
+    SessionLocal,
+    audit_kind: str,
+):
+    state = _seed_live_resume_orchestrator_state(
+        SessionLocal,
+        audit_kind=audit_kind,
+    )
+
+    outcome = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=state["registry"],
+    )
+
+    assert outcome.status == CYCLE_SKIPPED_NO_NEW_WINDOW
+    with SessionLocal() as db:
+        assert _completed(db, MQTT_FEATURE_RULE, "feature_logs") == state[
+            "boundary_before"
+        ]
+        assert _completed(
+            db,
+            TRUST_DETECTOR_NAME,
+            TRUST_SOURCE_TABLE,
+        ) == state["boundary_before"]
+
+
+@dataclass(frozen=True)
+class PacketIfMustNotRunStage:
+    detector_name: str = PACKET_IF
+    source_table: str = "packet_feature_logs"
+
+    def run_until(self, db, *, cycle_range_start, cycle_cutoff):
+        raise AssertionError("mismatched required Packet IF must not run")
+
+
+def _with_required_packet_if(registry: StageRegistry) -> StageRegistry:
+    return StageRegistry(
+        stages=registry.stages
+        + (
+            ConfiguredStage(
+                name=PACKET_IF,
+                stage=PacketIfMustNotRunStage(),
+                required=True,
+            ),
+        )
+    )
+
+
+def _with_only_required_packet_if() -> StageRegistry:
+    return StageRegistry(
+        stages=(
+            ConfiguredStage(
+                name=PACKET_IF,
+                stage=PacketIfMustNotRunStage(),
+                required=True,
+            ),
+        )
+    )
+
+
+def _align_packet_if_and_add_audit(
+    db,
+    *,
+    state: dict[str, object],
+    audit_target: str = LIVE_RESUME_TARGET_SESSION_ID,
+    audit_boundary: datetime | None = None,
+) -> None:
+    resume_boundary = state["resume_boundary"]
+    previous_feature_id = state["previous_feature_id"]
+    assert isinstance(resume_boundary, datetime)
+    assert isinstance(previous_feature_id, int)
+    checkpoints.upsert_detector_checkpoint(
+        db,
+        detector_name=PACKET_IF,
+        source_table="packet_feature_logs",
+        last_processed_id=previous_feature_id,
+        last_completed_window_end=resume_boundary,
+        updated_at=resume_boundary,
+    )
+    _insert_live_resume_recovery_audit(
+        db,
+        detector_name=PACKET_IF,
+        current_session_id=PACKET_SESSION_ID,
+        target_session_id=audit_target,
+        last_processed_id=previous_feature_id,
+        boundary_before=state["boundary_before"],
+        boundary_after=audit_boundary or resume_boundary,
+    )
+
+
+def test_live_resume_transition_accepts_matching_audits_for_all_required_packet_stages(
+    SessionLocal,
+):
+    state = _seed_live_resume_orchestrator_state(
+        SessionLocal,
+        include_packet_if_checkpoint=True,
+    )
+    registry = _with_required_packet_if(state["registry"])
+    with SessionLocal() as db:
+        _align_packet_if_and_add_audit(db, state=state)
+        db.commit()
+
+        transition = resolve_packet_live_resume_transition(
+            db,
+            registry=registry,
+            range_start=state["boundary_before"],
+            cutoff=state["producer_cutoff"],
+        )
+
+    assert transition is not None
+    assert transition.boundary == state["resume_boundary"]
+    assert transition.target_session_id == LIVE_RESUME_TARGET_SESSION_ID
+
+
+def test_live_resume_transition_accepts_matching_packet_if_only_audit(SessionLocal):
+    state = _seed_live_resume_orchestrator_state(
+        SessionLocal,
+        include_packet_if_checkpoint=True,
+    )
+    registry = _with_only_required_packet_if()
+    with SessionLocal() as db:
+        _align_packet_if_and_add_audit(db, state=state)
+        db.commit()
+
+        transition = resolve_packet_live_resume_transition(
+            db,
+            registry=registry,
+            range_start=state["boundary_before"],
+            cutoff=state["producer_cutoff"],
+        )
+
+    assert transition is not None
+    assert transition.boundary == state["resume_boundary"]
+    assert transition.target_session_id == LIVE_RESUME_TARGET_SESSION_ID
+
+
+def test_live_resume_transition_rejects_missing_packet_if_audit(SessionLocal):
+    state = _seed_live_resume_orchestrator_state(
+        SessionLocal,
+        include_packet_if_checkpoint=True,
+    )
+    registry = _with_required_packet_if(state["registry"])
+    with SessionLocal() as db:
+        resume_boundary = state["resume_boundary"]
+        previous_feature_id = state["previous_feature_id"]
+        checkpoints.upsert_detector_checkpoint(
+            db,
+            detector_name=PACKET_IF,
+            source_table="packet_feature_logs",
+            last_processed_id=previous_feature_id,
+            last_completed_window_end=resume_boundary,
+            updated_at=resume_boundary,
+        )
+        db.commit()
+
+        transition = resolve_packet_live_resume_transition(
+            db,
+            registry=registry,
+            range_start=state["boundary_before"],
+            cutoff=state["producer_cutoff"],
+        )
+
+    assert transition is None
+
+
+def test_live_resume_transition_rejects_packet_if_audit_target_mismatch(
+    SessionLocal,
+):
+    state = _seed_live_resume_orchestrator_state(
+        SessionLocal,
+        include_packet_if_checkpoint=True,
+    )
+    registry = _with_required_packet_if(state["registry"])
+    with SessionLocal() as db:
+        _align_packet_if_and_add_audit(
+            db,
+            state=state,
+            audit_target=PACKET_SESSION_ID,
+        )
+        db.commit()
+
+        transition = resolve_packet_live_resume_transition(
+            db,
+            registry=registry,
+            range_start=state["boundary_before"],
+            cutoff=state["producer_cutoff"],
+        )
+
+    assert transition is None
+
+
+def test_live_resume_transition_rejects_packet_if_audit_boundary_mismatch(
+    SessionLocal,
+):
+    state = _seed_live_resume_orchestrator_state(
+        SessionLocal,
+        include_packet_if_checkpoint=True,
+    )
+    registry = _with_required_packet_if(state["registry"])
+    with SessionLocal() as db:
+        _align_packet_if_and_add_audit(
+            db,
+            state=state,
+            audit_boundary=state["resume_boundary"] + timedelta(seconds=10),
+        )
+        db.commit()
+
+        transition = resolve_packet_live_resume_transition(
+            db,
+            registry=registry,
+            range_start=state["boundary_before"],
+            cutoff=state["producer_cutoff"],
+        )
+
+    assert transition is None
+
+
+def test_live_resume_transition_rejects_required_packet_boundary_mismatch(SessionLocal):
+    state = _seed_live_resume_orchestrator_state(
+        SessionLocal,
+        include_packet_if_checkpoint=True,
+    )
+    base_registry = state["registry"]
+    mismatched_registry = StageRegistry(
+        stages=base_registry.stages
+        + (
+            ConfiguredStage(
+                name=PACKET_IF,
+                stage=PacketIfMustNotRunStage(),
+                required=True,
+            ),
+        )
+    )
+
+    outcome = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=mismatched_registry,
+    )
+
+    assert outcome.status == CYCLE_SKIPPED_NO_NEW_WINDOW
+    with SessionLocal() as db:
+        assert _completed(db, PACKET_RULE, "packet_feature_logs") == state[
+            "resume_boundary"
+        ]
+        assert _completed(db, PACKET_IF, "packet_feature_logs") == state[
+            "boundary_before"
+        ]
+        assert _completed(db, MQTT_FEATURE_RULE, "feature_logs") == state[
+            "boundary_before"
+        ]
+
+
+def test_live_resume_transition_rejects_failed_target_session(SessionLocal):
+    state = _seed_live_resume_orchestrator_state(
+        SessionLocal,
+        target_status="FAILED",
+    )
+
+    outcome = run_orchestration_cycle(
+        session_factory=SessionLocal,
+        registry=state["registry"],
+    )
+
+    assert outcome.status == CYCLE_SKIPPED_NO_NEW_WINDOW
+    with SessionLocal() as db:
+        assert _completed(db, MQTT_FEATURE_RULE, "feature_logs") == state[
+            "boundary_before"
+        ]
+        assert _completed(
+            db,
+            TRUST_DETECTOR_NAME,
+            TRUST_SOURCE_TABLE,
+        ) == state["boundary_before"]
 
 
 def test_required_packet_stage_accepts_contiguous_empty_prefix(SessionLocal):

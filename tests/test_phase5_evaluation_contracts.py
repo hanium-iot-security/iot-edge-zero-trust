@@ -360,6 +360,49 @@ def test_matched_ids_preserve_null_and_empty_list_meaning() -> None:
     assert matched_ids["trigger_event_ids"] is None
 
 
+def test_phase6b_release_and_recovery_evidence_uses_manifest_references() -> None:
+    manifest = RunManifest.from_dict(
+        _manifest_dict(
+            matched_ids={
+                "detection_event_ids": [11],
+                "trust_score_history_ids": [12],
+                "firewall_rule_ids": [13],
+                "firewall_release_request_ids": [14],
+                "trigger_event_ids": [11],
+            },
+            artifacts=[
+                {
+                    "artifact_type": "firewall_release_request_audit",
+                    "relative_path": "audits/firewall-release-request-14.json",
+                    "size_bytes": 256,
+                    "sha256": "c" * 64,
+                },
+                {
+                    "artifact_type": "recovery_audit",
+                    "relative_path": "audits/baseline-recovery-op-1.json",
+                    "size_bytes": 512,
+                    "sha256": "d" * 64,
+                },
+            ],
+            external_observations={
+                "runtime_firewall_verified_at": "2026-08-01T01:00:40Z",
+                "recovery_completed_at": "2026-08-01T01:00:50Z",
+            },
+        )
+    )
+
+    payload = manifest.to_dict()
+
+    assert payload["matched_ids"]["firewall_release_request_ids"] == [14]
+    assert {item["artifact_type"] for item in payload["artifacts"]} == {
+        "firewall_release_request_audit",
+        "recovery_audit",
+    }
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "X-Recovery-Admin-Key" not in serialized
+    assert "api_key" not in serialized.lower()
+
+
 def test_duplicate_ids_are_deduped_and_serialized_deterministically() -> None:
     manifest = RunManifest.from_dict(
         _manifest_dict(

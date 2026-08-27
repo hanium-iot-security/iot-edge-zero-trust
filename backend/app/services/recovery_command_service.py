@@ -105,6 +105,7 @@ def build_recovery_preflight(
     device_report = dict(core["devices"][0])
     current = dict(device_report["current"])
     firewall_db_state = _firewall_db_state(core)
+    firewall_release_request_state = _firewall_release_request_state(core)
     pending_event_check = dict(core["pending_trust_event_check"])
     runtime = _normalize_runtime_verification(
         firewall_runtime_verifier(
@@ -121,11 +122,13 @@ def build_recovery_preflight(
 
     failure_code, failure_reason, result = _select_failure(
         preflight_errors=preflight_errors,
+        release_request_state=firewall_release_request_state,
         runtime=runtime,
         backup_check=backup_check,
     )
     can_execute = (
         bool(core["can_execute"])
+        and bool(firewall_release_request_state["passed"])
         and bool(runtime["passed"])
         and bool(backup_check["available"])
     )
@@ -136,6 +139,7 @@ def build_recovery_preflight(
         "can_execute": can_execute,
         "result": "SUCCESS" if can_execute else result,
         "firewall_db_state": firewall_db_state,
+        "firewall_release_request_state": firewall_release_request_state,
         "firewall_runtime_verification": runtime,
         "unprocessed_detection_count": int(pending_event_check["count"]),
         "backup_check": backup_check,
@@ -320,6 +324,13 @@ def _missing_or_core_error_preflight(
             "can_execute": False,
             "result": "DENIED",
             "firewall_db_state": {"passed": False, "count": None, "rules": []},
+            "firewall_release_request_state": {
+                "passed": False,
+                "count": None,
+                "statuses": [],
+                "request_ids": [],
+                "requests": [],
+            },
             "firewall_runtime_verification": _runtime_verification_unavailable({}),
             "unprocessed_detection_count": None,
             "backup_check": _backup_check(artifacts),
@@ -334,6 +345,13 @@ def _missing_or_core_error_preflight(
         "can_execute": False,
         "result": "DENIED",
         "firewall_db_state": {"passed": False, "count": None, "rules": []},
+        "firewall_release_request_state": {
+            "passed": False,
+            "count": None,
+            "statuses": [],
+            "request_ids": [],
+            "requests": [],
+        },
         "firewall_runtime_verification": _runtime_verification_unavailable({}),
         "unprocessed_detection_count": None,
         "backup_check": _backup_check(artifacts),
@@ -350,6 +368,18 @@ def _firewall_db_state(core: Mapping[str, Any]) -> dict[str, Any]:
         "count": int(check["count"]),
         "active_statuses": list(check["statuses"]),
         "rules": list(check.get("rules", [])),
+    }
+
+
+def _firewall_release_request_state(core: Mapping[str, Any]) -> dict[str, Any]:
+    check = dict(core["pending_firewall_release_request_check"])
+    requests = list(check.get("requests", []))
+    return {
+        "passed": bool(check["passed"]),
+        "count": int(check["count"]),
+        "statuses": list(check.get("statuses", [])),
+        "request_ids": list(check.get("request_ids", [])),
+        "requests": requests,
     }
 
 
@@ -393,6 +423,7 @@ def _nearest_existing_parent(path: Path) -> Path:
 def _select_failure(
     *,
     preflight_errors: list[str],
+    release_request_state: Mapping[str, Any],
     runtime: Mapping[str, Any],
     backup_check: Mapping[str, Any],
 ) -> tuple[str | None, str | None, str]:
@@ -404,9 +435,17 @@ def _select_failure(
             return "INVALID_DEVICE_STATUS", reason, "DENIED"
         if "Trust Score" in reason:
             return "TRUST_SCORE_MISMATCH", reason, "DENIED"
+        if "Firewall Release Request" in reason:
+            return "ACTIVE_FIREWALL_RELEASE_REQUEST", reason, "DENIED"
         if "Firewall" in reason:
             return "ACTIVE_FIREWALL_RULE", reason, "DENIED"
         return "PREFLIGHT_DENIED", reason, "DENIED"
+    if not release_request_state["passed"]:
+        return (
+            "ACTIVE_FIREWALL_RELEASE_REQUEST",
+            "Firewall release request is still PENDING",
+            "DENIED",
+        )
     if not runtime["passed"]:
         status = str(runtime["status"])
         code = (
@@ -623,12 +662,15 @@ def _firewall_release_status(preflight: Mapping[str, Any] | None) -> str:
     if not preflight:
         return "NOT_VERIFIED"
     db_passed = bool(preflight.get("firewall_db_state", {}).get("passed"))
+    request_passed = bool(
+        preflight.get("firewall_release_request_state", {}).get("passed", True)
+    )
     runtime_passed = bool(
         preflight.get("firewall_runtime_verification", {}).get("passed")
     )
-    if db_passed and runtime_passed:
+    if db_passed and request_passed and runtime_passed:
         return "VERIFIED_RELEASED"
-    if db_passed:
+    if db_passed and request_passed:
         return "DB_RELEASED_RUNTIME_UNVERIFIED"
     return "ACTIVE_OR_UNRELEASED"
 

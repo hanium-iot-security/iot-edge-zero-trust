@@ -16,9 +16,19 @@ from edge.scenarios.scenario_registry import (
     register,
     scenarios_by_series,
 )
-from edge.trust.trust_policy import BYTE_RATE_ANOMALY, PACKET_RATE_ANOMALY, PORT_SCAN
+from edge.trust.trust_policy import (
+    BROKER_DOS_SUSPECTED,
+    BYTE_RATE_ANOMALY,
+    PACKET_RATE_ANOMALY,
+    PORT_SCAN,
+)
 
-_KNOWN_EVENT_TYPES = RULE_EVENT_TYPES | {PACKET_RATE_ANOMALY, BYTE_RATE_ANOMALY, PORT_SCAN}
+_KNOWN_EVENT_TYPES = RULE_EVENT_TYPES | {
+    PACKET_RATE_ANOMALY,
+    BYTE_RATE_ANOMALY,
+    PORT_SCAN,
+    BROKER_DOS_SUSPECTED,
+}
 
 
 def test_three_official_series_are_present():

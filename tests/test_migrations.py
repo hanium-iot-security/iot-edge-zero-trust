@@ -315,9 +315,9 @@ def test_runner_applies_new_database_in_order(tmp_path: Path) -> None:
     result = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [1, 2, 3, 4, 5]
+        assert result.applied_versions == [1, 2, 3, 4, 5, 6]
         assert result.baselined_versions == []
-        assert _migration_versions(connection) == [1, 2, 3, 4, 5]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6]
         assert _table_exists(connection, "packet_capture_sessions")
         assert _table_exists(connection, "trust_score_history")
 
@@ -361,6 +361,110 @@ def test_packet_checkpoint_recovery_base_schema(tmp_path: Path) -> None:
         assert column_info["created_at"] == ("TEXT", 1, 0, "CURRENT_TIMESTAMP")
 
 
+def test_firewall_release_requests_schema_and_constraints(tmp_path: Path) -> None:
+    db_path = tmp_path / "firewall-release.db"
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    with connect_database(db_path) as connection:
+        migration = connection.execute(
+            "SELECT version, name FROM schema_migrations WHERE version = 6"
+        ).fetchone()
+        assert migration is not None
+        assert migration["name"] == "firewall_release_requests"
+        assert _table_exists(connection, "firewall_release_requests")
+        assert _column_names(connection, "firewall_release_requests") == {
+            "id",
+            "firewall_rule_id",
+            "status",
+            "requested_by",
+            "reason",
+            "requested_at",
+            "processed_at",
+            "last_error",
+            "created_at",
+            "updated_at",
+        }
+
+        connection.execute(
+            """
+            INSERT INTO devices (device_id, ip_address, trust_score, status)
+            VALUES ('esp32_01', '192.168.0.21', 20, 'isolated')
+            """
+        )
+        rule_id = connection.execute(
+            """
+            INSERT INTO firewall_rules (
+                device_id, source_ip, status, applied_at, reason
+            )
+            VALUES (
+                'esp32_01', '192.168.0.21', 'APPLIED',
+                '2026-08-22T00:00:00Z', 'test'
+            )
+            """
+        ).lastrowid
+        connection.execute(
+            """
+            INSERT INTO firewall_release_requests (
+                firewall_rule_id, requested_by, reason, requested_at
+            )
+            VALUES (?, 'operator@example', 'official release', '2026-08-22T00:00:01Z')
+            """,
+            (rule_id,),
+        )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO firewall_release_requests (
+                    firewall_rule_id, requested_by, reason, requested_at
+                )
+                VALUES (?, 'operator@example', 'duplicate', '2026-08-22T00:00:02Z')
+                """,
+                (rule_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO firewall_release_requests (
+                    firewall_rule_id, status, requested_by, reason,
+                    requested_at, processed_at
+                )
+                VALUES (
+                    ?, 'FAILED', 'operator@example', 'failed',
+                    '2026-08-22T00:00:02Z', '2026-08-22T00:00:03Z'
+                )
+                """,
+                (rule_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO firewall_release_requests (
+                    firewall_rule_id, requested_by, reason, requested_at
+                )
+                VALUES (999, 'operator@example', 'missing rule', '2026-08-22T00:00:02Z')
+                """
+            )
+
+        connection.execute(
+            """
+            UPDATE firewall_release_requests
+            SET status = 'SUCCEEDED',
+                processed_at = '2026-08-22T00:00:03Z'
+            WHERE firewall_rule_id = ?
+            """,
+            (rule_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO firewall_release_requests (
+                firewall_rule_id, requested_by, reason, requested_at
+            )
+            VALUES (?, 'operator@example', 'retry request', '2026-08-22T00:00:04Z')
+            """,
+            (rule_id,),
+        )
+
+
 def test_packet_checkpoint_recovery_migration_applies_005_to_existing_004(
     tmp_path: Path,
 ) -> None:
@@ -387,7 +491,7 @@ def test_packet_checkpoint_recovery_migration_applies_005_to_existing_004(
             ).fetchall()),
         }
     result = apply_migrations(db_path, MIGRATIONS_DIR)
-    assert result.applied_versions == [5]
+    assert result.applied_versions == [5, 6]
     with connect_database(db_path) as connection:
         after = {
             "checkpoints": tuple(connection.execute(
@@ -905,8 +1009,8 @@ def test_runner_applies_002_and_003_to_existing_001_db_and_preserves_rows(
 
     with connect_database(db_path) as connection:
         assert result.baselined_versions == [1]
-        assert result.applied_versions == [2, 3, 4, 5]
-        assert _migration_versions(connection) == [1, 2, 3, 4, 5]
+        assert result.applied_versions == [2, 3, 4, 5, 6]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6]
         device = connection.execute(
             "SELECT device_id, status, trust_score FROM devices"
         ).fetchone()
@@ -947,10 +1051,10 @@ def test_runner_skips_already_applied_migrations(tmp_path: Path) -> None:
     second = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert first.applied_versions == [1, 2, 3, 4, 5]
+        assert first.applied_versions == [1, 2, 3, 4, 5, 6]
         assert second.applied_versions == []
-        assert second.skipped_versions == [1, 2, 3, 4, 5]
-        assert _migration_versions(connection) == [1, 2, 3, 4, 5]
+        assert second.skipped_versions == [1, 2, 3, 4, 5, 6]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6]
 
 
 def test_runner_sorts_migration_files_by_version(tmp_path: Path) -> None:
@@ -1085,8 +1189,8 @@ def test_failed_002_migration_can_be_retried_after_fix(tmp_path: Path) -> None:
     result = apply_migrations(db_path, migrations_dir)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [2, 3, 4, 5]
-        assert _migration_versions(connection) == [1, 2, 3, 4, 5]
+        assert result.applied_versions == [2, 3, 4, 5, 6]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6]
         assert not _table_exists(connection, "retry_marker")
         assert _table_exists(connection, "packet_capture_sessions")
         assert "failed_retry_column" not in _column_names(
@@ -2084,8 +2188,8 @@ def test_phase4_migration_applies_003_to_existing_002_and_preserves_segments(
     result = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [3, 4, 5]
-        assert _migration_versions(connection) == [1, 2, 3, 4, 5]
+        assert result.applied_versions == [3, 4, 5, 6]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6]
         assert {
             "actual_capture_started_at",
             "capture_stop_requested_at",
@@ -2763,8 +2867,8 @@ def test_trust_score_compensation_migration_applies_004_to_existing_003(
     result = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [4, 5]
-        assert _migration_versions(connection) == [1, 2, 3, 4, 5]
+        assert result.applied_versions == [4, 5, 6]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6]
         assert _table_exists(connection, "trust_score_compensations")
         assert tuple(
             connection.execute(

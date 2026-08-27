@@ -19,6 +19,8 @@ GET /api/trust-score/{device_id}/history
 GET /api/trust-score/compensations
 GET /api/isolation/history
 GET /api/firewall-rules
+POST /api/firewall-rules/{rule_id}/release-requests
+GET /api/firewall-release-requests/{request_id}
 POST /api/recovery/preflight
 POST /api/recovery/execute
 GET /api/recovery/history
@@ -298,6 +300,61 @@ updated_at
 
 The backend only reads DB state. It does not run Firewall Worker logic or iptables.
 
+### POST /api/firewall-rules/{rule_id}/release-requests
+
+관리자가 `APPLIED` Firewall Rule의 공식 Release를 요청하는 Command API입니다.
+Backend는 `firewall_release_requests`에 `PENDING` 요청만 저장하며, sudo/iptables
+또는 `release_rule()`을 직접 실행하지 않습니다. 실제 Release는 Firewall Worker가
+공유 lock 아래에서 처리합니다.
+
+관리자 헤더:
+
+```text
+X-Recovery-Admin-Key: <RECOVERY_ADMIN_API_KEY>
+```
+
+Request:
+
+```json
+{
+  "reason": "official release approved",
+  "confirm": "RELEASE-FIREWALL-RULE-12"
+}
+```
+
+`confirm`은 Rule ID에 묶인 `RELEASE-FIREWALL-RULE-{rule_id}` 값이어야 합니다.
+`requested_by`는 요청 Body가 아니라 인증된 관리자 principal에서 파생합니다.
+
+Response `201`:
+
+```json
+{
+  "item": {
+    "id": 1,
+    "firewall_rule_id": 12,
+    "status": "PENDING",
+    "requested_by": "recovery-admin",
+    "reason": "official release approved",
+    "requested_at": "2026-08-22T00:00:00Z",
+    "processed_at": null,
+    "last_error": null,
+    "created_at": "2026-08-22T00:00:00Z",
+    "updated_at": "2026-08-22T00:00:00Z"
+  }
+}
+```
+
+Error:
+
+- `401`: 관리자 인증 실패
+- `404`: 대상 Firewall Rule 없음
+- `409`: 확인 문구 불일치, 대상 Rule이 `APPLIED`가 아님, 같은 Rule의 `PENDING` 요청 중복
+
+### GET /api/firewall-release-requests/{request_id}
+
+Firewall Release Request 처리 상태를 조회합니다. `PENDING`, `SUCCEEDED`, `FAILED`
+중 하나를 반환합니다. `FAILED`인 경우 `last_error`에 Worker 실패 사유가 저장됩니다.
+
 ## Recovery Command APIs
 
 Recovery API는 격리된 Device를 `normal`/`100` Baseline으로 되돌리는 관리 Command
@@ -340,6 +397,7 @@ Preflight는 읽기 전용이며 Recovery artifact나 backup을 생성하지 않
 - 현재 `devices.status='isolated'`
 - 현재 Trust Score와 `expected_trust_score` 일치
 - DB의 `PENDING`/`APPLIED` Firewall Rule 0건
+- DB의 `PENDING` Firewall Release Request 0건
 - Runtime Firewall verification
 - `processed_at IS NULL` Detection Event 0건
 - Backup artifact 경로 사용 가능성
@@ -363,6 +421,13 @@ Response:
     "count": 0,
     "active_statuses": ["PENDING", "APPLIED"],
     "rules": []
+  },
+  "firewall_release_request_state": {
+    "passed": true,
+    "count": 0,
+    "statuses": [],
+    "request_ids": [],
+    "requests": []
   },
   "firewall_runtime_verification": {
     "available": false,

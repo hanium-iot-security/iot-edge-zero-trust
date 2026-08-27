@@ -4,9 +4,9 @@
 사용해야 합니다 (실제 판정은 edge/detection/packet_rule_detector.py의
 PacketRulePolicy 기준을 따릅니다).
 
-탐지 기준 (DEFAULT_PACKET_RULE_POLICY 기준, Pilot 이후 조정될 수 있음):
-  - packets_per_second > packet_rate_threshold (기본 50.0)
-  - 또는 bytes_per_second > byte_rate_threshold (기본 100000.0)
+탐지 기준 (DEFAULT_PACKET_RULE_POLICY 기준):
+  - packets_per_second > packet_rate_threshold (기본 10.0)
+  - 또는 bytes_per_second > byte_rate_threshold (기본 2500.0)
 
 이 스크립트는 MQTT 애플리케이션 계층이 아니라 UDP 패킷을 직접 대상 Host로
 전송해 Raspberry Pi Packet Capture(모든 INBOUND 트래픽)에서 packets_per_second
@@ -20,7 +20,7 @@ source_ip(Attack Node 자신의 IP, 관찰용)와는 의미가 다르므로 별�
 실행 예시:
   python -m attacks.packet_rate_flood_attack
   python -m attacks.packet_rate_flood_attack --target-host 192.168.0.10 --duration 12 --rate_pps 80
-  python -m attacks.packet_rate_flood_attack --rate_pps 40 --payload_bytes 1400  # byte rate 위주
+  python -m attacks.packet_rate_flood_attack --rate_pps 4 --payload_bytes 1200  # 비단편 Byte Rate 단독 조건
 """
 
 from __future__ import annotations
@@ -39,6 +39,9 @@ MIN_PAYLOAD_BYTES = 1
 MAX_PAYLOAD_BYTES = 65000
 MIN_PORT = 1
 MAX_PORT = 65535
+IPV4_HEADER_BYTES = 20
+UDP_HEADER_BYTES = 8
+STANDARD_IPV4_MTU_BYTES = 1500
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,6 +86,26 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
 
 
+def _format_completion_summary(*, sent: int, elapsed: float, payload_bytes: int) -> str:
+    avg_pps = sent / elapsed if elapsed else 0.0
+    avg_payload_bps = sent * payload_bytes / elapsed if elapsed else 0.0
+    ipv4_packet_bytes = payload_bytes + UDP_HEADER_BYTES + IPV4_HEADER_BYTES
+
+    if ipv4_packet_bytes <= STANDARD_IPV4_MTU_BYTES:
+        estimated_ipv4_bps = sent * ipv4_packet_bytes / elapsed if elapsed else 0.0
+        ipv4_rate_detail = f"estimated_unfragmented_ipv4_bps={estimated_ipv4_bps:.0f}"
+    else:
+        ipv4_rate_detail = "estimated_unfragmented_ipv4_bps=not_applicable(fragmentation_possible)"
+
+    return (
+        f"[PacketRateFlood] 완료 — sent={sent} packets, "
+        f"elapsed={elapsed:.2f}s, "
+        f"avg_pps={avg_pps:.1f}, "
+        f"avg_payload_bps={avg_payload_bps:.0f}, "
+        f"{ipv4_rate_detail}"
+    )
+
+
 def main() -> None:
     args = parse_args()
     _validate_args(args)
@@ -94,7 +117,7 @@ def main() -> None:
 
     print(f"[PacketRateFlood] target_host={args.target_host}:{args.port}")
     print(f"  duration={args.duration}s, rate_pps={args.rate_pps}, payload_bytes={len(payload)}")
-    print(f"  탐지 조건: packets_per_second > 50.0 or bytes_per_second > 100000.0 (기본 Policy)")
+    print(f"  탐지 조건: packets_per_second > 10.0 or bytes_per_second > 2500.0 (기본 Policy)")
     print()
 
     sent = 0
@@ -109,12 +132,12 @@ def main() -> None:
         sock.close()
 
     elapsed = time.monotonic() - started
-    total_bytes = sent * len(payload)
     print(
-        f"[PacketRateFlood] 완료 — sent={sent} packets, "
-        f"elapsed={elapsed:.2f}s, "
-        f"avg_pps={sent / elapsed if elapsed else 0:.1f}, "
-        f"avg_bps={total_bytes / elapsed if elapsed else 0:.0f}"
+        _format_completion_summary(
+            sent=sent,
+            elapsed=elapsed,
+            payload_bytes=len(payload),
+        )
     )
 
 
