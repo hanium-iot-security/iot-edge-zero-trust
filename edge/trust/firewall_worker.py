@@ -28,7 +28,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from edge.detection.phase4_time import require_utc_whole_second
-from edge.trust import firewall_repository
+from edge.trust import firewall_release_repository, firewall_repository
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +136,17 @@ class ReconcileResult:
     restore_failed: list[int] = field(default_factory=list)
     validation_failed: list[int] = field(default_factory=list)
     orphan_rule_ids: list[int] = field(default_factory=list)
+
+
+@dataclass
+class ReleaseRequestCycleResult:
+    succeeded: list[int] = field(default_factory=list)
+    already_removed: list[int] = field(default_factory=list)
+    failed: list[int] = field(default_factory=list)
+
+    @property
+    def processed_count(self) -> int:
+        return len(self.succeeded) + len(self.already_removed) + len(self.failed)
 
 
 class IptablesRunner(Protocol):
@@ -443,6 +454,98 @@ def release_rule(
     return removed_from_os
 
 
+def process_pending_release_requests(
+    db: Session,
+    *,
+    runner: IptablesRunner,
+    policy: FirewallPolicy,
+    now: datetime,
+    limit: int | None = None,
+) -> ReleaseRequestCycleResult:
+    """Process administrator-approved firewall release requests."""
+
+    now_utc = require_utc_whole_second(now, "now")
+    batch_size = limit if limit is not None else policy.batch_size
+    rows = firewall_release_repository.list_pending_release_requests(
+        db,
+        limit=batch_size,
+    )
+    result = ReleaseRequestCycleResult()
+
+    for row in rows:
+        request_id = int(row["id"])
+        rule_id = int(row["firewall_rule_id"])
+        rule_status = str(row["rule_status"])
+        try:
+            if rule_status == firewall_repository.APPLIED:
+                release_rule(
+                    db,
+                    rule_id=rule_id,
+                    runner=runner,
+                    policy=policy,
+                    now=now_utc,
+                )
+                firewall_release_repository.mark_succeeded(
+                    db,
+                    request_id=request_id,
+                    processed_at=now_utc,
+                )
+                db.commit()
+                result.succeeded.append(request_id)
+                logger.info(
+                    "Firewall release request succeeded (request_id=%s, rule_id=%s)",
+                    request_id,
+                    rule_id,
+                )
+                continue
+
+            if rule_status == firewall_repository.REMOVED:
+                if _removed_rule_is_verified_absent(row, runner=runner, policy=policy):
+                    firewall_release_repository.mark_succeeded(
+                        db,
+                        request_id=request_id,
+                        processed_at=now_utc,
+                    )
+                    db.commit()
+                    result.already_removed.append(request_id)
+                    logger.info(
+                        "Firewall release request converged after crash "
+                        "(request_id=%s, rule_id=%s)",
+                        request_id,
+                        rule_id,
+                    )
+                    continue
+                raise FirewallValidationError(
+                    f"firewall rule is REMOVED in DB but still present at runtime: {rule_id}"
+                )
+
+            raise FirewallValidationError(
+                f"firewall rule is not releasable: {rule_id} (status={rule_status})"
+            )
+        except (FirewallTransientError, FirewallValidationError, ValueError) as exc:
+            db.rollback()
+            try:
+                firewall_release_repository.mark_failed(
+                    db,
+                    request_id=request_id,
+                    processed_at=now_utc,
+                    error=str(exc),
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            result.failed.append(request_id)
+            logger.warning(
+                "Firewall release request failed (request_id=%s, rule_id=%s): %s",
+                request_id,
+                rule_id,
+                exc,
+            )
+
+    return result
+
+
 def reconcile(
     db: Session,
     *,
@@ -459,10 +562,18 @@ def reconcile(
     now_utc = require_utc_whole_second(now, "now")
     result = ReconcileResult()
     managed = list_managed_rule_ids(runner)
+    pending_release_ids = firewall_release_repository.pending_release_rule_ids(db)
 
     applied_rows = _list_rows_by_status(db, firewall_repository.APPLIED)
     for row in applied_rows:
         rule_id = int(row["id"])
+        if rule_id in pending_release_ids:
+            logger.info(
+                "Skipping reconciliation restore for pending release request "
+                "(rule_id=%s)",
+                rule_id,
+            )
+            continue
         # 복원도 새 차단과 동일한 검증을 거친다. Protected IP 목록이 바뀌거나 DHCP로
         # IP가 재할당된 뒤 재부팅되면, 예전 APPLIED Row가 지금은 보호 대상인 IP를
         # 다시 차단할 수 있다.
@@ -546,6 +657,25 @@ def plan_pending_rules(
             continue
         planned.append((rule_id, (spec, build_rule_args(spec, operation=INSERT))))
     return planned
+
+
+def _removed_rule_is_verified_absent(
+    row: dict[str, Any],
+    *,
+    runner: IptablesRunner,
+    policy: FirewallPolicy,
+) -> bool:
+    spec = validate_rule_row(
+        {
+            "id": row["firewall_rule_id"],
+            "source_ip": row["rule_source_ip"],
+            "protocol": row["rule_protocol"],
+            "dest_port": row["rule_dest_port"],
+            "action": row["rule_action"],
+        },
+        policy,
+    )
+    return not rule_exists(runner, spec)
 
 
 def _record_validation_failure(

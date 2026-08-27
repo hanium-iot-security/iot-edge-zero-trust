@@ -41,16 +41,22 @@ verified against local Git `HEAD` or dirty worktree state. The official runner
 must add HEAD and dirty-worktree verification before using this field as a fully
 verified provenance guarantee.
 
-## Phase 6-A Recovery Evidence Reuse
+## Phase 6-A/6-B Recovery Evidence Reuse
 
-Phase 6-A does not introduce a separate evaluation schema for Recovery. Official
-E2E runs continue to use the Phase 5 `RunManifest`, Scenario Result JSONL,
-artifact references, and read-only SQLite evaluator.
+Phase 6-A and Phase 6-B do not introduce a separate evaluation schema for
+Recovery or Firewall Release. Official E2E runs continue to use the Phase 5
+`RunManifest`, Scenario Result JSONL, artifact references, and read-only SQLite
+evaluator.
 
 Recovery evidence is attached through existing provenance fields:
 
 - `artifacts[]` may include the normalized Baseline Recovery JSON artifact and
   its SHA256.
+- `artifacts[]` may include Firewall Release Request audit evidence when the
+  Worker processed a queued release.
+- `matched_ids.firewall_release_request_ids` records the DB request IDs used as
+  release evidence. The request body and artifacts must not include administrator
+  secrets.
 - `external_observations` or Scenario Result rows may record externally observed
   timestamps such as firewall release verification, recovery completion, and
   normal publish resumption when the Scenario Runner owns those observations.

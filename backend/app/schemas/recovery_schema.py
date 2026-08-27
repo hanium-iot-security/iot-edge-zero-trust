@@ -27,6 +27,7 @@ class RecoveryPreflightResponse(BaseModel):
     can_execute: bool
     result: RecoveryResult
     firewall_db_state: dict[str, Any]
+    firewall_release_request_state: dict[str, Any]
     firewall_runtime_verification: dict[str, Any]
     unprocessed_detection_count: int | None
     backup_check: dict[str, Any]

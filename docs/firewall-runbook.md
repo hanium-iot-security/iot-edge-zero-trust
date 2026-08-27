@@ -7,8 +7,8 @@ Phase 4 세부계획 §2.6 / P4-6-01 기준. Trust Score가 격리를 결정하�
 
 | 구분 | 담당 | 내용 |
 |---|---|---|
-| DB 상태·Repository | 정현수 | `firewall_rules` 상태 전이, `create_pending_rule_for_device`, 조회 API |
-| iptables Worker·운영 | 원우민 | 실제 Rule 적용·해제·Reconciliation, sudoers, systemd, 실기기 검증 |
+| DB 상태·Repository | 정현수 | `firewall_rules` 상태 전이, `firewall_release_requests` queue, 조회/요청 API |
+| iptables Worker·운영 | 원우민 | 실제 Rule 적용·해제·Release Request 처리·Reconciliation, sudoers, systemd, 실기기 검증 |
 
 **`devices.status=isolated`는 Trust 정책의 격리 "결정" 상태이고,
 `firewall_rules.status=APPLIED`가 실제 네트워크 차단 "적용" 상태다.**
@@ -16,7 +16,7 @@ Phase 4 세부계획 §2.6 / P4-6-01 기준. Trust Score가 격리를 결정하�
 
 ## 2. 사전 조건
 
-- [ ] Migration 003까지 적용된 DB (`retry_count`, `last_attempted_at`, `next_retry_at` 컬럼)
+- [ ] Migration 006까지 적용된 DB (`firewall_release_requests` 테이블과 partial unique index)
 - [ ] 테스트 Device(ESP32 #2)가 공유기 DHCP 예약 또는 고정 Lease로 IP 고정
 - [ ] `devices.ip_address`와 실제 Device IP 일치 확인
 
@@ -94,7 +94,21 @@ journalctl -u firewall-worker -f
 > Unit은 `NoNewPrivileges=false`다. `sudo`가 setuid 바이너리라 `true`로 두면 모든
 > iptables 호출이 실패한다. 대신 sudoers로 명령 범위를 좁혀 위험을 줄인다.
 
-## 4. 상태 전이
+## 4. Phase 6-B 배포 순서
+
+새 API와 Worker는 `firewall_release_requests` 테이블을 조회한다. Pi 배포 때 코드가
+Migration보다 먼저 올라가면 `no such table: firewall_release_requests` 오류가 날 수
+있으므로 다음 순서를 지킨다.
+
+1. DB Backup 생성
+2. Migration 006 적용
+3. `firewall_release_requests` 테이블과 `uq_firewall_release_requests_pending_rule`,
+   `idx_firewall_release_requests_status_requested` index 확인
+4. 코드 배포
+5. Backend API와 Firewall Worker 재시작
+6. Release Request API 생성, Worker 처리, Recovery Preflight Gate smoke test
+
+## 5. 상태 전이
 
 | 상태 | 의미 | 다음 |
 |---|---|---|
@@ -108,8 +122,13 @@ journalctl -u firewall-worker -f
 - **일시 오류**(iptables 실행 실패·Timeout)는 `retry_count`를 올리며 최대 **3회**까지만
   자동 재시도하고, 그 뒤에는 자동 재시도하지 않는다. `next_retry_at` 이전에는 다시
   집어가지 않는다.
+- Phase 6-B부터 공식 Release는 Backend API가 `firewall_release_requests`에
+  `PENDING` 요청을 만들고, Worker가 해당 요청을 처리해 `SUCCEEDED` 또는 `FAILED`로
+  종료하는 흐름을 사용한다. Backend API는 sudo/iptables를 직접 실행하지 않는다.
+  Worker Reconciliation은 `PENDING` Release Request가 있는 `APPLIED` Rule을 복구하지
+  않는다.
 
-## 5. 수동 Smoke Test
+## 6. 수동 Smoke Test
 
 ```bash
 cd /home/pi/iot-edge-zero-trust
@@ -159,7 +178,7 @@ mosquitto_pub -h 192.168.0.20 -t iot/esp32_02/sensor -m '{"device_id":"esp32_02"
 > 뒤에 붙이면 앞선 ACCEPT Rule(특히 `--ctstate ESTABLISHED,RELATED`)에서 판정이
 > 끝나, 진행 중인 MQTT 연결이 계속 통과하면서 DB만 `APPLIED`가 되는 상태가 됩니다.
 
-## 6. 격리 해제
+## 7. 격리 해제
 
 ```bash
 python -m edge.trust.run_firewall_worker --release <RULE_ID>
@@ -169,7 +188,7 @@ sudo iptables -S INPUT | grep hanium-firewall   # 사라졌는지 확인
 동일한 Match Specification으로 `-C` 확인 후 `-D` 삭제하고 `REMOVED`로 기록한다.
 실제 Rule이 이미 없어도 DB는 `REMOVED`로 정리된다(경고 로그 남음).
 
-## 7. 3회 실패한 Rule 재시도 (관리자 전용)
+## 8. 3회 실패한 Rule 재시도 (관리자 전용)
 
 자동 무한 재시도는 하지 않는다. 원인을 먼저 확인하고 명시적으로 되돌린다.
 
@@ -186,7 +205,7 @@ python -m edge.trust.run_firewall_worker \
 Protected IP 때문에 실패한 Rule은 되돌리지 말 것. 그 Rule은 애초에 만들어지면 안 되는
 Rule이며, Trust 쪽 Device·IP 매핑을 확인해야 한다.
 
-## 8. Reconciliation·재부팅
+## 9. Reconciliation·재부팅
 
 Worker는 기동 후 첫 Cycle에서 자동으로 Reconciliation을 수행한다. 수동 실행:
 
@@ -211,7 +230,7 @@ sudo iptables -S INPUT | grep hanium-firewall
 `iptables` Rule은 재부팅으로 사라지므로, 재부팅 후 첫 Cycle에서 `restored`로 복구되는
 것이 정상 동작이다.
 
-## 9. 단일 실행 Lock
+## 10. 단일 실행 Lock
 
 DB 상태와 실제 iptables를 함께 바꾸는 명령은 모두 같은 Lock을 거칩니다
 (`<db>.firewall.lock`, `FIREWALL_LOCK_PATH`로 변경 가능).
@@ -235,7 +254,7 @@ Lock이 없으면 다음 경합이 발생합니다:
 - `--release`로 지운 Rule을 서비스의 Reconciliation이 곧바로 되살림
 - DB 상태와 실제 Rule 불일치
 
-## 10. 문제 해결
+## 11. 문제 해결
 
 | 증상 | 확인 |
 |---|---|
@@ -247,7 +266,7 @@ Lock이 없으면 다음 경합이 발생합니다:
 | Wrapper 없음 | `FIREWALL_WRAPPER_PATH`와 `/usr/local/sbin/hanium-firewall-rule` 설치 확인 |
 | Wrapper가 종료 코드 65 | Source IP가 사설 IPv4가 아니거나 Rule ID가 숫자가 아니다 |
 
-## 11. 안전 규칙
+## 12. 안전 규칙
 
 - 허용 범위는 **등록된 사설 IPv4 / TCP / 목적지 Port 1883 / INPUT DROP**뿐이다
 - sudoers는 root 소유 Wrapper 하나만 허용한다. `iptables`를 직접 허용하지 않는다
