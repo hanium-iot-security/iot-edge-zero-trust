@@ -297,7 +297,7 @@ async function request(
         error
       ) ||
       error.name ===
-        "CanceledError";
+      "CanceledError";
 
     throw apiError;
   }
@@ -380,18 +380,18 @@ async function commandRequest(
             "application/json",
 
           ...(data !==
-          undefined
+            undefined
             ? {
-                "Content-Type":
-                  "application/json",
-              }
+              "Content-Type":
+                "application/json",
+            }
             : {}),
 
           ...(adminKey
             ? {
-                "X-Recovery-Admin-Key":
-                  adminKey,
-              }
+              "X-Recovery-Admin-Key":
+                adminKey,
+            }
             : {}),
         },
 
@@ -463,7 +463,7 @@ async function commandRequest(
         error
       ) ||
       error.name ===
-        "CanceledError";
+      "CanceledError";
 
     throw apiError;
   }
@@ -503,8 +503,8 @@ export function getDevices(
       mockDevices.items
     )
       ? [
-          ...mockDevices.items,
-        ]
+        ...mockDevices.items,
+      ]
       : [];
 
   if (
@@ -542,7 +542,41 @@ export function getDevices(
     options
   );
 }
+export function getDeviceDetail(
+  deviceId,
+  options = {}
+) {
+  if (!deviceId) {
+    return Promise.reject(
+      new Error(
+        "조회할 Device ID가 필요합니다."
+      )
+    );
+  }
 
+  const encodedDeviceId =
+    encodeURIComponent(
+      deviceId
+    );
+
+  const mockDevice =
+    Array.isArray(
+      mockDevices.items
+    )
+      ? mockDevices.items.find(
+        (device) =>
+          device.device_id ===
+          deviceId
+      ) ?? null
+      : null;
+
+  return request(
+    `/devices/${encodedDeviceId}`,
+    mockDevice,
+    {},
+    options
+  );
+}
 export function getIsolatedDevices(
   params = {},
   options = {}
@@ -633,8 +667,8 @@ export function getEvents(
       mockEvents.items
     )
       ? [
-          ...mockEvents.items,
-        ]
+        ...mockEvents.items,
+      ]
       : [];
 
   if (
@@ -687,13 +721,13 @@ export function getEvents(
   ) {
     const appliedValue =
       queryParams.applied_to_score ===
-        true ||
+      true ||
       queryParams.applied_to_score ===
-        1 ||
+      1 ||
       queryParams.applied_to_score ===
-        "1" ||
+      "1" ||
       queryParams.applied_to_score ===
-        "true";
+      "true";
 
     filteredItems =
       filteredItems.filter(
@@ -738,8 +772,8 @@ export function getIsolationHistory(
       mockIsolationHistory.items
     )
       ? [
-          ...mockIsolationHistory.items,
-        ]
+        ...mockIsolationHistory.items,
+      ]
       : [];
 
   if (
@@ -772,13 +806,58 @@ export function getIsolationHistory(
    ========================================================= */
 
 export function getTrustScoreSummary(
+  params = {},
   options = {}
 ) {
+  const queryParams = {
+    limit: 100,
+    offset: 0,
+    ...params,
+  };
+
+  const pagedMockData =
+    paginateMockItems(
+      mockTrustScoreSummary.items,
+      queryParams,
+      100
+    );
+
   return request(
     "/trust-score/summary",
-    mockTrustScoreSummary,
-    {},
+    pagedMockData,
+    queryParams,
     options
+  );
+}
+
+export function getTrustScoreCompensations(
+  params = {},
+  adminKey = "",
+  options = {}
+) {
+  const queryParams = {
+    limit: 100,
+    offset: 0,
+    ...params,
+  };
+
+  return commandRequest(
+    "GET",
+    "/trust-score/compensations",
+    {
+      params:
+        queryParams,
+
+      adminKey,
+
+      signal:
+        options.signal,
+
+      mockData: {
+        items: [],
+        total: 0,
+      },
+    }
   );
 }
 
@@ -808,7 +887,7 @@ export function getTrustScoreHistory(
 
   const history =
     mockTrustScoreHistories[
-      deviceId
+    deviceId
     ] || {
       device_id:
         deviceId,
@@ -844,7 +923,6 @@ export function getTrustScoreHistory(
     options
   );
 }
-
 /* =========================================================
    Packet Feature Logs
    ========================================================= */
@@ -864,8 +942,8 @@ export function getPacketFeatureLogs(
       mockPacketFeatureLogs.items
     )
       ? [
-          ...mockPacketFeatureLogs.items,
-        ]
+        ...mockPacketFeatureLogs.items,
+      ]
       : [];
 
   if (
@@ -896,13 +974,13 @@ export function getPacketFeatureLogs(
   ) {
     const eligibleValue =
       queryParams.capture_eligible ===
-        true ||
+      true ||
       queryParams.capture_eligible ===
-        1 ||
+      1 ||
       queryParams.capture_eligible ===
-        "1" ||
+      "1" ||
       queryParams.capture_eligible ===
-        "true";
+      "true";
 
     filteredItems =
       filteredItems.filter(
@@ -952,11 +1030,11 @@ export function getGatewayMetrics(
     ) =>
       index === 0
         ? {
-            ...item,
+          ...item,
 
-            collected_at:
-              new Date().toISOString(),
-          }
+          collected_at:
+            new Date().toISOString(),
+        }
         : item
   );
 
@@ -994,8 +1072,8 @@ export function getFirewallRules(
       mockFirewallRules.items
     )
       ? [
-          ...mockFirewallRules.items,
-        ]
+        ...mockFirewallRules.items,
+      ]
       : [];
 
   if (
