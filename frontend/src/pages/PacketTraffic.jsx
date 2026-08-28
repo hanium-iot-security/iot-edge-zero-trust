@@ -16,6 +16,12 @@ import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
 import StatusBadge from "../components/StatusBadge";
 import SummaryCard from "../components/SummaryCard";
+import {
+  getCaptureStatus,
+  getCaptureStatusLabel,
+  getExclusionLabel,
+  matchesCaptureStatusFilter,
+} from "../utils/packetCaptureStatus";
 
 import "../styles/pages/PacketTraffic.scss"
 
@@ -158,71 +164,6 @@ function getSessionId(item) {
   );
 }
 
-function getCaptureStatus(item) {
-  if (
-    item.capture_eligible === false
-  ) {
-    return "excluded";
-  }
-
-  if (
-    item.segment_status === "FAILED"
-  ) {
-    return "failed";
-  }
-
-  if (
-    item.capture_eligible === true
-  ) {
-    return "eligible";
-  }
-
-  return "unknown";
-}
-
-function getCaptureStatusLabel(item) {
-  if (
-    item.segment_status === "FAILED"
-  ) {
-    return "수집 실패";
-  }
-
-  if (
-    item.capture_eligible === false
-  ) {
-    return "분석 제외";
-  }
-
-  if (
-    item.capture_eligible === true
-  ) {
-    return "분석 가능";
-  }
-
-  return "상태 미확인";
-}
-
-function getExclusionLabel(reason) {
-  const labels = {
-    LATE_CAPTURE:
-      "지연 수집",
-    MISSING_TIMING_METADATA:
-      "Timing 정보 없음",
-    EMPTY_CAPTURE:
-      "수집 Packet 없음",
-    SEGMENT_FAILED:
-      "Segment 처리 실패",
-    PACKET_CAPTURE_GAP:
-      "Packet Capture Gap",
-  };
-
-  return (
-    labels[reason] ||
-    reason ||
-    "-"
-  );
-}
-
 function getCoverageStatus(
   coverageRatio
 ) {
@@ -307,22 +248,6 @@ export default function PacketTraffic() {
               undefined,
           };
 
-          if (
-            captureStatus ===
-            "eligible"
-          ) {
-            params.capture_eligible =
-              true;
-          }
-
-          if (
-            captureStatus ===
-            "excluded"
-          ) {
-            params.capture_eligible =
-              false;
-          }
-
           const data =
             await getPacketFeatureLogs(
               params
@@ -383,7 +308,6 @@ export default function PacketTraffic() {
       [
         offset,
         direction,
-        captureStatus,
       ]
     );
 
@@ -409,12 +333,21 @@ export default function PacketTraffic() {
           .trim()
           .toLowerCase();
 
-      if (!keyword) {
-        return packetFeatures;
-      }
-
       return packetFeatures.filter(
         (item) => {
+          if (
+            !matchesCaptureStatusFilter(
+              item,
+              captureStatus
+            )
+          ) {
+            return false;
+          }
+
+          if (!keyword) {
+            return true;
+          }
+
           const sessionId =
             getSessionId(item);
 
@@ -437,6 +370,7 @@ export default function PacketTraffic() {
     }, [
       packetFeatures,
       searchText,
+      captureStatus,
     ]);
 
   const pageSummary =
@@ -465,24 +399,14 @@ export default function PacketTraffic() {
             );
           }
 
-          if (
-            item.segment_status ===
-            "FAILED"
-          ) {
+          const captureState =
+            getCaptureStatus(item);
+
+          if (captureState === "failed") {
             failedCount += 1;
-          }
-
-          if (
-            item.capture_eligible ===
-            true
-          ) {
+          } else if (captureState === "eligible") {
             eligibleCount += 1;
-          }
-
-          if (
-            item.capture_eligible ===
-            false
-          ) {
+          } else if (captureState === "excluded") {
             excludedCount += 1;
           }
 
@@ -953,7 +877,7 @@ export default function PacketTraffic() {
                 pageSummary.eligibleCount,
                 0
               )}
-              description="Capture 품질 기준을 통과한 Window"
+              description="현재 페이지의 Capture 품질 통과 Window"
               status="normal"
             />
 
@@ -963,7 +887,7 @@ export default function PacketTraffic() {
                 pageSummary.excludedCount,
                 0
               )}
-              description="Timing 또는 Capture 품질 문제"
+              description="현재 페이지의 분석 제외 Window"
               status={
                 pageSummary.excludedCount >
                   0
@@ -978,7 +902,7 @@ export default function PacketTraffic() {
                 pageSummary.failedCount,
                 0
               )}
-              description="Segment 처리에 실패한 Window"
+              description="현재 페이지의 Segment 실패 Window"
               status={
                 pageSummary.failedCount >
                   0
@@ -1035,10 +959,8 @@ export default function PacketTraffic() {
             </h2>
 
             <p className="panel-description">
-              Direction과 분석 상태는
-              전체 조회에 적용되고,
-              검색어는 현재 페이지 결과에
-              적용됩니다.
+              Direction은 전체 조회에 적용되고,
+              검색어와 분석 상태는 현재 페이지 결과에 적용됩니다.
             </p>
           </div>
 
@@ -1128,6 +1050,7 @@ export default function PacketTraffic() {
               </option>
             </select>
           </div>
+
         </div>
       </section>
 
