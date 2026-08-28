@@ -15,6 +15,15 @@ export function getCaptureStatus(item) {
 }
 
 
+export function matchesCaptureStatusFilter(item, captureStatus) {
+  if (!captureStatus) {
+    return true;
+  }
+
+  return getCaptureStatus(item) === captureStatus;
+}
+
+
 export function getCaptureStatusLabel(item) {
   const status = getCaptureStatus(item);
 

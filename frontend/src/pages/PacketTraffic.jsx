@@ -20,6 +20,7 @@ import {
   getCaptureStatus,
   getCaptureStatusLabel,
   getExclusionLabel,
+  matchesCaptureStatusFilter,
 } from "../utils/packetCaptureStatus";
 
 import "../styles/pages/PacketTraffic.scss"
@@ -196,6 +197,9 @@ export default function PacketTraffic() {
   const [direction, setDirection] =
     useState("");
 
+  const [captureStatus, setCaptureStatus] =
+    useState("");
+
   const [offset, setOffset] =
     useState(0);
 
@@ -329,12 +333,21 @@ export default function PacketTraffic() {
           .trim()
           .toLowerCase();
 
-      if (!keyword) {
-        return packetFeatures;
-      }
-
       return packetFeatures.filter(
         (item) => {
+          if (
+            !matchesCaptureStatusFilter(
+              item,
+              captureStatus
+            )
+          ) {
+            return false;
+          }
+
+          if (!keyword) {
+            return true;
+          }
+
           const sessionId =
             getSessionId(item);
 
@@ -357,6 +370,7 @@ export default function PacketTraffic() {
     }, [
       packetFeatures,
       searchText,
+      captureStatus,
     ]);
 
   const pageSummary =
@@ -461,8 +475,16 @@ export default function PacketTraffic() {
     setOffset(0);
   }
 
+  function handleCaptureStatusChange(
+    value
+  ) {
+    setCaptureStatus(value);
+    setOffset(0);
+  }
+
   function handleResetFilters() {
     setDirection("");
+    setCaptureStatus("");
     setSearchText("");
     setOffset(0);
   }
@@ -938,7 +960,7 @@ export default function PacketTraffic() {
 
             <p className="panel-description">
               Direction은 전체 조회에 적용되고,
-              검색어는 현재 페이지 결과에 적용됩니다.
+              검색어와 분석 상태는 현재 페이지 결과에 적용됩니다.
             </p>
           </div>
 
@@ -997,6 +1019,34 @@ export default function PacketTraffic() {
 
               <option value="OUTBOUND">
                 OUTBOUND
+              </option>
+            </select>
+          </div>
+
+          <div className="filter-item">
+            <label htmlFor="capture-status-filter">
+              Capture 분석 상태
+            </label>
+
+            <select
+              id="capture-status-filter"
+              value={captureStatus}
+              onChange={(event) => {
+                handleCaptureStatusChange(
+                  event.target.value
+                );
+              }}
+            >
+              <option value="">
+                전체
+              </option>
+
+              <option value="eligible">
+                분석 가능
+              </option>
+
+              <option value="excluded">
+                분석 제외
               </option>
             </select>
           </div>

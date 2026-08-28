@@ -5,6 +5,7 @@ import {
   getCaptureStatus,
   getCaptureStatusLabel,
   getExclusionLabel,
+  matchesCaptureStatusFilter,
 } from "./packetCaptureStatus.js";
 
 
@@ -47,4 +48,22 @@ test("common capture policy exclusion reasons have Korean labels", () => {
     getExclusionLabel("error_code_present:LATE_CAPTURE"),
     "수집 오류 (LATE_CAPTURE)",
   );
+});
+
+
+test("capture status filter matches current-page rows without folding FAILED into excluded", () => {
+  const eligible = { capture_eligible: true };
+  const excluded = { capture_eligible: false };
+  const failed = {
+    segment_status: "FAILED",
+    capture_eligible: false,
+  };
+
+  assert.equal(matchesCaptureStatusFilter(eligible, ""), true);
+  assert.equal(matchesCaptureStatusFilter(excluded, ""), true);
+  assert.equal(matchesCaptureStatusFilter(failed, ""), true);
+  assert.equal(matchesCaptureStatusFilter(eligible, "eligible"), true);
+  assert.equal(matchesCaptureStatusFilter(excluded, "eligible"), false);
+  assert.equal(matchesCaptureStatusFilter(excluded, "excluded"), true);
+  assert.equal(matchesCaptureStatusFilter(failed, "excluded"), false);
 });
