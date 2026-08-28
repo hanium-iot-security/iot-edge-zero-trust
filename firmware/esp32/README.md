@@ -7,8 +7,20 @@ ESP32 정상 telemetry 펌웨어와 공격 모드 펌웨어를 이 디렉터리�
 ```txt
 normal_sender/
 attack_sender/
+multi_attack_sender/
 phase5_normal_collector/
 ```
+
+## multi_attack_sender
+
+`multi_attack_sender/multi_attack_sender.ino`는 등록된 ESP32 #2에서
+`IDENTITY_MISMATCH`, `MALFORMED_PAYLOAD`, `PACKET_RATE`, `MQTT_FLOOD`를
+한 번의 `RUN_DEMO` 명령으로 순차 실행하는 승인된 테스트베드 전용
+Firmware입니다. 고정 IP·사설 대상·최대 전송량·부팅당 1회 제한과 수동
+`ABORT`를 적용하며 자동 실행하지 않습니다.
+
+설정, 업로드, Serial 명령, 촬영과 `normal_sender` 복구 절차는
+[`multi_attack_sender/README.md`](multi_attack_sender/README.md)를 따릅니다.
 
 ## phase5_normal_collector
 
