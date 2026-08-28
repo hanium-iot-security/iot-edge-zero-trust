@@ -18,6 +18,8 @@ import PageHeader from "../components/PageHeader";
 import StatusBadge from "../components/StatusBadge";
 import SummaryCard from "../components/SummaryCard";
 
+import "../styles/pages/GatewayStatus.scss"
+
 const COLLECTION_INTERVAL_SECONDS = 10;
 const ONLINE_THRESHOLD_MULTIPLIER = 3;
 
@@ -140,7 +142,7 @@ function formatElapsedTime(dateString) {
       0,
       Math.floor(
         (Date.now() - timestamp) /
-          1_000
+        1_000
       )
     );
 
@@ -383,7 +385,7 @@ function InterfaceCard({
       ].join(" ")}
     >
       <header className="interface-header">
-        <div className="interface-title-area">
+        <div className="interface-title">
           <div className="interface-title-row">
             <h3>{title}</h3>
 
@@ -406,7 +408,7 @@ function InterfaceCard({
         </div>
       </header>
 
-      <div className="interface-name-row">
+      <div className="interface-name">
         <span>
           Interface:
         </span>
@@ -417,7 +419,7 @@ function InterfaceCard({
         </strong>
       </div>
 
-      <div className="interface-detail-grid">
+      <div className="interface-details">
         <div className="metric-item">
           <span>IP Address</span>
 
@@ -457,7 +459,7 @@ function InterfaceCard({
           <strong
             className={
               rxRate === null ||
-              rxRate === undefined
+                rxRate === undefined
                 ? "metric-unavailable"
                 : ""
             }
@@ -476,7 +478,7 @@ function InterfaceCard({
           <strong
             className={
               txRate === null ||
-              txRate === undefined
+                txRate === undefined
                 ? "metric-unavailable"
                 : ""
             }
@@ -762,21 +764,21 @@ export default function GatewayStatus() {
 
   const interfaceSummaryStatus =
     interfaceSummary.down > 0 ||
-    interfaceSummary.missing > 0 ||
-    interfaceSummary.unknown > 0
+      interfaceSummary.missing > 0 ||
+      interfaceSummary.unknown > 0
       ? "warning"
       : "normal";
 
   return (
-    <div className="page-container">
+    <div className="gateway-page">
       <PageHeader
         title="Gateway Status"
         description="Raspberry Pi Gateway의 시스템 자원, 수집 상태, 네트워크 Interface 상태를 확인합니다."
         updatedAt={
           lastSuccessfulFetchAt
             ? formatKST(
-                lastSuccessfulFetchAt
-              )
+              lastSuccessfulFetchAt
+            )
             : undefined
         }
         onRefresh={handleRefresh}
@@ -821,7 +823,7 @@ export default function GatewayStatus() {
       )}
 
       {loading &&
-      !hasSuccessfulResponseRef.current ? (
+        !hasSuccessfulResponseRef.current ? (
         <LoadingState
           title="Gateway Metrics를 불러오는 중입니다."
           description="Raspberry Pi 시스템 상태와 Interface 정보를 확인하고 있습니다."
@@ -841,12 +843,6 @@ export default function GatewayStatus() {
               value="NO DATA"
               description="API 요청은 성공했지만 Metric이 없습니다."
               status="unknown"
-              footer={
-                <StatusBadge
-                  status="NO_DATA"
-                  size="small"
-                />
-              }
             />
           </section>
 
@@ -872,12 +868,6 @@ export default function GatewayStatus() {
                 )
               }
               status={gatewayTheme}
-              footer={
-                <StatusBadge
-                  status={gatewayStatus}
-                  size="small"
-                />
-              }
             />
 
             <SummaryCard
@@ -921,17 +911,13 @@ export default function GatewayStatus() {
             />
           </section>
 
-          <section className="panel gateway-overview">
-            <div className="gateway-overview-main">
+          <section className="panel overview">
+            <div className="overview-main">
               <span className="section-label">
                 수집 상태
               </span>
 
-              <div className="gateway-status-row">
-                <StatusBadge
-                  status={gatewayStatus}
-                />
-
+              <div className="status-row">
                 <span className="last-collected">
                   마지막 수집:{" "}
                   {formatKST(
@@ -959,7 +945,7 @@ export default function GatewayStatus() {
               </p>
             </div>
 
-            <div className="gateway-overview-detail">
+            <div className="overview-detail">
               <div>
                 <span>Metric ID</span>
 
@@ -1077,7 +1063,7 @@ export default function GatewayStatus() {
                 </p>
               </div>
 
-              <div className="interface-summary-badges">
+              <div className="interface-summary">
                 <StatusBadge
                   status="connected"
                   label={`연결 ${interfaceSummary.connected}`}
@@ -1098,12 +1084,12 @@ export default function GatewayStatus() {
 
                 {interfaceSummary.unknown >
                   0 && (
-                  <StatusBadge
-                    status="unknown"
-                    label={`미확인 ${interfaceSummary.unknown}`}
-                    size="small"
-                  />
-                )}
+                    <StatusBadge
+                      status="unknown"
+                      label={`미확인 ${interfaceSummary.unknown}`}
+                      size="small"
+                    />
+                  )}
               </div>
             </div>
 

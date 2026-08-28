@@ -1,3 +1,5 @@
+import "../styles/components/MetricCard.scss";
+
 function clampPercent(value) {
   const number = Number(value);
 
@@ -35,30 +37,30 @@ export default function MetricCard({
     <article
       className={[
         "metric-card",
-        `metric-card-${status}`,
+        `status-${status}`,
       ].join(" ")}
     >
-      <div className="metric-card-header">
-        <span className="metric-card-label">
+      <div className="card-header">
+        <span className="card-label">
           {label}
         </span>
       </div>
 
-      <div className="metric-card-value-row">
+      <div className="value-row">
         {hasValue ? (
           <>
-            <strong className="metric-card-value">
+            <strong className="card-value">
               {value}
             </strong>
 
             {unit && (
-              <span className="metric-card-unit">
+              <span className="unit">
                 {unit}
               </span>
             )}
           </>
         ) : (
-          <span className="metric-card-unavailable">
+          <span className="unavailable">
             {unavailableText}
           </span>
         )}
@@ -66,11 +68,11 @@ export default function MetricCard({
 
       {safePercentage !== null && (
         <div
-          className="metric-progress"
+          className="progress"
           aria-label={`${label} ${safePercentage}%`}
         >
           <div
-            className="metric-progress-value"
+            className="progress-value"
             style={{
               width: `${safePercentage}%`,
             }}
@@ -79,7 +81,7 @@ export default function MetricCard({
       )}
 
       {description && (
-        <p className="metric-card-description">
+        <p className="description">
           {description}
         </p>
       )}

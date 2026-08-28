@@ -2,6 +2,8 @@ import EmptyState from "./EmptyState";
 import ErrorState from "./ErrorState";
 import LoadingState from "./LoadingState";
 
+import "../styles/components/DataTable.scss";
+
 function getRowKey(
   row,
   rowIndex,
@@ -80,9 +82,9 @@ export default function DataTable({
   }
 
   return (
-    <div className="data-table-container">
+    <div className="data-table">
       {error && (
-        <div className="table-inline-error">
+        <div className="inline-error">
           <span>
             최신 데이터를 불러오지 못해
             이전 데이터를 표시합니다.
@@ -91,7 +93,7 @@ export default function DataTable({
           {onRetry && (
             <button
               type="button"
-              className="button-link"
+              className="retry-link"
               onClick={onRetry}
             >
               다시 시도
@@ -102,16 +104,16 @@ export default function DataTable({
 
       {loading && (
         <div
-          className="table-refresh-indicator"
+          className="refresh-indicator"
           role="status"
         >
           최신 데이터를 불러오는 중...
         </div>
       )}
 
-      <div className="data-table-scroll">
+      <div className="table-scroll">
         <table
-          className="data-table"
+          className="table"
           style={{
             minWidth,
           }}
@@ -170,7 +172,7 @@ export default function DataTable({
                     className={[
                       customRowClass,
                       clickable
-                        ? "data-table-row-clickable"
+                        ? "clickable"
                         : "",
                     ]
                       .filter(Boolean)

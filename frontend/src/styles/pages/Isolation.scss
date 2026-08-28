@@ -1,0 +1,351 @@
+.isolation-page {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+
+    margin: 0 auto;
+
+
+    /* =========================================================
+     Table
+     ========================================================= */
+
+    .table-panel {
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+
+        overflow: hidden;
+    }
+
+    .table-scroll {
+        display: block;
+
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+
+        overflow-x: auto;
+        overflow-y: hidden;
+
+        box-sizing: border-box;
+
+        -webkit-overflow-scrolling: touch;
+
+        >* {
+            max-width: none;
+        }
+    }
+
+
+    /* =========================================================
+     Table Cells
+     ========================================================= */
+
+    .device-id {
+        display: block;
+
+        max-width: 190px;
+
+        overflow: hidden;
+
+        font-family:
+            ui-monospace,
+            SFMono-Regular,
+            Menlo,
+            Consolas,
+            monospace;
+
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .table-scroll .description {
+        display: block;
+
+        max-width: 320px;
+
+        overflow: hidden;
+
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .trust-score {
+        display: flex;
+
+        min-width: 92px;
+
+        flex-direction: column;
+
+        gap: 6px;
+
+        >strong {
+            text-align: center;
+        }
+    }
+
+    .last-seen {
+        display: flex;
+
+        flex-direction: column;
+        align-items: flex-start;
+
+        gap: 5px;
+
+        small {
+            color: var(--color-slate-500);
+        }
+    }
+
+
+    /* =========================================================
+     Row State
+     ========================================================= */
+
+    .row-warning {
+        background: #ffffff;
+
+        &:hover {
+            background: #ffffff;
+        }
+    }
+
+    .row-danger {
+        background: #fef2f2;
+
+        &:hover {
+            background: #fee2e2;
+        }
+    }
+
+
+    /* =========================================================
+     Detail Modal
+     ========================================================= */
+
+    .detail {
+        display: flex;
+
+        flex-direction: column;
+
+        gap: 20px;
+    }
+
+    .detail-grid {
+        display: grid;
+
+        grid-template-columns:
+            repeat(3, minmax(0, 1fr));
+
+        gap: 12px;
+    }
+
+    .detail-item {
+        min-width: 0;
+
+        padding: 14px;
+
+        border: 1px solid var(--border-color);
+        border-radius: 9px;
+
+        background: var(--color-slate-50);
+
+        >span {
+            display: block;
+
+            margin-bottom: 7px;
+
+            color: var(--color-slate-500);
+
+            font-size: 11px;
+            font-weight: 800;
+        }
+
+        strong {
+            display: block;
+
+            overflow-wrap: anywhere;
+
+            color: var(--color-slate-900);
+
+            font-size: 13px;
+        }
+
+        .status-badge.status-isolated {
+            background: var(--color-slate-900);
+            color: #ffffff;
+
+            >span {
+                color: #ffffff;
+            }
+
+            .dot {
+                background: #ffffff;
+            }
+        }
+    }
+
+    .detail-section {
+        min-width: 0;
+
+        h3 {
+            margin: 0 0 12px;
+
+            color: var(--color-slate-950);
+
+            font-size: 16px;
+        }
+    }
+
+
+    /* =========================================================
+     Recovery Form
+     ========================================================= */
+
+    .recovery-form {
+        display: grid;
+
+        grid-template-columns:
+            repeat(2, minmax(0, 1fr));
+
+        gap: 14px;
+
+        .filter-item:only-child {
+            grid-column: 1 / -1;
+        }
+    }
+
+    .help-text {
+        display: block;
+
+        margin-top: 6px;
+
+        color: var(--color-slate-500);
+
+        font-size: 11px;
+        line-height: 1.5;
+    }
+
+    .action-row {
+        display: flex;
+
+        justify-content: flex-end;
+
+        gap: 10px;
+        flex-wrap: wrap;
+
+        margin-top: 14px;
+    }
+
+
+    /* =========================================================
+     Recovery Result / Error
+     ========================================================= */
+
+    .inline-error {
+        margin: 12px 0 0;
+        padding: 11px 13px;
+
+        border: 1px solid #fecaca;
+        border-radius: 8px;
+
+        background: #fef2f2;
+        color: var(--color-danger-dark);
+
+        font-size: 12px;
+        line-height: 1.5;
+    }
+
+    .result-list {
+        margin-top: 14px;
+    }
+
+    .success-box {
+        margin-top: 14px;
+        padding: 15px;
+
+        border: 1px solid #bbf7d0;
+        border-radius: 10px;
+
+        background: #f0fdf4;
+
+        >strong {
+            display: block;
+
+            margin-bottom: 12px;
+
+            color: var(--color-success-dark);
+        }
+    }
+
+
+    /* =========================================================
+     Recovery History
+     ========================================================= */
+
+    .history-list {
+        display: flex;
+
+        flex-direction: column;
+
+        gap: 10px;
+    }
+
+    .history-item {
+        display: grid;
+
+        grid-template-columns:
+            minmax(0, 1fr) auto auto;
+
+        align-items: center;
+
+        gap: 12px;
+
+        padding: 12px 13px;
+
+        border: 1px solid var(--border-color);
+        border-radius: 9px;
+
+        background: var(--color-slate-50);
+
+        span,
+        small {
+            color: var(--color-slate-500);
+
+            font-size: 11px;
+        }
+    }
+
+
+    /* =========================================================
+     Responsive
+     ========================================================= */
+
+    @media (max-width: 1280px) {
+        .detail-grid {
+            grid-template-columns:
+                repeat(2, minmax(0, 1fr));
+        }
+    }
+
+    @media (max-width: 760px) {
+
+        .detail-grid,
+        .recovery-form {
+            grid-template-columns: 1fr;
+        }
+
+        .history-item {
+            grid-template-columns: 1fr;
+        }
+
+        .action-row {
+            justify-content: stretch;
+
+            .button {
+                width: 100%;
+            }
+        }
+    }
+}

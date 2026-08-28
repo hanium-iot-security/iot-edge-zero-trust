@@ -1,3 +1,5 @@
+import "../styles/components/Pagination.scss";
+
 export default function Pagination({
   currentPage,
   totalPages,
@@ -43,12 +45,12 @@ export default function Pagination({
 
   return (
     <nav
-      className="pagination-row"
+      className="pagination"
       aria-label="페이지 이동"
     >
       <button
         type="button"
-        className="pagination-button"
+        className="page-button"
         onClick={onPrevious}
         disabled={
           disabled ||
@@ -58,7 +60,7 @@ export default function Pagination({
         이전
       </button>
 
-      <div className="pagination-info">
+      <div className="page-info">
         <strong>
           {safeCurrentPage}
         </strong>
@@ -67,7 +69,7 @@ export default function Pagination({
           / {safeTotalPages} 페이지
         </span>
 
-        <span className="pagination-range">
+        <span className="range">
           {firstItem}–{lastItem}
           {" / "}
           총 {safeTotal}건
@@ -76,7 +78,7 @@ export default function Pagination({
 
       <button
         type="button"
-        className="pagination-button"
+        className="page-button"
         onClick={onNext}
         disabled={
           disabled ||

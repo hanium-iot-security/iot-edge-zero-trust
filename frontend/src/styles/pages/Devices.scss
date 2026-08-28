@@ -1,0 +1,333 @@
+.devices-page {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+
+  margin: 0 auto;
+
+
+  /* ========================================
+     TABLE
+     ======================================== */
+
+  .table-panel {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+
+    overflow: hidden;
+  }
+
+  .table-scroll {
+    display: block;
+
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+
+    overflow-x: auto;
+    overflow-y: hidden;
+
+    -webkit-overflow-scrolling: touch;
+
+    > * {
+      max-width: none;
+    }
+  }
+
+  .device-id {
+    display: block;
+
+    max-width: 190px;
+
+    overflow: hidden;
+
+    font-family:
+      ui-monospace,
+      SFMono-Regular,
+      Menlo,
+      Consolas,
+      monospace;
+
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+
+  /* ========================================
+     TRUST SCORE
+     ======================================== */
+
+  .score-cell {
+    display: flex;
+
+    min-width: 92px;
+
+    flex-direction: column;
+
+    gap: 6px;
+
+    > strong {
+      text-align: right;
+    }
+  }
+
+  .score-bar {
+    width: 100%;
+    height: 6px;
+
+    overflow: hidden;
+
+    border-radius: var(--radius-pill);
+
+    background: var(--color-slate-200);
+  }
+
+  .score-fill {
+    height: 100%;
+
+    border-radius: inherit;
+
+    background: var(--color-primary);
+  }
+
+  .score-normal {
+    background: var(--color-success);
+  }
+
+  .score-warning {
+    background: var(--color-warning);
+  }
+
+  .score-danger {
+    background: var(--color-danger);
+  }
+
+  .score-isolated {
+    background: var(--color-slate-900);
+  }
+
+
+  /* ========================================
+     LAST SEEN
+     ======================================== */
+
+  .last-seen {
+    display: flex;
+
+    flex-direction: column;
+    align-items: flex-start;
+
+    gap: 5px;
+
+    small {
+      color: var(--color-slate-500);
+    }
+  }
+
+
+  /* ========================================
+     ROW STATE
+     ======================================== */
+
+  .row-warning {
+    background: #fffbeb;
+
+    &:hover {
+      background: #fef3c7;
+    }
+  }
+
+  .row-danger {
+    background: #fef2f2;
+
+    &:hover {
+      background: #fee2e2;
+    }
+  }
+
+
+  /* ========================================
+     DEVICE DETAIL
+     ======================================== */
+
+  .detail {
+    display: flex;
+
+    min-width: 0;
+
+    flex-direction: column;
+
+    gap: 20px;
+
+    padding: 0 20px;
+  }
+
+  .detail-grid {
+    display: grid;
+
+    grid-template-columns:
+      repeat(3, minmax(0, 1fr));
+
+    gap: 12px;
+  }
+
+  .detail-item {
+    min-width: 0;
+
+    padding: 14px;
+
+    border: 1px solid var(--border-color);
+    border-radius: 9px;
+
+    background: var(--color-slate-50);
+
+    > span {
+      display: block;
+
+      margin-bottom: 7px;
+
+      color: var(--color-slate-500);
+
+      font-size: 11px;
+      font-weight: 800;
+    }
+
+    strong {
+      display: block;
+
+      overflow-wrap: anywhere;
+
+      color: var(--color-slate-900);
+
+      font-size: 13px;
+    }
+  }
+
+  .detail-section {
+    min-width: 0;
+
+    h3 {
+      margin: 0 0 12px;
+
+      color: var(--color-slate-950);
+
+      font-size: 16px;
+    }
+  }
+
+
+  /* ========================================
+     TRUST HISTORY
+     ======================================== */
+
+  .history-list {
+    display: flex;
+
+    flex-direction: column;
+
+    gap: 12px;
+  }
+
+  .history-item {
+    padding: 15px;
+
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+
+    background: var(--color-slate-50);
+  }
+
+  .history-score {
+    display: flex;
+
+    align-items: center;
+
+    gap: 10px;
+
+    margin-bottom: 10px;
+
+    strong {
+      font-size: 20px;
+    }
+
+    span {
+      color: var(--color-slate-400);
+    }
+  }
+
+  .history-meta {
+    display: flex;
+
+    align-items: center;
+
+    gap: 8px;
+    flex-wrap: wrap;
+
+    margin-bottom: 12px;
+
+    color: var(--color-slate-500);
+
+    font-size: 12px;
+  }
+
+  .history-info {
+    display: grid;
+
+    grid-template-columns:
+      repeat(4, minmax(0, 1fr));
+
+    gap: 10px;
+
+    margin: 0;
+
+    > div {
+      min-width: 0;
+    }
+
+    dt {
+      margin-bottom: 4px;
+
+      color: var(--color-slate-500);
+
+      font-size: 10px;
+      font-weight: 800;
+    }
+
+    dd {
+      margin: 0;
+
+      overflow-wrap: anywhere;
+
+      font-size: 12px;
+    }
+  }
+
+
+  /* ========================================
+     RESPONSIVE
+     ======================================== */
+
+  @media (max-width: 1280px) {
+    .detail-grid {
+      grid-template-columns:
+        repeat(2, minmax(0, 1fr));
+    }
+
+    .history-info {
+      grid-template-columns:
+        repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  @media (max-width: 760px) {
+    .detail {
+      padding: 0;
+    }
+
+    .detail-grid,
+    .history-info {
+      grid-template-columns: 1fr;
+    }
+  }
+}

@@ -1,3 +1,5 @@
+import "../styles/components/JsonViewer.scss";
+
 function formatValue(value) {
   if (
     value === null ||
@@ -39,7 +41,7 @@ export default function JsonViewer({
     typeof data !== "object"
   ) {
     return (
-      <div className="json-viewer-empty">
+      <div className="json-empty">
         표시할 상세 증거가 없습니다.
       </div>
     );
@@ -50,7 +52,7 @@ export default function JsonViewer({
       {Object.entries(data).map(
         ([key, value]) => (
           <div
-            className="json-viewer-row"
+            className="json-row"
             key={key}
           >
             <dt>{formatKey(key)}</dt>

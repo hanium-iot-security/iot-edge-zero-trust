@@ -1,3 +1,5 @@
+import "../styles/components/PageHeader.scss";
+
 export default function PageHeader({
   title,
   description,
@@ -8,27 +10,27 @@ export default function PageHeader({
 }) {
   return (
     <header className="page-header">
-      <div className="page-header-content">
-        <div className="page-header-title-row">
+      <div className="header-content">
+        <div className="title-row">
           <h1 className="page-title">
             {title}
           </h1>
 
           {updatedAt && (
-            <span className="page-updated-at">
+            <span className="updated-at">
               최근 업데이트: {updatedAt}
             </span>
           )}
         </div>
 
         {description && (
-          <p className="page-description">
+          <p className="description">
             {description}
           </p>
         )}
       </div>
 
-      <div className="page-header-actions">
+      <div className="header-actions">
         {actions}
 
         {onRefresh && (

@@ -1,3 +1,5 @@
+import "../styles/components/ErrorState.scss";
+
 export default function ErrorState({
   title = "데이터를 불러오지 못했습니다.",
   message = "잠시 후 다시 시도해 주세요.",
@@ -8,10 +10,9 @@ export default function ErrorState({
   return (
     <div
       className={[
-        "state-panel",
         "error-state",
         compact
-          ? "state-panel-compact"
+          ? "compact"
           : "",
       ]
         .filter(Boolean)
@@ -19,25 +20,25 @@ export default function ErrorState({
       role="alert"
     >
       <div
-        className="state-panel-icon"
+        className="state-icon"
         aria-hidden="true"
       >
         !
       </div>
 
-      <div className="state-panel-content">
-        <strong className="state-panel-title">
+      <div className="state-content">
+        <strong className="state-title">
           {title}
         </strong>
 
-        <p className="state-panel-description">
+        <p className="state-description">
           {message}
         </p>
 
         {onRetry && (
           <button
             type="button"
-            className="button button-danger-outline"
+            className="retry-button"
             onClick={onRetry}
           >
             {retryLabel}

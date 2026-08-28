@@ -3,6 +3,8 @@ import {
   useId,
 } from "react";
 
+import "../styles/components/DetailModal.scss";
+
 export default function DetailModal({
   open,
   title,
@@ -60,7 +62,7 @@ export default function DetailModal({
       <section
         className={[
           "detail-modal",
-          `detail-modal-${size}`,
+          `size-${size}`,
         ].join(" ")}
         role="dialog"
         aria-modal="true"
@@ -95,7 +97,7 @@ export default function DetailModal({
 
           <button
             type="button"
-            className="modal-close-button"
+            className="modal-close"
             onClick={onClose}
             aria-label="상세 창 닫기"
           >
