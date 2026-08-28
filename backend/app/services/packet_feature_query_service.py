@@ -11,6 +11,11 @@ from edge.features.packet_feature_repository import (
     count_packet_feature_logs,
     list_packet_feature_logs,
 )
+from edge.packet.capture_policy import (
+    CaptureEligibilitySegment,
+    CapturePolicy,
+    is_capture_eligible,
+)
 from edge.packet.pcap_naming import format_utc_iso
 
 
@@ -57,23 +62,38 @@ def list_packet_features(
         from_at=from_utc,
         to_at=to_utc,
     )
+    capture_policy = CapturePolicy.from_env()
 
     return {
-        "items": [_packet_feature_item(row) for row in rows],
+        "items": [
+            _packet_feature_item(row, capture_policy=capture_policy)
+            for row in rows
+        ],
         "total": total,
     }
 
 
-def _packet_feature_item(row: dict[str, Any]) -> dict[str, Any]:
+def _packet_feature_item(
+    row: dict[str, Any],
+    *,
+    capture_policy: CapturePolicy,
+) -> dict[str, Any]:
     packet_count = int(row["packet_count"])
     total_bytes = int(row["total_bytes"])
     captured_duration_seconds = row.get("captured_duration_seconds")
+    capture_eligibility = is_capture_eligible(
+        CaptureEligibilitySegment(
+            status=str(row["segment_status"]),
+            error_code=row.get("segment_error_code"),
+            start_delay_seconds=row.get("start_delay_seconds"),
+            captured_duration_seconds=captured_duration_seconds,
+        ),
+        capture_policy,
+    )
     effective_packets_per_second = None
     effective_bytes_per_second = None
-    coverage_ratio = None
     if captured_duration_seconds is not None:
         duration = float(captured_duration_seconds)
-        coverage_ratio = duration / PACKET_WINDOW_SECONDS
         if duration > 0:
             effective_packets_per_second = packet_count / duration
             effective_bytes_per_second = total_bytes / duration
@@ -103,10 +123,13 @@ def _packet_feature_item(row: dict[str, Any]) -> dict[str, Any]:
         "nominal_bytes_per_second": nominal_bytes_per_second,
         "effective_packets_per_second": effective_packets_per_second,
         "effective_bytes_per_second": effective_bytes_per_second,
+        "segment_status": row["segment_status"],
+        "segment_error_code": row["segment_error_code"],
+        "start_delay_seconds": row["start_delay_seconds"],
         "captured_duration_seconds": captured_duration_seconds,
-        "coverage_ratio": coverage_ratio,
-        "capture_eligible": None,
-        "capture_exclusion_reason": None,
+        "coverage_ratio": capture_eligibility.coverage_ratio,
+        "capture_eligible": capture_eligibility.eligible,
+        "capture_exclusion_reason": capture_eligibility.exclusion_reason,
         "capture_scope": row["capture_scope"],
         "created_at": _format_api_timestamp(row["created_at"], "created_at"),
     }

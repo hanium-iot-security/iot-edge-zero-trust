@@ -282,6 +282,9 @@ def list_packet_feature_logs(
                 pfl.non_mqtt_tcp_udp_packet_count,
                 pfl.capture_scope,
                 pfl.created_at,
+                pcsg.status AS segment_status,
+                pcsg.error_code AS segment_error_code,
+                pcsg.start_delay_seconds,
                 pcsg.captured_duration_seconds
             FROM packet_feature_logs pfl
             JOIN packet_capture_segments pcsg

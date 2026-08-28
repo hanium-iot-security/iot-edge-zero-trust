@@ -29,9 +29,12 @@ class PacketFeatureItem(BaseModel):
     nominal_bytes_per_second: float
     effective_packets_per_second: float | None = None
     effective_bytes_per_second: float | None = None
+    segment_status: Literal["READY", "PROCESSED", "EMPTY", "FAILED"]
+    segment_error_code: str | None = None
+    start_delay_seconds: float | None = None
     captured_duration_seconds: float | None = None
     coverage_ratio: float | None = None
-    capture_eligible: bool | None = None
+    capture_eligible: bool
     capture_exclusion_reason: str | None = None
     capture_scope: str | None = None
     created_at: str

@@ -21,12 +21,18 @@ def get_packet_feature_logs(
     device_id: str | None = None,
     peer_ip: str | None = None,
     direction: Literal["INBOUND", "OUTBOUND"] | None = None,
+    capture_eligible: bool | None = None,
     from_at: Annotated[datetime | None, Query(alias="from")] = None,
     to_at: Annotated[datetime | None, Query(alias="to")] = None,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ) -> dict:
+    if capture_eligible is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="capture_eligible filtering is not supported by this endpoint",
+        )
     try:
         return list_packet_features(
             db,

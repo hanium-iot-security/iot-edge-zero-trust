@@ -57,6 +57,8 @@ def seed_packet_gateway_rows(db_path: Path) -> None:
             capture_interface="eth0",
             window_start="2026-07-16T10:00:00Z",
             window_end="2026-07-16T10:00:10Z",
+            status="FAILED",
+            error_code="PCAP_PARSE_ERROR",
         )
         segment_a2 = _insert_segment(
             connection,
@@ -65,6 +67,7 @@ def seed_packet_gateway_rows(db_path: Path) -> None:
             capture_interface="eth0",
             window_start="2026-07-16T10:00:10Z",
             window_end="2026-07-16T10:00:20Z",
+            status="PROCESSED",
         )
         segment_b1 = _insert_segment(
             connection,
@@ -73,6 +76,9 @@ def seed_packet_gateway_rows(db_path: Path) -> None:
             capture_interface="eth1",
             window_start="2026-07-16T10:00:20Z",
             window_end="2026-07-16T10:00:30Z",
+            status="PROCESSED",
+            start_delay_seconds=0.1,
+            captured_duration_seconds=9.9,
         )
         _insert_feature(
             connection,
@@ -168,6 +174,10 @@ def _insert_segment(
     capture_interface: str,
     window_start: str,
     window_end: str,
+    status: str = "READY",
+    error_code: str | None = None,
+    start_delay_seconds: float | None = None,
+    captured_duration_seconds: float | None = None,
 ) -> int:
     cursor = connection.execute(
         """
@@ -176,11 +186,25 @@ def _insert_segment(
             file_name,
             capture_interface,
             window_start,
-            window_end
+            window_end,
+            status,
+            error_code,
+            start_delay_seconds,
+            captured_duration_seconds
         )
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (session_pk, file_name, capture_interface, window_start, window_end),
+        (
+            session_pk,
+            file_name,
+            capture_interface,
+            window_start,
+            window_end,
+            status,
+            error_code,
+            start_delay_seconds,
+            captured_duration_seconds,
+        ),
     )
     return int(cursor.lastrowid)
 
@@ -326,7 +350,36 @@ def test_packet_feature_logs_return_sorted_rows_and_derived_fields(api_client) -
     assert latest["device_id"] is None
     assert latest["packets_per_second"] == 3.0
     assert latest["bytes_per_second"] == 300.0
+    assert latest["segment_status"] == "PROCESSED"
+    assert latest["segment_error_code"] is None
+    assert latest["start_delay_seconds"] == pytest.approx(0.1)
+    assert latest["captured_duration_seconds"] == pytest.approx(9.9)
+    assert latest["coverage_ratio"] == pytest.approx(0.99)
+    assert latest["capture_eligible"] is True
+    assert latest["capture_exclusion_reason"] is None
     assert latest["created_at"] == "2026-07-16T10:00:23Z"
+
+
+def test_packet_feature_logs_expose_common_capture_exclusion_reasons(api_client) -> None:
+    client, db_path = api_client
+    seed_packet_gateway_rows(db_path)
+
+    response = client.get("/api/packet-feature-logs")
+
+    assert response.status_code == 200
+    items_by_peer = {item["peer_ip"]: item for item in response.json()["items"]}
+
+    missing_timing = items_by_peer["10.0.0.9"]
+    assert missing_timing["segment_status"] == "PROCESSED"
+    assert missing_timing["capture_eligible"] is False
+    assert missing_timing["capture_exclusion_reason"] == "missing_timing_metadata"
+    assert missing_timing["coverage_ratio"] is None
+
+    failed = items_by_peer["10.0.0.8"]
+    assert failed["segment_status"] == "FAILED"
+    assert failed["segment_error_code"] == "PCAP_PARSE_ERROR"
+    assert failed["capture_eligible"] is False
+    assert failed["capture_exclusion_reason"] == "status_not_eligible:FAILED"
 
 
 def test_packet_feature_logs_support_filters_and_pagination(api_client) -> None:
@@ -379,6 +432,15 @@ def test_packet_feature_logs_reject_invalid_queries(api_client) -> None:
             "to": "2026-07-16T10:00:00Z",
         },
     ).status_code == 422
+
+    unsupported_filter = client.get(
+        "/api/packet-feature-logs",
+        params={"capture_eligible": True},
+    )
+    assert unsupported_filter.status_code == 422
+    assert unsupported_filter.json()["detail"] == (
+        "capture_eligible filtering is not supported by this endpoint"
+    )
 
 
 def test_packet_feature_logs_return_500_for_stored_timestamp_error(api_client) -> None:
@@ -521,9 +583,13 @@ def test_query_services_call_repository_functions(monkeypatch) -> None:
                 "distinct_dest_port_count": 1,
                 "tcp_syn_count": 1,
                 "mqtt_related_packet_count": 1,
-                "non_mqtt_tcp_udp_packet_count": 0,
-                "capture_scope": "PI1_INTERNAL_LAN",
-                "created_at": "2026-07-16 10:00:11",
+                    "non_mqtt_tcp_udp_packet_count": 0,
+                    "capture_scope": "PI1_INTERNAL_LAN",
+                    "segment_status": "PROCESSED",
+                    "segment_error_code": None,
+                    "start_delay_seconds": 0.1,
+                    "captured_duration_seconds": 9.9,
+                    "created_at": "2026-07-16 10:00:11",
             }
         ]
 

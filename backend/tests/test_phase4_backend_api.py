@@ -128,7 +128,10 @@ def test_packet_feature_phase4_rate_fields(api_client) -> None:
     assert item["effective_packets_per_second"] == 4.0
     assert item["effective_bytes_per_second"] == 400.0
     assert item["coverage_ratio"] == 0.5
-    assert item["capture_eligible"] is None
+    assert item["segment_status"] == "PROCESSED"
+    assert item["start_delay_seconds"] is None
+    assert item["capture_eligible"] is False
+    assert item["capture_exclusion_reason"] == "missing_timing_metadata"
 
 
 def test_health_and_cors_contracts(api_client) -> None:
