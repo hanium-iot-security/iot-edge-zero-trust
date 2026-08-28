@@ -37,6 +37,7 @@ Query parameters:
 - `device_id`
 - `peer_ip`
 - `direction`: `INBOUND` or `OUTBOUND`
+- `capture_eligible`: 현재 지원하지 않으며 전달 시 `422`를 반환
 - `from`: timezone-aware ISO 8601 timestamp
 - `to`: timezone-aware ISO 8601 timestamp
 - `limit`: default `100`, minimum `1`, maximum `500`
@@ -62,15 +63,35 @@ nominal_bytes_per_second = total_bytes / 10.0
 
 `packets_per_second` and `bytes_per_second` are kept as nominal-rate aliases for backward compatibility.
 
-If `packet_capture_segments.captured_duration_seconds` is available and greater than `0`, the API also returns:
+The API joins the source Capture Segment metadata and returns:
+
+- `segment_status`
+- `segment_error_code`
+- `start_delay_seconds`
+- `captured_duration_seconds`
+
+It evaluates that metadata with the shared
+`edge.packet.capture_policy.is_capture_eligible()` contract and returns:
 
 ```text
 effective_packets_per_second = packet_count / captured_duration_seconds
 effective_bytes_per_second = total_bytes / captured_duration_seconds
-coverage_ratio = captured_duration_seconds / 10.0
+coverage_ratio = shared capture policy result
+capture_eligible = shared capture policy eligibility result
+capture_exclusion_reason = shared capture policy exclusion reason
 ```
 
-If the duration is `NULL` or `0`, `effective_packets_per_second` and `effective_bytes_per_second` are `null`. `capture_eligible` and `capture_exclusion_reason` are reserved for the shared capture policy integration; this PR does not duplicate another owner's capture eligibility algorithm.
+If the duration is `NULL` or `0`, `effective_packets_per_second` and
+`effective_bytes_per_second` are `null`. Missing or invalid Segment timing is
+fail-closed by the shared policy, so `capture_eligible` is `false` and
+`capture_exclusion_reason` contains the policy reason such as
+`missing_timing_metadata`.
+
+Exact server-side `capture_eligible` filtering is intentionally unsupported.
+The endpoint returns `422` when that query parameter is supplied rather than
+duplicating the policy in SQL or evaluating the entire result set outside the
+paginated query. The Dashboard therefore does not expose this filter; its
+eligible/excluded/failed summary is explicitly limited to the current page.
 
 Unmapped peer IP rows return `device_id: null`. Empty results return `items: []` and `total: 0`.
 
