@@ -313,6 +313,30 @@ function getGatewayStatusTheme(status) {
     "unknown"
   );
 }
+function getHealthDisplayLabel(value) {
+  const normalized =
+    String(value || "")
+      .trim()
+      .toUpperCase();
+
+  const labels = {
+    OK: "정상",
+    HEALTHY: "정상",
+    UP: "정상",
+    DEGRADED: "주의",
+    WARNING: "주의",
+    ERROR: "오류",
+    DOWN: "오류",
+    UNHEALTHY: "오류",
+  };
+
+  return (
+    labels[normalized] ||
+    value ||
+    "-"
+  );
+}
+
 function getHealthStatus(health) {
   const rawStatus =
     String(
@@ -442,6 +466,47 @@ function formatResourceValue(value) {
       maximumFractionDigits: 1,
     }
   );
+}
+
+/*
+ * Gateway Status 페이지와 동일한 자원 상태 기준을 사용합니다.
+ * CPU / Memory / Disk: 75%부터 warning, 90%부터 danger
+ * Temperature: 65℃부터 warning, 80℃부터 danger
+ */
+function getResourceStatus(value) {
+  const number = Number(value);
+
+  if (!Number.isFinite(number)) {
+    return "unknown";
+  }
+
+  if (number >= 90) {
+    return "danger";
+  }
+
+  if (number >= 75) {
+    return "warning";
+  }
+
+  return "normal";
+}
+
+function getTemperatureStatus(value) {
+  const number = Number(value);
+
+  if (!Number.isFinite(number)) {
+    return "unknown";
+  }
+
+  if (number >= 80) {
+    return "danger";
+  }
+
+  if (number >= 65) {
+    return "warning";
+  }
+
+  return "normal";
 }
 
 export default function Dashboard() {
@@ -1301,13 +1366,7 @@ export default function Dashboard() {
                   summary?.isolated_devices ?? 0
                 )}
                 description="Trust Score 30 미만"
-                status={
-                  Number(
-                    summary?.isolated_devices
-                  ) > 0
-                    ? "isolated"
-                    : "default"
-                }
+                status="isolated"
               />
 
               <SummaryCard
@@ -1384,6 +1443,9 @@ export default function Dashboard() {
                       percentage={
                         gatewayMetric.cpu_percent
                       }
+                      status={getResourceStatus(
+                        gatewayMetric.cpu_percent
+                      )}
                       description="현재 CPU 사용률"
                     />
 
@@ -1396,6 +1458,9 @@ export default function Dashboard() {
                       percentage={
                         gatewayMetric.memory_percent
                       }
+                      status={getResourceStatus(
+                        gatewayMetric.memory_percent
+                      )}
                       description="현재 Memory 사용률"
                     />
 
@@ -1408,6 +1473,9 @@ export default function Dashboard() {
                       percentage={
                         gatewayMetric.disk_percent
                       }
+                      status={getResourceStatus(
+                        gatewayMetric.disk_percent
+                      )}
                       description="현재 Disk 사용률"
                     />
 
@@ -1417,6 +1485,9 @@ export default function Dashboard() {
                         gatewayMetric.temperature_c
                       )}
                       unit="℃"
+                      status={getTemperatureStatus(
+                        gatewayMetric.temperature_c
+                      )}
                       description="CPU 온도"
                     />
                   </div>
@@ -1556,7 +1627,9 @@ export default function Dashboard() {
                     </span>
 
                     <strong>
-                      {health.status || "-"}
+                      {getHealthDisplayLabel(
+                        health.status
+                      )}
                     </strong>
                   </div>
 
@@ -1566,7 +1639,9 @@ export default function Dashboard() {
                     </span>
 
                     <strong>
-                      {health.database || "-"}
+                      {getHealthDisplayLabel(
+                        health.database
+                      )}
                     </strong>
                   </div>
 
@@ -1587,8 +1662,8 @@ export default function Dashboard() {
                         normalizeBoolean(
                           health.db_connected
                         )
-                          ? "conneted"
-                          : "failed"
+                          ? "연결됨"
+                          : "연결 실패"
                       }
                       size="small"
                     />

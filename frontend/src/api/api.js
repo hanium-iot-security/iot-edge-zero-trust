@@ -172,10 +172,28 @@ function createApiErrorMessage(
   }
 
   if (status === 409) {
-    return (
-      detail ||
-      "현재 상태에서는 요청을 수행할 수 없습니다."
-    );
+    if (
+      detail &&
+      typeof detail === "object" &&
+      !Array.isArray(detail)
+    ) {
+      const objectMessage = [
+        detail.message,
+        detail.reason,
+        detail.error,
+        detail.detail,
+      ].find(
+        (value) =>
+          typeof value === "string" &&
+          value.trim()
+      );
+
+      if (objectMessage) {
+        return objectMessage.trim();
+      }
+    }
+
+    return "현재 상태에서는 요청을 수행할 수 없습니다.";
   }
 
   if (status === 422) {
