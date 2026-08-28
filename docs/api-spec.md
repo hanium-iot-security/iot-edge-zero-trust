@@ -90,8 +90,9 @@ fail-closed by the shared policy, so `capture_eligible` is `false` and
 Exact server-side `capture_eligible` filtering is intentionally unsupported.
 The endpoint returns `422` when that query parameter is supplied rather than
 duplicating the policy in SQL or evaluating the entire result set outside the
-paginated query. The Dashboard therefore does not expose this filter; its
-eligible/excluded/failed summary is explicitly limited to the current page.
+paginated query. The Dashboard applies its Capture analysis status dropdown
+only to the current API page and does not send this query parameter. Its
+eligible/excluded/failed summary is also explicitly limited to the current page.
 
 Unmapped peer IP rows return `device_id: null`. Empty results return `items: []` and `total: 0`.
 
