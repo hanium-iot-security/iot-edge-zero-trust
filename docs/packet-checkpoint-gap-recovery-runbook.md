@@ -62,6 +62,20 @@ Orchestrator에서 `packet_rule`과 `packet_if`가 모두 required이면 같은 
 
 ## 4. Execute와 결과
 
+### 수집되지 않은 마지막 실패 구간에서의 명시적 복구
+
+현재 Session이 `FAILED`이면 기본 동작은 계속 거부한다. `live-resume`의
+`--allow-failed-current-session` 옵션은 Checkpoint까지 정상 구간이 모두 소비됐고,
+그 직후에 캡처가 시작되지 않은 `LATE_CAPTURE` 구간 하나만 남은 경우에만 허용한다.
+파일, 캡처 시작 시각, Packet Feature가 있거나 수집 시간이 0이 아니면 거부한다.
+FAILED Session과 Segment는 원래 상태로 보존하고, 건너뛴 구간은 Plan과 Audit에 기록한다.
+
+Dry-run에 `--allow-failed-current-session`을 명시한 경우 Execute 확인값은
+`APPLY-PACKET-FAILED-TAIL-LIVE-RESUME`이다. 중간에 처리 가능한 Session이 있으면
+기존의 Plan SHA 기반 `--confirm-skip-processable` 확인도 필요하다. 이 복구는
+과거의 탐지 공백을 성공적으로 처리한 것으로 바꾸지 않으며, 이후의 새 실험과
+과거 공백의 증거를 분리하여 기록해야 한다.
+
 일반 Gap Recovery:
 
 ```bash
@@ -91,3 +105,17 @@ Exit Code 2는 Commit 전 거부다. Exit Code 3은 DB Commit 뒤 검증 또는 
 승인한 Target Session에 대해 해당 Detector의 Manual Runner만 실행한다. Recovery 전 active였던 서비스만 원복한다. Live Resume에서는 required인 모든 Packet Detector에 유효한 공식 Audit가 있고, 각 Detector가 Target `first_window_start` 이후의 기존 Feature부터 처리하는지 확인한다. 공식 Trust/Firewall E2E는 새 Holdout Session에서 별도로 수행한다.
 
 이 문서는 코드 경로를 설명한다. 실제 Raspberry Pi의 systemd/lock/capture 동시 동작 Cutover 검증은 코드 PR과 별도로 수행하고 증거를 기록해야 한다.
+
+### 관리자 복구 이후에도 처리 시각 확인
+
+Device 상태·점수 복구 성공과 탐지 재개 성공은 별도 조건이다. 서비스의 `active`
+표시나 Device의 `normal/100`만으로 실험을 재개하지 않는다. 관리자 복구 이후
+활성화된 Packet·MQTT Detector와 Trust 처리 Checkpoint가 두 번 이상
+연속 전진하고, 실제 새 MQTT 수신 및 현재 Capture Session의 Feature 처리가
+이어지는지 확인한다. 처리 시각이 정체되면 해당 회차를 완료로 기록하지 않는다.
+
+Baseline Recovery는 쓰기 Transaction 안에서 Backup·무결성 검사를 수행하므로,
+Capture의 DB 기록과 경합할 수 있다. 캡처 경계에서 지연이 발생했는지 실제 Timing
+Metadata와 `LATE_CAPTURE` 이력을 확인한다. 작업 시점을 경계에서 떨어뜨리는 것은
+운영상 완화책이며 자동 복구나 지연 방지의 보장은 아니다. 기존 Capture 적격 기준을
+완화하지 않고, FAILED 전환이 발생하면 감사 기록을 보존하는 복구 절차로 처리한다.

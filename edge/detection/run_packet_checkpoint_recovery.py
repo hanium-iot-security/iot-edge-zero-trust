@@ -31,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     dry_run.add_argument("--approved-by", required=True)
     dry_run.add_argument("--reason", required=True)
     dry_run.add_argument("--plan-output", required=True)
+    dry_run.add_argument("--allow-failed-current-session", action="store_true")
     dry_run.add_argument(
         "--mode",
         choices=(GAP_RECOVERY_MODE, LIVE_RESUME_MODE),
@@ -60,6 +61,7 @@ def _run_command(args: argparse.Namespace) -> dict[str, object]:
             reason=args.reason,
             plan_output=args.plan_output,
             mode=args.mode,
+            allow_failed_current_session=args.allow_failed_current_session,
             orchestrator_lock_path=args.orchestrator_lock_path,
             manual_lock_path=args.manual_lock_path,
             extractor_lock_path=args.extractor_lock_path,
