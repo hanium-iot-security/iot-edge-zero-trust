@@ -38,6 +38,7 @@ LIVE_RESUME_MODE = "live-resume"
 RECOVERY_MODES = frozenset({GAP_RECOVERY_MODE, LIVE_RESUME_MODE})
 EXECUTE_CONFIRMATION = "APPLY-PACKET-CHECKPOINT-GAP-RECOVERY"
 LIVE_RESUME_CONFIRMATION = "APPLY-PACKET-LIVE-RESUME"
+FAILED_TAIL_RESUME_CONFIRMATION = "APPLY-PACKET-FAILED-TAIL-LIVE-RESUME"
 PROCESSABLE_SKIP_PREFIX = "SKIP-PROCESSABLE-SESSIONS:"
 _MIGRATION_005_SCHEMA_SHA256 = (
     "a4237ba4405a99a62c533e89fc75d68c76c09bfdc77e73587027022ac326bc0d"
@@ -235,7 +236,9 @@ def require_execute_confirmations(
     confirm_skip_processable: str | None,
 ) -> None:
     expected_confirmation = (
-        LIVE_RESUME_CONFIRMATION
+        FAILED_TAIL_RESUME_CONFIRMATION
+        if plan.get("allow_failed_current_session") is True
+        else LIVE_RESUME_CONFIRMATION
         if plan.get("mode", GAP_RECOVERY_MODE) == LIVE_RESUME_MODE
         else EXECUTE_CONFIRMATION
     )
@@ -247,6 +250,62 @@ def require_execute_confirmations(
         raise PacketCheckpointRecoveryError("processable-session confirmation mismatch")
     if not skips and confirm_skip_processable is not None:
         raise PacketCheckpointRecoveryError("processable-session confirmation not allowed")
+
+
+def _failed_capture_tail_evidence(
+    connection: sqlite3.Connection,
+    session: sqlite3.Row,
+    checkpoint: sqlite3.Row | None,
+) -> dict[str, object] | None:
+    """Accept only one uncaptured LATE_CAPTURE tail at the consumed boundary.
+
+    This does not relabel failed capture data or consume features. The explicit
+    operator plan records the discarded capture opportunity and is revalidated
+    under the existing transaction and runtime locks before either checkpoint moves.
+    """
+    if checkpoint is None or not checkpoint["last_completed_window_end"]:
+        return None
+    boundary = parse_db_utc(checkpoint["last_completed_window_end"], "checkpoint")
+    if not session["ended_at"]:
+        return None
+    segments = connection.execute(
+        "SELECT s.*, (SELECT COUNT(*) FROM packet_feature_logs f "
+        "WHERE f.capture_segment_id = s.id) AS feature_count "
+        "FROM packet_capture_segments s WHERE s.capture_session_id = ? "
+        "ORDER BY s.window_start, s.id",
+        (session["id"],),
+    ).fetchall()
+    tail = [s for s in segments if parse_db_utc(s["window_end"], "window_end") > boundary]
+    if len(tail) != 1 or not segments or tail[0]["id"] != segments[-1]["id"]:
+        return None
+    segment = tail[0]
+    window_start = parse_db_utc(segment["window_start"], "window_start")
+    window_end = parse_db_utc(segment["window_end"], "window_end")
+    ended_at = parse_db_utc(session["ended_at"], "ended_at")
+    if (
+        segment["status"] != "FAILED"
+        or segment["error_code"] != "LATE_CAPTURE"
+        or window_start != boundary
+        or (window_end - window_start).total_seconds() != 10
+        or not window_start <= ended_at <= window_end
+        or segment["file_name"] is not None
+        or segment["actual_capture_started_at"] is not None
+        or segment["captured_duration_seconds"] != 0
+        or segment["packet_count"] not in (None, 0)
+        or segment["feature_count"] != 0
+    ):
+        return None
+    return {
+        "session_id": session["session_id"],
+        "session_status": session["status"],
+        "ended_at": session["ended_at"],
+        "segment_id": segment["id"],
+        "window_start": segment["window_start"],
+        "window_end": segment["window_end"],
+        "error_code": segment["error_code"],
+        "captured_duration_seconds": segment["captured_duration_seconds"],
+        "feature_count": segment["feature_count"],
+    }
 
 
 def build_recovery_plan(
@@ -261,6 +320,7 @@ def build_recovery_plan(
     reason: str,
     lock_entries: Sequence[Mapping[str, object]],
     mode: str = GAP_RECOVERY_MODE,
+    allow_failed_current_session: bool = False,
 ) -> dict[str, object]:
     if mode not in RECOVERY_MODES:
         raise PacketCheckpointRecoveryError(f"unsupported recovery mode: {mode}")
@@ -289,9 +349,17 @@ def build_recovery_plan(
 
     if checkpoint is None:
         blocking_reasons.append("CHECKPOINT_NOT_FOUND")
+    failed_tail_evidence = None
+    if allow_failed_current_session:
+        if mode != LIVE_RESUME_MODE or current_session is None or current_session["status"] != "FAILED":
+            blocking_reasons.append("FAILED_TAIL_RESUME_REQUIRES_FAILED_SOURCE_AND_LIVE_MODE")
+        else:
+            failed_tail_evidence = _failed_capture_tail_evidence(connection, current_session, checkpoint)
+            if failed_tail_evidence is None:
+                blocking_reasons.append("FAILED_CURRENT_SESSION_TAIL_NOT_RECOVERABLE")
     if current_session is None:
         blocking_reasons.append("CURRENT_SESSION_NOT_FOUND")
-    elif current_session["status"] != "COMPLETED":
+    elif current_session["status"] != "COMPLETED" and failed_tail_evidence is None:
         blocking_reasons.append("CURRENT_SESSION_NOT_COMPLETED")
     if target_session is None:
         blocking_reasons.append("TARGET_SESSION_NOT_FOUND")
@@ -402,10 +470,14 @@ def build_recovery_plan(
     warning_codes = (
         ["PROCESSABLE_SESSION_SKIP"] if skips_processable_sessions else []
     )
+    if failed_tail_evidence is not None:
+        warning_codes.append("UNCAPTURED_FAILED_TAIL_SKIP")
 
     return {
         "plan_schema_version": PLAN_SCHEMA_VERSION,
         "mode": mode,
+        "allow_failed_current_session": allow_failed_current_session,
+        "failed_current_tail": failed_tail_evidence,
         "repository_root": repository_state.get("repository_root"),
         "repository_commit": repository_state.get("repository_commit"),
         "repository_state": dict(repository_state),
@@ -537,7 +609,9 @@ def _execute_command(
         "<ARTIFACT_DIR>",
         "--confirm",
         (
-            LIVE_RESUME_CONFIRMATION
+            FAILED_TAIL_RESUME_CONFIRMATION
+            if plan.get("allow_failed_current_session") is True
+            else LIVE_RESUME_CONFIRMATION
             if plan.get("mode", GAP_RECOVERY_MODE) == LIVE_RESUME_MODE
             else EXECUTE_CONFIRMATION
         ),
@@ -586,6 +660,7 @@ def inspect_packet_checkpoint_recovery(
     reason: str,
     plan_output: str | Path,
     mode: str = GAP_RECOVERY_MODE,
+    allow_failed_current_session: bool = False,
     orchestrator_lock_path: Path | None = None,
     manual_lock_path: Path | None = None,
     extractor_lock_path: Path | None = None,
@@ -629,6 +704,7 @@ def inspect_packet_checkpoint_recovery(
             reason=reason,
             lock_entries=serialize_resolved_locks(locks),
             mode=mode,
+            allow_failed_current_session=allow_failed_current_session,
         )
 
     plan = attach_plan_sha256(
@@ -707,6 +783,7 @@ def _rebuild_execute_plan(
         reason=str(plan["reason"]),
         lock_entries=serialize_resolved_locks(locks),
         mode=str(plan.get("mode", GAP_RECOVERY_MODE)),
+        allow_failed_current_session=plan.get("allow_failed_current_session") is True,
     )
 
 

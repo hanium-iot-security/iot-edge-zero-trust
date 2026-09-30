@@ -60,3 +60,6 @@ Thumbs.db
 
 # Local Git worktrees
 .worktrees/
+
+# Local generated output
+/output/

@@ -283,6 +283,7 @@ def _build_plan(
     current_session_id: str = CURRENT_SESSION,
     target_session_id: str = TARGET_SESSION,
     mode: str | None = None,
+    allow_failed_current_session: bool = False,
 ) -> dict[str, object]:
     database_path = Path(
         connection.execute("PRAGMA database_list").fetchone()["file"]
@@ -298,10 +299,88 @@ def _build_plan(
         "lock_entries": (
             {"path": str(tmp_path / "recovery.lock"), "roles": ["test"]},
         ),
+        "allow_failed_current_session": allow_failed_current_session,
     }
     if mode is not None:
         arguments["mode"] = mode
     return build_recovery_plan(connection, **arguments)
+
+
+def _add_uncaptured_failed_tail(connection: sqlite3.Connection) -> int:
+    session_pk = connection.execute(
+        "SELECT id FROM packet_capture_sessions WHERE session_id = ?", (CURRENT_SESSION,)
+    ).fetchone()[0]
+    connection.execute(
+        "UPDATE packet_capture_sessions SET status='FAILED', ended_at=? WHERE id=?",
+        (_db_utc(CURRENT_READY_THROUGH + timedelta(seconds=1)), session_pk),
+    )
+    tail_id = _insert_capture_segment(
+        connection, session_pk=session_pk, capture_interface="eth-current",
+        window_start=CURRENT_READY_THROUGH, status="FAILED",
+    )
+    connection.execute(
+        "UPDATE packet_capture_segments SET file_name=NULL, captured_duration_seconds=0, error_code='LATE_CAPTURE' WHERE id=?",
+        (tail_id,),
+    )
+    connection.commit()
+    return tail_id
+
+
+@pytest.mark.parametrize("detector", ["packet_rule", "packet_if"])
+def test_failed_tail_resume_requires_explicit_opt_in_and_confirmation(tmp_path: Path, detector: str) -> None:
+    fixture = _live_execute_fixture(tmp_path, detector_name=detector)
+    with sqlite3.connect(fixture["database"]) as connection:
+        connection.row_factory = sqlite3.Row
+        tail_id = _add_uncaptured_failed_tail(connection)
+        default = _build_plan(connection, tmp_path=tmp_path, detector_name=detector, mode="live-resume")
+        assert "CURRENT_SESSION_NOT_COMPLETED" in default["blocking_reasons"]
+        plan = _build_plan(connection, tmp_path=tmp_path, detector_name=detector, mode="live-resume", allow_failed_current_session=True)
+        assert plan["can_execute"]
+        assert plan["failed_current_tail"]["segment_id"] == tail_id
+        assert plan["current_session"]["status"] == "FAILED"
+        signed = attach_plan_sha256(plan, generated_at=UTC_A)
+        with pytest.raises(PacketCheckpointRecoveryError, match="confirmation mismatch"):
+            packet_checkpoint_recovery.require_execute_confirmations(signed, confirm=packet_checkpoint_recovery.LIVE_RESUME_CONFIRMATION, confirm_skip_processable=None)
+        packet_checkpoint_recovery.require_execute_confirmations(signed, confirm=packet_checkpoint_recovery.FAILED_TAIL_RESUME_CONFIRMATION, confirm_skip_processable=None)
+
+
+@pytest.mark.parametrize("change", [
+    "UPDATE packet_capture_segments SET error_code='EXTRACTOR_ERROR' WHERE status='FAILED'",
+    "UPDATE packet_capture_segments SET packet_count=1 WHERE status='FAILED'",
+    "INSERT INTO packet_feature_logs (capture_segment_id,peer_ip,direction,window_start,window_end,packet_count,total_bytes,avg_packet_size,max_packet_size) SELECT id,'10.0.0.1','INBOUND',window_start,window_end,1,60,60,60 FROM packet_capture_segments WHERE status='FAILED'",
+    "UPDATE packet_capture_sessions SET ended_at=NULL WHERE status='FAILED'",
+    "UPDATE packet_capture_sessions SET ended_at='2026-08-06T10:01:00Z' WHERE status='FAILED'",
+    "UPDATE detector_checkpoints SET last_completed_window_end='2026-08-06T10:00:10Z' WHERE detector_name='packet_rule'",
+])
+def test_failed_tail_resume_rejects_unsafe_source_shapes(tmp_path: Path, change: str) -> None:
+    fixture = _live_execute_fixture(tmp_path)
+    with sqlite3.connect(fixture["database"]) as connection:
+        connection.row_factory = sqlite3.Row
+        _add_uncaptured_failed_tail(connection)
+        connection.execute(change)
+        connection.commit()
+        plan = _build_plan(connection, tmp_path=tmp_path, mode="live-resume", allow_failed_current_session=True)
+        assert not plan["can_execute"]
+
+
+@pytest.mark.parametrize("detector", ["packet_rule", "packet_if"])
+def test_failed_tail_resume_execute_preserves_failed_data_and_records_audit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, detector: str) -> None:
+    fixture = _live_execute_fixture(tmp_path, detector_name=detector)
+    with sqlite3.connect(fixture["database"]) as connection:
+        connection.row_factory = sqlite3.Row
+        _add_uncaptured_failed_tail(connection)
+        before = snapshot_protected_rows(connection, requested_checkpoint_key=(detector, "packet_feature_logs"))
+    arguments = _dry_run_arguments(tmp_path, database=fixture["database"], repository_root=fixture["repository_root"], plan_output=fixture["plan_output"], mode="live-resume", detector_name=detector)
+    plan = packet_checkpoint_recovery.inspect_packet_checkpoint_recovery(**arguments, allow_failed_current_session=True)
+    assert plan["can_execute"]
+    _allow_execute_on_test_platform(monkeypatch)
+    result = execute_packet_checkpoint_recovery(plan_file=fixture["plan_output"], db_path=fixture["database"], artifact_dir=fixture["artifact_dir"], confirm=packet_checkpoint_recovery.FAILED_TAIL_RESUME_CONFIRMATION)
+    with sqlite3.connect(fixture["database"]) as connection:
+        connection.row_factory = sqlite3.Row
+        assert snapshot_protected_rows(connection, requested_checkpoint_key=(detector, "packet_feature_logs")) == before
+        audit = connection.execute("SELECT plan_json FROM packet_checkpoint_recoveries").fetchone()
+        assert json.loads(audit[0])["failed_current_tail"]["error_code"] == "LATE_CAPTURE"
+    assert _checkpoint(fixture["database"], detector)["last_completed_window_end"] == _db_utc(TARGET_FIRST)
 
 
 def _blocking_codes(plan: dict[str, object]) -> set[str]:

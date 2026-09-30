@@ -80,7 +80,12 @@ class TcpdumpCaptureProcess:
         output_path: Path,
         window_seconds: float,
     ) -> CaptureOutcome:
-        args = [self._tcpdump_path, "-i", interface, "-w", str(output_path), "-U"]
+        # -U flushes the output file; immediate mode also disables input buffering.
+        # Otherwise the final packets can remain unread when a short window ends.
+        args = [
+            self._tcpdump_path, "-i", interface, "-w", str(output_path),
+            "-U", "--immediate-mode",
+        ]
         if self._capture_filter:
             args.append(self._capture_filter)
 
