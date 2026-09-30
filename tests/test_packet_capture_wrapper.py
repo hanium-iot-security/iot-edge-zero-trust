@@ -7,6 +7,8 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import subprocess
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -14,6 +16,7 @@ from edge.packet.capture_policy import CapturePolicy
 from edge.packet.capture_runtime import (
     CaptureOutcome,
     CaptureRuntimeConfig,
+    TcpdumpCaptureProcess,
     execute_capture_window,
 )
 from edge.packet.pcap_naming import (
@@ -27,6 +30,36 @@ from edge.packet.pcap_naming import (
 )
 
 SESSION_ID = "550e8400-e29b-41d4-a716-446655440000"
+
+
+@pytest.mark.parametrize("forced_kill", [False, True])
+def test_tcpdump_immediate_capture_preserves_shutdown_quality(
+    monkeypatch, tmp_path, forced_kill
+) -> None:
+    process = Mock()
+    outcomes = [subprocess.TimeoutExpired("tcpdump", 10)]
+    if forced_kill:
+        outcomes.append(subprocess.TimeoutExpired("tcpdump", 5))
+    outcomes.append(0)
+    process.wait.side_effect = outcomes
+    spawn = Mock(return_value=process)
+    monkeypatch.setattr("edge.packet.capture_runtime.subprocess.Popen", spawn)
+
+    result = TcpdumpCaptureProcess(capture_filter="tcp or udp").capture_window(
+        interface="eth0", output_path=tmp_path / "window.pcap", window_seconds=10
+    )
+
+    arguments = spawn.call_args.args[0]
+    assert "--immediate-mode" in arguments
+    assert "-U" in arguments
+    assert arguments[-1] == "tcp or udp"
+    assert result.completed_full_window is True
+    assert result.terminated_cleanly is (not forced_kill)
+    assert result.stop_requested_at is not None
+    expected_calls = [call.wait(timeout=10), call.terminate(), call.wait(timeout=5)]
+    if forced_kill:
+        expected_calls += [call.kill(), call.wait(timeout=5)]
+    assert process.method_calls == expected_calls
 
 
 def _utc(*args) -> datetime:
