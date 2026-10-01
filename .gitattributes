@@ -21,3 +21,5 @@
 *.timer text eol=lf
 *.sql text eol=lf
 *.sh text eol=lf
+# Linux entry point without a .sh extension.
+infra/scripts/hanium-firewall-rule text eol=lf

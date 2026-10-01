@@ -19,6 +19,11 @@ Dry-run은 Windows와 POSIX에서 지원한다. Execute는 POSIX 전용이며 Ra
 
 `plan_output.parent`와 최상위 `artifact_dir`는 미리 존재해야 한다. Repository 내부 경로는 Git ignore 대상이어야 하며 CLI가 상위 Directory를 자동 생성하지 않는다.
 
+Repository 점검은 Git 미추적 일반 파일의 크기·SHA256을 기록하고, 일반 파일이 아닌
+심볼릭 링크·FIFO·소켓은 거부한다. Git 목록에서 생략되는 FIFO·소켓도 하위 Directory까지
+검사한다. `.git`과 Git ignore 대상 Directory는 탐색에서 제외하며, 검사 중 발견한 파일을
+삭제하거나 수정하지 않는다.
+
 ## 3. Dry-run
 
 ### 3.1 일반 Gap Recovery
