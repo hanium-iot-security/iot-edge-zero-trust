@@ -11,8 +11,10 @@ from __future__ import annotations
 import logging
 
 from backend.app.config import settings
+from edge.runtime_lock import RuntimeLockError, single_instance_lock
 from edge.trust.firewall_runtime_snapshot import capture_firewall_runtime_snapshot
 from edge.trust.firewall_worker import FirewallPolicy, WrapperIptablesRunner
+from edge.trust.run_firewall_worker import firewall_lock_path
 
 
 logger = logging.getLogger(__name__)
@@ -30,10 +32,16 @@ def load_snapshot_policy() -> FirewallPolicy:
 
 def run_once() -> bool:
     runner = WrapperIptablesRunner(load_snapshot_policy())
-    payload = capture_firewall_runtime_snapshot(
-        runner,
-        snapshot_path=settings.firewall_runtime_snapshot_path,
-    )
+    try:
+        # Do not publish an intermediate Worker state (e.g. delete succeeded
+        # while DB commit is still pending). No SQLite write lock is held here.
+        with single_instance_lock(firewall_lock_path(), wait_seconds=settings.firewall_lock_wait_seconds):
+            payload = capture_firewall_runtime_snapshot(
+                runner, snapshot_path=settings.firewall_runtime_snapshot_path,
+            )
+    except (RuntimeLockError, OSError) as exc:
+        logger.error("Firewall runtime snapshot unavailable: %s", exc)
+        return False
     if payload["available"]:
         logger.info(
             "Firewall runtime snapshot updated (managed_rules=%s, observed_at=%s)",
