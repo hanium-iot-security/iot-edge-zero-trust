@@ -68,7 +68,7 @@ class FakeCaptureProcess:
     def capture_window(self, *, interface, output_path, window_seconds):
         outcome = self.outcomes.pop(0)
         if self.write_file:
-            output_path.write_bytes(b"fake-pcap-bytes")
+            output_path.write_bytes(Path("tests/fixtures/packet/pcap/empty_window.pcap").read_bytes())
         return outcome
 
 
@@ -99,7 +99,7 @@ class _OverheadCaptureProcess:
 
     def capture_window(self, *, interface, output_path, window_seconds):
         self.calls.append(window_seconds)
-        output_path.write_bytes(b"fake-pcap-bytes")
+        output_path.write_bytes(Path("tests/fixtures/packet/pcap/empty_window.pcap").read_bytes())
         self.clock.advance(window_seconds + self.overhead_seconds)
         return CaptureOutcome(completed_full_window=True, exit_code=-15)
 

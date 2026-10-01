@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.database import SessionLocal
 from edge.packet import capture_session_repository as repo
+from edge.packet.capture_lock import capture_resource_locks
 from edge.packet.capture_runtime import (
     LATE_CAPTURE,
     CaptureProcess,
@@ -430,35 +431,40 @@ def main() -> None:
     )
 
     config = CaptureRuntimeConfig.from_env()
-    config.ensure_directories()
-    process = TcpdumpCaptureProcess(
-        tcpdump_path=config.tcpdump_path,
-        capture_filter=config.capture_filter,
-    )
-
     shutdown = GracefulShutdown()
     shutdown.install()
 
     with SessionLocal() as db:
-        reconcile_leftover_tmp_files(db, config)
-        reconcile_orphan_ready_files(db, config)
-        reconcile_orphan_failed_files(db, config)
+        database_url = db.get_bind().url
+        if database_url.get_backend_name() != "sqlite" or database_url.database in (None, "", ":memory:"):
+            raise ValueError("capture requires a file-backed SQLite database for resource locking")
+        with capture_resource_locks(
+            Path(database_url.database), (config.incoming_dir, config.ready_dir, config.failed_dir),
+        ) as inherited_lock_fds:
+            process = TcpdumpCaptureProcess(
+                tcpdump_path=config.tcpdump_path, capture_filter=config.capture_filter,
+                inherited_lock_fds=inherited_lock_fds,
+            )
+            config.ensure_directories()
+            reconcile_leftover_tmp_files(db, config)
+            reconcile_orphan_ready_files(db, config)
+            reconcile_orphan_failed_files(db, config)
 
-        now = datetime.now(timezone.utc)
-        reconcile_stale_running_sessions(db, config, now)
-        session_pk, session_id, first_window_start = start_new_session(db, config, now)
+            now = datetime.now(timezone.utc)
+            reconcile_stale_running_sessions(db, config, now)
+            session_pk, session_id, first_window_start = start_new_session(db, config, now)
 
-        windows_captured = run_capture_loop(
-            db,
-            process,
-            config,
-            session_pk=session_pk,
-            session_id=session_id,
-            first_window_start=first_window_start,
-            shutdown=shutdown,
-            max_windows=args.windows,
-        )
-        logger.info("Capture Runtime 종료: windows_captured=%d", windows_captured)
+            windows_captured = run_capture_loop(
+                db,
+                process,
+                config,
+                session_pk=session_pk,
+                session_id=session_id,
+                first_window_start=first_window_start,
+                shutdown=shutdown,
+                max_windows=args.windows,
+            )
+            logger.info("Capture Runtime 종료: windows_captured=%d", windows_captured)
 
 
 if __name__ == "__main__":
