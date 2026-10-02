@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+from shutil import copyfile
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -74,7 +75,12 @@ PACKET_SESSION_ID = "33333333-3333-4333-8333-333333333333"
 @pytest.fixture
 def SessionLocal(tmp_path: Path):
     db_path = tmp_path / "phase4-orchestrator-runner.db"
-    apply_migrations(db_path, MIGRATIONS_DIR)
+    legacy_migrations = tmp_path / "migrations-v2"
+    legacy_migrations.mkdir()
+    for source in MIGRATIONS_DIR.glob("[0-9][0-9][0-9]_*.sql"):
+        if int(source.name[:3]) <= 6:
+            copyfile(source, legacy_migrations / source.name)
+    apply_migrations(db_path, legacy_migrations)
     engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     with TestingSessionLocal() as db:

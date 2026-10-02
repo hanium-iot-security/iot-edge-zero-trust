@@ -34,6 +34,7 @@ from edge.mqtt.identity import (
     fetch_registered_device_ids,
     payload_validity_from_log_row,
 )
+from edge.policy.repository import load_policy_resolver
 
 
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -57,10 +58,10 @@ class ProducerRunResult:
 
 def parse_db_datetime(value: str | datetime) -> datetime:
     if isinstance(value, datetime):
-        return value.replace(microsecond=0)
+        return value
     # Python 3.10 이하에서는 fromisoformat()이 'Z' 접미사를 처리하지 못함
     normalized = value[:-1] + "+00:00" if isinstance(value, str) and value.endswith("Z") else value
-    return datetime.fromisoformat(normalized).replace(microsecond=0)
+    return datetime.fromisoformat(normalized)
 
 
 def format_db_datetime(value: datetime) -> str:
@@ -271,8 +272,9 @@ def produce_mqtt_features_until(
     if completed_before is not None and completed_before > cutoff:
         raise ValueError("existing MQTT feature checkpoint exceeds producer_cutoff")
 
+    resolver = load_policy_resolver(db)
     registered_devices = registered_feature_devices(db)
-    all_registered_devices = fetch_registered_device_ids(db)
+    all_registered_devices = fetch_registered_device_ids(db) if resolver is None else None
     source_rows = _fetch_mqtt_sources_after_checkpoint(
         db,
         last_processed_id=last_processed_before,
@@ -292,9 +294,11 @@ def produce_mqtt_features_until(
             if last_processed_after is None
             else max(last_processed_after, source_id)
         )
-        received_at = parse_db_utc(source["received_at"], "received_at")
+        received_at = parse_db_utc(
+            source["received_at"], "received_at", allow_subseconds=True
+        )
         source["received_at"] = received_at
-        window_start = phase4_floor_window_start(received_at)
+        window_start = phase4_floor_window_start(received_at.replace(microsecond=0))
         window_end = window_start + timedelta(seconds=WINDOW_SECONDS)
 
         if completed_before is not None and window_end <= completed_before:
@@ -303,16 +307,20 @@ def produce_mqtt_features_until(
                 "event=LATE_SOURCE source_table=mqtt_logs source_id=%s "
                 "received_at=%s last_completed_window_end=%s",
                 source_id,
-                format_db_utc(received_at),
+                received_at.isoformat().replace("+00:00", "Z"),
                 format_db_utc(completed_before),
             )
             continue
         if window_end > cutoff:
             continue
+        window_registered = (
+            resolver.registered_ids_at(window_start)
+            if resolver is not None else all_registered_devices
+        )
         identity = classify_mqtt_identity(
             source["topic"],
             source["payload"],
-            all_registered_devices,
+            window_registered,
             is_payload_valid=payload_validity_from_log_row(source),
         )
         if not identity.is_attributable:
@@ -320,6 +328,10 @@ def produce_mqtt_features_until(
         device_id = identity.attributed_device_id
         if device_id not in registered_devices:
             continue
+        if resolver is not None:
+            registration = resolver.registration_at(device_id, window_start)
+            if registration is None or registration.status == "DISABLED":
+                continue
         grouped[(device_id, window_start, window_end)].append(source)
 
     inserted_count = 0

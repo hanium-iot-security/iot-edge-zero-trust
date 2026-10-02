@@ -68,8 +68,8 @@ AI_ANOMALY -15
 
 이 window에서는 `-25`만 적용합니다.
 
-Trust Score DB 갱신은 `edge.trust.run_trust_score_update`에서 수행합니다.
+Trust Score DB 갱신은 Phase 4/v2 Orchestrator의 Trust 단계에서 수행합니다.
 
 ```bash
-python -m edge.trust.run_trust_score_update
+python -m edge.orchestration.run_detection_orchestrator --once
 ```

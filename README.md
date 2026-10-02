@@ -99,9 +99,7 @@ Bootstrap하지 않고 Phase 4 Cutover 도구로 Checkpoint를 초기화합니�
 탐지 및 Trust Score 실행:
 
 ```bash
-python -m edge.detection.run_rule_detector
-python -m edge.detection.run_ai_detector
-python -m edge.trust.run_trust_score_update
+python -m edge.orchestration.run_detection_orchestrator --once
 ```
 
 FastAPI 로컬 개발 실행:

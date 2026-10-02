@@ -4,12 +4,15 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from shutil import copyfile
 
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from ai.predict_packet_isolation_forest import PacketIFArtifact, PacketIFPrediction
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
+from edge.detection.packet_ai_detector import PacketIsolationForestStage
 from edge.detection.packet_rule_detector import (
     PacketRuleDetectorStage,
     PacketRulePolicy,
@@ -19,6 +22,7 @@ from edge.detection.packet_rule_detector import (
 )
 from edge.detection.runtime_checkpoint_repository import get_detector_checkpoint
 from edge.packet.capture_policy import CapturePolicy
+from edge.trust.trust_score_v2 import apply_trust_score_v2_until
 
 
 RANGE_START = datetime(2026, 7, 26, 10, 0, 0, tzinfo=timezone.utc)
@@ -40,7 +44,12 @@ TEST_POLICY = PacketRulePolicy(
 @pytest.fixture
 def SessionLocal(tmp_path: Path):
     db_path = tmp_path / "packet-rule-runtime.db"
-    apply_migrations(db_path, MIGRATIONS_DIR)
+    legacy_migrations = tmp_path / "migrations-v2"
+    legacy_migrations.mkdir()
+    for source in MIGRATIONS_DIR.glob("[0-9][0-9][0-9]_*.sql"):
+        if int(source.name[:3]) <= 6:
+            copyfile(source, legacy_migrations / source.name)
+    apply_migrations(db_path, legacy_migrations)
     engine = create_engine(
         f"sqlite:///{db_path}",
         connect_args={"check_same_thread": False},
@@ -69,6 +78,23 @@ def _insert_device(db, *, device_id: str = "esp32_01", ip_address: str = "192.16
         ),
         {"device_id": device_id, "ip_address": ip_address},
     )
+
+
+def _enable_phase8(SessionLocal) -> None:
+    apply_migrations(Path(SessionLocal.kw["bind"].url.database), MIGRATIONS_DIR)
+
+
+def _insert_policy_revision(db, *, device_id="esp32_01", revision=1,
+                            state="ACTIVE", effective="2026-07-26T10:00:00Z",
+                            packet_max=10.0, byte_max=2500.0) -> None:
+    db.execute(text("""INSERT INTO device_policy_revisions (
+        device_id, revision, effective_from, registration_state,
+        policy_profile, expected_publish_interval_seconds,
+        publish_count_max, payload_size_max_bytes, packet_rate_max_pps,
+        byte_rate_max_bytes_per_second, created_at, created_by, reason
+    ) VALUES (:device_id, :revision, :effective, :state, 'periodic-sensor-v1',
+        5, 15, 5120, :packet_max, :byte_max, :effective, 'test', 'test setup')"""),
+        locals())
 
 
 def _insert_capture_session(db, *, session_id: str = SESSION_ID, capture_interface: str = "eth0") -> int:
@@ -175,6 +201,139 @@ def _insert_packet_source(
             "mqtt_related_packet_count": mqtt_related_packet_count,
         },
     )
+
+
+def test_phase8_packet_stage_uses_historical_ip_and_device_rate_limits(SessionLocal) -> None:
+    start = "2026-07-26T10:00:00Z"
+    next_start = "2026-07-26T10:00:10Z"
+    _enable_phase8(SessionLocal)
+    with SessionLocal() as db:
+        for device_id, ip, packet_max, byte_max in (
+            ("esp32_01", "192.168.0.4", 5, 50),
+            ("esp32_02", "192.168.0.5", 10, 100),
+        ):
+            _insert_device(db, device_id=device_id, ip_address=ip)
+            db.execute(text("""UPDATE devices SET registration_effective_from=:start
+                WHERE device_id=:device_id"""),
+                {"device_id": device_id, "start": start})
+            _insert_policy_revision(db, device_id=device_id,
+                                    packet_max=packet_max, byte_max=byte_max)
+        _insert_policy_revision(db, revision=2, effective=next_start,
+                                packet_max=50, byte_max=500)
+        session_pk = _insert_capture_session(db)
+        _insert_packet_source(
+            db, session_pk=session_pk, feature_id=1, segment_id=1,
+            packet_count=51, total_bytes=501, duration=9.8,
+        )
+        # The stored candidate is deliberately stale; the historical IP owns the row.
+        db.execute(text("""INSERT INTO packet_feature_logs (
+            capture_segment_id, device_id, peer_ip, direction, window_start,
+            window_end, packet_count, total_bytes, avg_packet_size,
+            max_packet_size, distinct_dest_port_count, tcp_syn_count,
+            mqtt_related_packet_count
+        ) SELECT capture_segment_id, 'esp32_01', '192.168.0.5', direction,
+                 window_start, window_end, packet_count, total_bytes,
+                 avg_packet_size, max_packet_size, distinct_dest_port_count,
+                 tcp_syn_count, mqtt_related_packet_count
+          FROM packet_feature_logs WHERE id=1"""))
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            result = _stage().run_until(
+                db, cycle_range_start=RANGE_START, cycle_cutoff=CUTOFF,
+            )
+        assert result.created_event_count == 2
+        rows = db.execute(text("""SELECT device_id, event_type, policy_version,
+            evidence_json FROM detection_events ORDER BY id""")).mappings().all()
+        assert {(row["device_id"], row["event_type"]) for row in rows} == {
+            ("esp32_01", "PACKET_RATE_ANOMALY"),
+            ("esp32_01", "BYTE_RATE_ANOMALY"),
+        }
+        for row in rows:
+            evidence = json.loads(row["evidence_json"])
+            assert evidence["device_id"] == "esp32_01"
+            assert evidence["device_policy_revision"] == 1
+            assert evidence["window_start"] == start
+            assert evidence["captured_duration_seconds"] == 9.8
+            assert evidence["candidate_device_id"] == "esp32_01"
+            assert evidence["threshold"] == (5 if row["event_type"] == "PACKET_RATE_ANOMALY" else 50)
+            assert evidence["unit"] == ("packets/second" if row["event_type"] == "PACKET_RATE_ANOMALY" else "bytes/second")
+            assert row["policy_version"] == TEST_POLICY.version
+        db.rollback()
+        with db.begin():
+            again = _stage().run_until(
+                db, cycle_range_start=RANGE_START, cycle_cutoff=CUTOFF,
+            )
+        assert again.created_event_count == 0
+        assert db.execute(text("SELECT COUNT(*) FROM detection_events")).scalar_one() == 2
+
+
+def test_phase8_pending_packet_if_receives_input_but_trust_excludes_response(
+    SessionLocal, tmp_path: Path,
+) -> None:
+    start = "2026-07-26T10:00:00Z"
+    capture_policy = CapturePolicy()
+    artifact = PacketIFArtifact(
+        model=object(), model_path=tmp_path / "model.joblib",
+        metadata_path=tmp_path / "metadata.json",
+        training_report_path=tmp_path / "train.json",
+        model_version="pending-test", threshold=0.1,
+        bundle_sha256="a" * 64, capture_policy=capture_policy, metadata={},
+    )
+    seen = []
+
+    def predict(_artifact, rows):
+        seen.extend(rows)
+        return tuple(PacketIFPrediction(
+            model_version="pending-test", raw_decision_score=-0.2,
+            anomaly_score=0.2, threshold=0.1, is_anomaly=True,
+            feature_values=(
+                float(row["packet_count"]), float(row["total_bytes"]),
+                float(row["avg_packet_size"]), float(row["max_packet_size"]),
+                float(row["mean_inter_arrival_time"]),
+                float(row["distinct_dest_port_count"]),
+            ),
+        ) for row in rows)
+
+    _enable_phase8(SessionLocal)
+    with SessionLocal() as db:
+        _insert_device(db)
+        db.execute(text("""UPDATE devices SET registration_effective_from=:start
+            WHERE device_id='esp32_01'"""),
+            {"start": start})
+        _insert_policy_revision(db, state="PENDING")
+        session_pk = _insert_capture_session(db)
+        _insert_packet_source(db, session_pk=session_pk, feature_id=1,
+                              segment_id=1, packet_count=10, total_bytes=1000)
+        db.commit()
+    with SessionLocal() as db:
+        with db.begin():
+            result = PacketIsolationForestStage(
+                artifact=artifact, expected_model_version="pending-test",
+                capture_policy=capture_policy, predict_rows=predict,
+            ).run_until(db, cycle_range_start=RANGE_START, cycle_cutoff=CUTOFF)
+        assert result.created_event_count == 1
+        assert len(seen) == 1
+        assert seen[0]["packet_count"] == 10
+        db.rollback()
+        with db.begin():
+            trust = apply_trust_score_v2_until(
+                db, cycle_range_start=RANGE_START, cycle_cutoff=CUTOFF,
+                decision_at=NEXT_CUTOFF,
+            )
+        assert trust.created_history_count == 0
+        assert trust.created_firewall_rule_count == 0
+        assert db.execute(text("SELECT trust_score FROM devices")).scalar_one() == 100
+        event = db.execute(text("""SELECT device_id, event_type, score_delta,
+            applied_to_score, processing_reason, processed_at
+            FROM detection_events""")).mappings().one()
+        assert event["event_type"] == "AI_PACKET_ANOMALY"
+        assert event["device_id"] == "esp32_01"
+        assert event["score_delta"] == -15
+        assert event["applied_to_score"] == 0
+        assert event["processing_reason"] == "PENDING_AT_WINDOW"
+        assert event["processed_at"] is not None
 
 
 class TestEffectiveRateFormulas:

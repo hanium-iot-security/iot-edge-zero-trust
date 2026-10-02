@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from backend.app.database import SessionLocal
 from edge.detection.ai_detector import DEFAULT_MODEL_PATH, load_model, predict_feature_window
 from edge.detection.detection_event_writer import insert_detection_event
+from edge.detection.legacy_guard import reject_v2_database
 from edge.detection.rule_detector import AI_ANOMALY, DETECTOR_AI
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ def run_ai_detector(
         {"feature_events": int} — 새로 저장된 이벤트 수
     """
     try:
+        reject_v2_database(db, "MVP AI runner")
         load_model(model_path)
         feature_events = _process_feature_logs(db, model_path)
         db.commit()

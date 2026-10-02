@@ -19,6 +19,8 @@ from edge.detection.phase4_time import (
     parse_db_utc,
     require_utc_window_boundary,
 )
+from edge.policy.repository import load_policy_resolver
+from edge.policy.resolver import POLICY_AVAILABLE
 from edge.trust import firewall_repository
 from edge.trust.trust_policy import (
     AI_ANOMALY,
@@ -49,6 +51,8 @@ PROCESSING_NO_SCORE_EVENT = "NO_SCORE_EVENT"
 PROCESSING_AI_OBSERVATION = "AI_OBSERVATION_ONLY"
 AI_OBSERVATION_POLICY_VERSION = "trust-ai-observation-v1"
 AI_EVENT_TYPES = frozenset((AI_ANOMALY, AI_PACKET_ANOMALY))
+PROCESSING_PENDING_AT_WINDOW = "PENDING_AT_WINDOW"
+PROCESSING_DISABLED_AT_WINDOW = "DISABLED_AT_WINDOW"
 AI_WINDOW_CAP = -15
 WINDOW_DELTA_CAP = -30
 SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3}
@@ -99,6 +103,7 @@ def apply_trust_score_v2_until(
     cycle_range_start: datetime,
     cycle_cutoff: datetime,
     ai_mode: str | None = None,
+    decision_at: datetime | None = None,
 ) -> TrustScoreV2RunResult:
     # Resolve once for the transaction, including direct service callers.
     mode = resolve_ai_mode(ai_mode)
@@ -106,6 +111,9 @@ def apply_trust_score_v2_until(
     cutoff = require_utc_window_boundary(cycle_cutoff, "cycle_cutoff")
     if range_start >= cutoff:
         raise ValueError("cycle_range_start must be before cycle_cutoff")
+    _ensure_sqlite_immediate_transaction(db)
+    resolver = load_policy_resolver(db)
+    response_time = decision_at or datetime.now(timezone.utc)
     checkpoint = checkpoints.get_detector_checkpoint(
         db,
         detector_name=TRUST_DETECTOR_NAME,
@@ -145,10 +153,27 @@ def apply_trust_score_v2_until(
 
     for event in events:
         if _is_before_current_cycle(event, range_start):
+            reason = _past_event_processing_reason(event, range_start)
+            if resolver is not None and event.get("device_id"):
+                window_start, _ = _event_window(event)
+                resolution = resolver.resolve(str(event["device_id"]), window_start)
+                registration = resolution.registration
+                if registration is not None and registration.status == "PENDING":
+                    reason = PROCESSING_PENDING_AT_WINDOW
+                elif registration is not None and registration.status == "DISABLED":
+                    reason = PROCESSING_DISABLED_AT_WINDOW
+                elif resolution.reason != POLICY_AVAILABLE:
+                    reason = resolution.reason
+                else:
+                    current_exclusion = resolver.automatic_response_exclusion(
+                        str(event["device_id"]), response_time
+                    )
+                    if current_exclusion is not None:
+                        reason = current_exclusion
             _mark_events(
                 db,
                 [event],
-                _past_event_processing_reason(event, range_start),
+                reason,
                 cutoff,
                 [],
             )
@@ -167,6 +192,30 @@ def apply_trust_score_v2_until(
         if device is None:
             _mark_events(db, group, PROCESSING_UNMAPPED_DEVICE, cutoff, [])
             continue
+        if resolver is not None:
+            window_start, _ = _group_window(group)
+            resolution = resolver.resolve(str(device_id), window_start)
+            registration_status = (
+                resolution.registration.status
+                if resolution.registration is not None else None
+            )
+            if registration_status in {"PENDING", "DISABLED"}:
+                reason = (
+                    PROCESSING_PENDING_AT_WINDOW
+                    if registration_status == "PENDING"
+                    else PROCESSING_DISABLED_AT_WINDOW
+                )
+                _mark_events(db, group, reason, cutoff, [])
+                continue
+            if resolution.reason != POLICY_AVAILABLE:
+                _mark_events(db, group, resolution.reason, cutoff, [])
+                continue
+            exclusion = resolver.automatic_response_exclusion(
+                str(device_id), response_time
+            )
+            if exclusion is not None:
+                _mark_events(db, group, exclusion, cutoff, [])
+                continue
         if device["status"] == ISOLATED_STATUS:
             _mark_events(db, group, PROCESSING_ALREADY_ISOLATED, cutoff, [])
             continue
@@ -359,6 +408,20 @@ def _record_ai_observation(db: Session, event: dict[str, Any], cutoff: datetime)
             "evidence_json": json.dumps(evidence, ensure_ascii=False, sort_keys=True),
         },
     )
+
+
+def _ensure_sqlite_immediate_transaction(db: Session) -> None:
+    """Reserve the SQLite writer before reading registration or score state."""
+    if db.get_bind().dialect.name != "sqlite":
+        return
+    connection = db.connection()
+    raw_connection = connection.connection.driver_connection
+    if not raw_connection.in_transaction:
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+    else:
+        # The caller already began a physical transaction. Upgrade its lock
+        # before any state read; a conflicting snapshot must fail and roll back.
+        connection.exec_driver_sql("UPDATE devices SET trust_score = trust_score WHERE 0")
 
 
 def _fetch_candidate_events(

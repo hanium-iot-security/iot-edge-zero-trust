@@ -2,7 +2,12 @@
 
 from typing import Any
 
-from edge.mqtt.identity import IdentityStatus, classify_mqtt_identity
+from edge.mqtt.identity import (
+    IdentityStatus,
+    classify_mqtt_identity,
+    payload_validity_from_log_row,
+)
+from edge.policy.resolver import DevicePolicyRevision
 
 DETECTOR_RULE = "RULE"
 DETECTOR_AI = "AI"
@@ -52,14 +57,26 @@ _MQTT_SEVERITY = {
 }
 
 
-def detect_feature_rules(feature_row: dict[str, Any]) -> list[dict[str, Any]]:
+def detect_feature_rules(
+    feature_row: dict[str, Any],
+    device_policy: DevicePolicyRevision | None = None,
+    include_policy_thresholds: bool = True,
+) -> list[dict[str, Any]]:
     """feature_logs row에서 Rule 이벤트 목록을 반환합니다. DB 접근 없음."""
     events: list[dict[str, Any]] = []
 
-    if int(feature_row["publish_count"]) > PUBLISH_COUNT_THRESHOLD:
+    publish_limit = (
+        device_policy.publish_count_max
+        if device_policy is not None else PUBLISH_COUNT_THRESHOLD
+    )
+    payload_limit = (
+        device_policy.payload_size_max
+        if device_policy is not None else LARGE_PAYLOAD_BYTES
+    )
+    if include_policy_thresholds and int(feature_row["publish_count"]) > publish_limit:
         events.append({"event_type": ABNORMAL_PUBLISH_RATE, "severity": _FEATURE_SEVERITY[ABNORMAL_PUBLISH_RATE]})
 
-    if int(feature_row["max_payload_size"]) > LARGE_PAYLOAD_BYTES:
+    if include_policy_thresholds and int(feature_row["max_payload_size"]) > payload_limit:
         events.append({"event_type": LARGE_PAYLOAD, "severity": _FEATURE_SEVERITY[LARGE_PAYLOAD]})
 
     if int(feature_row["malformed_payload_count"]) >= MALFORMED_PAYLOAD_THRESHOLD:
@@ -87,7 +104,10 @@ def detect_mqtt_rules(
     3. 둘 다 추출 불가, 또는 정상 판정(MATCHED) → 이벤트 미생성
     """
     identity = classify_mqtt_identity(
-        mqtt_row["topic"], mqtt_row["payload"], registered_devices
+        mqtt_row["topic"],
+        mqtt_row["payload"],
+        registered_devices,
+        is_payload_valid=payload_validity_from_log_row(mqtt_row),
     )
 
     if identity.status is IdentityStatus.UNKNOWN_DEVICE:

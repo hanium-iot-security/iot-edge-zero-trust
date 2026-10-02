@@ -18,13 +18,14 @@ from sqlalchemy.orm import Session
 
 from backend.app.config import settings
 from backend.app.database import SessionLocal
-from edge.detection.phase4_time import format_db_utc
+from edge.detection.phase4_time import format_db_utc, floor_window_start, parse_db_utc
 from edge.features.feature_utils import extract_payload_device_id, payload_size
 from edge.mqtt.identity import (
     classify_mqtt_identity,
     fetch_registered_device_ids,
     payload_validity_from_log_row,
 )
+from edge.policy.repository import load_policy_resolver
 from edge.mqtt.topic_utils import (
     extract_device_id_candidate_from_topic,
     extract_device_id_from_topic,
@@ -42,7 +43,13 @@ def _normalize_received_at(value: datetime | None) -> datetime:
     timestamp = value if value is not None else _utc_now()
     if timestamp.tzinfo is None or timestamp.utcoffset() is None:
         raise ValueError("received_at must be timezone-aware")
-    return timestamp.astimezone(timezone.utc).replace(microsecond=0)
+    return timestamp.astimezone(timezone.utc)
+
+
+def _format_received_at(value: datetime) -> str:
+    if value.microsecond:
+        return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return format_db_utc(value)
 
 
 def _decode_payload(payload: str | bytes) -> str:
@@ -77,7 +84,7 @@ def build_mqtt_log_row(
         "topic": topic,
         "payload": payload_text,
         "payload_size": payload_size(payload),
-        "received_at": format_db_utc(_normalize_received_at(received_at)),
+        "received_at": _format_received_at(_normalize_received_at(received_at)),
         "is_json_valid": 1 if is_json_valid else 0,
         "is_topic_valid": 1 if is_topic_valid else 0,
         "error_message": ", ".join(error_parts) if error_parts else None,
@@ -100,6 +107,28 @@ def insert_mqtt_log(db: Session, row: dict[str, Any]) -> int:
     DEVICE_ID_MISMATCH·UNKNOWN_DEVICE 메시지는 Raw 증적으로는 남지만 등록 Device의
     정상 last_seen_at을 갱신하지 않는다.
     """
+    resolver = load_policy_resolver(db)
+    received_at = parse_db_utc(row["received_at"], "received_at", allow_subseconds=True)
+    window_start = floor_window_start(received_at.replace(microsecond=0))
+    registered_devices = (
+        resolver.registered_ids_at(window_start)
+        if resolver is not None else fetch_registered_device_ids(db)
+    )
+    identity = classify_mqtt_identity(
+        row["topic"],
+        row["payload"],
+        registered_devices,
+        is_payload_valid=payload_validity_from_log_row(row),
+    )
+    registration = (
+        resolver.registration_at(identity.attributed_device_id, window_start)
+        if resolver is not None and identity.attributed_device_id is not None
+        else None
+    )
+    raw_row = dict(row)
+    if registration is not None and registration.status == "DISABLED":
+        errors = [part for part in (row.get("error_message"), "disabled_device_communication") if part]
+        raw_row["error_message"] = ", ".join(errors)
     result = db.execute(
         text(
             """
@@ -125,23 +154,22 @@ def insert_mqtt_log(db: Session, row: dict[str, Any]) -> int:
             )
             """
         ),
-        row,
+        raw_row,
     )
     if row["device_id"]:
-        registered_devices = fetch_registered_device_ids(db)
-        identity = classify_mqtt_identity(
-            row["topic"],
-            row["payload"],
-            registered_devices,
-            is_payload_valid=payload_validity_from_log_row(row),
-        )
-        if identity.is_normal_telemetry:
+        if identity.is_normal_telemetry and (
+            registration is None or registration.status != "DISABLED"
+        ):
             db.execute(
                 text(
                     """
                     UPDATE devices
                     SET last_seen_at = :received_at
                     WHERE device_id = :device_id
+                      AND (
+                          last_seen_at IS NULL
+                          OR julianday(last_seen_at) < julianday(:received_at)
+                      )
                     """
                 ),
                 {

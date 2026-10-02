@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from shutil import copyfile
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -9,6 +10,12 @@ from sqlalchemy.orm import sessionmaker
 
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
 from edge.trust import firewall_repository
+from edge.detection.run_ai_detector import run_ai_detector
+from edge.detection.run_rule_detector import run_rule_detector
+from edge.trust.trust_score_service import (
+    LegacyTrustPathBlockedError,
+    update_trust_scores,
+)
 from edge.trust.trust_score_v2 import (
     PROCESSING_ALREADY_ISOLATED,
     PROCESSING_APPLIED,
@@ -31,7 +38,12 @@ WINDOW_END = "2026-07-23T10:00:10Z"
 @pytest.fixture
 def SessionLocal(tmp_path: Path):
     db_path = tmp_path / "phase4-trust-firewall.db"
-    apply_migrations(db_path, MIGRATIONS_DIR)
+    legacy_migrations = tmp_path / "migrations-v2"
+    legacy_migrations.mkdir()
+    for source in MIGRATIONS_DIR.glob("[0-9][0-9][0-9]_*.sql"):
+        if int(source.name[:3]) <= 6:
+            copyfile(source, legacy_migrations / source.name)
+    apply_migrations(db_path, legacy_migrations)
     engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     try:
@@ -102,6 +114,82 @@ def test_trust_v2_suppresses_ai_when_rule_events_exist_and_caps_window(
         assert reasons[first] == PROCESSING_APPLIED
         assert reasons[duplicate_family] == "NOT_REPRESENTATIVE"
         assert reasons[ai] == "NOT_REPRESENTATIVE"
+
+
+@pytest.mark.parametrize("with_policy_table", [False, True])
+def test_legacy_trust_runner_refuses_v2_after_flooding_representative(
+    SessionLocal, with_policy_table: bool, tmp_path: Path,
+) -> None:
+    """V16: the MVP writer must not turn v2's 80 -> 60 into another penalty."""
+    if with_policy_table:
+        apply_migrations(tmp_path / "phase4-trust-firewall.db", MIGRATIONS_DIR)
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01", trust_score=80)
+        if with_policy_table:
+            db.execute(text("""INSERT INTO device_policy_revisions (
+                device_id, revision, effective_from, registration_state,
+                policy_profile, expected_publish_interval_seconds,
+                publish_count_max, payload_size_max_bytes, packet_rate_max_pps,
+                byte_rate_max_bytes_per_second, created_at, created_by, reason
+            ) VALUES ('esp32_01', 1, :start, 'ACTIVE', 'periodic-sensor-v1',
+                5, 15, 5120, 10, 2500, :start, 'test', 'V16')"""),
+                {"start": WINDOW_START})
+        for event_type, detector_type in (
+            ("PACKET_RATE_ANOMALY", "RULE"),
+            ("BYTE_RATE_ANOMALY", "RULE"),
+            ("AI_PACKET_ANOMALY", "AI"),
+        ):
+            _insert_event(db, "esp32_01", event_type, detector_type=detector_type,
+                          incident_family="AI_ONLY" if detector_type == "AI" else "FLOODING")
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            first = apply_trust_score_v2_until(
+                db, cycle_range_start=CYCLE_START, cycle_cutoff=CUTOFF,
+            )
+        assert first.changes[0].calculated_delta == -20
+        assert first.changes[0].new_score == 60
+        before = {
+            table: db.execute(text(f"SELECT * FROM {table} ORDER BY 1")).fetchall()
+            for table in (
+                "devices", "detection_events", "trust_score_history",
+                "isolation_history", "firewall_rules", "detector_checkpoints",
+            )
+        }
+        db_path = db.get_bind().url.database
+
+    with pytest.raises(LegacyTrustPathBlockedError, match="Phase 4/v2"):
+        update_trust_scores(db_path)
+
+    with SessionLocal() as db:
+        with db.begin():
+            second = apply_trust_score_v2_until(
+                db, cycle_range_start=CYCLE_START, cycle_cutoff=CUTOFF,
+            )
+        assert second.created_history_count == 0
+        assert second.created_firewall_rule_count == 0
+        after = {
+            table: db.execute(text(f"SELECT * FROM {table} ORDER BY 1")).fetchall()
+            for table in before
+        }
+        assert after == before
+
+
+def test_legacy_trust_runner_refuses_empty_v2_database(SessionLocal) -> None:
+    with SessionLocal() as db:
+        db_path = db.get_bind().url.database
+    with pytest.raises(LegacyTrustPathBlockedError, match="Phase 4/v2"):
+        update_trust_scores(db_path)
+
+
+def test_mvp_detectors_refuse_v2_database_before_creating_events(SessionLocal) -> None:
+    with SessionLocal() as db:
+        with pytest.raises(RuntimeError, match="MVP Rule runner.*Phase 4/v2"):
+            run_rule_detector(db)
+        with pytest.raises(RuntimeError, match="MVP AI runner.*Phase 4/v2"):
+            run_ai_detector(db)
+        assert db.execute(text("SELECT COUNT(*) FROM detection_events")).scalar_one() == 0
 
 
 def test_trust_v2_does_not_isolate_at_exactly_30(SessionLocal) -> None:

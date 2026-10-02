@@ -39,9 +39,7 @@ curl --fail http://127.0.0.1:8000/api/health
 탐지 및 Trust Score 실행:
 
 ```bash
-python -m edge.detection.run_rule_detector
-python -m edge.detection.run_ai_detector
-python -m edge.trust.run_trust_score_update
+python -m edge.orchestration.run_detection_orchestrator --once
 ```
 
 Windows 가상환경 활성화:
