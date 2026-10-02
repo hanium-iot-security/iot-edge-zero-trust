@@ -257,6 +257,83 @@ def test_diagnostic_write_failure_never_publishes_ready_pcap(tmp_path, monkeypat
     assert len(list(config.incoming_dir.glob("*.pcap.tmp"))) == 1
 
 
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_failed_pcap_publication_retracts_success_diagnostics_on_failure_or_restart(
+    tmp_path, monkeypatch, cleanup_fails,
+):
+    config = _config(tmp_path)
+    database = tmp_path / "capture.db"
+    apply_migrations(db_path=database, migrations_dir="db/migrations")
+    engine = create_engine(f"sqlite:///{database.as_posix()}")
+    factory = sessionmaker(bind=engine)
+    now = START
+    failures = {"cleanup": cleanup_fails}
+    original_replace = os.replace
+    original_unlink = Path.unlink
+
+    def fail_publication(source, destination):
+        if Path(source).name.endswith(".pcap.tmp") and Path(destination).parent == config.ready_dir:
+            # Capture evidence must already be durable before PCAP publication.
+            sidecar = config.ready_dir / f"{Path(destination).name}.capture.json"
+            assert json.loads(sidecar.read_text(encoding="utf-8"))["success"] is True
+            raise PermissionError("fixture PCAP publication failure")
+        return original_replace(source, destination)
+
+    def controlled_unlink(path, *args, **kwargs):
+        if failures["cleanup"] and path.name.endswith(".capture.json"):
+            raise PermissionError("fixture diagnostic cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    class ClockedProcess(_PcapProcess):
+        def capture_window(self, **kwargs):
+            nonlocal now
+            super().capture_window(**kwargs)
+            now += timedelta(seconds=kwargs["window_seconds"])
+            return CaptureOutcome(True, 0, stop_requested_at=now)
+
+    def sleep(seconds):
+        nonlocal now
+        now += timedelta(seconds=seconds)
+
+    monkeypatch.setattr(capture_runtime.os, "replace", fail_publication)
+    monkeypatch.setattr(Path, "unlink", controlled_unlink)
+    try:
+        with factory() as db:
+            pk, session_id, start = run_packet_capture.start_new_session(db, config, now)
+            exception = capture_runtime.CaptureProcessError if cleanup_fails else PermissionError
+            with pytest.raises(exception, match="PCAP publication fail"):
+                run_packet_capture.run_capture_loop(
+                    db, ClockedProcess(CaptureOutcome(True, 0)), config,
+                    session_pk=pk, session_id=session_id, first_window_start=start,
+                    shutdown=run_packet_capture.GracefulShutdown(), max_windows=1,
+                    clock=lambda: now, sleep=sleep,
+                )
+            assert db.execute(text("SELECT status FROM packet_capture_sessions")).scalar_one() == "FAILED"
+            assert db.execute(text("SELECT COUNT(*) FROM packet_capture_segments")).scalar_one() == 0
+            assert not list(config.ready_dir.glob("*.pcap"))
+            assert len(list(config.ready_dir.glob("*.capture.json"))) == int(cleanup_fails)
+            assert len(list(config.incoming_dir.glob("*.pcap.tmp"))) == 1
+            if cleanup_fails:
+                # The same persisted files can remain after a wrapper crash.
+                # Startup must fail closed while diagnostic cleanup still fails.
+                with pytest.raises(PermissionError, match="diagnostic cleanup failure"):
+                    run_packet_capture.reconcile_leftover_tmp_files(db, config)
+                assert len(list(config.incoming_dir.glob("*.pcap.tmp"))) == 1
+                assert not list(config.failed_dir.glob("*.pcap"))
+                assert db.execute(text("SELECT COUNT(*) FROM packet_capture_segments")).scalar_one() == 0
+                failures["cleanup"] = False
+            run_packet_capture.reconcile_leftover_tmp_files(db, config)
+            run_packet_capture.reconcile_orphan_ready_files(db, config)
+            run_packet_capture.reconcile_orphan_failed_files(db, config)
+            assert not list(config.ready_dir.glob("*.capture.json"))
+            assert not list(config.incoming_dir.glob("*.pcap.tmp"))
+            assert len(list(config.failed_dir.glob("*.pcap"))) == 1
+            assert db.execute(text("SELECT status FROM packet_capture_segments")).scalar_one() == "FAILED"
+    finally:
+        failures["cleanup"] = False
+        engine.dispose()
+
+
 def test_clean_exit_without_file_is_failed_with_diagnostics(tmp_path):
     class NoFileProcess:
         def capture_window(self, **kwargs):
@@ -367,6 +444,68 @@ def test_success_exit_does_not_publish_invalid_pcap(tmp_path, contents):
     metadata = json.loads(result.diagnostics_path.read_text(encoding="utf-8"))
     assert metadata["file_validation_error"]
     assert not list(config.ready_dir.glob("*.pcap"))
+
+
+def test_pcap_validation_rejects_regular_file_replaced_after_lstat(tmp_path, monkeypatch):
+    candidate = tmp_path / "candidate.pcap"
+    replacement = tmp_path / "replacement.pcap"
+    valid = Path("tests/fixtures/packet/pcap/empty_window.pcap").read_bytes()
+    candidate.write_bytes(valid)
+    replacement.write_bytes(valid)
+    original_lstat = Path.lstat
+
+    def replace_after_lstat(path):
+        observed = original_lstat(path)
+        if path == candidate:
+            replacement.replace(candidate)
+        return observed
+
+    monkeypatch.setattr(Path, "lstat", replace_after_lstat)
+    assert capture_runtime._pcap_file_error(candidate) == "capture output changed before validation"
+    # The validation descriptor must be closed even on this early rejection.
+    candidate.replace(tmp_path / "rejected.pcap")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX FIFO and no-follow file opening")
+@pytest.mark.parametrize("replacement_type", ["fifo", "symlink"])
+def test_pcap_validation_rejects_special_file_replacement_without_blocking(tmp_path, replacement_type):
+    script = """
+import os, sys
+from pathlib import Path
+from edge.packet import capture_runtime
+candidate = Path(sys.argv[1])
+target = candidate.with_name('target.pcap')
+valid = Path('tests/fixtures/packet/pcap/empty_window.pcap').read_bytes()
+candidate.write_bytes(valid)
+target.write_bytes(valid)
+original_lstat = Path.lstat
+def replace_after_lstat(path):
+    observed = original_lstat(path)
+    if path == candidate:
+        candidate.unlink()
+        if sys.argv[2] == 'fifo':
+            os.mkfifo(candidate)
+        else:
+            candidate.symlink_to(target)
+    return observed
+Path.lstat = replace_after_lstat
+error = capture_runtime._pcap_file_error(candidate)
+assert error is not None, 'replacement was accepted as valid capture'
+assert target.read_bytes() == valid
+print('REJECTED', flush=True)
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", script, str(tmp_path / "candidate.pcap"), replacement_type],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        stdout, stderr = child.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.communicate(timeout=5)
+        pytest.fail("PCAP validation blocked on a replacement FIFO")
+    assert child.returncode == 0, stderr
+    assert stdout.strip() == "REJECTED"
 
 
 def test_interface_drop_is_quality_failure_even_if_kernel_reports_zero(tmp_path):

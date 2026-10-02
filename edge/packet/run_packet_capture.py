@@ -30,6 +30,7 @@ from edge.packet.capture_runtime import (
     CaptureProcess,
     CaptureRuntimeConfig,
     TcpdumpCaptureProcess,
+    discard_unpublished_capture_diagnostics,
     execute_capture_window,
 )
 from edge.packet.pcap_naming import format_utc_iso, next_utc_boundary, parse_pcap_filename
@@ -69,6 +70,10 @@ def reconcile_leftover_tmp_files(db: Session, config: CaptureRuntimeConfig) -> i
             continue
 
         ready_filename = tmp_path.name[: -len(".tmp")]
+        # A crash may occur after the success sidecar is saved but before the
+        # PCAP is published. Retract it before committing this file as FAILED;
+        # if removal fails, abort startup with the incoming file still intact.
+        discard_unpublished_capture_diagnostics(config, ready_filename)
         tmp_path.replace(config.failed_dir / ready_filename)
 
         session_pk = repo.find_session_pk_by_session_id(db, parsed.session_id)

@@ -448,8 +448,20 @@ def execute_capture_window(
             start_delay_seconds=start_delay_seconds if start_delay_seconds is not None else 0.0,
             captured_duration_seconds=captured_duration_seconds,
         ))
-        # Publish READY only after diagnostic evidence has been persisted.
-        _atomic_rename_same_filesystem(tmp_path, final_path)
+        # Publish READY only after diagnostic evidence has been persisted. A
+        # failed publication must not leave a sidecar claiming success.
+        try:
+            _atomic_rename_same_filesystem(tmp_path, final_path)
+        except OSError as publish_error:
+            try:
+                discard_unpublished_capture_diagnostics(config, ready_filename)
+            except OSError as cleanup_error:
+                logger.exception("Failed to retract capture diagnostics after PCAP publication failed: %s", publish_error)
+                raise CaptureProcessError(
+                    f"PCAP publication failed ({publish_error}); diagnostic cleanup failed "
+                    f"({cleanup_error}); startup reconciliation must retract the sidecar"
+                ) from cleanup_error
+            raise
         return result
 
     # PARTIAL_CAPTURE(파일은 있으나 조기 종료)와 PCAP_FILE_MISSING(파일이 아예
@@ -535,10 +547,19 @@ def _pcap_file_error(path: Path) -> str | None:
     truncated bodies are not. Protocol parsing remains the Extractor's job.
     """
     try:
-        if not stat.S_ISREG(path.lstat().st_mode):
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode):
             return "capture output is not a regular file"
-        with path.open("rb") as handle:
-            size = os.fstat(handle.fileno()).st_size
+        # Replacing a regular file by a FIFO after lstat must not block open;
+        # replacing it by a symlink must not redirect the validation read.
+        flags = getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+        with open(path, "rb", opener=lambda name, mode: os.open(name, mode | flags)) as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                return "capture output is not a regular file"
+            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                return "capture output changed before validation"
+            size = opened.st_size
             header = handle.read(24)
             byte_orders = {
                 b"\xd4\xc3\xb2\xa1": "<", b"\xa1\xb2\xc3\xd4": ">",
@@ -567,6 +588,15 @@ def _atomic_rename_same_filesystem(source: Path, destination: Path) -> Path:
     """같은 파일시스템 안에서 확장자만 제거하는 원자적 rename (3.1 절)."""
     os.replace(source, destination)
     return destination
+
+
+def discard_unpublished_capture_diagnostics(config: CaptureRuntimeConfig, file_name: str) -> None:
+    """Retract evidence for a PCAP that failed publication or remains incoming.
+
+    Cleanup errors propagate: callers must stop instead of treating the orphan
+    success sidecar as settled evidence. Never call this for processed PCAPs.
+    """
+    (config.ready_dir / f"{file_name}.capture.json").unlink(missing_ok=True)
 
 
 def _move_to_failed(source: Path, destination: Path) -> Path:
