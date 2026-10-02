@@ -182,6 +182,7 @@ def test_verify_passes_when_fresh_snapshot_has_no_rule_for_target(tmp_path: Path
         "passed": True,
         "status": "VERIFIED_RELEASED",
         "rule_count": 0,
+        "observed_at": "2026-08-14T07:29:55Z",
         "details": f"Fresh runtime snapshot has no managed DROP rule for {DEVICE_IP}.",
     }
 

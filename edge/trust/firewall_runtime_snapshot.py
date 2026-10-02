@@ -128,6 +128,14 @@ def verify_firewall_runtime_snapshot(
                 f"Runtime firewall snapshot is stale: age={age_seconds:.1f}s, "
                 f"max_age={max_age_seconds:.1f}s."
             )
+        last_activity = device.get("last_firewall_activity_at")
+        if last_activity is not None and observed_at.replace(microsecond=0) <= _parse_utc(str(last_activity)).replace(microsecond=0):
+            # Worker timestamps have whole-second precision. A same-second
+            # observation cannot prove whether it preceded the OS operation.
+            raise FirewallRuntimeSnapshotError(
+                "Runtime firewall snapshot must be observed after the last "
+                f"firewall attempt/release: last_activity={last_activity}."
+            )
         if not normalized["available"]:
             raise FirewallRuntimeSnapshotError(
                 str(normalized["error"] or "Runtime firewall observation unavailable.")
@@ -156,6 +164,7 @@ def verify_firewall_runtime_snapshot(
         "passed": True,
         "status": "VERIFIED_RELEASED",
         "rule_count": 0,
+        "observed_at": _format_utc(observed_at),
         "details": f"Fresh runtime snapshot has no managed DROP rule for {target_ip}.",
     }
 

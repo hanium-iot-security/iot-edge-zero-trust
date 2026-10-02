@@ -113,6 +113,38 @@ Window 2026-07-15T00:00:20Z~2026-07-15T00:00:30Z는 캡처 시작 전에 만료�
 새 Capture Session 시작: session_id=<new-uuid> first_window_start=2026-07-15T00:00:40Z
 ```
 
+### 3.4 Capture 품질·중복 실행 안전 계약
+
+- `READY`는 예정 Window 종료, 허용된 종료 코드(`0` 또는 요청한 `SIGTERM`), 강제
+  종료 없음, stderr 수집 완료, 정상적인 classic PCAP 파일 구조를 모두 확인한 뒤
+  공개한다. 24바이트 Header만 있는 빈 PCAP는 정상이나, 0바이트·잘린 Header·잘린
+  Record는 `PARTIAL_CAPTURE`로 제외한다. 파일을 열 때 FIFO 대기와 Symlink 추적을
+  방지하고 열린 Descriptor의 일반 파일 여부·동일 파일 식별자를 확인한다.
+  프로토콜 해석은 Extractor에서 수행한다.
+- tcpdump stderr는 실행 중 계속 비우고 마지막 64 KiB까지만 보관한다. 보고된
+  Kernel/Interface Drop이 양수이면 `FAILED`/`PARTIAL_CAPTURE`다. 통계가 없으면
+  `null`/`unknown`으로 기록하며 0으로 추정하지 않는다.
+- 실행 결과는 `ready/<pcap>.capture.json` 또는 `failed/<pcap>.capture.json`에
+  Session·Window·PCAP 식별자, 종료 코드, stderr, Drop 통계를 함께 남긴다. 성공
+  진단 파일을 저장한 뒤 PCAP를 `ready`로 옮긴다. 진단 파일은 Extractor의 PCAP
+  입력 대상이 아니며, 이 변경에서는 진단 파일의 후속 이동·보관 기한을 추가하지 않는다.
+- PCAP 공개가 실패하면 먼저 저장했던 성공 진단 파일을 회수하고 Runtime을 실패로
+  종료한다. 재시작 시에도 `incoming`에 남은 `.pcap.tmp`의 성공 진단부터 회수한 뒤
+  해당 PCAP를 FAILED로 정리한다. 진단 회수에 실패하면 파일을 그대로 보존하고
+  시작을 중단한다. 이미 처리된 PCAP의 진단 파일은 이 정리 대상이 아니다.
+- Wrapper는 시작 정리 전에 DB 옆 `<db파일명>.packet-capture.lock`과
+  `incoming`·`ready`·`failed`의 `.packet-capture.lock`을 모두 확보한다. 같은 DB
+  **또는** 같은 Capture Directory를 사용하는 두 번째 실행은 임시 파일과 RUNNING
+  Segment를 정리하기 전에 거부된다. 잠금 파일이 남아 있다는 것만으로 실행 중이라고
+  판단하지 않으며, 잠금 파일을 지워 중복 실행을 우회하지 않는다.
+- POSIX에서는 tcpdump가 잠금 Descriptor를 상속한다. Wrapper만 강제 종료되고
+  tcpdump가 남아 있어도 새 Wrapper의 정리가 시작되지 않는다. 자식 프로세스까지
+  종료되면 잠금이 해제된다.
+
+배포 전 Raspberry Pi에서 서비스 사용자별 잠금 파일 접근 권한, 실제 tcpdump 종료
+통계, 정상 중지·재시작과 자식 프로세스 정리를 확인한다. 로컬 합성 테스트와 실제
+장비 검증 결과를 구분해 기록한다.
+
 ## 4. Test Pack (`tests/fixtures/packet/pcap/`)
 
 Extractor(정종민) 및 Capture 자체 개발·회귀 테스트가 실제 장비 없이도 병렬로 진행될 수

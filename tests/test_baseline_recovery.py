@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -11,6 +12,8 @@ import sqlite3
 import pytest
 
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
+from backend.app.config import settings
+from edge.trust.firewall_runtime_snapshot import SNAPSHOT_SCHEMA_VERSION
 
 
 def _load_core():
@@ -28,7 +31,15 @@ def _load_cli():
 
 
 @pytest.fixture
-def db_path(tmp_path: Path) -> Path:
+def db_path(tmp_path: Path, monkeypatch) -> Path:
+    snapshot = tmp_path / "runtime.json"
+    snapshot.write_text(json.dumps({
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "available": True, "managed_rules": [], "error": None,
+    }), encoding="utf-8")
+    monkeypatch.setattr(settings, "firewall_runtime_snapshot_path", str(snapshot))
+    monkeypatch.setattr(settings, "firewall_lock_path", str(tmp_path / "firewall.lock"))
     path = tmp_path / "baseline-recovery.db"
     apply_migrations(path, MIGRATIONS_DIR)
     with sqlite3.connect(path) as connection:
@@ -370,6 +381,7 @@ def test_dry_run_reports_two_isolated_devices_without_changing_database(
         {
             "device_id": "esp32_01",
             "ip_address": "192.168.0.4",
+            "last_firewall_activity_at": None,
             "current": {"status": "isolated", "trust_score": 20},
             "expected": {"status": "isolated", "trust_score": 20},
             "proposed": {"status": "normal", "trust_score": 100},
@@ -377,6 +389,7 @@ def test_dry_run_reports_two_isolated_devices_without_changing_database(
         {
             "device_id": "esp32_02",
             "ip_address": "192.168.0.5",
+            "last_firewall_activity_at": None,
             "current": {"status": "isolated", "trust_score": 40},
             "expected": {"status": "isolated", "trust_score": 40},
             "proposed": {"status": "normal", "trust_score": 100},

@@ -29,16 +29,19 @@ from edge.trust.firewall_worker import (
 WRAPPER = Path("infra/scripts/hanium-firewall-rule")
 DEVICE_IP = "192.168.0.5"
 RULE_ID = 12
+BASH = shutil.which("bash")
 
 pytestmark = pytest.mark.skipif(
-    shutil.which("bash") is None, reason="bash가 없는 환경에서는 Wrapper를 검증할 수 없습니다"
+    BASH is None, reason="bash가 없는 환경에서는 Wrapper를 검증할 수 없습니다"
 )
 
 
 def _run_wrapper(*args: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ, HANIUM_FW_DRY_RUN="1")
     return subprocess.run(
-        ["bash", WRAPPER.as_posix(), *args],
+        # Use the executable we checked; Windows may otherwise resolve the WSL
+        # launcher from System32 before the Bash selected through PATH.
+        [BASH, WRAPPER.as_posix(), *args],
         capture_output=True,
         text=True,
         env=env,

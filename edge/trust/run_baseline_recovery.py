@@ -14,6 +14,7 @@ if __package__ in (None, ""):
 
 from edge.trust.baseline_recovery import (
     BaselineRecoveryError,
+    BaselineRecoveryHoldError,
     execute_baseline_recovery,
     inspect_baseline_recovery,
     parse_device_expectations,
@@ -75,7 +76,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except BaselineRecoveryError as exc:
         print(
             json.dumps(
-                {"mode": args.mode, "result": "FAILED", "error": str(exc)},
+                {"mode": args.mode, "result": "HOLD" if isinstance(exc, BaselineRecoveryHoldError) else "FAILED", "error": str(exc)},
                 ensure_ascii=False,
                 indent=2,
             ),

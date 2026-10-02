@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime, timezone
 import json
 import sqlite3
 import threading
@@ -17,6 +18,7 @@ from backend.app.services import recovery_command_service
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
 from edge.trust import baseline_recovery
 from edge.trust.baseline_recovery import CONFIRMATION, BaselineRecoveryError
+from edge.trust.firewall_runtime_snapshot import SNAPSHOT_SCHEMA_VERSION
 
 
 ADMIN_HEADERS = {"X-Recovery-Admin-Key": "test-secret"}
@@ -28,6 +30,14 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     artifact_dir = tmp_path / "recovery-artifacts"
     apply_migrations(db_path, MIGRATIONS_DIR)
     _seed_isolated_device(db_path)
+    snapshot = tmp_path / "runtime.json"
+    snapshot.write_text(json.dumps({
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "available": True, "managed_rules": [], "error": None,
+    }), encoding="utf-8")
+    monkeypatch.setattr(settings, "firewall_runtime_snapshot_path", str(snapshot))
+    monkeypatch.setattr(settings, "firewall_lock_path", str(tmp_path / "firewall.lock"))
 
     engine = create_engine(
         f"sqlite:///{db_path}",
@@ -120,6 +130,44 @@ def test_recovery_preflight_all_gates_pass(api_client) -> None:
     assert body["firewall_runtime_verification"]["status"] == "VERIFIED_RELEASED"
     assert body["unprocessed_detection_count"] == 0
     assert not artifact_dir.exists()
+
+
+def test_recovery_rechecks_new_firewall_attempt_after_preflight(api_client, monkeypatch):
+    client, db_path, _ = api_client
+    execute = recovery_command_service.execute_baseline_recovery
+
+    def attempt_after_preflight(**kwargs):
+        with sqlite3.connect(db_path) as db:
+            db.execute(
+                "INSERT INTO firewall_rules(device_id,source_ip,status,last_attempted_at) "
+                "VALUES ('esp32_01','192.168.0.21','FAILED',?)",
+                (datetime.now(timezone.utc).isoformat(),),
+            )
+        return execute(**kwargs)
+
+    monkeypatch.setattr(recovery_command_service, "execute_baseline_recovery", attempt_after_preflight)
+    response = _post_execute(client)
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["result"] == "HOLD"
+    assert detail["failure_code"] == "FIREWALL_RUNTIME_UNVERIFIED"
+    assert detail["firewall_release_status"] == "NOT_VERIFIED"
+    assert _device_state(db_path) == ("isolated", 20)
+
+
+def test_recovery_preflight_uses_last_attempt_even_with_fresh_snapshot(api_client):
+    client, db_path, _ = api_client
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "INSERT INTO firewall_rules(device_id,source_ip,status,last_attempted_at) "
+            "VALUES ('esp32_01','192.168.0.21','FAILED',?)",
+            (datetime.now(timezone.utc).isoformat(),),
+        )
+    response = _post_preflight(client)
+    body = response.json()
+    assert body["can_execute"] is False
+    assert body["result"] == "HOLD"
+    assert body["failure_code"] == "FIREWALL_RUNTIME_UNAVAILABLE"
 
 
 def test_recovery_preflight_missing_device_is_denied(api_client) -> None:

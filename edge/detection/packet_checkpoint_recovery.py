@@ -1264,7 +1264,9 @@ def _git(repository_root: Path, *args: str) -> str:
 
 
 def _sha256_open_regular_file(path: Path, expected: os.stat_result) -> str:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # A regular file can be replaced by a FIFO after lstat; do not block in
+    # open before fstat gets a chance to reject the replacement.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     descriptor = os.open(path, flags)
     try:
         opened = os.fstat(descriptor)
@@ -1303,6 +1305,47 @@ def _inventory_entry(repository_root: Path, relative_path: str) -> dict[str, obj
     return {"path": relative.as_posix(), "size": after.st_size, "sha256": digest}
 
 
+def _reject_non_regular_repository_entries(root: Path) -> None:
+    """Git omits FIFOs/sockets from ls-files; reject them without opening them.
+
+    Prune ignored directories before descent, including large local environments
+    and evidence directories. Untracked symlinks remain subject to the existing
+    Git inventory check and are never followed by this traversal.
+    """
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        candidates: dict[str, tuple[Path, bool]] = {}
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name == ".git":
+                    continue
+                mode = entry.stat(follow_symlinks=False).st_mode
+                if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+                    continue
+                path = Path(entry.path)
+                candidates[path.relative_to(root).as_posix()] = (path, stat.S_ISDIR(mode))
+        if not candidates:
+            continue
+        ignored = subprocess.run(
+            ["git", "check-ignore", "--stdin", "-z"],
+            cwd=root,
+            input="\0".join(candidates) + "\0",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if ignored.returncode not in (0, 1):
+            ignored.check_returncode()
+        ignored_paths = set(ignored.stdout.split("\0"))
+        for relative_path, (path, is_directory) in candidates.items():
+            if relative_path in ignored_paths:
+                continue
+            if not is_directory:
+                raise PacketCheckpointRecoveryError("untracked entry must be a regular file")
+            pending.append(path)
+
+
 def inspect_repository_state(repository_root: str | Path) -> dict[str, object]:
     root = Path(repository_root).expanduser().resolve(strict=True)
     commit = _git(root, "rev-parse", "HEAD").strip()
@@ -1311,6 +1354,7 @@ def inspect_repository_state(repository_root: str | Path) -> dict[str, object]:
     untracked = _git(
         root, "ls-files", "--others", "--exclude-standard", "-z"
     ).split("\0")
+    _reject_non_regular_repository_entries(root)
     inventory = [_inventory_entry(root, path) for path in untracked if path]
     if tracked or staged:
         raise PacketCheckpointRecoveryError("tracked/staged worktree must be clean")

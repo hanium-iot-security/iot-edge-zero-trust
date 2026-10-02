@@ -1,0 +1,316 @@
+{
+  "contract_version": "device-policy-v1",
+  "kind": "synthetic-contract-examples-not-live-responses",
+  "notes": [
+    "주소·시각·기기·증적 ID는 설명용 예시이며 실제 장비 예약/시험 성공을 뜻하지 않는다.",
+    "Write 인증키는 예시 파일에 포함하지 않는다.",
+    "임계값은 기존 코드 기본값이며 관측으로 최적화한 수치가 아니다."
+  ],
+  "cases": [
+    {
+      "name": "create_pending",
+      "method": "POST",
+      "path": "/api/devices",
+      "request": {
+        "device_id": "pico_01",
+        "ip_address": "192.168.0.6",
+        "device_type": "SENSOR",
+        "mqtt_principal": "pico_01",
+        "policy": {
+          "policy_profile": "periodic-sensor-v1",
+          "expected_publish_interval_seconds": 5.0,
+          "publish_count_max": 15,
+          "payload_size_max_bytes": 5120,
+          "packet_rate_max_pps": 10.0,
+          "byte_rate_max_bytes_per_second": 2500.0
+        },
+        "reason": "Pico 센서 연결 검증 준비"
+      },
+      "status": 201,
+      "response": {
+        "device": {
+          "device_id": "pico_01",
+          "ip_address": "192.168.0.6",
+          "status": "normal",
+          "trust_score": 100,
+          "last_seen_at": null,
+          "created_at": "2026-10-02T00:00:03Z",
+          "device_type": "SENSOR",
+          "mqtt_principal": "pico_01",
+          "mqtt_topic": "iot/pico_01/sensor",
+          "registration_state": "PENDING",
+          "registration_effective_from": "2026-10-02T00:00:10Z",
+          "current_policy_revision": null,
+          "pending_policy_revision": 1,
+          "auto_response_eligible": false,
+          "auto_response_exclusion_reason": "REGISTRATION_NOT_EFFECTIVE"
+        },
+        "policy": {
+          "device_id": "pico_01",
+          "server_time": "2026-10-02T00:00:03Z",
+          "latest_revision": 1,
+          "current": null,
+          "pending": {
+            "device_id": "pico_01",
+            "revision": 1,
+            "effective_from": "2026-10-02T00:00:10Z",
+            "registration_state": "PENDING",
+            "policy": {
+              "policy_profile": "periodic-sensor-v1",
+              "expected_publish_interval_seconds": 5.0,
+              "publish_count_max": 15,
+              "payload_size_max_bytes": 5120,
+              "packet_rate_max_pps": 10.0,
+              "byte_rate_max_bytes_per_second": 2500.0
+            },
+            "created_at": "2026-10-02T00:00:03Z",
+            "created_by": "recovery-admin",
+            "reason": "Pico 센서 연결 검증 준비"
+          }
+        }
+      }
+    },
+    {
+      "name": "list_before_effective_boundary",
+      "method": "GET",
+      "path": "/api/devices",
+      "status": 200,
+      "response": {
+        "items": [
+          {
+            "device_id": "pico_01",
+            "ip_address": "192.168.0.6",
+            "status": "normal",
+            "trust_score": 100,
+            "last_seen_at": null,
+            "created_at": "2026-10-02T00:00:03Z",
+            "device_type": "SENSOR",
+            "mqtt_principal": "pico_01",
+            "mqtt_topic": "iot/pico_01/sensor",
+            "registration_state": "PENDING",
+            "registration_effective_from": "2026-10-02T00:00:10Z",
+            "current_policy_revision": null,
+            "pending_policy_revision": 1,
+            "auto_response_eligible": false,
+            "auto_response_exclusion_reason": "REGISTRATION_NOT_EFFECTIVE"
+          }
+        ],
+        "total": 1
+      }
+    },
+    {
+      "name": "detail_before_effective_boundary",
+      "method": "GET",
+      "path": "/api/devices/pico_01",
+      "status": 200,
+      "response": {
+        "device_id": "pico_01",
+        "ip_address": "192.168.0.6",
+        "status": "normal",
+        "trust_score": 100,
+        "last_seen_at": null,
+        "created_at": "2026-10-02T00:00:03Z",
+        "device_type": "SENSOR",
+        "mqtt_principal": "pico_01",
+        "mqtt_topic": "iot/pico_01/sensor",
+        "registration_state": "PENDING",
+        "registration_effective_from": "2026-10-02T00:00:10Z",
+        "current_policy_revision": null,
+        "pending_policy_revision": 1,
+        "auto_response_eligible": false,
+        "auto_response_exclusion_reason": "REGISTRATION_NOT_EFFECTIVE"
+      }
+    },
+    {
+      "name": "policy_after_boundary",
+      "method": "GET",
+      "path": "/api/devices/pico_01/policy",
+      "status": 200,
+      "response": {
+        "device_id": "pico_01",
+        "server_time": "2026-10-02T00:00:10Z",
+        "latest_revision": 1,
+        "current": {
+          "device_id": "pico_01",
+          "revision": 1,
+          "effective_from": "2026-10-02T00:00:10Z",
+          "registration_state": "PENDING",
+          "policy": {
+            "policy_profile": "periodic-sensor-v1",
+            "expected_publish_interval_seconds": 5.0,
+            "publish_count_max": 15,
+            "payload_size_max_bytes": 5120,
+            "packet_rate_max_pps": 10.0,
+            "byte_rate_max_bytes_per_second": 2500.0
+          },
+          "created_at": "2026-10-02T00:00:03Z",
+          "created_by": "recovery-admin",
+          "reason": "Pico 센서 연결 검증 준비"
+        },
+        "pending": null
+      }
+    },
+    {
+      "name": "schedule_activation",
+      "method": "POST",
+      "path": "/api/devices/pico_01/policy-revisions",
+      "request": {
+        "expected_revision": 1,
+        "registration_state": "ACTIVE",
+        "policy": {
+          "policy_profile": "periodic-sensor-v1",
+          "expected_publish_interval_seconds": 5.0,
+          "publish_count_max": 15,
+          "payload_size_max_bytes": 5120,
+          "packet_rate_max_pps": 10.0,
+          "byte_rate_max_bytes_per_second": 2500.0
+        },
+        "reason": "운영 확인 기록 BROKER-CHECK-001: 본인 Topic 허용·타 Topic 거부·정책 연결 확인"
+      },
+      "status": 201,
+      "response": {
+        "device_id": "pico_01",
+        "server_time": "2026-10-02T01:00:03Z",
+        "latest_revision": 2,
+        "current": {
+          "device_id": "pico_01",
+          "revision": 1,
+          "effective_from": "2026-10-02T00:00:10Z",
+          "registration_state": "PENDING",
+          "policy": {
+            "policy_profile": "periodic-sensor-v1",
+            "expected_publish_interval_seconds": 5.0,
+            "publish_count_max": 15,
+            "payload_size_max_bytes": 5120,
+            "packet_rate_max_pps": 10.0,
+            "byte_rate_max_bytes_per_second": 2500.0
+          },
+          "created_at": "2026-10-02T00:00:03Z",
+          "created_by": "recovery-admin",
+          "reason": "Pico 센서 연결 검증 준비"
+        },
+        "pending": {
+          "device_id": "pico_01",
+          "revision": 2,
+          "effective_from": "2026-10-02T01:00:10Z",
+          "registration_state": "ACTIVE",
+          "policy": {
+            "policy_profile": "periodic-sensor-v1",
+            "expected_publish_interval_seconds": 5.0,
+            "publish_count_max": 15,
+            "payload_size_max_bytes": 5120,
+            "packet_rate_max_pps": 10.0,
+            "byte_rate_max_bytes_per_second": 2500.0
+          },
+          "created_at": "2026-10-02T01:00:03Z",
+          "created_by": "recovery-admin",
+          "reason": "운영 확인 기록 BROKER-CHECK-001: 본인 Topic 허용·타 Topic 거부·정책 연결 확인"
+        }
+      }
+    },
+    {
+      "name": "pending_conflict",
+      "method": "POST",
+      "path": "/api/devices/pico_01/policy-revisions",
+      "status": 409,
+      "response": {
+        "detail": {
+          "code": "PENDING_REVISION_EXISTS",
+          "message": "적용 예정인 변경이 있습니다. 적용 후 다시 확인해주세요.",
+          "latest_revision": 2,
+          "current_revision": 1,
+          "pending_revision": 2
+        }
+      }
+    },
+    {
+      "name": "stale_revision",
+      "method": "POST",
+      "path": "/api/devices/pico_01/policy-revisions",
+      "status": 409,
+      "response": {
+        "detail": {
+          "code": "REVISION_CONFLICT",
+          "message": "정책이 변경되었습니다. 최신 정책을 확인해주세요.",
+          "latest_revision": 2,
+          "current_revision": 2,
+          "pending_revision": null
+        }
+      }
+    },
+    {
+      "name": "blocked_disable",
+      "method": "POST",
+      "path": "/api/devices/pico_01/policy-revisions",
+      "status": 409,
+      "response": {
+        "detail": {
+          "code": "STATE_TRANSITION_BLOCKED",
+          "message": "실제 차단 해제 상태를 확인한 뒤 비활성화해주세요."
+        }
+      }
+    },
+    {
+      "name": "numeric_string_rejected",
+      "method": "POST",
+      "path": "/api/devices",
+      "status": 422,
+      "response": {
+        "detail": [
+          {
+            "loc": [
+              "body",
+              "policy",
+              "publish_count_max"
+            ],
+            "type": "int_type",
+            "msg": "Input should be a valid integer",
+            "input": "15"
+          }
+        ]
+      }
+    },
+    {
+      "name": "unauthorized",
+      "method": "POST",
+      "path": "/api/devices",
+      "status": 401,
+      "response": {
+        "detail": "RECOVERY_ADMIN_UNAUTHORIZED"
+      }
+    },
+    {
+      "name": "management_not_configured",
+      "method": "POST",
+      "path": "/api/devices",
+      "status": 503,
+      "response": {
+        "detail": "RECOVERY_ADMIN_NOT_CONFIGURED"
+      }
+    }
+  ],
+  "boundary_examples": [
+    {
+      "server_decision_time": "2026-10-02T00:00:09.900Z",
+      "effective_from": "2026-10-02T00:00:10Z"
+    },
+    {
+      "server_decision_time": "2026-10-02T00:00:10Z",
+      "effective_from": "2026-10-02T00:00:20Z"
+    },
+    {
+      "received_at": "2026-10-02T00:00:09.999Z",
+      "window_start": "2026-10-02T00:00:00Z",
+      "registration_effective_from": "2026-10-02T00:00:10Z",
+      "resolution": "NOT_REGISTERED"
+    },
+    {
+      "received_at": "2026-10-02T00:00:10Z",
+      "window_start": "2026-10-02T00:00:10Z",
+      "registration_effective_from": "2026-10-02T00:00:10Z",
+      "resolution": "OK",
+      "registration_state": "PENDING",
+      "auto_response_eligible": false
+    }
+  ]
+}
