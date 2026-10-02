@@ -22,6 +22,18 @@ PRAGMA busy_timeout = 5000;
 Migration 005 (`packet_checkpoint_recovery`)는 운영 적용과 Recovery Execute를 분리한다.
 Migration 006 (`firewall_release_requests`)는 관리자 승인 Firewall Release 요청을
 DB queue로 저장하고 Worker가 실제 iptables release를 처리하도록 분리한다.
+Migration 007 (`device_policy_revisions`)은 기기 등록 메타데이터와 불변 정책 Revision 이력을
+추가한다(device-policy-v1). 기존 `devices`의 Trust 필드와 이력은 변경하지 않는다. 기존 `devices`에
+같은 IP가 둘 이상 있으면 007은 유일 인덱스 생성에서 실패하고 전체가 rollback되므로, 적용 전에
+`edge.policy.device_policy_repository.diagnose_device_ip_conflicts`로 진단한다.
+
+적용과 복구: 007은 컬럼 추가를 포함하며 되돌리는(down) Migration이 없다. 운영 DB에는 먼저
+일관된 백업(SQLite backup API 등, 쓰기 중 파일 하나만 복사하지 않는다)을 만든 뒤 **복사본에서**
+Migration과 backfill dry-run을 확인하고 적용한다. 적용 중 오류가 나면 Migration 전체가 rollback되어
+007 이전 상태로 남는다. 적용이 끝난 뒤 문제가 있으면 서비스를 멈추고 백업을 복원한다.
+`edge/policy`의 쓰기 함수는 **트랜잭션이 열려 있지 않은 연결**이 필요하다. Backend는 SQLAlchemy
+세션의 연결을 재사용하기보다 `db.migration_runner.connect_database`로 연 별도 연결을 쓰는 것이 안전하다
+(세션이 이미 쓰기를 시작한 연결은 `RuntimeError`로 거부된다).
 
 ## packet_checkpoint_recoveries
 
@@ -44,7 +56,52 @@ Detector별 Packet Checkpoint Gap Recovery 감사 Row를 저장한다. `operatio
 | status | TEXT | `normal`, `warning`, `danger`, `isolated` |
 | trust_score | INTEGER | 기본값 `100` |
 | last_seen_at | DATETIME | 마지막 MQTT 수신 시각. 신규 Subscriber는 UTC `YYYY-MM-DDTHH:MM:SSZ` 저장 |
-| created_at | DATETIME | 생성 시각, 기본 current timestamp |
+| created_at | DATETIME | 생성 시각(등록 시각), 기본 current timestamp. 관리자 등록은 UTC `Z` 정수 초로 저장 |
+| device_type | TEXT | Migration 007. 표시용 `SENSOR`/`CAMERA`/`ACTUATOR`/`OTHER`. NULL 허용 |
+| mqtt_principal | TEXT | Migration 007. Broker Principal 이름(1~128자). 비밀번호는 저장하지 않음. NULL 허용 |
+| registration_effective_from | TEXT | Migration 007. 등록 효력 시작 시각(UTC `Z`, 10초 경계). NULL은 정책 도입 전부터 있던 기존 기기 |
+
+`devices.status`는 Trust 상태(`normal/warning/danger/isolated`)이며 등록 상태(PENDING/ACTIVE/DISABLED)와
+별개다. 등록 상태는 `device_policy_revisions`에만 저장한다. `registration_effective_from`은 한 번
+정해지면 트리거로 수정을 막는다(값이 없던 기존 기기에 처음 채우는 것만 허용). Device ID·IP·유형·Principal의
+수정 금지는 DB가 아니라 서비스/API가 담당하며 수정 경로를 제공하지 않는다. 등록된 기기의 IP를 직접 바꾸면
+과거 Window의 IP 귀속이 달라지므로 운영에서 바꾸지 않는다.
+IP는 정규 dotted-decimal 형태만 저장하며(앞자리 0 거부) 비어 있지 않은 IP는 유일 인덱스로 중복을 막는다.
+octet 범위와 사설/LAN 대역 검사는 서비스(`edge/policy`)가 담당한다.
+
+## device_policy_revisions
+
+기기별 정책 Revision을 쌓는 불변 이력이다. 행을 수정하거나 삭제할 수 없고(트리거), 변경은 새 revision으로만 한다.
+
+| 컬럼 | 타입 | 설명 |
+| --- | --- | --- |
+| id | INTEGER | primary key autoincrement |
+| device_id | TEXT | `devices(device_id)` FK, `ON DELETE RESTRICT` |
+| revision | INTEGER | 기기별 1부터 연속 증가(이전 revision + 1) |
+| effective_from | TEXT | 효력 시작 시각. UTC `YYYY-MM-DDTHH:MM:SSZ`, 정수 초, 10초 경계. 이전 revision보다 커야 함 |
+| registration_state | TEXT | `PENDING`/`ACTIVE`/`DISABLED` |
+| policy_profile | TEXT | 첫 버전은 `periodic-sensor-v1`(서비스가 검사) |
+| expected_publish_interval_seconds | REAL | 설명용 주기. 0 초과 86400 이하 |
+| publish_count_max | INTEGER | 10초당 메시지 수 상한. 1~10000 |
+| payload_size_max_bytes | INTEGER | MQTT Payload 바이트 상한. 1~1048576 |
+| packet_rate_max_pps | REAL | packets/second 상한. 0 초과 100000 이하 |
+| byte_rate_max_bytes_per_second | REAL | bytes/second 상한. 0 초과 125000000 이하 |
+| created_at | TEXT | 작성 시각(UTC `Z`, 소수 초 허용) |
+| created_by | TEXT | 서버 인증 결과의 작성자(1~128자). 현재 공용 관리자 키는 개인 신원을 증명하지 않음 |
+| reason | TEXT | 변경 사유 1~500자 |
+
+`UNIQUE(device_id, revision)`, `UNIQUE(device_id, effective_from)`를 둔다. 상태 전이는
+PENDING→ACTIVE, PENDING/ACTIVE→DISABLED만 허용하며 DISABLED 이후 revision은 만들 수 없다(트리거).
+0·음수·범위 초과 임계값은 저장할 수 없고, 0을 "탐지 끄기"로 해석하지 않는다.
+숫자 문자열·bool 같은 묵시 변환과 "예정 revision이 이미 있음(`PENDING_REVISION_EXISTS`)"은
+서버 시각이 필요하므로 `edge/policy`가 검사한다. 시각 비교는 정수 초 UTC 문자열의 사전식 비교다.
+
+기존 기기의 초기 revision은 Migration이 만들지 않는다. 확인된 운영값으로
+`python -m db.backfill_device_policies --db <복사본> --manifest <manifest.json>`(기본 dry-run)을 실행해
+ACTIVE revision 1을 만든다. 이때 `registration_effective_from`은 NULL로 두어 이관 이전 Window의 기존
+등록 판정을 바꾸지 않고, 그 Window의 정책은 추정하지 않는다(`POLICY_UNAVAILABLE`).
+새 개발 DB는 `python db/create_tables.py` 뒤 `python db/seed_devices.py`가 기기와 초기 revision을
+한 트랜잭션으로 만든다.
 
 ## mqtt_logs
 

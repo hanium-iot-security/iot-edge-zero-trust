@@ -177,7 +177,8 @@ def test_trust_v2_packet_event_penalties_affect_scores(SessionLocal) -> None:
     with SessionLocal() as db:
         for index, (event_type, expected_delta) in enumerate(expected.items(), start=1):
             device_id = f"esp32_{index:02d}"
-            _insert_device(db, device_id, trust_score=100)
+            # 기기마다 서로 다른 IP를 쓴다(devices.ip_address는 비어 있지 않으면 유일).
+            _insert_device(db, device_id, trust_score=100, ip_address=f"192.168.0.{10 + index}")
             _insert_event(
                 db,
                 device_id,
