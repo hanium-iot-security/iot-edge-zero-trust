@@ -1,5 +1,7 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Literal
 from urllib.parse import urlparse
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 DEFAULT_API_ALLOWED_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
@@ -37,6 +39,8 @@ class Settings(BaseSettings):
     orchestrator_enabled_stages: str = "mqtt_feature_rule,mqtt_message_rule"
     orchestrator_required_stages: str = "mqtt_feature_rule,mqtt_message_rule"
     orchestrator_lock_path: str = ""
+    # AI inference/checkpoints keep running in both modes. Only Trust changes.
+    trust_ai_mode: Literal["enforce", "observe"] = "enforce"
 
     # Gateway Metrics
     gateway_metrics_interval_seconds: float = 10.0

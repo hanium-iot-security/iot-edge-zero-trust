@@ -68,6 +68,7 @@ from edge.trust.trust_score_v2 import (
     TRUST_SOURCE_TABLE,
     TrustScoreV2RunResult,
     apply_trust_score_v2_until,
+    resolve_ai_mode,
 )
 
 logger = logging.getLogger(__name__)
@@ -466,6 +467,7 @@ def run_orchestration_cycle(
     다른 Stage 실패와 무관하게 유지됩니다. Required Stage가 모두 cutoff까지 완료된
     뒤에만 Trust를 호출합니다.
     """
+    ai_mode = resolve_ai_mode()
     with session_factory() as db:
         cutoff = resolve_cycle_cutoff(db)
         if cutoff is None:
@@ -662,6 +664,7 @@ def run_orchestration_cycle(
                     db,
                     cycle_range_start=range_start,
                     cycle_cutoff=cutoff,
+                    ai_mode=ai_mode,
                 )
         finally:
             db.close()
@@ -694,7 +697,8 @@ def run_orchestration_cycle(
 
     logger.info(
         "event=CYCLE_COMPLETED range_start=%s cutoff=%s stages=%d trust_events=%d "
-        "trust_history=%d isolations=%d firewall_pending=%d",
+        "trust_history=%d isolations=%d firewall_pending=%d "
+        "trust_ai_mode=%s ai_observations=%d",
         format_db_utc(range_start),
         format_db_utc(cutoff),
         len(stage_results),
@@ -702,6 +706,8 @@ def run_orchestration_cycle(
         trust_result.created_history_count if trust_result is not None else 0,
         trust_result.created_isolation_count if trust_result is not None else 0,
         trust_result.created_firewall_rule_count if trust_result is not None else 0,
+        ai_mode,
+        trust_result.observed_ai_event_count if trust_result is not None else 0,
     )
     return CycleOutcome(
         status=CYCLE_COMPLETED,
@@ -740,6 +746,7 @@ def run_orchestrator_loop(
 
 def print_checkpoint_status(session_factory: SessionFactory = SessionLocal) -> None:
     """Phase 4 Checkpoint 7개의 현재 상태를 출력합니다."""
+    print(f"trust_ai_mode={settings.trust_ai_mode}")
     with session_factory() as db:
         rows = [
             (
@@ -795,10 +802,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     registry = load_stage_registry()
     logger.info(
-        "Orchestrator stages enabled=%s required=%s packet_layer_enabled=%s",
+        "Orchestrator stages enabled=%s required=%s packet_layer_enabled=%s trust_ai_mode=%s",
         ",".join(registry.enabled_names),
         ",".join(registry.required_names),
         registry.packet_layer_enabled,
+        settings.trust_ai_mode,
     )
 
     try:
