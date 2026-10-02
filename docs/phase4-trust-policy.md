@@ -68,7 +68,7 @@ Within one device window:
 - Same rule incident family is represented once.
 - Different rule incident families can be summed.
 - If one or more rule events affect score, AI events remain evidence only and are not applied to Trust Score.
-- If no rule event affects score, one AI representative event can apply up to `-15`.
+- In the default `enforce` mode, if no rule event affects score, one AI representative event can apply up to `-15`.
 - Total window delta is capped to `-30`.
 - Trust Score is clamped to `0..100`.
 
@@ -79,6 +79,22 @@ Penalty absolute value -> Severity -> earliest detected_at -> smallest ID
 ```
 
 Representative event IDs are stored in `trust_score_history.representative_event_ids_json`.
+
+## AI Observation Mode
+
+`TRUST_AI_MODE=enforce` preserves the existing policy. `observe` keeps IF stages,
+events, and checkpoints running but completes eligible AI events with
+`processing_reason=AI_OBSERVATION_ONLY`, `processed_at`, `applied_to_score=0`, and
+`score_delta=0`. Existing exclusion checks still take precedence. Rule processing
+is unchanged; an observation-only window creates no score history or isolation.
+
+The detector's original evidence, model scores, policy version, and dedupe identity
+remain intact. `evidence.trust_decision` records `original_score_delta`, the mapped
+`policy_score_delta`, `actual_delta=0`, `ai_mode`, `trust-ai-observation-v1`, and the
+processing cutoff. Mode selection applies when Trust processes an unprocessed
+event. Returning to enforce never rescores completed observations or reverses old
+deductions. Deployment, checkpoint recovery, and verification are described in the
+[AI observation runbook](ai-observation-mode-runbook.md).
 
 ## Isolation Boundary
 

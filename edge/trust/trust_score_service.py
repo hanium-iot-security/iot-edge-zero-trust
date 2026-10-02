@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import sqlite3
 
+from backend.app.config import settings
 from edge.trust.trust_policy import (
     ISOLATED_STATUS,
     UNKNOWN_DEVICE,
@@ -54,8 +55,18 @@ def connect_database(db_path: str | Path = DB_PATH) -> sqlite3.Connection:
 
 
 def update_trust_scores(db_path: str | Path = DB_PATH) -> TrustScoreUpdateResult:
+    if settings.trust_ai_mode == "observe":
+        raise RuntimeError("AI observation mode requires the v2 detection orchestrator; legacy Trust is blocked")
     connection = connect_database(db_path)
     try:
+        # Serialize the observation guard with all writes; a separate v2 process
+        # must not commit an observation between our check and legacy update.
+        connection.execute("BEGIN IMMEDIATE")
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(detection_events)")}
+        if "processing_reason" in columns and connection.execute(
+            "SELECT 1 FROM detection_events WHERE processing_reason = 'AI_OBSERVATION_ONLY' LIMIT 1"
+        ).fetchone():
+            raise RuntimeError("AI observation records require v2 Trust; legacy Trust is blocked")
         candidate_events = _fetch_candidate_events(connection)
         event_groups = _group_events_by_window(candidate_events)
         result = TrustScoreUpdateResult(

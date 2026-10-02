@@ -208,6 +208,16 @@ evidence_json -> evidence object
 
 Input validation errors return `422`. Stored JSON or timestamp conversion errors return `500`; malformed stored rows are server data errors, not user request errors.
 
+AI 관찰 완료 이벤트는 기존 응답 형식으로 `processing_reason=AI_OBSERVATION_ONLY`,
+`processed_at`, `applied_to_score=0`, `score_delta=0`을 반환합니다. 처리 사유는 자유 문자열이며
+같은 값으로 필터링할 수 있습니다. `evidence.trust_decision`에는 `ai_mode=observe`,
+`policy_version=trust-ai-observation-v1`, 원래 저장값 `original_score_delta`, 공통 정책의
+`policy_score_delta`, `actual_delta=0`, 처리 cutoff인 `processed_at`을 보존합니다.
+Event 최상위 `policy_version`은 탐지 정책 버전으로 유지합니다. 이미 관찰 완료한 이벤트는
+모드 전환 후에도 재감점하지 않습니다. `applied_to_score=0`은 처리 완료된 관찰·제외도
+포함하므로 미처리 건수로 해석하지 않습니다. 자세한 적용 절차는
+[AI 관찰 모드 운영 가이드](ai-observation-mode-runbook.md)를 참고합니다.
+
 ## Trust Score History
 
 ### GET /api/trust-score/{device_id}/history

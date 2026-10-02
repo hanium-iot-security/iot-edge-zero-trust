@@ -10,6 +10,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from backend.app.config import settings
 from edge.detection import runtime_checkpoint_repository as checkpoints
 from edge.detection.phase4_time import (
     WINDOW_SECONDS,
@@ -20,6 +21,8 @@ from edge.detection.phase4_time import (
 )
 from edge.trust import firewall_repository
 from edge.trust.trust_policy import (
+    AI_ANOMALY,
+    AI_PACKET_ANOMALY,
     ISOLATED_STATUS,
     UNKNOWN_DEVICE,
     apply_score_delta,
@@ -43,6 +46,9 @@ PROCESSING_LATE_EVENT = "LATE_EVENT"
 PROCESSING_LEGACY_MIGRATION = "LEGACY_MIGRATION"
 PROCESSING_INVALID_INCIDENT_FAMILY = "INVALID_INCIDENT_FAMILY"
 PROCESSING_NO_SCORE_EVENT = "NO_SCORE_EVENT"
+PROCESSING_AI_OBSERVATION = "AI_OBSERVATION_ONLY"
+AI_OBSERVATION_POLICY_VERSION = "trust-ai-observation-v1"
+AI_EVENT_TYPES = frozenset((AI_ANOMALY, AI_PACKET_ANOMALY))
 AI_WINDOW_CAP = -15
 WINDOW_DELTA_CAP = -30
 SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3}
@@ -77,6 +83,14 @@ class TrustScoreV2RunResult:
     completed_window_end_before: datetime | None
     completed_window_end_after: datetime
     changes: list[TrustScoreV2Change] = field(default_factory=list)
+    observed_ai_event_count: int = 0
+
+
+def resolve_ai_mode(ai_mode: str | None = None) -> str:
+    mode = settings.trust_ai_mode if ai_mode is None else ai_mode
+    if mode not in ("enforce", "observe"):
+        raise ValueError("trust_ai_mode must be 'enforce' or 'observe'")
+    return mode
 
 
 def apply_trust_score_v2_until(
@@ -84,7 +98,10 @@ def apply_trust_score_v2_until(
     *,
     cycle_range_start: datetime,
     cycle_cutoff: datetime,
+    ai_mode: str | None = None,
 ) -> TrustScoreV2RunResult:
+    # Resolve once for the transaction, including direct service callers.
+    mode = resolve_ai_mode(ai_mode)
     range_start = require_utc_window_boundary(cycle_range_start, "cycle_range_start")
     cutoff = require_utc_window_boundary(cycle_cutoff, "cycle_cutoff")
     if range_start >= cutoff:
@@ -124,6 +141,7 @@ def apply_trust_score_v2_until(
     created_history_count = 0
     created_isolation_count = 0
     created_firewall_rule_count = 0
+    observed_ai_event_count = 0
 
     for event in events:
         if _is_before_current_cycle(event, range_start):
@@ -174,6 +192,19 @@ def apply_trust_score_v2_until(
             )
         if not valid_group:
             continue
+
+        if mode == "observe":
+            observed = [
+                event for event in valid_group
+                if event["detector_type"] == "AI" and event["event_type"] in AI_EVENT_TYPES
+            ]
+            for event in observed:
+                _record_ai_observation(db, event, cutoff)
+            observed_ai_event_count += len(observed)
+            observed_ids = {event["id"] for event in observed}
+            valid_group = [event for event in valid_group if event["id"] not in observed_ids]
+            if not valid_group:
+                continue
 
         selected = _select_representative_events(valid_group)
         if not selected:
@@ -280,6 +311,53 @@ def apply_trust_score_v2_until(
         completed_window_end_before=completed_before,
         completed_window_end_after=cutoff,
         changes=changes,
+        observed_ai_event_count=observed_ai_event_count,
+    )
+
+
+def _record_ai_observation(db: Session, event: dict[str, Any], cutoff: datetime) -> None:
+    """Complete an AI event without creating score/isolating side effects.
+
+    Keep detector/model evidence and the original candidate penalty. The event's
+    displayed delta is zero so existing consumers do not present a -15 penalty
+    for an observation. Scoring policies and detector dedupe keys stay unchanged.
+    """
+    raw_evidence = event.get("evidence_json")
+    try:
+        evidence = json.loads(raw_evidence) if raw_evidence is not None else {}
+    except (TypeError, ValueError):
+        evidence = {"original_evidence": raw_evidence}
+    if not isinstance(evidence, dict):
+        evidence = {"original_evidence": raw_evidence}
+    if "trust_decision" in evidence:
+        evidence["original_trust_decision"] = evidence["trust_decision"]
+    evidence["trust_decision"] = {
+        "ai_mode": "observe",
+        "policy_version": AI_OBSERVATION_POLICY_VERSION,
+        "policy_score_delta": score_delta_for_event(str(event["event_type"])),
+        "original_score_delta": event["score_delta"],
+        "actual_delta": 0,
+        "processed_at": format_db_utc(cutoff),
+    }
+    db.execute(
+        text(
+            """
+            UPDATE detection_events
+            SET processed_at = :processed_at,
+                processing_reason = :reason,
+                applied_to_score = 0,
+                score_delta = 0,
+                evidence_json = :evidence_json,
+                evidence_schema_version = COALESCE(evidence_schema_version, 1)
+            WHERE id = :id AND processed_at IS NULL
+            """
+        ),
+        {
+            "id": event["id"],
+            "processed_at": format_db_utc(cutoff),
+            "reason": PROCESSING_AI_OBSERVATION,
+            "evidence_json": json.dumps(evidence, ensure_ascii=False, sort_keys=True),
+        },
     )
 
 
