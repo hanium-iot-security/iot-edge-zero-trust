@@ -53,12 +53,17 @@ Detector별 Packet Checkpoint Gap Recovery 감사 Row를 저장한다. `operatio
 | id | INTEGER | primary key autoincrement |
 | device_id | TEXT | topic 또는 payload에서 얻은 device ID |
 | topic | TEXT | MQTT topic |
-| payload | TEXT | 원본 payload |
-| payload_size | INTEGER | payload byte 크기 |
+| payload | TEXT | 수신 payload를 UTF-8로 해석한 문자열. 잘못된 UTF-8 바이트는 U+FFFD로 치환돼 있어 원본 바이트와 같지 않음 |
+| payload_size | INTEGER | 수신 원본 payload의 byte 크기(문자 수나 치환 후 크기가 아님) |
 | received_at | DATETIME | 수신 시각. 신규 Subscriber는 UTC `YYYY-MM-DDTHH:MM:SSZ`, DB 기본값은 `CURRENT_TIMESTAMP` |
-| is_json_valid | INTEGER | `0` 또는 `1` |
+| is_json_valid | INTEGER | `0` 또는 `1`. 수신 원본 바이트가 UTF-8 JSON 객체이고 `device_id`가 있을 때만 `1` |
 | is_topic_valid | INTEGER | `0` 또는 `1` |
 | error_message | TEXT | 검증 오류 상세 |
+
+저장된 `payload` 문자열은 치환된 값일 수 있어 다시 JSON으로 읽으면 정상처럼 보입니다. 그래서
+Subscriber(`last_seen_at` 갱신)와 Feature 집계는 `is_json_valid = 0`인 메시지에서 Payload Device ID를
+추출하지 않고 Topic으로만 귀속하며, 이런 메시지는 `last_seen_at`을 갱신하지 않습니다.
+MQTT Rule의 Identity 판정은 아직 이 해석을 쓰지 않고(P8-05), 원본 바이트 보존은 후속 Migration에서 추가합니다.
 
 신규 Subscriber는 한 메시지에서 생성한 UTC `Z` 문자열 하나를 `mqtt_logs.received_at`과
 `devices.last_seen_at`에 동일하게 저장합니다. 기존 DB의 공백 형식에는 서로 다른 의미가

@@ -13,13 +13,17 @@ UNKNOWN_DEVICE 판정)가 이 모듈을 공유하며 각자 Topic/Payload 파싱
 4. 둘 다 추출 불가 → NO_CANDIDATE
 
 이 모듈은 `error_message`처럼 이미 파생된 문자열을 다시 Parsing하지 않는다. 항상
-Raw Topic과 Raw Payload에서 직접 다시 계산한다.
+Raw Topic과 Raw Payload에서 직접 다시 계산한다. 다만 DB에 저장된 Payload 문자열은
+잘못된 UTF-8이 U+FFFD로 치환돼 있어 정상 JSON처럼 읽힐 수 있으므로, DB 행을 판정할 때는
+수신 시 Raw Bytes로 계산해 둔 `mqtt_logs.is_json_valid`를 `is_payload_valid`로 함께 넘긴다.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -76,18 +80,34 @@ class MqttIdentityResult:
         )
 
 
+def payload_validity_from_log_row(row: Mapping[str, Any]) -> bool | None:
+    """`mqtt_logs` 행의 `is_json_valid`를 `is_payload_valid` 인자로 변환한다.
+
+    컬럼이 없거나 NULL이면 None을 반환해 Payload 문자열을 직접 해석하는 기존 동작을 유지한다.
+    """
+    value = row.get("is_json_valid")
+    if value is None:
+        return None
+    return bool(int(value))
+
+
 def classify_mqtt_identity(
     topic: str,
     payload: str | bytes,
     registered_devices: set[str],
+    *,
+    is_payload_valid: bool | None = None,
 ) -> MqttIdentityResult:
     """Raw Topic/Payload와 등록 Device 집합으로부터 Identity를 판정한다. DB 접근 없음.
 
     `registered_devices`는 호출자가 원하는 기준(예: 전체 등록 기기, Isolation 여부
     무관)으로 미리 구성해 전달한다. 이 함수 자체는 어떤 집합을 등록 기기로 볼지 결정하지 않는다.
+
+    `is_payload_valid`가 False이면 Payload에서 Device ID를 추출하지 않는다. None이면
+    `payload`를 직접 해석한다.
     """
     topic_id = extract_device_id_candidate_from_topic(topic)
-    payload_id = extract_payload_device_id(payload)
+    payload_id = None if is_payload_valid is False else extract_payload_device_id(payload)
     strict_topic = is_telemetry_topic(topic)
 
     if topic_id is None and payload_id is None:

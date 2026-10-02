@@ -32,6 +32,7 @@ from edge.detection.phase4_time import (
 from edge.mqtt.identity import (
     classify_mqtt_identity,
     fetch_registered_device_ids,
+    payload_validity_from_log_row,
 )
 
 
@@ -212,7 +213,12 @@ def collect_feature_windows(
 
     grouped: dict[tuple[str, datetime, datetime], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        identity = classify_mqtt_identity(row["topic"], row["payload"], all_registered_devices)
+        identity = classify_mqtt_identity(
+            row["topic"],
+            row["payload"],
+            all_registered_devices,
+            is_payload_valid=payload_validity_from_log_row(row),
+        )
         if not identity.is_attributable:
             continue
         device_id = identity.attributed_device_id
@@ -303,7 +309,12 @@ def produce_mqtt_features_until(
             continue
         if window_end > cutoff:
             continue
-        identity = classify_mqtt_identity(source["topic"], source["payload"], all_registered_devices)
+        identity = classify_mqtt_identity(
+            source["topic"],
+            source["payload"],
+            all_registered_devices,
+            is_payload_valid=payload_validity_from_log_row(source),
+        )
         if not identity.is_attributable:
             continue
         device_id = identity.attributed_device_id
