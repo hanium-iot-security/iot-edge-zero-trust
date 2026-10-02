@@ -28,6 +28,16 @@ iptables 조회 계층 생성, Firewall Release 실행도 하지 않는다. Runt
 검증을 수행할 안전한 기존 read helper가 없는 환경에서는 Preflight를 `HOLD`로 닫고
 Recovery Execute를 허용하지 않는다.
 
+API와 CLI 모두 Core에서 Runtime Snapshot을 검증한다. `FAILED` Firewall Rule도
+실제 차단이 남아 있을 수 있으므로 실패 상태만으로 복구를 허용하지 않는다.
+Snapshot은 TTL 내에 있어야 하고, 대상 Device **또는 같은 IP**의 마지막 차단
+시도·적용·해제·Release 처리보다 뒤에 관측되어야 한다. 같은 초에 기록된 관측은
+선후를 증명할 수 없어 거부한다. 이후 Observer의 새 관측을 기다린 뒤 재검사한다.
+
+API·CLI·Observer·Firewall Worker는 같은 DB와 `FIREWALL_LOCK_PATH` 설정을 사용한다.
+기본 잠금 경로가 DB에서 파생되는 환경에서는 실제 DB 경로도 같아야 한다.
+잠금 파일을 지워 우회하거나 Snapshot 파일을 수동으로 수정하지 않는다.
+
 ## 2. 실행 전 Gate
 
 1. 실제 운영 DB 경로를 `DATABASE_URL`과 대조한다. 예시 경로를 추측해서 실행하지
@@ -157,6 +167,7 @@ JSON에는 다음이 포함된다.
 - Device ID 또는 IP에 연결된 `PENDING`·`APPLIED` Firewall Rule 확인 결과
 - Device ID 또는 IP에 연결된 `PENDING` Firewall Release Request 확인 결과
 - `processed_at IS NULL`인 대상 Device Detection Event의 개수·ID·상세와 Gate 결과
+- Device별 `last_firewall_activity_at`과 `runtime_firewall_check`
 - 동일 입력을 사용하는 실제 Execute 명령 예시
 - `can_execute`와 `preflight_errors`
 
@@ -182,11 +193,12 @@ python -m edge.trust.run_baseline_recovery execute \
 Execute 순서:
 
 1. 확인 문구와 입력 집합을 검증한다.
-2. `BEGIN IMMEDIATE`로 다른 Writer의 변경을 차단한다.
+2. Firewall 공용 잠금을 얻은 뒤 `BEGIN IMMEDIATE`로 다른 Writer의 변경을 차단한다.
+   공용 잠금을 기다리는 동안 DB 쓰기 잠금을 점유하지 않는다.
 3. Transaction 안에서 Device status·Trust Score, 활성 Firewall Rule과
    `processed_at IS NULL` Detection Event를 다시 확인한다.
-4. 아직 DB를 변경하지 않은 상태에서 Python `sqlite3` Backup API로 Snapshot을
-   생성한다.
+4. Runtime Snapshot의 최신성·대상 Rule 부재를 검증하고, 아직 DB를 변경하지 않은
+   상태에서 Python `sqlite3` Backup API로 DB Backup을 생성한다.
 5. Backup SHA256, `PRAGMA integrity_check`, `PRAGMA foreign_key_check`를 검증한다.
 6. 각 Device에 다음 조건부 UPDATE를 적용한다.
 
@@ -199,11 +211,16 @@ WHERE device_id = :device_id
 ```
 
 7. 한 Device라도 정확히 1개 Row가 변경되지 않으면 전체 Transaction을 Rollback한다.
-8. Commit 전과 후에 대상 상태와 DB integrity·FK를 검증한다.
+8. Commit 직전 Runtime Snapshot을 다시 검증하고 대상 상태와 DB integrity·FK를
+   확인한다. Backup 중 TTL이 만료되어도 전체 UPDATE를 Rollback한다. Commit까지
+   공용 잠금을 유지하며, Commit 후에도 대상 상태와 DB integrity·FK를 확인한다.
 9. 결과, Backup 경로·SHA256과 검증값을 JSON Log에 기록한다.
 
 성공 시 종료 코드 `0`, 안전 계약 거부 시 `2`다. 실행 실패 시 이미 생성된 Backup과
 `result=FAILED` JSON은 원인 분석을 위해 보존한다.
+Runtime 검증 또는 공용 잠금 획득이 실패하면 CLI는 `result=HOLD`, 종료 코드 `2`로
+끝나며, API는 `409`/`HOLD`와 `firewall_release_status=NOT_VERIFIED`를 반환한다.
+Core 실패 증적과 API Command 증적은 같은 `operation_id`로 연결된다.
 
 ## 6. Artifact
 

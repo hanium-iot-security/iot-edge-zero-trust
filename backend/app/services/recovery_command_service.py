@@ -27,6 +27,7 @@ from edge.packet.pcap_naming import format_utc_iso
 from edge.trust.baseline_recovery import (
     CONFIRMATION,
     BaselineRecoveryError,
+    BaselineRecoveryHoldError,
     execute_baseline_recovery,
     inspect_baseline_recovery,
 )
@@ -114,9 +115,13 @@ def build_recovery_preflight(
                 "ip_address": device_report.get("ip_address"),
                 "current_status": current.get("status"),
                 "current_trust_score": current.get("trust_score"),
+                "last_firewall_activity_at": device_report.get("last_firewall_activity_at"),
             }
         )
     )
+    core_runtime = core["runtime_firewall_check"][device_id]
+    if not core_runtime.get("available") or not core_runtime.get("passed"):
+        runtime = _normalize_runtime_verification(core_runtime)
     backup_check = _backup_check(artifacts)
     preflight_errors = list(core["preflight_errors"])
 
@@ -250,15 +255,19 @@ def execute_recovery_command(
                 requested_by=admin.principal,
                 approved_by=admin.principal,
                 requested_at=requested_at,
-                result="FAILED",
-                failure_code="BASELINE_RECOVERY_CORE_FAILED",
+                result="HOLD" if isinstance(exc, BaselineRecoveryHoldError) else "FAILED",
+                failure_code=("FIREWALL_RUNTIME_UNVERIFIED" if isinstance(exc, BaselineRecoveryHoldError)
+                              else "BASELINE_RECOVERY_CORE_FAILED"),
                 failure_reason=str(exc),
                 preflight=preflight,
+                firewall_release_status=("NOT_VERIFIED" if isinstance(exc, BaselineRecoveryHoldError) else None),
                 after_status=after.get("status"),
                 after_trust_score=after.get("trust_score"),
                 backup_reference=backup["backup_reference"],
                 backup_sha256=backup["backup_sha256"],
             )
+            if isinstance(exc, BaselineRecoveryHoldError):
+                raise RecoveryNotExecutableError(payload) from exc
             raise RecoveryCoreFailedError(payload) from exc
 
         return _normalize_baseline_audit(
@@ -472,6 +481,7 @@ def _write_command_audit(
     failure_code: str | None,
     failure_reason: str | None,
     preflight: Mapping[str, Any] | None,
+    firewall_release_status: str | None = None,
     after_status: str | None = None,
     after_trust_score: int | None = None,
     backup_reference: str | None = None,
@@ -494,9 +504,9 @@ def _write_command_audit(
             after_trust_score if after_trust_score is not None else before_score
         ),
         "firewall_release_status": (
-            "NOT_VERIFIED"
-            if preflight is None
-            else _firewall_release_status(preflight)
+            firewall_release_status or (
+                "NOT_VERIFIED" if preflight is None else _firewall_release_status(preflight)
+            )
         ),
         "backup_reference": backup_reference,
         "backup_sha256": backup_sha256,
