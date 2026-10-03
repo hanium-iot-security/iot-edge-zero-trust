@@ -7,8 +7,10 @@ import json
 import os
 from pathlib import Path
 import shlex
+import socket
 import sqlite3
 import subprocess
+import sys
 
 import pytest
 from sqlalchemy import create_engine
@@ -929,6 +931,97 @@ def test_inventory_entry_rejects_non_regular_file(
 ) -> None:
     with pytest.raises(PacketCheckpointRecoveryError, match="regular file"):
         packet_checkpoint_recovery.inspect_repository_state(untracked_fifo_repository)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX filesystem special entries")
+@pytest.mark.parametrize("entry_type", ["fifo", "socket"])
+def test_repository_state_rejects_nested_special_entry(tmp_path: Path, monkeypatch, entry_type: str) -> None:
+    repository_root = _repository(tmp_path)
+    directory = repository_root / "nested" / "deeper"
+    directory.mkdir(parents=True)
+    special = directory / "queue"
+    listener = None
+    try:
+        if entry_type == "fifo":
+            os.mkfifo(special)
+        else:
+            listener = socket.socket(socket.AF_UNIX)
+            # AF_UNIX addresses are length-limited even when pytest's base path
+            # is a perfectly valid, longer filesystem path.
+            monkeypatch.chdir(directory)
+            listener.bind(special.name)
+        with pytest.raises(PacketCheckpointRecoveryError, match="regular file"):
+            packet_checkpoint_recovery.inspect_repository_state(repository_root)
+    finally:
+        if listener is not None:
+            listener.close()
+
+
+def test_repository_state_prunes_git_and_ignored_directories(tmp_path: Path, monkeypatch) -> None:
+    repository_root = _repository(tmp_path)
+    (repository_root / ".gitignore").write_text("local-evidence/\n", encoding="utf-8")
+    _git(repository_root, "add", ".gitignore")
+    _git(repository_root, "commit", "-m", "ignore local evidence")
+    ignored = repository_root / "local-evidence"
+    ignored.mkdir()
+    (ignored / "private.txt").write_text("not inventory input", encoding="utf-8")
+    scan = os.scandir
+
+    def guarded_scan(path):
+        assert Path(path) not in (ignored, repository_root / ".git")
+        return scan(path)
+
+    monkeypatch.setattr(packet_checkpoint_recovery.os, "scandir", guarded_scan)
+    state = packet_checkpoint_recovery.inspect_repository_state(repository_root)
+    assert state["untracked_inventory"] == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX FIFO support")
+def test_repository_state_excludes_ignored_special_entry(tmp_path: Path) -> None:
+    repository_root = _repository(tmp_path)
+    (repository_root / ".gitignore").write_text("ignored-queue\n", encoding="utf-8")
+    _git(repository_root, "add", ".gitignore")
+    _git(repository_root, "commit", "-m", "ignore local pipe")
+    os.mkfifo(repository_root / "ignored-queue")
+    state = packet_checkpoint_recovery.inspect_repository_state(repository_root)
+    assert state["untracked_inventory"] == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX FIFO replacement race")
+def test_inventory_hash_rejects_fifo_replacement_without_blocking(tmp_path: Path) -> None:
+    script = """
+import os, sys
+from pathlib import Path
+from edge.detection import packet_checkpoint_recovery as recovery
+path = Path(sys.argv[1])
+path.write_bytes(b'original regular file')
+expected = path.lstat()
+real_open = os.open
+def replaced_open(target, flags):
+    path.unlink()
+    os.mkfifo(path)
+    return real_open(target, flags)
+recovery.os.open = replaced_open
+try:
+    recovery._sha256_open_regular_file(path, expected)
+except recovery.PacketCheckpointRecoveryError as exc:
+    assert 'regular file' in str(exc)
+    print('REJECTED', flush=True)
+else:
+    raise AssertionError('FIFO replacement was accepted')
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", script, str(tmp_path / "replaced")],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        stdout, stderr = child.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.communicate(timeout=5)
+        pytest.fail("inventory hashing blocked on a replacement FIFO")
+    assert child.returncode == 0, stderr
+    assert stdout.strip() == "REJECTED"
 
 
 def test_generated_path_allows_path_outside_repository(tmp_path: Path) -> None:

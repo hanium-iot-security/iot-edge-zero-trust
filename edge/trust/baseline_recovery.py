@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -12,12 +13,21 @@ import shlex
 import sqlite3
 from uuid import uuid4
 
+from backend.app.config import settings
+from edge.runtime_lock import RuntimeLockError, single_instance_lock
+from edge.trust.firewall_runtime_snapshot import verify_firewall_runtime_snapshot
+from edge.trust.run_firewall_worker import firewall_lock_path
+
 
 CONFIRMATION = "RESET-TO-NORMAL-100"
 
 
 class BaselineRecoveryError(RuntimeError):
     """Raised when a requested baseline reset violates a safety contract."""
+
+
+class BaselineRecoveryHoldError(BaselineRecoveryError):
+    """Runtime evidence or exclusive access is unavailable; keep isolation."""
 
 
 def parse_device_expectations(
@@ -99,6 +109,7 @@ def inspect_baseline_recovery(
                 source_ips=[row["ip_address"] for row in devices.values()],
             )
             pending_events = _fetch_pending_trust_events(connection, device_ids)
+            runtime_devices = _runtime_verification_devices(connection, devices)
     except sqlite3.DatabaseError as exc:
         raise BaselineRecoveryError(f"Database 사전 검증 실패: {exc}") from exc
 
@@ -129,6 +140,7 @@ def inspect_baseline_recovery(
         {
             "device_id": device_id,
             "ip_address": devices[device_id]["ip_address"],
+            "last_firewall_activity_at": runtime_devices[device_id]["last_firewall_activity_at"],
             "current": {
                 "status": devices[device_id]["status"],
                 "trust_score": int(devices[device_id]["trust_score"]),
@@ -178,17 +190,24 @@ def inspect_baseline_recovery(
         "event_ids": [int(event["id"]) for event in pending_events],
         "events": [_pending_event_report(event) for event in pending_events],
     }
+    runtime_check = {
+        device_id: _verify_runtime_firewall(device)
+        for device_id, device in runtime_devices.items()
+    }
     return {
         "mode": "dry-run",
         "database_path": str(database),
         "artifact_dir": str(artifacts),
         "database_changed": False,
-        "can_execute": not preflight_errors,
+        "can_execute": not preflight_errors and all(
+            result.get("available") and result.get("passed") for result in runtime_check.values()
+        ),
         "preflight_errors": preflight_errors,
         "devices": device_report,
         "active_firewall_rule_check": firewall_check,
         "pending_firewall_release_request_check": release_request_check,
         "pending_trust_event_check": pending_event_check,
+        "runtime_firewall_check": runtime_check,
         "execute_command": _build_execute_command(
             database=database,
             artifacts=artifacts,
@@ -234,8 +253,18 @@ def execute_baseline_recovery(
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
+    locks = ExitStack()
 
     try:
+        # Same order as Worker: firewall lock first, then SQLite write lock.
+        # Only the observer invokes OS commands; Recovery reads a JSON file.
+        lock_settings = settings.model_copy(update={"database_url": f"sqlite:///{database}"})
+        try:
+            locks.enter_context(single_instance_lock(
+                firewall_lock_path(lock_settings), wait_seconds=settings.firewall_lock_wait_seconds,
+            ))
+        except (RuntimeLockError, OSError) as exc:
+            raise BaselineRecoveryHoldError(f"Runtime firewall lock unavailable: {exc}") from exc
         connection.execute("BEGIN IMMEDIATE")
         previous_devices = _fetch_target_devices(connection, device_ids)
         _require_expected_device_state(previous_devices, targets)
@@ -268,6 +297,8 @@ def execute_baseline_recovery(
                 "대상 Device에 Trust Score v2 미처리 Detection Event가 있습니다: "
                 f"event_ids={event_ids}"
             )
+
+        _require_runtime_released(connection, previous_devices)
 
         artifacts.mkdir(parents=True, exist_ok=True)
         if backup_path.exists() or log_path.exists():
@@ -315,6 +346,9 @@ def execute_baseline_recovery(
                 f"integrity_check={integrity_check}, "
                 f"foreign_key_violations={foreign_key_violations}"
             )
+        # Backup/verification may outlive the snapshot TTL. Recheck immediately
+        # before commit while Worker and DB writers remain excluded.
+        runtime_check = _require_runtime_released(connection, previous_devices)
         connection.commit()
     except Exception as exc:
         if connection.in_transaction:
@@ -327,11 +361,12 @@ def execute_baseline_recovery(
             backup_sha256=backup_sha256,
             device_ids=device_ids,
             error=str(exc),
+            result="HOLD" if isinstance(exc, BaselineRecoveryHoldError) else "FAILED",
             reason=reason,
             requested_by=requested_by,
             approved_by=approved_by,
             requested_at=requested_at,
-            firewall_release_status=firewall_release_status,
+            firewall_release_status="NOT_VERIFIED" if isinstance(exc, BaselineRecoveryHoldError) else firewall_release_status,
             preflight=preflight,
         )
         if isinstance(exc, BaselineRecoveryError):
@@ -341,6 +376,7 @@ def execute_baseline_recovery(
         raise BaselineRecoveryError(f"Baseline Recovery 실행 실패: {exc}") from exc
     finally:
         connection.close()
+        locks.close()
 
     try:
         post_integrity, post_foreign_keys = _verify_database_path(database)
@@ -403,6 +439,7 @@ def execute_baseline_recovery(
         "integrity_check": post_integrity,
         "foreign_key_violations": [list(row) for row in post_foreign_keys],
         "devices": device_changes,
+        "runtime_firewall_check": runtime_check,
         "log_path": str(log_path),
     }
     if any(
@@ -509,6 +546,7 @@ def _write_failure_log_if_possible(
     backup_sha256: str | None,
     device_ids: Sequence[str],
     error: str,
+    result: str = "FAILED",
     reason: str | None = None,
     requested_by: str | None = None,
     approved_by: str | None = None,
@@ -520,7 +558,7 @@ def _write_failure_log_if_possible(
         return
     failure_report = {
         "mode": "execute",
-        "result": "FAILED",
+        "result": result,
         "operation_id": operation_id,
         "database_path": str(database),
         "backup_path": str(backup_path) if backup_path is not None else None,
@@ -596,6 +634,65 @@ def _fetch_target_devices(
         tuple(device_ids),
     ).fetchall()
     return {str(row["device_id"]): row for row in rows}
+
+
+def _runtime_verification_devices(
+    connection: sqlite3.Connection, devices: Mapping[str, sqlite3.Row],
+) -> dict[str, dict[str, object]]:
+    """Bind runtime proof to all attempts for the Device or its current IP."""
+    result = {}
+    for device_id, device in devices.items():
+        values = []
+        rules = connection.execute(
+            "SELECT last_attempted_at, applied_at, released_at, updated_at "
+            "FROM firewall_rules WHERE device_id = ? OR source_ip = ?",
+            (device_id, device["ip_address"]),
+        ).fetchall()
+        for rule in rules:
+            attempts = [rule[key] for key in ("last_attempted_at", "applied_at", "released_at") if rule[key]]
+            values.extend(attempts or [rule["updated_at"]])
+        requests = connection.execute(
+            "SELECT request.processed_at FROM firewall_release_requests AS request "
+            "JOIN firewall_rules AS rule ON rule.id = request.firewall_rule_id "
+            "WHERE (rule.device_id = ? OR rule.source_ip = ?) AND request.processed_at IS NOT NULL",
+            (device_id, device["ip_address"]),
+        ).fetchall()
+        values.extend(row[0] for row in requests)
+        try:
+            # SQLite defaults use UTC without a suffix; explicit Worker values
+            # use ISO UTC. Compare instants, not lexicographic text ordering.
+            instants = [datetime.fromisoformat(str(value).replace("Z", "+00:00")) for value in values]
+            latest = max((value.replace(tzinfo=timezone.utc) if value.tzinfo is None
+                          else value.astimezone(timezone.utc) for value in instants), default=None)
+        except (ValueError, TypeError) as exc:
+            raise BaselineRecoveryError("Runtime firewall attempt timestamp is invalid") from exc
+        result[device_id] = {
+            "device_id": device_id, "ip_address": device["ip_address"],
+            "last_firewall_activity_at": latest.isoformat() if latest else None,
+        }
+    return result
+
+
+def _verify_runtime_firewall(device: Mapping[str, object]) -> dict[str, object]:
+    return verify_firewall_runtime_snapshot(
+        device, snapshot_path=settings.firewall_runtime_snapshot_path,
+        max_age_seconds=settings.firewall_runtime_snapshot_max_age_seconds,
+    )
+
+
+def _require_runtime_released(
+    connection: sqlite3.Connection, devices: Mapping[str, sqlite3.Row],
+) -> dict[str, object]:
+    checks = {}
+    for device in _runtime_verification_devices(connection, devices).values():
+        verification = _verify_runtime_firewall(device)
+        if not verification.get("available") or not verification.get("passed"):
+            raise BaselineRecoveryHoldError(
+                f"Runtime firewall release is not verified for {device['device_id']}: "
+                f"{verification.get('details', 'unavailable')}"
+            )
+        checks[str(device["device_id"])] = {**verification, "last_firewall_activity_at": device["last_firewall_activity_at"]}
+    return checks
 
 
 def _fetch_active_firewall_rules(

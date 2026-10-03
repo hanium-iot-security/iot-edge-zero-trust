@@ -7,6 +7,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import io
 import subprocess
 from unittest.mock import Mock, call
 
@@ -37,6 +38,8 @@ def test_tcpdump_immediate_capture_preserves_shutdown_quality(
     monkeypatch, tmp_path, forced_kill
 ) -> None:
     process = Mock()
+    process.stderr = io.BytesIO(b"")
+    process.poll.return_value = None
     outcomes = [subprocess.TimeoutExpired("tcpdump", 10)]
     if forced_kill:
         outcomes.append(subprocess.TimeoutExpired("tcpdump", 5))
@@ -56,7 +59,7 @@ def test_tcpdump_immediate_capture_preserves_shutdown_quality(
     assert result.completed_full_window is True
     assert result.terminated_cleanly is (not forced_kill)
     assert result.stop_requested_at is not None
-    expected_calls = [call.wait(timeout=10), call.terminate(), call.wait(timeout=5)]
+    expected_calls = [call.wait(timeout=10), call.poll(), call.terminate(), call.wait(timeout=5)]
     if forced_kill:
         expected_calls += [call.kill(), call.wait(timeout=5)]
     assert process.method_calls == expected_calls
@@ -210,7 +213,7 @@ class FakeCaptureProcess:
             "window_seconds": window_seconds,
         }
         if self.write_file:
-            output_path.write_bytes(b"fake-pcap-bytes")
+            output_path.write_bytes(Path("tests/fixtures/packet/pcap/empty_window.pcap").read_bytes())
         return self.outcome
 
 

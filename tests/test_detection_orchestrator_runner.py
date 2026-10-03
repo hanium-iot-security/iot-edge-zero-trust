@@ -1786,7 +1786,8 @@ def test_status_prints_all_checkpoint_keys_and_real_updated_at(
     print_checkpoint_status(SessionLocal)
 
     lines = capsys.readouterr().out.strip().splitlines()
-    assert len(lines) == 7
+    assert lines[0] == "trust_ai_mode=enforce"
+    assert len(lines) == 8
     assert any(
         line.startswith("mqtt_feature_builder+mqtt_logs: status=PRESENT")
         and "updated_at=2026-07-25T12:00:00Z" in line
@@ -1860,10 +1861,17 @@ def test_repeated_cycles_do_not_duplicate_trust_history(SessionLocal, registry):
         assert _scalar(db, f"SELECT trust_score FROM devices WHERE device_id = '{DEVICE_ID}'") == 80
 
 
+@pytest.mark.parametrize("ai_mode", ["enforce", "observe"])
+@pytest.mark.parametrize("packet_count", [2, 980])
 def test_packet_rule_and_if_share_ready_session_and_reach_trust_once(
     SessionLocal,
     tmp_path: Path,
+    monkeypatch,
+    ai_mode,
+    packet_count,
 ):
+    from backend.app.config import settings
+    monkeypatch.setattr(settings, "trust_ai_mode", ai_mode)
     capture_policy = CapturePolicy()
     model_version = "packet-if-orchestrator-e2e-v1"
     artifact = PacketIFArtifact(
@@ -1927,7 +1935,7 @@ def test_packet_rule_and_if_share_ready_session_and_reach_trust_once(
 
     with SessionLocal() as db:
         _insert_mqtt_log(db, received_at=BASE + timedelta(seconds=1))
-        packet_feature_id = _insert_processed_packet_window(db)
+        packet_feature_id = _insert_processed_packet_window(db, packet_count=packet_count)
         db.commit()
     run_producer_cycle(
         session_factory=SessionLocal,
@@ -1957,7 +1965,8 @@ def test_packet_rule_and_if_share_ready_session_and_reach_trust_once(
         events = db.execute(
             text(
                 """
-                SELECT dedupe_key, event_type, packet_feature_log_id
+                SELECT dedupe_key, event_type, packet_feature_log_id,
+                       applied_to_score, processing_reason, score_delta, processed_at
                 FROM detection_events
                 WHERE dedupe_key LIKE 'packet_rule:%'
                    OR dedupe_key LIKE 'packet_if:%'
@@ -1965,20 +1974,27 @@ def test_packet_rule_and_if_share_ready_session_and_reach_trust_once(
                 """
             )
         ).mappings().all()
-        assert len(events) == 2
-        packet_if_event, packet_rule_event = events
+        assert len(events) == (2 if packet_count == 980 else 1)
+        packet_if_event = events[0]
         assert packet_if_event["dedupe_key"].startswith(
             f"packet_if:packet_feature_logs:{packet_feature_id}:"
             "AI_PACKET_ANOMALY:"
         )
         assert packet_if_event["event_type"] == "AI_PACKET_ANOMALY"
         assert packet_if_event["packet_feature_log_id"] == packet_feature_id
-        assert packet_rule_event["dedupe_key"].startswith(
-            f"packet_rule:packet_feature_logs:{packet_feature_id}:"
-            "PACKET_RATE_ANOMALY:"
-        )
-        assert packet_rule_event["event_type"] == "PACKET_RATE_ANOMALY"
-        assert packet_rule_event["packet_feature_log_id"] == packet_feature_id
+        assert packet_if_event["processed_at"] is not None
+        if ai_mode == "observe":
+            assert packet_if_event["processing_reason"] == "AI_OBSERVATION_ONLY"
+            assert packet_if_event["applied_to_score"] == 0
+            assert packet_if_event["score_delta"] == 0
+        if packet_count == 980:
+            packet_rule_event = events[1]
+            assert packet_rule_event["dedupe_key"].startswith(
+                f"packet_rule:packet_feature_logs:{packet_feature_id}:"
+                "PACKET_RATE_ANOMALY:"
+            )
+            assert packet_rule_event["event_type"] == "PACKET_RATE_ANOMALY"
+            assert packet_rule_event["packet_feature_log_id"] == packet_feature_id
         assert _completed(
             db,
             PACKET_RULE,
@@ -1994,11 +2010,12 @@ def test_packet_rule_and_if_share_ready_session_and_reach_trust_once(
             TRUST_DETECTOR_NAME,
             TRUST_SOURCE_TABLE,
         ) == BASE + timedelta(seconds=10)
-        assert _scalar(db, "SELECT COUNT(*) FROM trust_score_history") == 1
+        expected_score = 80 if packet_count == 980 else (85 if ai_mode == "enforce" else 100)
+        assert _scalar(db, "SELECT COUNT(*) FROM trust_score_history") == int(expected_score < 100)
         assert _scalar(
             db,
             f"SELECT trust_score FROM devices WHERE device_id = '{DEVICE_ID}'",
-        ) == 80
+        ) == expected_score
 
 
 def test_producer_and_orchestrator_checkpoints_stay_consistent(SessionLocal, registry):

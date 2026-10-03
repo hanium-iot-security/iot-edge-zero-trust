@@ -2,6 +2,10 @@
 
 모든 API 경로는 `/api` prefix를 사용합니다. 백엔드는 SQLite를 조회해 대시보드용 JSON을 반환합니다. 탐지와 Trust Score 판단은 `edge/`에 둡니다.
 
+Phase 8에서 추가할 기기 등록·정책 API의 구현 계약과 가상 응답은
+[기기 정책 v1 계약](contracts/device-policy-v1.md)을 참고합니다.
+해당 신규 경로는 아직 구현 전이며 아래 기존 엔드포인트와 구분합니다.
+
 ## 엔드포인트
 
 ```txt
@@ -203,6 +207,16 @@ evidence_json -> evidence object
 ```
 
 Input validation errors return `422`. Stored JSON or timestamp conversion errors return `500`; malformed stored rows are server data errors, not user request errors.
+
+AI 관찰 완료 이벤트는 기존 응답 형식으로 `processing_reason=AI_OBSERVATION_ONLY`,
+`processed_at`, `applied_to_score=0`, `score_delta=0`을 반환합니다. 처리 사유는 자유 문자열이며
+같은 값으로 필터링할 수 있습니다. `evidence.trust_decision`에는 `ai_mode=observe`,
+`policy_version=trust-ai-observation-v1`, 원래 저장값 `original_score_delta`, 공통 정책의
+`policy_score_delta`, `actual_delta=0`, 처리 cutoff인 `processed_at`을 보존합니다.
+Event 최상위 `policy_version`은 탐지 정책 버전으로 유지합니다. 이미 관찰 완료한 이벤트는
+모드 전환 후에도 재감점하지 않습니다. `applied_to_score=0`은 처리 완료된 관찰·제외도
+포함하므로 미처리 건수로 해석하지 않습니다. 자세한 적용 절차는
+[AI 관찰 모드 운영 가이드](ai-observation-mode-runbook.md)를 참고합니다.
 
 ## Trust Score History
 
@@ -429,6 +443,10 @@ Preflight는 읽기 전용이며 Recovery artifact나 backup을 생성하지 않
 `can_execute=false`로 실패 폐쇄합니다. Backend가 새 subprocess/iptables 조회 계층을
 만들어 PASS로 추정하지 않습니다.
 
+설정된 Runtime Snapshot도 TTL뿐 아니라 마지막 차단·해제 동작 이후의 관측인지
+확인합니다. 대상 Device 또는 같은 IP의 Firewall 시도·적용·해제·Release 처리와
+동일한 초이거나 더 오래된 관측은 `UNAVAILABLE`/`HOLD`입니다.
+
 Response:
 
 ```json
@@ -487,6 +505,12 @@ Execute는 승인·인증 후 preflight를 즉시 다시 수행합니다. 통과
 `409`와 `DENIED` 또는 `HOLD` audit payload를 반환하고 baseline recovery core를
 호출하지 않습니다. 성공 조건에서는 기존 baseline recovery core가 SQLite Backup API,
 SHA256, integrity check, foreign key check, 조건부 UPDATE를 수행합니다.
+
+Core는 Firewall Worker와 같은 잠금을 먼저 얻고 DB 쓰기 잠금을 획득한 뒤 Runtime
+Snapshot을 재검증합니다. Backup 전과 Commit 직전에 모두 검증하므로 사전검사 통과
+후 새 차단 시도가 생기거나 Snapshot이 만료되면 `409`/`HOLD`로 보류하며 점수·상태
+변경을 Rollback합니다. 이때 응답과 Audit의 `firewall_release_status`는
+`NOT_VERIFIED`입니다. 같은 Core를 사용하는 CLI에도 이 검사가 적용됩니다.
 
 성공 Response:
 
