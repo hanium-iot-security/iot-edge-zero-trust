@@ -9,11 +9,19 @@ import sys
 if __package__ in (None, ""):
     sys.path.append(str(Path(__file__).resolve().parents[2]))
 
-from edge.trust.trust_score_service import DB_PATH, update_trust_scores
+from edge.trust.trust_score_service import (
+    DB_PATH,
+    LegacyTrustPathBlockedError,
+    update_trust_scores,
+)
 
 
-def main() -> None:
-    result = update_trust_scores(DB_PATH)
+def main() -> int:
+    try:
+        result = update_trust_scores(DB_PATH)
+    except LegacyTrustPathBlockedError as exc:
+        print(f"Trust Score update refused: {exc}", file=sys.stderr)
+        return 2
 
     print(f"Trust Score update complete: {DB_PATH}")
     print(f"Candidate events: {result.candidate_event_count}")
@@ -27,7 +35,7 @@ def main() -> None:
 
     if not result.changes:
         print("No Trust Score changes.")
-        return
+        return 0
 
     print("Changes:")
     for change in result.changes:
@@ -42,7 +50,8 @@ def main() -> None:
             f"score_delta={change.score_delta}"
             f"{isolation_note}"
         )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

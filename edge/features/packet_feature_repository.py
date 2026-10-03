@@ -8,7 +8,9 @@ from typing import Any
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
+from edge.detection.phase4_time import parse_db_utc
 from edge.packet.pcap_naming import format_utc_iso
+from edge.policy.repository import load_policy_resolver
 
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 RECONCILIATION_STATUS_BATCH_SIZE = 500
@@ -169,8 +171,15 @@ def insert_packet_feature_rows(
     capture_scope: str,
 ) -> int:
     inserted_count = 0
+    resolver = load_policy_resolver(db)
     for row in feature_rows:
-        device_id = ip_device_map.get(row["peer_ip"])
+        device_id = (
+            resolver.device_id_for_ip(
+                str(row["peer_ip"]),
+                parse_db_utc(row["window_start"], "window_start"),
+            )
+            if resolver is not None else ip_device_map.get(row["peer_ip"])
+        )
         # ON CONFLICT DO NOTHING only ignores duplicate feature keys.
         # NOT NULL/CHECK failures still propagate so the caller can rollback.
         result = db.execute(

@@ -138,7 +138,7 @@ python -m edge.features.run_mqtt_feature_builder --loop
 ```bash
 python -m attacks.malformed_payload_attack --device_id esp32_02 --count 5 --interval 1.5
 sleep 15
-python -m edge.detection.run_rule_detector
+python -m edge.orchestration.run_detection_orchestrator --once
 ```
 
 확인 SQL:
@@ -159,7 +159,7 @@ LIMIT 10;
 ```bash
 python -m attacks.abnormal_topic_attack --device_id esp32_02 --count 5 --interval 1.5
 sleep 15
-python -m edge.detection.run_rule_detector
+python -m edge.orchestration.run_detection_orchestrator --once
 ```
 
 확인 SQL:
@@ -180,7 +180,7 @@ LIMIT 10;
 ```bash
 python -m attacks.device_id_mismatch_attack --count 4 --interval 2.0
 sleep 3
-python -m edge.detection.run_rule_detector
+python -m edge.orchestration.run_detection_orchestrator --once
 ```
 
 확인 SQL:
@@ -213,7 +213,7 @@ Flooding 공격을 실행하고 AI detector를 실행한다.
 ```bash
 python -m attacks.flooding_attack --count 30 --interval 0.2
 sleep 15
-python -m edge.detection.run_ai_detector
+python -m edge.orchestration.run_detection_orchestrator --once
 ```
 
 확인 SQL:
@@ -234,7 +234,7 @@ LIMIT 10;
 Trust Score update를 실행한다.
 
 ```bash
-python -m edge.trust.run_trust_score_update
+python -m edge.orchestration.run_detection_orchestrator --once
 ```
 
 기기 상태를 확인한다.

@@ -70,6 +70,7 @@ from edge.trust.trust_score_v2 import (
     apply_trust_score_v2_until,
     resolve_ai_mode,
 )
+from edge.trust.run_firewall_worker import firewall_lock_path
 
 logger = logging.getLogger(__name__)
 
@@ -201,7 +202,10 @@ def earliest_source_window_start(db: Session) -> datetime | None:
 
     mqtt_received = db.execute(text("SELECT MIN(received_at) FROM mqtt_logs")).scalar()
     if mqtt_received is not None:
-        candidates.append(floor_window_start(parse_db_utc(mqtt_received, "received_at")))
+        received = parse_db_utc(
+            mqtt_received, "received_at", allow_subseconds=True
+        )
+        candidates.append(floor_window_start(received.replace(microsecond=0)))
 
     return min(candidates) if candidates else None
 
@@ -657,17 +661,23 @@ def run_orchestration_cycle(
 
     trust_result: TrustScoreV2RunResult | None = None
     if trust_completed is None or trust_completed < cutoff:
-        db = session_factory()
-        try:
-            with db.begin():
-                trust_result = apply_trust_score_v2_until(
-                    db,
-                    cycle_range_start=range_start,
-                    cycle_cutoff=cutoff,
-                    ai_mode=ai_mode,
-                )
-        finally:
-            db.close()
+        # The Worker uses this same absolute file lock before touching the DB
+        # or iptables.  Acquire it before BEGIN IMMEDIATE in Trust v2.
+        with single_instance_lock(
+            firewall_lock_path(),
+            wait_seconds=settings.firewall_lock_wait_seconds,
+        ):
+            db = session_factory()
+            try:
+                with db.begin():
+                    trust_result = apply_trust_score_v2_until(
+                        db,
+                        cycle_range_start=range_start,
+                        cycle_cutoff=cutoff,
+                        ai_mode=ai_mode,
+                    )
+            finally:
+                db.close()
 
     with session_factory() as db:
         ensure_checkpoint_completed(

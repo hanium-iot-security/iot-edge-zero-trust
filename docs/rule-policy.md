@@ -34,6 +34,5 @@
 탐지 실행:
 
 ```bash
-python -m edge.detection.run_rule_detector
-python -m edge.detection.run_ai_detector
+python -m edge.orchestration.run_detection_orchestrator --once
 ```

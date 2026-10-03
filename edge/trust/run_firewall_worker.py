@@ -99,12 +99,12 @@ def _now() -> datetime:
 def firewall_lock_path(app_settings: Settings = settings) -> Path:
     """DB 상태와 실제 iptables를 함께 바꾸는 작업이 공유하는 Lock 경로입니다."""
     if app_settings.firewall_lock_path.strip():
-        return Path(app_settings.firewall_lock_path.strip())
+        return Path(app_settings.firewall_lock_path.strip()).expanduser().resolve()
     return resolve_lock_path(
         app_settings.database_url,
         suffix=".firewall.lock",
         fallback="data/firewall-worker.lock",
-    )
+    ).expanduser().resolve()
 
 
 def run_worker_cycle(

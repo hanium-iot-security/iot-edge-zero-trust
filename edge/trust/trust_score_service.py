@@ -21,6 +21,10 @@ ISOLATION_ACTION = "ISOLATED"
 ISOLATION_REASON = "Trust Score below threshold"
 
 
+class LegacyTrustPathBlockedError(RuntimeError):
+    """The MVP Trust writer cannot safely process a Phase 4/v2 database."""
+
+
 @dataclass(frozen=True)
 class TrustScoreChange:
     event_id: int
@@ -49,7 +53,6 @@ def connect_database(db_path: str | Path = DB_PATH) -> sqlite3.Connection:
     connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON;")
-    connection.execute("PRAGMA journal_mode=WAL;")
     connection.execute("PRAGMA busy_timeout = 5000;")
     return connection
 
@@ -59,9 +62,11 @@ def update_trust_scores(db_path: str | Path = DB_PATH) -> TrustScoreUpdateResult
         raise RuntimeError("AI observation mode requires the v2 detection orchestrator; legacy Trust is blocked")
     connection = connect_database(db_path)
     try:
-        # Serialize the observation guard with all writes; a separate v2 process
-        # must not commit an observation between our check and legacy update.
+        # Hold the write reservation through the schema check and all later writes.
+        # This also prevents a concurrent cutover from racing the legacy writer.
         connection.execute("BEGIN IMMEDIATE")
+        _reject_phase4_trust_database(connection)
+        # The observation guard shares this reservation with the v2 writer.
         columns = {row[1] for row in connection.execute("PRAGMA table_info(detection_events)")}
         if "processing_reason" in columns and connection.execute(
             "SELECT 1 FROM detection_events WHERE processing_reason = 'AI_OBSERVATION_ONLY' LIMIT 1"
@@ -96,6 +101,31 @@ def update_trust_scores(db_path: str | Path = DB_PATH) -> TrustScoreUpdateResult
         raise
     finally:
         connection.close()
+
+
+def _reject_phase4_trust_database(connection: sqlite3.Connection) -> None:
+    """Reject the v2 schema even before its first checkpoint or policy revision."""
+    tables = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    event_columns = (
+        {row[1] for row in connection.execute("PRAGMA table_info(detection_events)")}
+        if "detection_events" in tables
+        else set()
+    )
+    if (
+        {"processed_at", "analysis_window_start", "analysis_window_end"}
+        & event_columns
+        or "trust_score_history" in tables
+        or "detector_checkpoints" in tables
+    ):
+        raise LegacyTrustPathBlockedError(
+            "Legacy Trust writer is disabled for Phase 4/v2 databases; "
+            "run edge.orchestration.run_detection_orchestrator instead"
+        )
 
 
 def _fetch_candidate_events(connection: sqlite3.Connection) -> list[sqlite3.Row]:

@@ -262,6 +262,7 @@ def test_cycle_without_reconcile_skips_rule_listing(SessionLocal, policy):
 def test_lock_path_defaults_next_to_database_file():
     path = firewall_lock_path()
     assert path.name.endswith(".firewall.lock")
+    assert path.is_absolute()
 
 
 def test_loop_rejects_invalid_max_cycles(SessionLocal, policy):

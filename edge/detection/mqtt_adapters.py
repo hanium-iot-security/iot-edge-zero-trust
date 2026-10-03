@@ -22,10 +22,14 @@ from edge.detection.phase4_time import (
 from edge.detection.rule_detector import (
     DETECTOR_AI,
     DETECTOR_RULE,
+    LARGE_PAYLOAD_BYTES,
+    PUBLISH_COUNT_THRESHOLD,
     detect_feature_rules,
     detect_mqtt_rules,
 )
-from edge.trust.trust_policy import incident_family_for_event
+from edge.policy.repository import load_policy_resolver
+from edge.policy.resolver import DevicePolicyRevision, POLICY_AVAILABLE
+from edge.trust.trust_policy import POLICY_UNAVAILABLE, incident_family_for_event
 
 
 MQTT_FEATURE_RULE_POLICY_VERSION = "mqtt-feature-rule-v1"
@@ -51,6 +55,7 @@ class MqttFeatureRuleStage:
         )
         before = _checkpoint_before(db, self.detector_name, self.source_table)
         device_ips = _registered_device_ips(db)
+        resolver = load_policy_resolver(db)
         rows = _select_feature_rows(
             db,
             range_start=range_start,
@@ -63,7 +68,49 @@ class MqttFeatureRuleStage:
             source_id = int(row["id"])
             last_processed_after = _max_optional_id(last_processed_after, source_id)
             feature_row = dict(row)
-            for event in detect_feature_rules(feature_row):
+            window_start = parse_db_utc(feature_row["window_start"], "window_start")
+            resolution = (
+                resolver.resolve(str(feature_row["device_id"]), window_start)
+                if resolver is not None else None
+            )
+            if resolution is not None and resolution.reason != POLICY_AVAILABLE:
+                written = write_detection_event(
+                    db,
+                    device_id=feature_row["device_id"],
+                    detector_name=self.detector_name,
+                    source_table=self.source_table,
+                    source_id=source_id,
+                    detector_type=DETECTOR_RULE,
+                    event_type=POLICY_UNAVAILABLE,
+                    severity="medium",
+                    description=f"Device policy resolution failed: {resolution.reason}",
+                    policy_version=self.policy_version,
+                    detected_at=cutoff,
+                    analysis_window_start=window_start,
+                    analysis_window_end=parse_db_utc(
+                        feature_row["window_end"], "window_end"
+                    ),
+                    subject_ip=(
+                        resolution.registration.ip_address
+                        if resolution.registration is not None else None
+                    ),
+                    evidence={
+                        "device_id": feature_row["device_id"],
+                        "window_start": format_db_utc(window_start),
+                        "reason": resolution.reason,
+                        "candidate_score_delta": 0,
+                    },
+                    feature_log_id=source_id,
+                )
+                created_count += int(written.inserted)
+            device_policy = resolution.policy if resolution is not None else None
+            for event in detect_feature_rules(
+                feature_row,
+                device_policy,
+                include_policy_thresholds=(
+                    resolution is None or resolution.reason == POLICY_AVAILABLE
+                ),
+            ):
                 event_type = event["event_type"]
                 result = write_detection_event(
                     db,
@@ -84,7 +131,12 @@ class MqttFeatureRuleStage:
                         feature_row["window_end"], "window_end"
                     ),
                     incident_family=incident_family_for_event(event_type),
-                    subject_ip=device_ips.get(str(feature_row["device_id"])),
+                    subject_ip=(
+                        resolution.registration.ip_address
+                        if resolution is not None and resolution.registration is not None
+                        else device_ips.get(str(feature_row["device_id"])) if resolution is None
+                        else None
+                    ),
                     evidence=_feature_evidence(
                         detector_name=self.detector_name,
                         source_id=source_id,
@@ -93,6 +145,7 @@ class MqttFeatureRuleStage:
                         range_start=range_start,
                         cutoff=cutoff,
                         policy_version=self.policy_version,
+                        device_policy=device_policy,
                     ),
                     feature_log_id=source_id,
                 )
@@ -137,6 +190,7 @@ class MqttMessageRuleStage:
         )
         before = _checkpoint_before(db, self.detector_name, self.source_table)
         device_ips = _registered_device_ips(db)
+        resolver = load_policy_resolver(db)
         registered_devices = set(device_ips)
         rows = _select_mqtt_rows(
             db,
@@ -150,10 +204,16 @@ class MqttMessageRuleStage:
             source_id = int(row["id"])
             last_processed_after = _max_optional_id(last_processed_after, source_id)
             mqtt_row = dict(row)
-            received_at = parse_db_utc(mqtt_row["received_at"], "received_at")
-            window_start = floor_window_start(received_at)
+            received_at = parse_db_utc(
+                mqtt_row["received_at"], "received_at", allow_subseconds=True
+            )
+            window_start = floor_window_start(received_at.replace(microsecond=0))
             window_end = window_start + timedelta(seconds=WINDOW_SECONDS)
-            for event in detect_mqtt_rules(mqtt_row, registered_devices):
+            window_registered = (
+                resolver.registered_ids_at(window_start)
+                if resolver is not None else registered_devices
+            )
+            for event in detect_mqtt_rules(mqtt_row, window_registered):
                 event_type = event["event_type"]
                 result = write_detection_event(
                     db,
@@ -170,7 +230,11 @@ class MqttMessageRuleStage:
                     analysis_window_start=window_start,
                     analysis_window_end=window_end,
                     incident_family=incident_family_for_event(event_type),
-                    subject_ip=device_ips.get(str(event["device_id"])),
+                    subject_ip=(
+                        resolver.registration_at(str(event["device_id"]), window_start).ip_address
+                        if resolver is not None and event["device_id"] in window_registered
+                        else device_ips.get(str(event["device_id"])) if resolver is None else None
+                    ),
                     evidence={
                         "source_type": self.source_table,
                         "source_id": source_id,
@@ -183,6 +247,8 @@ class MqttMessageRuleStage:
                         "policy_version": self.policy_version,
                         "cycle_range_start": format_db_utc(range_start),
                         "cycle_cutoff": format_db_utc(cutoff),
+                        "window_start": format_db_utc(window_start),
+                        "candidate_device_id": mqtt_row.get("device_id"),
                     },
                     mqtt_log_id=source_id,
                 )
@@ -230,6 +296,7 @@ class MqttIsolationForestStage:
         )
         before = _checkpoint_before(db, self.detector_name, self.source_table)
         device_ips = _registered_device_ips(db)
+        resolver = load_policy_resolver(db)
         rows = _select_feature_rows(
             db,
             range_start=range_start,
@@ -242,6 +309,11 @@ class MqttIsolationForestStage:
             source_id = int(row["id"])
             last_processed_after = _max_optional_id(last_processed_after, source_id)
             feature_row = dict(row)
+            window_start = parse_db_utc(feature_row["window_start"], "window_start")
+            resolution = (
+                resolver.resolve(str(feature_row["device_id"]), window_start)
+                if resolver is not None else None
+            )
             result = predict_feature_window(feature_row, self.model_path)
             if not result["is_anomaly"]:
                 continue
@@ -265,7 +337,11 @@ class MqttIsolationForestStage:
                     feature_row["window_end"], "window_end"
                 ),
                 incident_family=incident_family_for_event(event_type),
-                subject_ip=device_ips.get(str(feature_row["device_id"])),
+                subject_ip=(
+                    resolution.registration.ip_address
+                    if resolution is not None and resolution.registration is not None
+                    else device_ips.get(str(feature_row["device_id"])) if resolver is None else None
+                ),
                 evidence={
                     "source_type": self.source_table,
                     "source_id": source_id,
@@ -278,6 +354,12 @@ class MqttIsolationForestStage:
                     "model_version": self.policy_version,
                     "cycle_range_start": format_db_utc(range_start),
                     "cycle_cutoff": format_db_utc(cutoff),
+                    "window_start": format_db_utc(window_start),
+                    "registration_status_at_window": (
+                        resolution.registration.status
+                        if resolution is not None and resolution.registration is not None
+                        else None
+                    ),
                 },
                 feature_log_id=source_id,
             )
@@ -384,10 +466,12 @@ def _select_mqtt_rows(
     rows = db.execute(
         text(
             """
-            SELECT id, device_id, topic, payload, received_at
+            SELECT id, device_id, topic, payload, received_at, is_json_valid
             FROM mqtt_logs
             WHERE unixepoch(received_at) >= unixepoch(:range_start)
-              AND unixepoch(received_at) < unixepoch(:cutoff)
+              -- Include SQLite's rounded boundary second; Python applies the
+              -- precise half-open interval to the original microsecond value.
+              AND unixepoch(received_at) <= unixepoch(:cutoff)
             ORDER BY id ASC
             """
         ),
@@ -396,7 +480,15 @@ def _select_mqtt_rows(
             "cutoff": format_db_utc(cutoff),
         },
     ).mappings()
-    return [dict(row) for row in rows]
+    selected = []
+    for row in rows:
+        source = dict(row)
+        received_at = parse_db_utc(
+            source["received_at"], "received_at", allow_subseconds=True
+        )
+        if range_start <= received_at < cutoff:
+            selected.append(source)
+    return selected
 
 
 def _registered_device_ips(db: Session) -> dict[str, str | None]:
@@ -440,12 +532,17 @@ def _feature_evidence(
     range_start: datetime,
     cutoff: datetime,
     policy_version: str,
+    device_policy: DevicePolicyRevision | None,
 ) -> dict[str, Any]:
+    publish_limit = (
+        device_policy.publish_count_max if device_policy else PUBLISH_COUNT_THRESHOLD
+    )
+    payload_limit = device_policy.payload_size_max if device_policy else LARGE_PAYLOAD_BYTES
     thresholds = {
         "ABNORMAL_PUBLISH_RATE": {
-            "publish_count": "> 15",
+            "publish_count": f"> {publish_limit}",
         },
-        "LARGE_PAYLOAD": {"max_payload_size": "> 5120"},
+        "LARGE_PAYLOAD": {"max_payload_size": f"> {payload_limit}"},
         "MALFORMED_PAYLOAD": {"malformed_payload_count": ">= 3"},
         "ABNORMAL_TOPIC": {"abnormal_topic_count": ">= 3"},
     }
@@ -462,6 +559,23 @@ def _feature_evidence(
         },
         "thresholds": thresholds.get(event_type, {}),
         "policy_version": policy_version,
+        "device_id": feature_row.get("device_id"),
+        "device_policy_revision": device_policy.revision if device_policy else None,
+        "window_start": feature_row.get("window_start"),
+        "observed_value": (
+            feature_row.get("publish_count") if event_type == "ABNORMAL_PUBLISH_RATE"
+            else feature_row.get("max_payload_size") if event_type == "LARGE_PAYLOAD"
+            else None
+        ),
+        "threshold": (
+            publish_limit if event_type == "ABNORMAL_PUBLISH_RATE"
+            else payload_limit if event_type == "LARGE_PAYLOAD"
+            else None
+        ),
+        "unit": (
+            "messages/10s" if event_type == "ABNORMAL_PUBLISH_RATE"
+            else "bytes" if event_type == "LARGE_PAYLOAD" else None
+        ),
         "cycle_range_start": format_db_utc(range_start),
         "cycle_cutoff": format_db_utc(cutoff),
     }

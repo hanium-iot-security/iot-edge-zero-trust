@@ -39,6 +39,7 @@ from edge.packet.capture_policy import (
     is_capture_eligible,
 )
 from edge.trust.trust_policy import AI_ONLY, AI_PACKET_ANOMALY
+from edge.policy.repository import load_policy_resolver
 
 
 logger = logging.getLogger(__name__)
@@ -203,13 +204,22 @@ class PacketIsolationForestStage:
             expected_capture_session_id=expected_capture_session_id,
         )
         _validate_single_capture_session(rows)
+        resolver = load_policy_resolver(db)
 
         eligible_rows: list[dict[str, Any]] = []
         eligible_source_rows: list[dict[str, Any]] = []
         exclusion_reasons: Counter[str] = Counter()
         last_processed_after = before["last_processed_id"]
 
-        for row in rows:
+        for source_row in rows:
+            row = dict(source_row)
+            if resolver is not None:
+                window_start = parse_db_utc(row["window_start"], "window_start")
+                owner = resolver.device_id_for_ip(str(row["peer_ip"]), window_start)
+                row["candidate_device_id"] = row["device_id"]
+                row["device_id"] = owner
+                row["registered_device_id"] = owner
+                row["registered_ip_address"] = row["peer_ip"] if owner else None
             source_id = int(row["id"])
             last_processed_after = _max_optional_id(
                 last_processed_after,
@@ -533,6 +543,9 @@ def _event_evidence(
         "capture_segment_id": int(row["capture_segment_id"]),
         "capture_session_id": str(row["session_id"]),
         "detector_name": PACKET_IF_DETECTOR_NAME,
+        "device_id": row["device_id"],
+        "candidate_device_id": row.get("candidate_device_id", row["device_id"]),
+        "window_start": row["window_start"],
         "observed_values": _prediction_row(row),
         "normalized_values": normalized_values,
         "capture_coverage_ratio": eligibility.coverage_ratio,

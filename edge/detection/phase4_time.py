@@ -28,7 +28,9 @@ def require_utc_window_boundary(value: datetime, field_name: str) -> datetime:
     return normalized
 
 
-def parse_db_utc(value: Any, field_name: str = "timestamp") -> datetime:
+def parse_db_utc(
+    value: Any, field_name: str = "timestamp", *, allow_subseconds: bool = False
+) -> datetime:
     if isinstance(value, datetime):
         parsed = value
     else:
@@ -42,7 +44,7 @@ def parse_db_utc(value: Any, field_name: str = "timestamp") -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     parsed = parsed.astimezone(timezone.utc)
-    if parsed.microsecond != 0:
+    if parsed.microsecond != 0 and not allow_subseconds:
         raise ValueError(f"{field_name} must use whole-second precision")
     return parsed
 

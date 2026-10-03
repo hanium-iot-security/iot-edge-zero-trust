@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.database import SessionLocal
 from edge.detection.detection_event_writer import insert_detection_event
+from edge.detection.legacy_guard import reject_v2_database
 from edge.detection.rule_detector import (
     ABNORMAL_PUBLISH_RATE,
     ABNORMAL_TOPIC,
@@ -41,6 +42,7 @@ def run_rule_detector(db: Session) -> dict[str, int]:
         {"feature_events": int, "mqtt_events": int} — 새로 저장된 이벤트 수
     """
     try:
+        reject_v2_database(db, "MVP Rule runner")
         registered = _load_registered_devices(db)
         feature_events = _process_feature_logs(db)
         mqtt_events = _process_mqtt_logs(db, registered)

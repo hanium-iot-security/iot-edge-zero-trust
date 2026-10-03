@@ -17,6 +17,10 @@ SCHEMA_PATH = Path("db/migrations/001_init.sql")
 
 
 def ensure_schema() -> None:
+    # Some runtime tests migrate this temporary global DB to v2.  Each MVP
+    # fixture must start from 001 so a later test cannot inherit that schema.
+    engine.dispose()
+    TEST_DB_PATH.unlink(missing_ok=True)
     raw_connection = engine.raw_connection()
     try:
         raw_connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))

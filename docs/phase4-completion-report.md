@@ -44,7 +44,7 @@ ESP32 #1·#2
 
 Trust Score v2는 별도의 `trust-score.service`로 실행하지 않습니다. Phase 4 운영 경로에서는 `detection-orchestrator.service`가 `edge.orchestration.run_detection_orchestrator --loop`를 실행하고, 탐지 Stage 완료 후 Trust Score v2까지 같은 Cycle 안에서 처리합니다.
 
-수동 실행용 `edge.trust.run_trust_score_update`는 저장소에 존재하지만 Phase 4 상시 운영 Runtime으로 사용하지 않습니다. Orchestrator와 수동 Trust Runner를 동시에 실행하지 않습니다.
+수동 실행용 `edge.trust.run_trust_score_update`는 Phase 4/v2 DB에서 명시적으로 거부됩니다. Trust 갱신은 `edge.orchestration.run_detection_orchestrator --once` 경로를 사용합니다.
 
 ## 4. 상시 Runtime 서비스
 

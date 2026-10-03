@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from ipaddress import ip_address
 import logging
@@ -28,13 +28,16 @@ from edge.detection.detection_event_writer import write_detection_event
 from edge.detection.detector_contract import DetectorRunResult, validate_cycle_window
 from edge.detection.phase4_time import format_db_utc, parse_db_utc
 from edge.detection.rule_detector import DETECTOR_RULE
+from edge.policy.repository import load_policy_resolver
+from edge.policy.resolver import DevicePolicyRevision
+from edge.policy.resolver import POLICY_AVAILABLE
 from edge.packet.capture_policy import (
     CaptureEligibilityResult,
     CaptureEligibilitySegment,
     CapturePolicy,
     is_capture_eligible,
 )
-from edge.trust.trust_policy import BROKER_DOS_SUSPECTED, BYTE_RATE_ANOMALY, PACKET_RATE_ANOMALY, PORT_SCAN
+from edge.trust.trust_policy import BROKER_DOS_SUSPECTED, BYTE_RATE_ANOMALY, PACKET_RATE_ANOMALY, POLICY_UNAVAILABLE, PORT_SCAN
 
 
 logger = logging.getLogger(__name__)
@@ -183,6 +186,8 @@ def effective_bytes_per_second(total_bytes: float, captured_duration_seconds: fl
 def detect_packet_rules(
     row: dict[str, Any],
     policy: PacketRulePolicy = DEFAULT_PACKET_RULE_POLICY,
+    device_policy: DevicePolicyRevision | None = None,
+    include_rate_rules: bool = True,
 ) -> list[dict[str, Any]]:
     """packet_feature_logs row(+captured_duration_seconds)에서 Rule 이벤트 목록을 반환합니다.
 
@@ -193,6 +198,12 @@ def detect_packet_rules(
     판정하지 않는다 (Phase 4 Required Rule에서는 비활성화한다).
     """
     peer_ip = str(row.get("peer_ip") or "")
+    if device_policy is not None:
+        policy = replace(
+            policy,
+            packet_rate_threshold=device_policy.packet_rate_max,
+            byte_rate_threshold=device_policy.byte_rate_max,
+        )
     if peer_ip in policy.excluded_peer_ips:
         return []
 
@@ -200,7 +211,7 @@ def detect_packet_rules(
     duration = float(row["captured_duration_seconds"])
 
     packets_per_second = effective_packets_per_second(float(row["packet_count"]), duration)
-    if packets_per_second > policy.packet_rate_threshold:
+    if include_rate_rules and packets_per_second > policy.packet_rate_threshold:
         events.append(
             {
                 "event_type": PACKET_RATE_ANOMALY,
@@ -211,7 +222,7 @@ def detect_packet_rules(
         )
 
     bytes_per_second = effective_bytes_per_second(float(row["total_bytes"]), duration)
-    if bytes_per_second > policy.byte_rate_threshold:
+    if include_rate_rules and bytes_per_second > policy.byte_rate_threshold:
         events.append(
             {
                 "event_type": BYTE_RATE_ANOMALY,
@@ -335,6 +346,7 @@ class PacketRuleDetectorStage:
             expected_capture_session_id=expected_capture_session_id,
         )
         _validate_single_capture_session(rows)
+        resolver = load_policy_resolver(db)
 
         created_count = 0
         last_processed_after = before["last_processed_id"]
@@ -352,12 +364,60 @@ class PacketRuleDetectorStage:
 
             window_start = parse_db_utc(row["window_start"], "window_start")
             window_end = parse_db_utc(row["window_end"], "window_end")
+            attributed_device_id = (
+                resolver.device_id_for_ip(str(row["peer_ip"]), window_start)
+                if resolver is not None else row["device_id"]
+            )
+            resolution = (
+                resolver.resolve(attributed_device_id, window_start)
+                if resolver is not None and attributed_device_id is not None else None
+            )
+            device_policy = resolution.policy if resolution is not None else None
+            effective_policy = (
+                replace(
+                    self.rule_policy,
+                    packet_rate_threshold=device_policy.packet_rate_max,
+                    byte_rate_threshold=device_policy.byte_rate_max,
+                )
+                if device_policy is not None else self.rule_policy
+            )
+            if resolution is not None and resolution.reason != POLICY_AVAILABLE:
+                audit = write_detection_event(
+                    db,
+                    device_id=attributed_device_id,
+                    detector_name=self.detector_name,
+                    source_table=self.source_table,
+                    source_id=source_id,
+                    detector_type=DETECTOR_RULE,
+                    event_type=POLICY_UNAVAILABLE,
+                    severity="medium",
+                    description=f"Device policy resolution failed: {resolution.reason}",
+                    policy_version=self.rule_policy.version,
+                    detected_at=cutoff,
+                    analysis_window_start=window_start,
+                    analysis_window_end=window_end,
+                    subject_ip=str(row["peer_ip"]),
+                    evidence={
+                        "device_id": attributed_device_id,
+                        "candidate_device_id": row["device_id"],
+                        "window_start": format_db_utc(window_start),
+                        "reason": resolution.reason,
+                        "candidate_score_delta": 0,
+                    },
+                    packet_feature_log_id=source_id,
+                )
+                created_count += int(audit.inserted)
 
-            for event in detect_packet_rules(row, self.rule_policy):
+            for event in detect_packet_rules(
+                row, effective_policy,
+                include_rate_rules=(
+                    resolution is None or resolution.reason == POLICY_AVAILABLE
+                ),
+            ):
                 # 미매핑 IP는 Event만 저장하고 점수·격리를 변경하지 않는다. device_id가 없어도 Event는 그대로 저장한다.
                 written = write_detection_event(
                     db,
-                    device_id=row["device_id"],
+                    device_id=attributed_device_id,
                     detector_name=self.detector_name,
                     source_table=self.source_table,
                     source_id=source_id,
@@ -378,7 +438,9 @@ class PacketRuleDetectorStage:
                         event=event,
                         eligibility=eligibility,
                         capture_policy=self.capture_policy,
-                        rule_policy=self.rule_policy,
+                        rule_policy=effective_policy,
+                        device_policy=device_policy,
+                        attributed_device_id=attributed_device_id,
                         range_start=range_start,
                         cutoff=cutoff,
                     ),
@@ -590,6 +652,8 @@ def _event_evidence(
     eligibility: CaptureEligibilityResult,
     capture_policy: CapturePolicy,
     rule_policy: PacketRulePolicy,
+    device_policy: DevicePolicyRevision | None,
+    attributed_device_id: str | None,
     range_start: datetime,
     cutoff: datetime,
 ) -> dict[str, Any]:
@@ -599,8 +663,17 @@ def _event_evidence(
         "capture_segment_id": int(row["capture_segment_id"]),
         "capture_session_id": str(row["session_id"]),
         "detector_name": PACKET_RULE_DETECTOR_NAME,
+        "device_id": attributed_device_id,
+        "candidate_device_id": row["device_id"],
+        "device_policy_revision": device_policy.revision if device_policy else None,
+        "window_start": row["window_start"],
         "observed_value": event["observed_value"],
         "threshold": event["threshold"],
+        "unit": (
+            "packets/second" if event["event_type"] == PACKET_RATE_ANOMALY
+            else "bytes/second" if event["event_type"] == BYTE_RATE_ANOMALY
+            else None
+        ),
         "raw_counts": {
             "packet_count": row["packet_count"],
             "total_bytes": row["total_bytes"],
