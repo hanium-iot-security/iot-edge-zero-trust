@@ -264,8 +264,7 @@
               "publish_count_max"
             ],
             "type": "int_type",
-            "msg": "Input should be a valid integer",
-            "input": "15"
+            "msg": "Input should be a valid integer"
           }
         ]
       }

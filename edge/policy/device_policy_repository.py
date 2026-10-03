@@ -26,6 +26,7 @@ from edge.policy.device_policy import (
     DeviceIpConflictError,
     DeviceNotFoundError,
     DevicePolicy,
+    DevicePolicyValidationError,
     IpRegistrationPolicy,
     NoPolicyChangeError,
     PendingRevisionExistsError,
@@ -37,6 +38,7 @@ from edge.policy.device_policy import (
     format_utc_millis,
     format_utc_seconds,
     next_effective_boundary,
+    parse_effective_from,
     require_aware,
     utc_now,
     validate_actor,
@@ -252,13 +254,34 @@ def get_policy_snapshot(
     latest = get_latest_revision(connection, device_id)
     if latest is None:
         raise PolicyUnavailableError(f"Device {device_id!r} has no policy revision")
-    return PolicySnapshot(
+    first = _fetch_revision(connection, "device_id = ? AND revision = 1", (device_id,))
+    registered_from = connection.execute(
+        "SELECT registration_effective_from FROM devices WHERE device_id = ?", (device_id,)
+    ).fetchone()[0]
+    snapshot = PolicySnapshot(
         device_id=device_id,
         server_time=format_utc_millis(now),
         latest_revision=latest.revision,
         current=get_revision_effective_at(connection, device_id, now),
         pending=get_pending_revision(connection, device_id, now),
     )
+    try:
+        if first is None:
+            raise ValueError("Initial policy revision is missing")
+        for revision in (first, latest, snapshot.current, snapshot.pending):
+            if revision is not None:
+                validate_policy(revision.policy)
+                validate_registration_state(revision.registration_state)
+                parse_effective_from(revision.effective_from)
+                validate_revision_number(revision.revision)
+        # NULL is intentionally preserved for identities registered before 007.
+        if registered_from is not None:
+            parse_effective_from(registered_from, "registration_effective_from")
+            if registered_from != first.effective_from:
+                raise ValueError("Registration and initial policy boundaries disagree")
+    except (DevicePolicyValidationError, ValueError, TypeError) as exc:
+        raise PolicyUnavailableError(f"Device {device_id!r} has invalid policy state") from exc
+    return snapshot
 
 
 def diagnose_device_ip_conflicts(connection: sqlite3.Connection) -> dict[str, list[Any]]:
@@ -492,12 +515,13 @@ def append_policy_revision(
         now = require_aware(clock(), "clock()")
         if not device_exists(connection, device_id):
             raise DeviceNotFoundError(f"Device {device_id!r} is not registered")
-        latest = get_latest_revision(connection, device_id)
+        # Validate existing metadata and policy inside the write transaction,
+        # before inserting anything or returning an error after a commit.
+        snapshot = get_policy_snapshot(connection, device_id, server_time=now)
+        current, pending = snapshot.current, snapshot.pending
+        latest = pending if pending is not None else current
         if latest is None:
-            raise PolicyUnavailableError(f"Device {device_id!r} has no policy revision")
-
-        current = get_revision_effective_at(connection, device_id, now)
-        pending = get_pending_revision(connection, device_id, now)
+            raise PolicyUnavailableError(f"Device {device_id!r} has no effective or pending policy")
         current_number = current.revision if current is not None else None
         pending_number = pending.revision if pending is not None else None
 

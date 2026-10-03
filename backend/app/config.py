@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     recovery_admin_api_key: str = ""
     recovery_admin_principal: str = "recovery-admin"
     recovery_artifact_dir: str = "data/recovery/baseline"
+    # Empty/invalid LAN configuration keeps device-policy writes unavailable.
+    device_registration_cidr: str = ""
 
     # MQTT Feature Producer
     mqtt_feature_builder_interval_seconds: float = 5.0

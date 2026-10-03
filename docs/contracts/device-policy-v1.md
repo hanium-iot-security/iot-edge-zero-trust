@@ -2,9 +2,15 @@
 
 작성: 2026-10-01 / 작업: P8-02 / 기준: develop `c8ea2bc` (PR #82).
 
-이 문서는 P8-03~07의 구현 기준이다. **신규 API·DB·UI가 이미 구현됐다는 뜻은 아니다.**
+이 문서는 P8-03~07의 구현 기준이다. 계약 확정과 각 기능의 구현·배포 완료는 구분한다.
 기존 조회 API는 `docs/api-spec.md`를 따른다. 팀원 검토 결과로 계약을 바꾸면 이 문서와
 예시를 함께 수정하고 변경 내용을 공유한다. 전원 검토 완료 여부는 별도로 기록한다.
+
+P8-04 Backend 등록·정책 API는 `backend/app/routers/devices.py`와
+`backend/app/services/device_policy_service.py`에서 구현하며, P8-03의 공통 저장소와
+Migration 007을 사용한다. 로컬 API 검증은 Pi 운영 배포·P8-05/06 Rule·Trust 연결·
+P8-07 화면 구현 완료를 대신하지 않는다. 운영 활성화 순서는
+[기기 정책 API 운영 확인](../device-policy-api-runbook.md)을 따른다.
 
 ## 1. 담당 접점과 구현 순서
 
@@ -107,13 +113,15 @@ Devices 요약은 현재 페이지, Dashboard 요약은 전체라는 기존 범�
 | 422 | FastAPI 필드 검증: 자료형·범위·미지원 필드·ID/IP·허용 LAN 등 |
 
 신규 업무 오류는 `detail: {code,message,...}`로 반환한다. revision 충돌은
-current_revision/pending_revision도 제공한다. 기존 인증 오류 문자열과 기존 GET 404
+current_revision/pending_revision/latest_revision도 제공한다. 기존 인증 오류 문자열과 기존 GET 404
 문자열은 변경하지 않는다. 프론트는 문자열·업무 오류 객체·422 배열을 각각 처리한다.
 현재 API helper의 `error.code`는 Axios 코드이므로 업무 코드는
 `error.responseData?.detail?.code`에서 읽는다.
 충돌 시 재조회하되 작성 중 값은 보존하고 자동 재전송하지 않는다. 네트워크 오류로
 결과가 불명확하면 조회로 등록/최신 revision을 확인한 뒤 재시도한다.
 
+422 배열은 `type`, `loc`, `msg`만 반환하며 입력 원문을 포함하지 않는다.
+정책 GET은 관리자 키를 요구하지 않는 기존 읽기 경로다.
 관리자 변경 요청은 기존 `X-Recovery-Admin-Key` 인증을 사용한다. 키는 메모리에서만
 유지하고 모달 종료/기기 전환 시 폐기한다. 로컬 개발은 브라우저가 접속하는 API까지
 loopback이어야 하며, Pi API는 검증된 SSH 포워딩 loopback 또는 HTTPS 경로를 사용한다.
@@ -126,6 +134,9 @@ loopback이어야 하며, Pi API는 검증된 SSH 포워딩 loopback 또는 HTTP
   UTC 10초 경계다. 00:00:09.900 → 00:00:10Z, 정확히 00:00:10Z → 00:00:20Z.
 - 모든 새 정책 시각은 UTC `YYYY-MM-DDTHH:MM:SSZ`. 입력으로 과거 효력 시점을 받지 않는다.
   효력 시각은 정수 초 10초 배수. created_at/server_time도 UTC Z이며 소수 초를 허용한다.
+- POST 응답의 server_time과 current/pending은 쓰기 잠금 후 결정한 접수 시각을 기준으로
+  반환한다. GET은 조회 시각 기준이다. 응답이 효력 경계를 지나 도착할 수도 있으므로,
+  저장 후와 효력 시점 이후에는 GET으로 재조회하며 클라이언트 시각으로 상태를 확정하지 않는다.
 - `window_start <= t < window_end`로 원본 시각을 10초 Window에 귀속한다.
   당시 `effective_from <= window_start`인 최신 revision을 선택한다.
   처리 시각·현재 설정·최신 등록 집합으로 과거를 다시 해석하지 않는다.
@@ -184,6 +195,7 @@ DISABLED 또는 비활성화 예정이면 제외한다. `processed_at`, `applied
 
 비활성화는 대상 device_id **또는 같은 고정 source_ip**의 APPLIED/PENDING 차단,
 PENDING 해제 요청, 불확실한 Runtime 상태가 있으면 409로 보류한다.
+같은 기기의 차단 이력이 다른 IP를 사용하면 현재 IP의 관측만으로 비활성화하지 않는다.
 FAILED라는 이유만으로 잔존 규칙이 없다고 가정하지 않는다. 마지막 변경 시도 이후의
 fresh 관측과 Worker 상호 배제가 필요하다. 기존 차단을 자동 해제하지 않는다.
 기존 관리자 해제·복구는 가능하되 등록 상태를 변경하거나 ACTIVE로 되돌리지 않는다.
@@ -208,7 +220,7 @@ Trust 점수·차단·이력은 변경하지 않는다. 과거 정책을 재구�
 
 기존 Rule 감점표·Incident Family 대표·10초 최대 −30·격리 `<30`·Rule 우선은 유지한다.
 FLOODING 대표는 일반 과다 전송 −20, Broker DoS가 있으면 −25가 될 수 있다.
-AI 관찰/감점 0·경고·재학습은 Phase 9다.
+AI 관찰 모드의 기존 운영 설정은 유지한다. AI 경고·감점 정책 평가와 재학습은 Phase 9에서 진행한다.
 
 검증은 노션 V01~V13/V16/V19~V22와 연결한다. 특히 다음을 공동 완료 기준으로 사용한다.
 
@@ -221,4 +233,4 @@ AI 관찰/감점 0·경고·재학습은 Phase 9다.
 - 별도 프로세스의 Worker·상태 변경·재시도 경합에서 교착·동시 성공·잔존 차단 위장 없음.
 
 P8-02 완료 자료는 이 문서·JSON 예시·담당 접점이다. P8-03~07 구현 완료나 팀원의 검토
-완료를 대신하지 않는다. 운영값·LAN·Pi 모델 활성 상태는 10/2 실장비 확인 사항이다.
+완료를 대신하지 않는다. 운영값·LAN·Pi 모델 활성 상태는 배포 시 실제 장비에서 확인한다.

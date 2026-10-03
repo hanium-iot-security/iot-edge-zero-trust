@@ -1,10 +1,9 @@
 # API 명세
 
-모든 API 경로는 `/api` prefix를 사용합니다. 백엔드는 SQLite를 조회해 대시보드용 JSON을 반환합니다. 탐지와 Trust Score 판단은 `edge/`에 둡니다.
+모든 API 경로는 `/api` prefix를 사용합니다. 백엔드는 SQLite 조회와 보호된 관리자 명령을 제공합니다. 탐지와 Trust Score 판단은 `edge/`에 둡니다.
 
-Phase 8에서 추가할 기기 등록·정책 API의 구현 계약과 가상 응답은
-[기기 정책 v1 계약](contracts/device-policy-v1.md)을 참고합니다.
-해당 신규 경로는 아직 구현 전이며 아래 기존 엔드포인트와 구분합니다.
+Phase 8 기기 등록·정책 API는 [기기 정책 v1 계약](contracts/device-policy-v1.md)을
+따릅니다. Backend 구현과 로컬 검증은 운영 Pi 배포·Rule/Trust·화면 연동 완료와 구분합니다.
 
 ## 엔드포인트
 
@@ -13,6 +12,9 @@ GET /api/health
 GET /api/dashboard/summary
 GET /api/devices
 GET /api/devices/{device_id}
+POST /api/devices
+GET /api/devices/{device_id}/policy
+POST /api/devices/{device_id}/policy-revisions
 GET /api/mqtt-logs
 GET /api/feature-logs
 GET /api/packet-feature-logs
@@ -30,6 +32,76 @@ POST /api/recovery/execute
 GET /api/recovery/history
 GET /api/recovery/history/{operation_id}
 ```
+
+## Device 등록·정책 APIs
+
+두 POST는 기존 `X-Recovery-Admin-Key` 관리자 인증을 사용합니다. 정책 GET은 기존
+Devices 조회와 동일한 읽기 경로이며 관리자 키를 요구하지 않습니다.
+
+| 경로 | 요청·응답 |
+| --- | --- |
+| `POST /api/devices` | `device_id`, `ip_address`, `device_type`, `mqtt_principal`, 완전한 `policy`, `reason` 입력. 201 `{device,policy}` 반환 |
+| `GET /api/devices/{device_id}/policy` | 200 `{device_id,server_time,latest_revision,current,pending}`. current/pending은 revision 객체 또는 null |
+| `POST /api/devices/{device_id}/policy-revisions` | `expected_revision`, `registration_state`, 완전한 `policy`, `reason` 입력. 201로 정책 GET과 같은 구조 반환 |
+
+`policy`의 여섯 필드는 `policy_profile`, `expected_publish_interval_seconds`,
+`publish_count_max`, `payload_size_max_bytes`, `packet_rate_max_pps`,
+`byte_rate_max_bytes_per_second`입니다. Publish Count는 10초당 메시지 수,
+Payload는 원본 바이트, Packet/Byte Rate는 유효 캡처 초당 수치입니다.
+센서 주기는 설명값이며 이 API가 센서 펌웨어를 변경하지 않습니다.
+정확한 자료형·상한과 요청 예시는 [공유 계약](contracts/device-policy-v1.md)과
+[JSON 예시](contracts/device-policy-v1.examples.json)를 따릅니다.
+
+신규 등록은 서버가 `PENDING`, revision 1, `iot/{device_id}/sensor` Topic과
+효력 시점을 생성합니다. 효력은 DB 쓰기 잠금 후 결정한 접수 시각의 **엄격히 다음 UTC
+10초 경계**입니다. 두 POST의 `server_time`과 current/pending은 이 접수 시각을 기준으로
+반환합니다. 응답 도착 전에 경계를 지났더라도 pending으로 표시될 수 있으므로,
+저장 후와 효력 경계 이후에는 GET으로 재조회합니다. GET은 조회 시각을 기준으로 반환합니다.
+
+상태는 PENDING→ACTIVE, PENDING/ACTIVE→DISABLED만 전환할 수 있습니다.
+DISABLED 재활성화·편집, 기기 삭제, ID/IP/type/principal 변경, 부분 PATCH는 지원하지
+않습니다. 적용 예정 revision이 있거나 값이 동일하면 409이며 자동 재전송하지 않습니다.
+Broker 계정·ACL 생성과 센서 설정은 별도 운영 작업입니다.
+
+기존 `GET /api/devices`의 `{items,total}` 및 Trust status 필터, 상세 DeviceItem의 기존
+필드는 유지합니다. DeviceItem에는 다음 필드가 추가됩니다.
+
+```text
+device_type, mqtt_principal, mqtt_topic, registration_state,
+registration_effective_from, current_policy_revision, pending_policy_revision,
+auto_response_eligible, auto_response_exclusion_reason
+```
+
+`auto_response_eligible`은 등록 정책상 자격만 표시하며 실제 차단 권한이나 통신 정상성의
+증거가 아닙니다. 초기 효력 대기는 GET 200/current=null/pending=1입니다. Migration 또는
+정책이 누락·손상된 기존 기기는 목록/상세 GET 200에서 등록 상태 null·eligible=false·
+`POLICY_UNAVAILABLE`로 표시하고, 정책 GET과 변경은 503으로 거부합니다.
+기존 backfill 기기의 `registration_effective_from=null`은 그대로 보존합니다.
+
+오류는 기존 인증 문자열, 업무 오류 객체 `{detail:{code,message,...}}`,
+422 필드 오류 배열로 구분합니다. 422 항목에는 `type`, `loc`, `msg`만 포함하며 입력 원문을
+돌려주지 않습니다. 잘못된 경로 ID의 loc는 `['path','device_id']`입니다.
+
+| 상태 | 의미 |
+| --- | --- |
+| 401 | 관리자 키 불일치 |
+| 404 | 미등록 기기 |
+| 409 | 중복 ID/IP, revision 충돌, pending 존재, 변경 없음, 금지 상태 전환, Worker/DB busy |
+| 422 | 잘못된 자료형·범위·필드·기기 IP |
+| 503 | 관리자 키/허용 LAN 설정 미비, Migration 또는 정책 누락·손상 |
+
+`REVISION_CONFLICT`, `PENDING_REVISION_EXISTS`는 `current_revision`, `pending_revision`,
+`latest_revision`을 함께 제공합니다. 충돌이나 결과가 불명확한 네트워크 오류는 초안을
+보존한 채 GET으로 먼저 확인합니다. 비활성화는 대상 ID 또는 같은 IP의 미완료 차단/해제,
+다른 IP에 남은 해당 기기의 차단 이력, 마지막 시도 이후의 fresh Runtime 관측 부재가 있으면
+409로 보류합니다. API가 차단을 자동 해제하거나 sudo/iptables를 실행하지 않습니다.
+
+운영 활성화 전 Migration 007·실제 운영값 backfill과 PENDING/DISABLED의 Rule·Trust·Worker
+보호를 함께 검증해야 합니다. 서버 `DEVICE_REGISTRATION_CIDR`은 기본 공란이며,
+공란/잘못된 설정이면 두 POST 모두 503입니다. 실제 DHCP 예약 LAN 및 기존 보호 IP와
+공용 Firewall lock 경로·권한을 확인한 뒤 활성화합니다. 관리자 키는 검증된 SSH 포워딩
+loopback 또는 HTTPS 경로에서 전송합니다. 세부 절차는
+[기기 정책 API 운영 확인](device-policy-api-runbook.md)을 따릅니다.
 
 ## Packet Gateway Read APIs
 
