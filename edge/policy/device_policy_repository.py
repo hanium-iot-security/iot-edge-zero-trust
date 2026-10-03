@@ -40,6 +40,7 @@ from edge.policy.device_policy import (
     next_effective_boundary,
     parse_effective_from,
     require_aware,
+    require_lookup_id,
     utc_now,
     validate_actor,
     validate_device_id,
@@ -194,7 +195,7 @@ def _fetch_revision(
 def device_exists(connection: sqlite3.Connection, device_id: str) -> bool:
     return (
         connection.execute(
-            "SELECT 1 FROM devices WHERE device_id = ?", (device_id,)
+            "SELECT 1 FROM devices WHERE device_id = ?", (require_lookup_id(device_id),)
         ).fetchone()
         is not None
     )
@@ -203,13 +204,14 @@ def device_exists(connection: sqlite3.Connection, device_id: str) -> bool:
 def get_latest_revision(
     connection: sqlite3.Connection, device_id: str
 ) -> PolicyRevision | None:
-    return _fetch_revision(connection, "device_id = ?", (device_id,))
+    return _fetch_revision(connection, "device_id = ?", (require_lookup_id(device_id),))
 
 
 def get_revision_effective_at(
     connection: sqlite3.Connection, device_id: str, at: datetime
 ) -> PolicyRevision | None:
     """`at`에 효력이 있던 최신 Revision(`effective_from <= at`). 없으면 None."""
+    device_id = require_lookup_id(device_id)
     at_text = format_utc_seconds(floor_to_second(at))
     return _fetch_revision(
         connection, "device_id = ? AND effective_from <= ?", (device_id, at_text)
@@ -220,6 +222,7 @@ def get_pending_revision(
     connection: sqlite3.Connection, device_id: str, server_time: datetime
 ) -> PolicyRevision | None:
     """아직 효력이 시작되지 않은 최신 Revision. 쓰기 규칙상 최대 1개다."""
+    device_id = require_lookup_id(device_id)
     time_text = format_utc_seconds(floor_to_second(server_time))
     return _fetch_revision(
         connection, "device_id = ? AND effective_from > ?", (device_id, time_text)
@@ -232,7 +235,7 @@ def list_revisions(
     rows = connection.execute(
         f"SELECT {_REVISION_COLUMNS} FROM device_policy_revisions "
         "WHERE device_id = ? ORDER BY revision ASC",
-        (device_id,),
+        (require_lookup_id(device_id),),
     ).fetchall()
     return [_revision_from_row(row) for row in rows]
 
@@ -248,6 +251,7 @@ def get_policy_snapshot(
     정상적인 초기 효력 대기(current=None, pending=revision 1)는 오류가 아니다. 등록된 기기에
     Revision이 하나도 없으면 `PolicyUnavailableError`다.
     """
+    device_id = require_lookup_id(device_id)
     now = require_aware(server_time if server_time is not None else utc_now(), "server_time")
     if not device_exists(connection, device_id):
         raise DeviceNotFoundError(f"Device {device_id!r} is not registered")
@@ -326,6 +330,12 @@ def _insert_revision(
     created_by: str,
     reason: str,
 ) -> PolicyRevision:
+    # 모든 revision 쓰기(등록·변경·이관·seed)가 지나는 곳이라 여기서 다시 검증한다.
+    device_id = validate_device_id(device_id)
+    registration_state = validate_registration_state(registration_state)
+    policy = validate_policy(policy)
+    reason = validate_reason(reason)
+    created_by = validate_actor(created_by)
     effective_text = format_utc_seconds(effective_from)
     created_text = format_utc_millis(created_at)
     connection.execute(
@@ -380,11 +390,16 @@ def create_device_locked(
     effective_from: datetime,
     now: datetime,
 ) -> RegisteredDevice:
-    """기기와 초기 revision 1을 만든다. 쓰기 잠금과 입력 검증은 호출자 책임이다.
+    """기기와 초기 revision 1을 만든다. 쓰기 잠금과 LAN·제외 주소 검증은 호출자 책임이다.
 
     Trust 필드는 기존 기본값(normal/100/last_seen 없음)으로 시작한다. `mqtt_principal`은
     관리자 등록에서는 필수지만, 확인되지 않은 값을 지어내지 않도록 seed는 None을 쓸 수 있다.
     """
+    device_id = validate_device_id(device_id)
+    ip_address = validate_registration_ip(ip_address, IpRegistrationPolicy())  # 정규 형식·RFC1918
+    device_type = validate_device_type(device_type)
+    if mqtt_principal is not None:
+        mqtt_principal = validate_mqtt_principal(mqtt_principal)
     created_at = format_utc_seconds(floor_to_second(now))
     effective_text = format_utc_seconds(effective_from)
 

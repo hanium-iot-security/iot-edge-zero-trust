@@ -204,7 +204,10 @@ def _require_int(value: Any, field: str, *, minimum: int, maximum: int) -> int:
 def _require_positive_real(value: Any, field: str, *, maximum: float) -> float:
     if type(value) not in (int, float):
         raise _field_error(field, "must be a number")
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:  # float로 표현할 수 없는 매우 큰 정수
+        raise _field_error(field, f"must be greater than 0 and at most {maximum}") from None
     if not math.isfinite(number):
         raise _field_error(field, "must be finite")
     if not 0 < number <= maximum:
@@ -279,6 +282,18 @@ def validate_mqtt_principal(value: Any) -> str:
             "mqtt_principal",
             "must be 1-128 ASCII letters, digits, '_', '.' or '-' starting with alphanumeric",
         )
+    return value
+
+
+def require_lookup_id(value: Any, field: str = "device_id") -> str:
+    """조회용 ID. 기존 기기와 호환되도록 형식 규칙은 적용하지 않고 문자열인지, DB에 바인딩할 수
+    있는 UTF-8 텍스트인지만 확인한다."""
+    if type(value) is not str:
+        raise _field_error(field, "must be a string")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise _field_error(field, "must be valid UTF-8 text") from None
     return value
 
 

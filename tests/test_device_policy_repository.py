@@ -16,6 +16,7 @@ from edge.policy.device_policy import (
     DeviceIdConflictError,
     DeviceIpConflictError,
     DeviceNotFoundError,
+    DevicePolicy,
     DevicePolicyError,
     DevicePolicyValidationError,
     NoPolicyChangeError,
@@ -24,9 +25,11 @@ from edge.policy.device_policy import (
     PolicyWriteBusyError,
     RevisionConflictError,
     StateTransitionBlockedError,
+    next_effective_boundary,
 )
 from edge.policy.device_policy_repository import (
     append_policy_revision,
+    create_device_locked,
     get_latest_revision,
     get_policy_snapshot,
     list_revisions,
@@ -423,6 +426,59 @@ class TestAppendPolicyRevision:
         assert not db.in_transaction
 
 
+# ── 저장 진입점 재검증 ───────────────────────────────────────────────────────
+
+
+class TestWriteEntryPointsRevalidate:
+    """`*_locked` 함수를 직접 호출해도 호출자의 검증을 믿지 않는다."""
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"device_type": "ROUTER"},
+            {"device_id": "bad id"},
+            {"ip_address": "8.8.8.8"},
+            {"ip_address": "192.168.0.256"},
+            {"ip_address": "192.168.000.6"},
+            {"mqtt_principal": "bad principal"},
+            {"initial_state": "NORMAL"},
+            {"reason": " "},
+            {"created_by": ""},
+            {"policy": DevicePolicy(**{**POLICY, "publish_count_max": True})},
+            {"policy": DevicePolicy(**{**POLICY, "payload_size_max_bytes": "5120"})},
+            {"policy": DevicePolicy(**{**POLICY, "packet_rate_max_pps": 10**400})},
+        ],
+    )
+    def test_create_device_locked_rejects_invalid_values(self, db, overrides) -> None:
+        arguments = dict(
+            device_id="pico_01",
+            ip_address="192.168.0.6",
+            device_type="SENSOR",
+            mqtt_principal="pico_01",
+            policy=DevicePolicy(**POLICY),
+            reason="등록 준비",
+            created_by="recovery-admin",
+            initial_state="PENDING",
+            effective_from=next_effective_boundary(T0),
+            now=T0,
+        )
+        arguments.update(overrides)
+
+        with pytest.raises(DevicePolicyValidationError):
+            with write_transaction(db):
+                create_device_locked(db, **arguments)
+
+        assert count(db, "devices") == 0
+        assert count(db, "device_policy_revisions") == 0
+        assert not db.in_transaction
+
+    def test_huge_number_in_a_registration_request_is_a_validation_error(self, db) -> None:
+        with pytest.raises(DevicePolicyValidationError):
+            register(db, policy={**POLICY, "packet_rate_max_pps": 10**400})
+
+        assert count(db, "devices") == 0
+
+
 # ── 동시 변경 (V03) ──────────────────────────────────────────────────────────
 
 
@@ -585,6 +641,39 @@ class TestResolver:
         assert exact.device_policy_revision == 1
         assert exact.registration_state == "PENDING"
         assert exact.policy.publish_count_max == 15
+
+    @pytest.mark.parametrize("window", [None, 123, 10**400, "not-a-time", "", object(), b"x"])
+    def test_invalid_window_is_a_validation_error(self, db, window) -> None:
+        register(db)
+
+        with pytest.raises(DevicePolicyValidationError):
+            resolve_device_policy(db, "pico_01", window)
+        with pytest.raises(DevicePolicyValidationError):
+            registered_device_ids_at(db, window)
+        with pytest.raises(DevicePolicyValidationError):
+            registered_device_by_ip_at(db, "192.168.0.6", window)
+
+    @pytest.mark.parametrize("device_id", [None, 10**400, b"x", 1.5, "\ud800", ["a"]])
+    def test_invalid_lookup_id_is_a_validation_error_not_a_driver_error(
+        self, db, device_id
+    ) -> None:
+        for call in (
+            lambda: resolve_device_policy(db, device_id, self.window(10)),
+            lambda: get_policy_snapshot(db, device_id, server_time=T0),
+            lambda: list_revisions(db, device_id),
+            lambda: get_latest_revision(db, device_id),
+        ):
+            with pytest.raises(DevicePolicyValidationError):
+                call()
+
+    def test_existing_device_ids_outside_the_new_id_pattern_still_resolve(self, db) -> None:
+        # 조회 함수는 새 등록 ID 규칙을 강제하지 않는다(정책 도입 전부터 있던 기기 호환).
+        insert_legacy_device(db, "Legacy.Device-1", "192.168.0.40")
+
+        resolution = resolve_device_policy(db, "Legacy.Device-1", self.window(10))
+
+        assert resolution.resolution == RESOLUTION_POLICY_UNAVAILABLE
+        assert "Legacy.Device-1" in registered_device_ids_at(db, self.window(10))
 
     def test_unknown_device_is_not_registered(self, db) -> None:
         assert (

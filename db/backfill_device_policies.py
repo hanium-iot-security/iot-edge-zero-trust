@@ -45,6 +45,7 @@ from edge.policy.device_policy import (  # noqa: E402
     DevicePolicyValidationError,
     IpRegistrationPolicy,
     parse_effective_from,
+    validate_reason,
 )
 from edge.policy.device_policy_backfill import (  # noqa: E402
     LegacyDeviceOverride,
@@ -69,7 +70,7 @@ def load_manifest(
 ) -> tuple[dict[str, LegacyDeviceOverride], Any, IpRegistrationPolicy, str]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:  # JSON 오류·인코딩 오류·너무 긴 정수 포함
         raise DevicePolicyValidationError(f"cannot read manifest: {exc}") from exc
     if not isinstance(raw, dict):
         raise DevicePolicyValidationError("manifest must be a JSON object")
@@ -82,7 +83,7 @@ def load_manifest(
         )
 
     effective_from = parse_effective_from(raw.get("effective_from"))
-    reason = raw.get("reason")
+    reason = validate_reason(raw.get("reason"))  # 누락·null·문자열이 아닌 값은 거부
     devices_raw = raw.get("devices")
     if not isinstance(devices_raw, list) or not devices_raw:
         raise DevicePolicyValidationError("devices must be a non-empty list")
@@ -94,19 +95,19 @@ def load_manifest(
             raise DevicePolicyValidationError(f"duplicate device in manifest: {override.device_id}")
         overrides[override.device_id] = override
 
+    network_raw = raw.get("registration_network")
+    excluded_raw = raw.get("excluded_ips", [])
+    if network_raw is not None and type(network_raw) is not str:
+        raise DevicePolicyValidationError("registration_network must be a string")
+    if not isinstance(excluded_raw, list) or any(type(v) is not str for v in excluded_raw):
+        raise DevicePolicyValidationError("excluded_ips must be a list of strings")
     try:
-        network = (
-            ipaddress.IPv4Network(raw["registration_network"])
-            if raw.get("registration_network") is not None
-            else None
-        )
-        excluded = frozenset(
-            ipaddress.IPv4Address(value) for value in raw.get("excluded_ips", [])
-        )
-    except (ValueError, TypeError) as exc:
+        network = ipaddress.IPv4Network(network_raw) if network_raw is not None else None
+        excluded = frozenset(ipaddress.IPv4Address(value) for value in excluded_raw)
+    except ValueError as exc:
         raise DevicePolicyValidationError(f"invalid network settings: {exc}") from exc
 
-    return overrides, effective_from, IpRegistrationPolicy(network, excluded), str(reason)
+    return overrides, effective_from, IpRegistrationPolicy(network, excluded), reason
 
 
 def main(argv: Sequence[str] | None = None) -> int:

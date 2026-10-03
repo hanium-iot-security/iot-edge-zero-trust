@@ -17,7 +17,12 @@ from datetime import datetime
 from typing import Any
 
 from edge.detection.phase4_time import parse_db_utc
-from edge.policy.device_policy import DevicePolicy, format_utc_seconds
+from edge.policy.device_policy import (
+    DevicePolicy,
+    DevicePolicyValidationError,
+    format_utc_seconds,
+    require_lookup_id,
+)
 from edge.policy.device_policy_repository import get_revision_effective_at
 
 
@@ -42,7 +47,17 @@ class DevicePolicyResolution:
 
 
 def _to_utc(window_start_utc: datetime | str) -> datetime:
-    return parse_db_utc(window_start_utc, "window_start_utc")
+    if not isinstance(window_start_utc, (datetime, str)):
+        raise DevicePolicyValidationError(
+            "window_start_utc: must be a datetime or a timestamp string",
+            field="window_start_utc",
+        )
+    try:
+        return parse_db_utc(window_start_utc, "window_start_utc")
+    except (ValueError, OverflowError) as exc:
+        raise DevicePolicyValidationError(
+            f"window_start_utc: {exc}", field="window_start_utc"
+        ) from None
 
 
 def _registration_effective_from(
@@ -107,6 +122,7 @@ def resolve_device_policy(
     - 등록돼 있지만 그 시점의 revision이 없거나 모순: `POLICY_UNAVAILABLE` (기본값으로 보정하지 않는다)
     - 그 외: `OK`와 당시 revision·등록 상태·불변 정책 스냅샷
     """
+    device_id = require_lookup_id(device_id)
     window_start = _to_utc(window_start_utc)
     at_text = format_utc_seconds(window_start)
 
