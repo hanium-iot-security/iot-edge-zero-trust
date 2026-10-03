@@ -371,6 +371,75 @@ class TestBackfillIsBlockedAtomically:
         assert count(legacy_db, "device_policy_revisions") == 0
 
 
+class TestDirectCallsAreRevalidated:
+    """manifest를 거치지 않고 저장 함수를 직접 호출해도 같은 검증을 받는다."""
+
+    @pytest.mark.parametrize(
+        "policy_changes",
+        [
+            {"publish_count_max": True},  # bool은 정수가 아니다
+            {"payload_size_max_bytes": "5120"},  # 숫자 문자열 묵시 변환 금지
+            {"publish_count_max": 15.0},
+            {"packet_rate_max_pps": 0},
+            {"packet_rate_max_pps": 10**400},  # 매우 큰 수
+        ],
+    )
+    def test_invalid_policy_objects_are_rejected_without_changes(
+        self, legacy_db, policy_changes
+    ) -> None:
+        bad = {name: override(name, **policy_changes) for name in OVERRIDES}
+        before = protected_state(legacy_db)
+
+        with pytest.raises(DevicePolicyValidationError):
+            apply(legacy_db, bad)
+        with pytest.raises(DevicePolicyValidationError):
+            plan_legacy_backfill(legacy_db, bad, ip_policy=LAN_POLICY)
+
+        assert count(legacy_db, "device_policy_revisions") == 0
+        assert protected_state(legacy_db) == before
+        assert not legacy_db.in_transaction
+
+    def test_other_fields_of_override_objects_are_validated(self, legacy_db) -> None:
+        for bad in (
+            LegacyDeviceOverride(
+                device_id="esp32_01", device_type="ROUTER", source="x", policy=DevicePolicy(**OPERATING_POLICY)
+            ),
+            LegacyDeviceOverride(
+                device_id="esp32_01", device_type="SENSOR", source=" ", policy=DevicePolicy(**OPERATING_POLICY)
+            ),
+            LegacyDeviceOverride(
+                device_id="esp32_01",
+                device_type="SENSOR",
+                source="x",
+                policy=DevicePolicy(**OPERATING_POLICY),
+                mqtt_principal="bad principal",
+            ),
+        ):
+            with pytest.raises(DevicePolicyValidationError):
+                apply(legacy_db, {"esp32_01": bad, "esp32_02": override("esp32_02")})
+
+        assert count(legacy_db, "device_policy_revisions") == 0
+
+    def test_key_must_match_the_override_device_id(self, legacy_db) -> None:
+        mismatched = {"esp32_01": override("esp32_02"), "esp32_02": override("esp32_02")}
+
+        with pytest.raises(DevicePolicyValidationError, match="does not match"):
+            apply(legacy_db, mismatched)
+
+        assert count(legacy_db, "device_policy_revisions") == 0
+
+    def test_non_override_values_are_rejected(self, legacy_db) -> None:
+        with pytest.raises(DevicePolicyValidationError):
+            apply(legacy_db, {"esp32_01": {"device_id": "esp32_01"}})  # type: ignore[dict-item]
+
+    @pytest.mark.parametrize("overrides", [None, [], "esp32_01", 5])
+    def test_overrides_must_be_a_mapping(self, legacy_db, overrides) -> None:
+        with pytest.raises(DevicePolicyValidationError):
+            apply(legacy_db, overrides)  # type: ignore[arg-type]
+        with pytest.raises(DevicePolicyValidationError):
+            plan_legacy_backfill(legacy_db, overrides, ip_policy=LAN_POLICY)  # type: ignore[arg-type]
+
+
 class TestParseOverride:
     VALID = {
         "device_id": "esp32_01",
@@ -503,6 +572,9 @@ class TestSeed:
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
+DROP = object()  # write_manifest에서 해당 키를 manifest에서 삭제한다
+
+
 def write_manifest(path: Path, **changes) -> Path:
     manifest = {
         "schema_version": "device-policy-backfill-v1",
@@ -522,6 +594,8 @@ def write_manifest(path: Path, **changes) -> Path:
         ],
     }
     manifest.update(changes)
+    for key in [key for key, value in manifest.items() if value is DROP]:
+        del manifest[key]
     path.write_text(json.dumps(manifest), encoding="utf-8")
     return path
 
@@ -640,6 +714,75 @@ class TestCli:
 
         assert code == 2
         assert revision_count(cli_db) == 0
+
+    @pytest.mark.parametrize("reason", [DROP, None, 123, "", "   ", ["x"], "line1\nline2"])
+    def test_invalid_reason_is_rejected_in_dry_run_and_apply(
+        self, cli_db, tmp_path, capsys, reason
+    ) -> None:
+        manifest = write_manifest(tmp_path / "manifest.json", reason=reason)
+
+        for extra in ([], ["--apply"]):
+            code = backfill_device_policies.main(
+                ["--db", str(cli_db), "--manifest", str(manifest), *extra]
+            )
+            assert code == 2
+
+        assert "reason" in capsys.readouterr().err
+        assert revision_count(cli_db) == 0  # "None" 같은 값이 사유로 저장되지 않는다
+
+    @pytest.mark.parametrize(
+        "changes",
+        [
+            {"registration_network": 123},
+            {"registration_network": ["192.168.0.0/24"]},
+            {"excluded_ips": "192.168.0.1"},
+            {"excluded_ips": [1]},
+            {"excluded_ips": {"a": "192.168.0.1"}},
+        ],
+    )
+    def test_network_settings_with_wrong_types_are_rejected(
+        self, cli_db, tmp_path, changes
+    ) -> None:
+        manifest = write_manifest(tmp_path / "manifest.json", **changes)
+
+        code = backfill_device_policies.main(
+            ["--db", str(cli_db), "--manifest", str(manifest), "--apply"]
+        )
+
+        assert code == 2
+        assert revision_count(cli_db) == 0
+
+    @pytest.mark.parametrize("field", ["packet_rate_max_pps", "byte_rate_max_bytes_per_second"])
+    def test_huge_number_in_manifest_is_a_validation_error_not_a_traceback(
+        self, cli_db, tmp_path, capsys, field
+    ) -> None:
+        manifest = write_manifest(
+            tmp_path / "manifest.json",
+            devices=[
+                {
+                    "device_id": name,
+                    "device_type": "SENSOR",
+                    "source": "baseline-manifest:test",
+                    "policy": {**OPERATING_POLICY, field: 10**400},
+                }
+                for name in ("esp32_01", "esp32_02")
+            ],
+        )
+
+        code = backfill_device_policies.main(
+            ["--db", str(cli_db), "--manifest", str(manifest), "--apply"]
+        )
+
+        assert code == 2
+        assert field in capsys.readouterr().err
+        assert revision_count(cli_db) == 0
+
+    def test_over_long_integer_literal_is_rejected_cleanly(self, cli_db, tmp_path) -> None:
+        # Python의 정수 문자열 변환 제한에 걸리면 JSONDecodeError가 아닌 ValueError가 난다.
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text('{"schema_version": ' + "9" * 5000 + "}", encoding="utf-8")
+
+        assert backfill_device_policies.main(["--db", str(cli_db), "--manifest", str(manifest)]) == 2
 
     def test_unreadable_manifest_is_rejected(self, cli_db, tmp_path) -> None:
         bad = tmp_path / "broken.json"

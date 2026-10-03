@@ -102,6 +102,31 @@ def parse_override(raw: Mapping[str, Any]) -> LegacyDeviceOverride:
     )
 
 
+def _revalidated(overrides: Mapping[str, LegacyDeviceOverride]) -> dict[str, LegacyDeviceOverride]:
+    """직접 만든 override 객체도 manifest와 같은 규칙으로 다시 검증한다."""
+    if not isinstance(overrides, Mapping):
+        raise DevicePolicyValidationError("overrides must be a mapping of device_id to override")
+    checked: dict[str, LegacyDeviceOverride] = {}
+    for key, value in overrides.items():
+        if not isinstance(value, LegacyDeviceOverride):
+            raise DevicePolicyValidationError("overrides must be LegacyDeviceOverride objects")
+        raw: dict[str, Any] = {
+            "device_id": value.device_id,
+            "device_type": value.device_type,
+            "policy": value.policy,
+            "source": value.source,
+        }
+        if value.mqtt_principal is not None:
+            raw["mqtt_principal"] = value.mqtt_principal
+        parsed = parse_override(raw)
+        if key != parsed.device_id:
+            raise DevicePolicyValidationError(
+                f"override key {key!r} does not match its device_id {parsed.device_id!r}"
+            )
+        checked[key] = parsed
+    return checked
+
+
 def _plan_locked(
     connection: sqlite3.Connection,
     overrides: Mapping[str, LegacyDeviceOverride],
@@ -170,7 +195,7 @@ def plan_legacy_backfill(
     ip_policy: IpRegistrationPolicy,
 ) -> BackfillPlan:
     """dry-run. 아무것도 쓰지 않고 무엇이 만들어지고 무엇이 막히는지 보여준다."""
-    return _plan_locked(connection, overrides, ip_policy)
+    return _plan_locked(connection, _revalidated(overrides), ip_policy)
 
 
 def _fingerprint(connection: sqlite3.Connection) -> dict[str, Any]:
@@ -214,6 +239,7 @@ def apply_legacy_backfill(
     effective = parse_effective_from(
         format_utc_seconds(require_aware(effective_from, "effective_from"))
     )
+    overrides = _revalidated(overrides)
 
     with write_transaction(connection):
         now = require_aware(clock(), "clock()")

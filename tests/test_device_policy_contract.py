@@ -92,6 +92,13 @@ class TestValidatePolicy:
             ("byte_rate_max_bytes_per_second", 0.0),
             ("byte_rate_max_bytes_per_second", 125000001),
             ("byte_rate_max_bytes_per_second", None),
+            # float로 표현할 수 없는 매우 큰 정수도 OverflowError가 아닌 검증 오류여야 한다
+            ("expected_publish_interval_seconds", 10**400),
+            ("packet_rate_max_pps", 10**400),
+            ("packet_rate_max_pps", -(10**400)),
+            ("byte_rate_max_bytes_per_second", 10**400),
+            ("publish_count_max", 10**400),
+            ("payload_size_max_bytes", 10**400),
         ],
     )
     def test_invalid_value_is_rejected_with_field_name(self, field, value) -> None:
