@@ -22,7 +22,9 @@ from edge.policy.device_policy import (
     IpRegistrationPolicy, POLICY_FIELDS, PolicyUnavailableError, PolicyWriteBusyError,
     StateTransitionBlockedError, utc_now, validate_actor,
 )
-from edge.policy.device_policy_repository import append_policy_revision, get_policy_snapshot, register_device
+from edge.policy.device_policy_repository import (
+    append_policy_revision, auto_response_exclusion_reason, get_policy_snapshot, register_device,
+)
 from edge.runtime_lock import RuntimeLockError, single_instance_lock
 from edge.trust.run_firewall_worker import firewall_lock_path
 
@@ -102,16 +104,7 @@ def _enrich_device(connection, row: dict, now: datetime, schema_available: bool)
     result["registration_state"] = current.registration_state if current else "PENDING"
     result["current_policy_revision"] = current.revision if current else None
     result["pending_policy_revision"] = pending.revision if pending else None
-    if pending and pending.registration_state == "DISABLED":
-        reason = "DISABLE_REQUESTED_OR_DISABLED"
-    elif current is None:
-        reason = "REGISTRATION_NOT_EFFECTIVE"
-    elif current.registration_state == "DISABLED":
-        reason = "DISABLE_REQUESTED_OR_DISABLED"
-    elif current.registration_state != "ACTIVE":
-        reason = f"CURRENT_{current.registration_state}"
-    else:
-        reason = None
+    reason = auto_response_exclusion_reason(snapshot)
     result["auto_response_eligible"] = reason is None
     result["auto_response_exclusion_reason"] = reason
     return result

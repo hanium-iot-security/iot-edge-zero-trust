@@ -64,6 +64,15 @@ def recovery_env(tmp_path, monkeypatch):
     with sqlite3.connect(database) as db:
         db.execute("INSERT INTO devices(device_id,ip_address,status,trust_score) "
                    "VALUES (?,?,'isolated',20)", (DEVICE, IP))
+        db.execute(
+            "INSERT INTO device_policy_revisions (device_id,revision,effective_from,"
+            "registration_state,policy_profile,expected_publish_interval_seconds,"
+            "publish_count_max,payload_size_max_bytes,packet_rate_max_pps,"
+            "byte_rate_max_bytes_per_second,created_at,created_by,reason) "
+            "VALUES (?,1,'2026-07-01T00:00:00Z','ACTIVE','periodic-sensor-v1',"
+            "5,15,256,100,65536,'2026-07-01T00:00:00Z','test','verified fixture policy')",
+            (DEVICE,),
+        )
     monkeypatch.setattr(settings, "firewall_runtime_snapshot_path", str(tmp_path / "runtime.json"))
     monkeypatch.setattr(settings, "firewall_lock_path", str(tmp_path / "firewall.lock"))
     monkeypatch.setattr(settings, "firewall_lock_wait_seconds", 0)

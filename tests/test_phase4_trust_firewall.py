@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from shutil import copyfile
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -31,7 +32,12 @@ WINDOW_END = "2026-07-23T10:00:10Z"
 @pytest.fixture
 def SessionLocal(tmp_path: Path):
     db_path = tmp_path / "phase4-trust-firewall.db"
-    apply_migrations(db_path, MIGRATIONS_DIR)
+    legacy_migrations = tmp_path / "migrations-v2"
+    legacy_migrations.mkdir()
+    for source in MIGRATIONS_DIR.glob("[0-9][0-9][0-9]_*.sql"):
+        if int(source.name[:3]) <= 6:
+            copyfile(source, legacy_migrations / source.name)
+    apply_migrations(db_path, legacy_migrations)
     engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     try:
@@ -825,6 +831,9 @@ def test_firewall_repository_retry_and_manual_reset_are_transaction_controlled(
         ).mappings().one()
         assert row["status"] == "FAILED"
         assert row["retry_count"] == 3
+
+        # The administrator command starts after the failed Worker transaction.
+        db.commit()
 
         firewall_repository.reset_failed_to_pending(
             db,

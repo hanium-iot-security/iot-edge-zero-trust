@@ -128,6 +128,21 @@ Migration보다 먼저 올라가면 `no such table: firewall_release_requests` �
   Worker Reconciliation은 `PENDING` Release Request가 있는 `APPLIED` Rule을 복구하지
   않는다.
 
+Migration 007 이후에는 현재 유효한 ACTIVE 정책과 기기/IP 소유 관계가 확인된 대상만
+새 차단을 적용한다. 예약 DISABLED도 접수 직후부터 제외한다. PENDING, 등록 효력 대기,
+정책 누락·오류, 기기/IP 불일치는 실행 직전 다시 검사하며 제외된 PENDING 요청은
+사유를 남겨 FAILED로 종료한다. API의 `auto_response_eligible`과 같은 공통 정책 판단을
+사용한다. Migration 007 이전 DB의 기존 동작은 유지한다.
+
+Worker와 관리자 요청은 공용 파일 lock을 먼저 얻는다. FAILED 재시도는 DB write
+transaction에서 정책 확인과 상태 변경을 함께 수행하고, OS 적용은 최신 DB read
+snapshot을 검사한 뒤 transaction을 끝낸 상태에서 실행한다. 파일 lock은 OS 작업이
+끝날 때까지 유지한다. 이미 열린 DB transaction을 자동 rollback하여 재사용하지 않는다.
+
+Reconciliation도 자동 대응 자격이 없는 대상의 사라진 차단을 다시 만들지 않는다.
+기존 APPLIED 이력과 실제 잔존 차단을 자동 삭제하지 않으며, 관리자 해제·Recovery는
+기존 경로로 진행한다.
+
 ## 6. 수동 Smoke Test
 
 ```bash
@@ -201,6 +216,10 @@ sqlite3 backend/data/iot_security.db \
 python -m edge.trust.run_firewall_worker \
   --admin-reset-failed <RULE_ID> --confirm RESET-FIREWALL-RULE
 ```
+
+Migration 007 이후에는 실행 시점의 자동 대응 자격도 확인한다. PENDING·예약/효력
+DISABLED·정책 오류·기기/IP 불일치이면 종료 코드 2로 거부하고 기존 FAILED 행과
+retry 이력을 보존한다. ACTIVE 대상의 재시도가 접수돼도 실제 적용 직전에 다시 검사한다.
 
 Protected IP 때문에 실패한 Rule은 되돌리지 말 것. 그 Rule은 애초에 만들어지면 안 되는
 Rule이며, Trust 쪽 Device·IP 매핑을 확인해야 한다.

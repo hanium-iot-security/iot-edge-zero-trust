@@ -297,6 +297,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     except Exception:
                         db.rollback()
                         raise
+        except (firewall_repository.AutomaticResponseBlockedError, ValueError) as exc:
+            logger.error("FAILED Rule 재시도 거부: %s", exc)
+            return 2
         except RuntimeLockError as exc:
             logger.error("Lock 획득 실패: %s", exc)
             return 3

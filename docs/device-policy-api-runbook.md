@@ -32,7 +32,10 @@ P8-04의 로컬 API 구현을 운영에 적용할 때 사용한다. 이 API는 B
    당시 revision 사용, pending 중 재변경 409를 검증한다.
 7. **비활성화·회귀:** 진행 중/잔존 차단 또는 오래된 관측에서 DISABLED 요청이 409인지,
    차단 해제 확인 후에만 수락되는지 검증한다. 수락 직후부터 새 자동 대응이 제외되고
-   기존 점수·이력이 보존돼야 한다. ESP32 두 대와 Pico의 정상 수신·기존 Recovery도 확인한다.
+   기존 점수·이력이 보존돼야 한다. FAILED 차단의 관리자 재시도가 PENDING·예약/효력
+   DISABLED·정책 오류에서 거부되고, Worker의 새 적용과 Reconciliation 복원도 제외되는지
+   확인한다. API의 `auto_response_eligible`과 Worker가 같은 현재/예정 정책을 사용해야 한다.
+   ESP32 두 대와 Pico의 정상 수신·기존 Recovery도 확인한다.
 
 문제가 생기면 변경 요청을 중단하고 서비스를 멈춘 뒤 호환되는 코드·DB·설정 백업을
 함께 복원한다. Migration 007은 down migration이 없다. 초기 PENDING과 기존 ACTIVE의

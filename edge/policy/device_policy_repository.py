@@ -123,6 +123,24 @@ class RegisteredDevice:
     revision: PolicyRevision
 
 
+def auto_response_exclusion_reason(snapshot: PolicySnapshot) -> str | None:
+    """Validated current/pending policy's automatic-response eligibility.
+
+    API display and Worker execution share this decision. The caller must first
+    load a valid snapshot; missing or corrupt policy is handled as unavailable.
+    """
+    current, pending = snapshot.current, snapshot.pending
+    if pending is not None and pending.registration_state == "DISABLED":
+        return "DISABLE_REQUESTED_OR_DISABLED"
+    if current is None:
+        return "REGISTRATION_NOT_EFFECTIVE"
+    if current.registration_state == "DISABLED":
+        return "DISABLE_REQUESTED_OR_DISABLED"
+    if current.registration_state != "ACTIVE":
+        return f"CURRENT_{current.registration_state}"
+    return None
+
+
 # ── 트랜잭션 ─────────────────────────────────────────────────────────────────
 
 

@@ -4,12 +4,18 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import ipaddress
+import sqlite3
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from edge.detection.phase4_time import format_db_utc, require_utc_whole_second
+from edge.policy.device_policy import DevicePolicyError, POLICY_FIELDS
+from edge.policy.device_policy_repository import (
+    auto_response_exclusion_reason,
+    get_policy_snapshot,
+)
 
 
 PENDING = "PENDING"
@@ -18,6 +24,86 @@ FAILED = "FAILED"
 REMOVED = "REMOVED"
 ACTIVE_STATUSES = {PENDING, APPLIED}
 MAX_TRANSIENT_RETRIES = 3
+
+
+class AutomaticResponseBlockedError(ValueError):
+    """The current device policy does not authorize a new automatic block."""
+
+
+def _begin_authorization_transaction(db: Session, *, write: bool = False) -> None:
+    # A stale read snapshot cannot authorize an OS change. Worker entry points
+    # own their transactions; callers must commit/rollback prior writes first.
+    connection = db.connection().connection.driver_connection
+    if connection.in_transaction:
+        raise RuntimeError("Firewall authorization requires a fresh database transaction")
+    db.execute(text("BEGIN IMMEDIATE" if write else "BEGIN"))
+
+
+def _require_automatic_response_eligible(
+    db: Session, row: dict[str, Any], *, now: datetime
+) -> None:
+    """Read current/pending policy in the caller's explicit SQLite snapshot.
+
+    Pre-007 databases retain Phase 4 behavior. A partially migrated schema or
+    missing/invalid policy after 007 never falls back to that behavior.
+    """
+    connection = db.connection().connection.driver_connection
+    try:
+        device_columns = {item[1] for item in connection.execute("PRAGMA table_info(devices)")}
+        revision_columns = {
+            item[1] for item in connection.execute("PRAGMA table_info(device_policy_revisions)")
+        }
+        migration = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        if type(migration) is not int or migration < 1:
+            raise ValueError("Invalid migration metadata")
+    except (sqlite3.Error, ValueError, TypeError) as exc:
+        raise AutomaticResponseBlockedError("POLICY_UNAVAILABLE") from exc
+    metadata = {"device_type", "mqtt_principal", "registration_effective_from"}
+    if not (device_columns & metadata) and not revision_columns and (migration or 0) < 7:
+        return
+    if not metadata <= device_columns or not {
+        "device_id", "revision", "effective_from", "registration_state",
+        "created_at", "created_by", "reason", *POLICY_FIELDS,
+    } <= revision_columns:
+        raise AutomaticResponseBlockedError("POLICY_UNAVAILABLE")
+    device_id = row.get("device_id")
+    try:
+        owner = connection.execute(
+            "SELECT ip_address FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise AutomaticResponseBlockedError("POLICY_UNAVAILABLE") from exc
+    if owner is None or owner[0] != row.get("source_ip"):
+        raise AutomaticResponseBlockedError("DEVICE_IP_OWNERSHIP_MISMATCH")
+    try:
+        snapshot = get_policy_snapshot(connection, device_id, server_time=now)
+    except (DevicePolicyError, sqlite3.Error, ValueError, TypeError) as exc:
+        raise AutomaticResponseBlockedError("POLICY_UNAVAILABLE") from exc
+    reason = auto_response_exclusion_reason(snapshot)
+    if reason is not None:
+        raise AutomaticResponseBlockedError(reason)
+
+
+def authorized_automatic_rule(
+    db: Session, *, rule_id: int, required_status: str, now: datetime
+) -> dict[str, Any]:
+    """Authorize a fresh rule snapshot, then release the read transaction.
+
+    The caller holds the shared Worker/API file lock through the subsequent OS
+    operation. SQLite does not remain locked while the wrapper runs.
+    """
+    _begin_authorization_transaction(db)
+    try:
+        result = db.execute(
+            text("SELECT * FROM firewall_rules WHERE id = :id"), {"id": rule_id}
+        ).mappings().first()
+        if result is None or result["status"] != required_status:
+            raise AutomaticResponseBlockedError(f"firewall rule is not {required_status}: {rule_id}")
+        row = dict(result)
+        _require_automatic_response_eligible(db, row, now=now)
+        return row
+    finally:
+        db.rollback()
 
 
 def create_pending_rule_for_device(
@@ -232,6 +318,19 @@ def reset_failed_to_pending(
     reset_retry_count: bool = True,
 ) -> None:
     requested_utc = require_utc_whole_second(requested_at, "requested_at")
+    # The CLI obtains the shared file lock before this write transaction. Keep
+    # eligibility and FAILED -> PENDING in the same DB transaction.
+    _begin_authorization_transaction(db, write=True)
+    try:
+        row = db.execute(
+            text("SELECT * FROM firewall_rules WHERE id = :id"), {"id": rule_id}
+        ).mappings().first()
+        if row is None or row["status"] != FAILED:
+            raise ValueError(f"firewall rule is not FAILED: {rule_id}")
+        _require_automatic_response_eligible(db, dict(row), now=requested_utc)
+    except Exception:
+        db.rollback()
+        raise
     result = db.execute(
         text(
             """
