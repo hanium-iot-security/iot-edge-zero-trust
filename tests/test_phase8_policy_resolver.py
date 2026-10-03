@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 
 import pytest
 
@@ -163,3 +164,32 @@ def test_message_rule_uses_receive_time_payload_validity_for_invalid_utf8():
     assert detect_mqtt_rules(row, {"esp32_01", "esp32_02"}) == []
     assert detect_mqtt_rules({**row, "is_json_valid": 1},
                              {"esp32_01", "esp32_02"})[0]["event_type"] == "DEVICE_ID_MISMATCH"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("policy_profile", "unsupported-profile"),
+    ("expected_publish_interval_seconds", 0),
+    ("expected_publish_interval_seconds", 86401),
+    ("expected_publish_interval_seconds", True),
+    ("expected_publish_interval_seconds", "5"),
+    ("publish_count_max", 0),
+    ("publish_count_max", 10001),
+    ("publish_count_max", True),
+    ("publish_count_max", 15.0),
+    ("payload_size_max", 1048577),
+    ("packet_rate_max", 100001),
+    ("byte_rate_max", 125000001),
+    ("packet_rate_max", float("inf")),
+    ("revision", True),
+    ("revision", "1"),
+])
+def test_in_memory_policy_obeys_full_shared_v1_validation(field, value):
+    valid = _policy("esp32_01", 1, T0, publish=15, payload=5120,
+                    packets=10, bytes_=2500)
+    resolver = DevicePolicyResolver(
+        [RegistrationRevision("esp32_01", "ACTIVE", T0)],
+        [replace(valid, **{field: value})],
+    )
+    result = resolver.resolve("esp32_01", T0)
+    assert result.reason == INVALID_POLICY_REVISION
+    assert result.policy is None

@@ -133,7 +133,9 @@ class MqttFeatureRuleStage:
                     incident_family=incident_family_for_event(event_type),
                     subject_ip=(
                         resolution.registration.ip_address
-                        if resolution is not None else device_ips.get(str(feature_row["device_id"]))
+                        if resolution is not None and resolution.registration is not None
+                        else device_ips.get(str(feature_row["device_id"])) if resolution is None
+                        else None
                     ),
                     evidence=_feature_evidence(
                         detector_name=self.detector_name,

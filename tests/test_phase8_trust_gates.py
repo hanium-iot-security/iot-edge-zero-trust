@@ -18,6 +18,11 @@ from edge.detection.mqtt_adapters import (
 )
 from edge.features.collect_feature_logs import produce_mqtt_features_until
 from edge.mqtt.subscriber import build_mqtt_log_row, insert_mqtt_log
+from edge.policy.repository import load_policy_resolver
+from edge.policy.resolver import (
+    INVALID_POLICY_REVISION, INVALID_REGISTRATION_REVISION, POLICY_AVAILABLE,
+    POLICY_UNAVAILABLE, UNREGISTERED_AT_WINDOW,
+)
 from edge.trust.trust_score_v2 import apply_trust_score_v2_until
 
 
@@ -42,14 +47,14 @@ def session_factory(tmp_path: Path):
 
 def _revision(db, *, device_id="esp32_01", revision=1, status="ACTIVE",
               effective=START, created=START, publish=15, payload=5120,
-              packets=10.0, bytes_=2500.0):
+              packets=10.0, bytes_=2500.0, profile="periodic-sensor-v1", interval=5):
     db.execute(text("""INSERT INTO device_policy_revisions (
         device_id, revision, effective_from, registration_state,
         policy_profile, expected_publish_interval_seconds,
         publish_count_max, payload_size_max_bytes, packet_rate_max_pps,
         byte_rate_max_bytes_per_second, created_at, created_by, reason
     ) VALUES (
-        :device_id, :revision, :effective, :status, 'periodic-sensor-v1', 5,
+        :device_id, :revision, :effective, :status, :profile, :interval,
         :publish, :payload, :packets, :bytes_, :created, 'test', 'test setup'
     )"""), locals())
 
@@ -442,3 +447,235 @@ def test_disabled_raw_records_communication_without_new_feature(session_factory)
             produced = produce_mqtt_features_until(db, producer_cutoff=T1)
         assert produced.created_feature_count == 0
         assert db.execute(text("SELECT COUNT(*) FROM feature_logs")).scalar_one() == 0
+
+
+@pytest.mark.parametrize("override", [
+    {"profile": "unsupported-profile"},
+    {"interval": 0},
+    {"interval": 86401},
+    {"interval": "invalid-interval"},
+    {"publish": 15.5},
+    {"publish": "invalid-count"},
+    {"payload": 1048577},
+    {"packets": 100001},
+    {"bytes_": 125000001},
+    {"status": "INVALID_STATE"},
+    {"effective": "2026-09-30T00:00:01Z"},
+    {"created": "invalid-time"},
+])
+def test_invalid_stored_policy_keeps_detection_without_scoring_or_blocking(
+    session_factory, override,
+):
+    with session_factory() as db:
+        _seed(db, status="ACTIVE", with_policy=False)
+        # Unsupported profile is accepted by the real migration. Other cases
+        # model imported/corrupt values only in this disposable test database.
+        if "profile" not in override:
+            db.execute(text("PRAGMA ignore_check_constraints=ON"))
+        _revision(db, **override)
+        _event(db)
+        db.execute(text("""INSERT INTO feature_logs (
+            device_id, window_start, window_end, publish_count,
+            max_payload_size, malformed_payload_count
+        ) VALUES ('esp32_01', :start, :end, 100, 10000, 3)"""),
+            {"start": START, "end": END})
+        db.commit()
+    with session_factory() as db:
+        resolver = load_policy_resolver(db)
+        resolution = resolver.resolve("esp32_01", T0)
+        assert resolution.reason == INVALID_POLICY_REVISION
+        assert resolution.policy is None
+        assert resolver.registered_ids_at(T0) == {"esp32_01"}
+        db.rollback()
+        with db.begin():
+            MqttFeatureRuleStage().run_until(
+                db, cycle_range_start=T0, cycle_cutoff=T1,
+            )
+    _, score, events, history, firewall, checkpoint = _run(session_factory)
+    assert {event["event_type"] for event in events} == {
+        "DEVICE_ID_MISMATCH", "POLICY_UNAVAILABLE", "MALFORMED_PAYLOAD",
+    }
+    assert (score, history, firewall) == (40, 0, 0)
+    assert all(event["applied_to_score"] == 0 for event in events)
+    assert all(event["processing_reason"] == INVALID_POLICY_REVISION for event in events)
+    assert checkpoint == END
+
+
+@pytest.mark.parametrize("registration,first_policy", [(START, END), (END, START)])
+def test_registration_boundary_mismatch_is_known_but_never_authorizes_response(
+    session_factory, registration, first_policy,
+):
+    start = T0 if registration == START else T1
+    cutoff = start + timedelta(seconds=10)
+    with session_factory() as db:
+        _seed(db, status="ACTIVE", with_policy=False)
+        # Registration time is set once by _seed; a new device fixture allows
+        # both mismatches without weakening any migration constraints.
+        if registration != START:
+            db.execute(text("DELETE FROM devices WHERE device_id='esp32_01'"))
+            db.execute(text("""INSERT INTO devices (
+                device_id, ip_address, status, trust_score, registration_effective_from
+            ) VALUES ('esp32_01', '192.0.2.1', 'normal', 40, :start)"""),
+                {"start": registration})
+        _revision(db, effective=first_policy)
+        _event(db)
+        db.execute(text("""UPDATE detection_events SET
+            analysis_window_start=:start, analysis_window_end=:end, detected_at=:end"""),
+            {"start": registration, "end": cutoff.isoformat().replace("+00:00", "Z")})
+        db.commit()
+    with session_factory() as db:
+        resolver = load_policy_resolver(db)
+        assert resolver.resolve("esp32_01", start).reason == INVALID_POLICY_REVISION
+        assert resolver.resolve("esp32_01", cutoff).reason == INVALID_POLICY_REVISION
+        assert resolver.registered_ids_at(start) == {"esp32_01"}
+        assert resolver.resolve("esp32_01", start - timedelta(seconds=10)).reason == UNREGISTERED_AT_WINDOW
+        db.rollback()
+        with db.begin():
+            apply_trust_score_v2_until(
+                db, cycle_range_start=start, cycle_cutoff=cutoff, decision_at=cutoff,
+            )
+        assert db.execute(text("SELECT trust_score FROM devices")).scalar_one() == 40
+        assert db.execute(text("SELECT COUNT(*) FROM trust_score_history")).scalar_one() == 0
+        assert db.execute(text("SELECT COUNT(*) FROM firewall_rules")).scalar_one() == 0
+        assert db.execute(text("SELECT processing_reason FROM detection_events")).scalar_one() == INVALID_POLICY_REVISION
+
+
+def test_legacy_null_registration_keeps_identity_before_valid_backfill(session_factory):
+    with session_factory() as db:
+        db.execute(text("""INSERT INTO devices (device_id, ip_address)
+            VALUES ('esp32_01', '192.0.2.1')"""))
+        _revision(db, effective=END)
+        db.commit()
+        resolver = load_policy_resolver(db)
+        assert resolver.registered_ids_at(T0) == {"esp32_01"}
+        assert resolver.resolve("esp32_01", T0).reason == POLICY_UNAVAILABLE
+        assert resolver.resolve("esp32_01", T1).reason == POLICY_AVAILABLE
+
+
+@pytest.mark.parametrize("bad_kind", ["profile", "registration", "policy_time", "missing"])
+def test_invalid_device_cannot_drop_another_devices_raw(session_factory, bad_kind):
+    with session_factory() as db:
+        _seed(db, status="ACTIVE", with_policy=False)
+        if bad_kind == "registration":
+            # Imported invalid timestamp, isolated to this disposable DB.
+            db.execute(text("DELETE FROM devices WHERE device_id='esp32_01'"))
+            db.execute(text("PRAGMA ignore_check_constraints=ON"))
+            db.execute(text("""INSERT INTO devices
+                (device_id, ip_address, registration_effective_from)
+                VALUES ('esp32_01', '192.0.2.1', 'invalid-time')"""))
+        elif bad_kind == "profile":
+            _revision(db, profile="unsupported-profile")
+        elif bad_kind == "policy_time":
+            db.execute(text("PRAGMA ignore_check_constraints=ON"))
+            _revision(db, effective="invalid-time")
+        db.execute(text("""INSERT INTO devices
+            (device_id, ip_address, registration_effective_from)
+            VALUES ('esp32_02', '192.0.2.2', :start)"""), {"start": START})
+        _revision(db, device_id="esp32_02")
+        db.commit()
+    with session_factory() as db:
+        for device_id in ("esp32_01", "esp32_02"):
+            row = build_mqtt_log_row(
+                f"iot/{device_id}/sensor", f'{{"device_id":"{device_id}"}}',
+                received_at=T0 + timedelta(seconds=2),
+            )
+            insert_mqtt_log(db, row)
+        assert db.execute(text("SELECT COUNT(*) FROM mqtt_logs")).scalar_one() == 2
+        assert db.execute(text("""SELECT COUNT(*) FROM mqtt_logs WHERE
+            device_id='esp32_01' AND topic='iot/esp32_01/sensor'
+            AND payload='{"device_id":"esp32_01"}'""")).scalar_one() == 1
+        resolver = load_policy_resolver(db)
+        assert resolver.resolve("esp32_02", T0).reason == POLICY_AVAILABLE
+        assert resolver.device_id_for_ip("192.0.2.2", T0) == "esp32_02"
+        if bad_kind == "registration":
+            assert resolver.resolve("esp32_01", T0).reason == INVALID_REGISTRATION_REVISION
+            assert resolver.device_id_for_ip("192.0.2.1", T0) is None
+        else:
+            assert resolver.registered_ids_at(T0) == {"esp32_01", "esp32_02"}
+
+
+def test_bad_registration_timestamp_does_not_abort_fixed_rule_or_trust(session_factory):
+    with session_factory() as db:
+        db.execute(text("PRAGMA ignore_check_constraints=ON"))
+        db.execute(text("""INSERT INTO devices (
+            device_id, ip_address, status, trust_score, registration_effective_from
+        ) VALUES ('esp32_01', '192.0.2.1', 'normal', 40, 'invalid-time')"""))
+        _revision(db)
+        db.execute(text("""INSERT INTO feature_logs (
+            device_id, window_start, window_end, malformed_payload_count
+        ) VALUES ('esp32_01', :start, :end, 3)"""), {"start": START, "end": END})
+        db.commit()
+    with session_factory() as db:
+        with db.begin():
+            result = MqttFeatureRuleStage().run_until(
+                db, cycle_range_start=T0, cycle_cutoff=T1,
+            )
+        assert result.created_event_count == 2
+        assert db.execute(text("SELECT COUNT(*) FROM detection_events WHERE subject_ip IS NOT NULL")).scalar_one() == 0
+    _, score, events, history, firewall, _ = _run(session_factory)
+    assert (score, history, firewall) == (40, 0, 0)
+    assert all(event["processing_reason"] == INVALID_REGISTRATION_REVISION for event in events)
+
+
+def test_missing_initial_revision_is_not_renumbered_into_valid_policy(session_factory):
+    with session_factory() as db:
+        _seed(db, status="ACTIVE", with_policy=False)
+        # Model an imported incomplete history only in this disposable DB.
+        db.execute(text("DROP TRIGGER trg_device_policy_revisions_validate_insert"))
+        _revision(db, revision=2)
+        _event(db)
+        db.commit()
+    with session_factory() as db:
+        resolver = load_policy_resolver(db)
+        assert resolver.registered_ids_at(T0) == {"esp32_01"}
+        assert resolver.resolve("esp32_01", T0).reason == INVALID_POLICY_REVISION
+        assert resolver.resolve("esp32_01", T0).policy is None
+    _, score, events, history, firewall, _ = _run(session_factory)
+    assert (score, history, firewall) == (40, 0, 0)
+    assert events[0]["processing_reason"] == INVALID_POLICY_REVISION
+
+
+@pytest.mark.parametrize("keep_version,keep_columns", [(True, True), (False, True), (True, False)])
+def test_missing_post_phase8_policy_table_cannot_enable_legacy_trust(
+    session_factory, keep_version, keep_columns,
+):
+    with session_factory() as db:
+        _seed(db, status="ACTIVE")
+        _event(db)
+        db.execute(text("DROP TABLE device_policy_revisions"))
+        if not keep_version:
+            db.execute(text("DELETE FROM schema_migrations WHERE version=7"))
+        if not keep_columns:
+            # The marker alone is sufficient, even after an incomplete restore.
+            db.execute(text("DROP TRIGGER trg_devices_registration_effective_from_immutable"))
+            for column in ("registration_effective_from", "mqtt_principal", "device_type"):
+                db.execute(text(f"ALTER TABLE devices DROP COLUMN {column}"))
+        db.commit()
+    with session_factory() as db:
+        with pytest.raises(RuntimeError, match="policy table missing"):
+            with db.begin():
+                apply_trust_score_v2_until(
+                    db, cycle_range_start=T0, cycle_cutoff=T1, decision_at=T2,
+                )
+        assert db.execute(text("SELECT trust_score FROM devices")).scalar_one() == 40
+        assert db.execute(text("SELECT COUNT(*) FROM trust_score_history")).scalar_one() == 0
+        assert db.execute(text("SELECT COUNT(*) FROM firewall_rules")).scalar_one() == 0
+        assert db.execute(text("SELECT COUNT(*) FROM detector_checkpoints")).scalar_one() == 0
+        assert db.execute(text("SELECT processed_at FROM detection_events")).scalar_one() is None
+
+
+def test_genuine_pre_phase8_schema_keeps_legacy_resolver_path(tmp_path):
+    import shutil
+    migrations = tmp_path / "pre-phase8-migrations"
+    migrations.mkdir()
+    for source in MIGRATIONS_DIR.glob("*.sql"):
+        if int(source.name.split("_")[0]) < 7:
+            shutil.copy2(source, migrations / source.name)
+    path = tmp_path / "pre-phase8.db"
+    apply_migrations(path, migrations)
+    engine = create_engine(f"sqlite:///{path}")
+    try:
+        with sessionmaker(bind=engine)() as db:
+            assert load_policy_resolver(db) is None
+    finally:
+        engine.dispose()

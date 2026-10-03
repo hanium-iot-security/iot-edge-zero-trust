@@ -9,10 +9,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from math import isfinite
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from edge.detection.phase4_time import floor_window_start
+from edge.policy.device_policy import (
+    POLICY_PROFILE,
+    validate_policy,
+    validate_registration_state,
+    validate_revision_number,
+)
 
 
 WINDOW_SECONDS = 10
@@ -43,6 +48,10 @@ class DevicePolicyRevision:
     payload_size_max: int
     packet_rate_max: float
     byte_rate_max: float
+    # Defaults preserve the established in-memory constructor. The DB reader
+    # must supply both fields explicitly and reject incomplete schemas/rows.
+    policy_profile: str = POLICY_PROFILE
+    expected_publish_interval_seconds: float = 5
 
 
 @dataclass(frozen=True)
@@ -76,14 +85,19 @@ class DevicePolicyResolver:
         self,
         registrations: Iterable[RegistrationRevision],
         policies: Iterable[DevicePolicyRevision],
+        *,
+        invalid_devices: Mapping[str, str] | None = None,
     ) -> None:
         self._registrations = tuple(registrations)
         self._policies = tuple(policies)
+        self._invalid_devices = dict(invalid_devices or {})
 
     def registration_at(
         self, device_id: str, window_start: datetime
     ) -> RegistrationRevision | None:
         require_window_start(window_start)
+        if self._invalid_devices.get(device_id) == INVALID_REGISTRATION_REVISION:
+            raise ValueError(INVALID_REGISTRATION_REVISION)
         candidates = [
             row for row in self._registrations
             if row.device_id == device_id
@@ -113,10 +127,15 @@ class DevicePolicyResolver:
     def registered_ids_at(self, window_start: datetime) -> set[str]:
         require_window_start(window_start)
         ids = {row.device_id for row in self._registrations}
-        return {
-            device_id for device_id in ids
-            if self.registration_at(device_id, window_start) is not None
-        }
+        registered = set()
+        for device_id in ids:
+            try:
+                if self.registration_at(device_id, window_start) is not None:
+                    registered.add(device_id)
+            except ValueError:
+                # Invalid membership for one device must not abort the batch.
+                continue
+        return registered
 
     def device_id_for_ip(self, ip_address: str, window_start: datetime) -> str | None:
         """Return only an unambiguous historical IP owner, including PENDING."""
@@ -131,6 +150,9 @@ class DevicePolicyResolver:
     ) -> str | None:
         """Recheck current state and accepted disable requests before scoring."""
         _require_utc(decision_at, "decision_at")
+        invalid_reason = self._invalid_devices.get(device_id)
+        if invalid_reason is not None:
+            return invalid_reason
         accepted = [
             row for row in self._registrations
             if row.device_id == device_id
@@ -165,6 +187,11 @@ class DevicePolicyResolver:
         if registration is None:
             return PolicyResolution(
                 device_id, window_start, None, None, UNREGISTERED_AT_WINDOW
+            )
+        invalid_reason = self._invalid_devices.get(device_id)
+        if invalid_reason is not None:
+            return PolicyResolution(
+                device_id, window_start, registration, None, invalid_reason
             )
         candidates = [
             row for row in self._policies
@@ -214,7 +241,7 @@ class DevicePolicyResolver:
 
 
 def _require_utc(value: datetime, name: str) -> None:
-    if value.tzinfo is None or value.utcoffset() != timedelta(0):
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() != timedelta(0):
         raise ValueError(f"{name} must be timezone-aware UTC")
 
 
@@ -227,29 +254,34 @@ def _valid_boundary(value: datetime) -> bool:
 
 
 def _valid_policy(row: DevicePolicyRevision) -> bool:
-    return (
-        row.revision > 0
-        and _valid_boundary(row.effective_from)
-        and isinstance(row.publish_count_max, int)
-        and not isinstance(row.publish_count_max, bool)
-        and row.publish_count_max >= 0
-        and isinstance(row.payload_size_max, int)
-        and not isinstance(row.payload_size_max, bool)
-        and row.payload_size_max >= 0
-        and all(
-            isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and isfinite(value) and value >= 0
-            for value in (row.packet_rate_max, row.byte_rate_max)
-        )
-    )
+    try:
+        validate_revision_number(row.revision, "revision")
+        require_window_start(row.effective_from)
+        validate_policy({
+            "policy_profile": row.policy_profile,
+            "expected_publish_interval_seconds": row.expected_publish_interval_seconds,
+            "publish_count_max": row.publish_count_max,
+            "payload_size_max_bytes": row.payload_size_max,
+            "packet_rate_max_pps": row.packet_rate_max,
+            "byte_rate_max_bytes_per_second": row.byte_rate_max,
+        })
+    except (ValueError, TypeError, OverflowError):
+        return False
+    return True
 
 
 def _valid_revision_sequence(rows: list[RegistrationRevision | DevicePolicyRevision]) -> bool:
     ordered = sorted(rows, key=lambda row: row.effective_from)
-    return all(
-        current.revision > 0
-        and (index == 0 or current.revision > ordered[index - 1].revision)
-        and (index == 0 or current.effective_from > ordered[index - 1].effective_from)
-        for index, current in enumerate(ordered)
-    )
+    for index, current in enumerate(ordered):
+        try:
+            validate_revision_number(current.revision, "revision")
+            if isinstance(current, RegistrationRevision):
+                validate_registration_state(current.status)
+        except ValueError:
+            return False
+        if index and (
+            current.revision <= ordered[index - 1].revision
+            or current.effective_from <= ordered[index - 1].effective_from
+        ):
+            return False
+    return True
