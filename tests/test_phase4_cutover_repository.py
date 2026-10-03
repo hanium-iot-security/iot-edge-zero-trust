@@ -296,6 +296,22 @@ def test_initialize_phase4_cutover_allows_current_open_mqtt_window(
         assert summary["checkpoints"][key]["last_processed_id"] == included_id
 
 
+def test_initialize_phase4_cutover_uses_exact_microsecond_boundaries(
+    migrated_db: Path,
+) -> None:
+    with connect_database(migrated_db) as connection:
+        included_id = _insert_mqtt_log(
+            connection, received_at="2026-07-21T04:29:59.999999Z"
+        )
+        _insert_mqtt_log(
+            connection, received_at="2026-07-21T04:30:09.999999Z"
+        )
+
+    summary = initialize_phase4_cutover(migrated_db, CUTOVER_AT)
+    for key in ("mqtt_feature_builder+mqtt_logs", "mqtt_message_rule+mqtt_logs"):
+        assert summary["checkpoints"][key]["last_processed_id"] == included_id
+
+
 def test_initialize_phase4_cutover_rejects_mqtt_timestamp_beyond_open_window(
     migrated_db: Path,
 ) -> None:

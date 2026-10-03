@@ -467,7 +467,9 @@ def _select_mqtt_rows(
             SELECT id, device_id, topic, payload, received_at, is_json_valid
             FROM mqtt_logs
             WHERE unixepoch(received_at) >= unixepoch(:range_start)
-              AND unixepoch(received_at) < unixepoch(:cutoff)
+              -- Include SQLite's rounded boundary second; Python applies the
+              -- precise half-open interval to the original microsecond value.
+              AND unixepoch(received_at) <= unixepoch(:cutoff)
             ORDER BY id ASC
             """
         ),
@@ -476,7 +478,15 @@ def _select_mqtt_rows(
             "cutoff": format_db_utc(cutoff),
         },
     ).mappings()
-    return [dict(row) for row in rows]
+    selected = []
+    for row in rows:
+        source = dict(row)
+        received_at = parse_db_utc(
+            source["received_at"], "received_at", allow_subseconds=True
+        )
+        if range_start <= received_at < cutoff:
+            selected.append(source)
+    return selected
 
 
 def _registered_device_ips(db: Session) -> dict[str, str | None]:

@@ -47,23 +47,40 @@ def load_policy_resolver(db: Session) -> DevicePolicyResolver | None:
     if not required_device <= device_columns or not required_policy <= policy_columns:
         raise RuntimeError("Phase 8 device-policy-v1 schema is incomplete")
 
-    devices = list(db.execute(text(
-        "SELECT device_id, ip_address, registration_effective_from FROM devices"
-    )).mappings())
-    revision_rows = list(db.execute(text(
-        "SELECT device_id, revision, effective_from, registration_state, "
-        "created_at, publish_count_max, payload_size_max_bytes, "
-        "packet_rate_max_pps, byte_rate_max_bytes_per_second "
-        "FROM device_policy_revisions ORDER BY device_id, revision"
-    )).mappings())
+    # SQLite's legacy transaction mode does not start a read transaction for
+    # separate SELECTs. A registration committed between them would make its
+    # policy look orphaned. One statement gives both tables the same snapshot
+    # without holding a read transaction across the caller's later Raw write.
+    snapshot_rows = list(db.execute(text("""
+        WITH ids AS (
+            SELECT device_id FROM devices
+            UNION
+            SELECT device_id FROM device_policy_revisions
+        )
+        SELECT d.device_id AS registered_device_id, d.ip_address,
+               d.registration_effective_from,
+               p.device_id AS policy_device_id, p.revision, p.effective_from,
+               p.registration_state, p.created_at, p.publish_count_max,
+               p.payload_size_max_bytes, p.packet_rate_max_pps,
+               p.byte_rate_max_bytes_per_second
+        FROM ids
+        LEFT JOIN devices AS d ON d.device_id = ids.device_id
+        LEFT JOIN device_policy_revisions AS p ON p.device_id = ids.device_id
+        ORDER BY ids.device_id, p.revision
+    """)).mappings())
+    devices: dict[str, dict] = {}
     by_device: dict[str, list] = defaultdict(list)
-    for row in revision_rows:
-        by_device[str(row["device_id"])].append(row)
+    for row in snapshot_rows:
+        if row["registered_device_id"] is None:
+            raise RuntimeError("Policy revision references an unknown device")
+        device_id = str(row["registered_device_id"])
+        devices[device_id] = row
+        if row["policy_device_id"] is not None:
+            by_device[device_id].append(row)
 
     registrations: list[RegistrationRevision] = []
     policies: list[DevicePolicyRevision] = []
-    for device in devices:
-        device_id = str(device["device_id"])
+    for device_id, device in devices.items():
         ip_address = str(device["ip_address"]) if device["ip_address"] else None
         starts_at = (
             parse_db_utc(device["registration_effective_from"], "registration_effective_from")
@@ -103,8 +120,6 @@ def load_policy_resolver(db: Session) -> DevicePolicyResolver | None:
                 packet_rate_max=row["packet_rate_max_pps"],
                 byte_rate_max=row["byte_rate_max_bytes_per_second"],
             ))
-    if by_device:
-        raise RuntimeError("Policy revision references an unknown device")
     return DevicePolicyResolver(registrations, policies)
 
 

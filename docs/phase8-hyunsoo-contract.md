@@ -1,10 +1,10 @@
 # Phase 8 현수: resolver·탐지·Trust 연결 계약
 
-최초 기준: develop `559fa41fcd5cdf4deb74219a902ca91a9ec8095b`. 2026-10-02 로컬 통합은 우민 #84의 `docs/contracts/device-policy-v1.md`, 종민 #86·#87을 반영한다. 이 문서는 현수의 Rule·Identity·Trust 연결을 설명하며, 저장/API 계약의 기준은 `docs/contracts/device-policy-v1.md`다. #84·#86·#87의 로컬 병합은 원격 PR의 승인·병합을 뜻하지 않는다. 운영 DB는 변경하지 않았다.
+최초 기준: develop `559fa41fcd5cdf4deb74219a902ca91a9ec8095b`. 2026-10-03 현재 #84·#86·#87은 develop `7ab389a`에 병합됐고 현수 브랜치는 그 커밋 위에 재배치했다. #84의 리뷰 수정 `125e564`와 #87의 후속 수정 `c681fb9`도 이 기준에 포함된다. 이 문서는 현수의 Rule·Identity·Trust 연결을 설명하며, 저장/API 계약의 기준은 `docs/contracts/device-policy-v1.md`다. 운영 DB는 변경하지 않았다.
 
 ## UTC 원본 시각과 resolver
 
-`DevicePolicyResolver`는 Migration 007의 `devices`와 `device_policy_revisions`를 Window/배치 단위로 읽은 불변 snapshot이다. 조회 키는 **원본의 UTC 10초 `window_start`**이며 처리 시각이 아니다. 정확히 경계에 접수한 변경도 다음 10초부터 효력이 생긴다. 종민의 `device_policy_resolver.py`와 같은 등록·정책 시점 계약을 따르고, 탐지용 adapter는 SQLAlchemy Session의 동일 DB 연결에서 읽는다. API의 현재/예정 정책은 저장소의 `get_policy_snapshot()` 계약을 따른다. 원본 `mqtt_logs.topic`, `payload`, `received_at`, 후보 `device_id`는 판정으로 수정하지 않는다.
+`DevicePolicyResolver`는 Migration 007의 `devices`와 `device_policy_revisions`를 Window/배치 단위로 읽은 불변 snapshot이다. 두 집합은 단일 SQLite SELECT에서 읽어 동시 등록이 끼어들어도 서로 다른 시점의 행을 섞지 않는다. 조회 키는 **원본의 UTC 10초 `window_start`**이며 처리 시각이 아니다. 정확히 경계에 접수한 변경도 다음 10초부터 효력이 생긴다. 종민의 `device_policy_resolver.py`와 같은 등록·정책 시점 계약을 따르고, 탐지용 adapter는 SQLAlchemy Session의 동일 DB 연결에서 읽는다. API의 현재/예정 정책은 저장소의 `get_policy_snapshot()` 계약을 따른다. 원본 `mqtt_logs.topic`, `payload`, `received_at`, 후보 `device_id`는 판정으로 수정하지 않는다.
 
 현재 repository projection 계약:
 
@@ -27,9 +27,9 @@ Trust 단계는 Worker와 같은 **절대 경로** `firewall_lock_path()`를 먼
 
 ## 병합 순서와 남은 검증
 
-1. #84 계약과 #86 MQTT 원본 유효성, #87 Migration·저장소를 각 PR의 팀 리뷰 후 develop에 병합한다. 현수 브랜치에서는 같은 Commit을 로컬에서 먼저 통합했다.
-2. 현수의 Subscriber/Feature, `edge/policy`, `tests/test_phase4_trust_firewall.py` 중복 변경을 조정하고 Migration 007 fixture로 회귀 검증한다.
-3. 우민의 P8-04 등록/정책 API에서 `state_change_guard`와 공용 파일 lock → DB write lock, 비활성화 예약 및 FAILED 재시도 경계를 연결한다. API PR은 2026-10-02 현재 미확인이다.
+1. #84·#86·#87은 develop에 병합됐다. 현수 PR의 최종 diff는 이 기준의 현수 변경만 포함하도록 재배치했다.
+2. Subscriber/Feature·`edge/policy`의 동시 등록과 마이크로초 경계 회귀를 확인한다. develop의 #89 AI 관측 모드는 현수 구현 범위가 아니며, 유효 정책을 가진 ACTIVE 기기 fixture와 함께 통합 회귀를 확인한다.
+3. 우민의 P8-04 등록/정책 API에서 `state_change_guard`와 공용 파일 lock → DB write lock, 비활성화 예약 및 FAILED 재시도 경계를 연결한다. API는 이 브랜치에 아직 포함되지 않았다.
 4. 운영값 backfill과 Pi 배포·Recovery/Firewall 실기기 검증은 우민·종민의 별도 결과로 판정한다.
 
 현재 로컬 fixture 검증은 실기기 Pi E2E, Runtime Firewall 상태, Pico G2 동작을 증명하지 않는다. API의 FAILED 재시도·동시 비활성화 처리와 운영 정책값 이관은 후속 통합 검증 대상이다.

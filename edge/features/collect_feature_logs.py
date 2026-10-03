@@ -396,7 +396,9 @@ def _fetch_mqtt_sources_after_checkpoint(
                       AND unixepoch(received_at) >= unixepoch(:completed_before)
                   )
               )
-              AND unixepoch(received_at) < unixepoch(:cutoff)
+              -- unixepoch() can round 09.999999 up to the 10-second cutoff.
+              -- Include that second, then apply the exact half-open bound in Python.
+              AND unixepoch(received_at) <= unixepoch(:cutoff)
             ORDER BY id ASC
             """
         ),
@@ -410,7 +412,22 @@ def _fetch_mqtt_sources_after_checkpoint(
             "cutoff": format_db_utc(cutoff),
         },
     ).mappings()
-    return [dict(row) for row in rows]
+    selected = []
+    for row in rows:
+        source = dict(row)
+        received_at = parse_db_utc(
+            source["received_at"], "received_at", allow_subseconds=True
+        )
+        if received_at >= cutoff:
+            continue
+        if (
+            last_processed_id is not None
+            and int(source["id"]) <= last_processed_id
+            and (completed_before is None or received_at < completed_before)
+        ):
+            continue
+        selected.append(source)
+    return selected
 
 
 def phase4_producer_checkpoint_exists(db: Session) -> bool:

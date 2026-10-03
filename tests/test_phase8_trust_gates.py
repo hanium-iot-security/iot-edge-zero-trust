@@ -1,7 +1,9 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import sqlite3
 
 import pytest
+from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
@@ -88,6 +90,93 @@ def _run(factory, *, decision_at=T2):
         checkpoint = db.execute(text("""SELECT last_completed_window_end
             FROM detector_checkpoints WHERE detector_name='trust_score_v2'""")).scalar_one()
         return result, score, events, history, firewall, checkpoint
+
+
+def test_subscriber_keeps_raw_when_registration_commits_during_policy_snapshot(
+    session_factory,
+):
+    engine = session_factory.kw["bind"]
+    db_path = engine.url.database
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+    with session_factory() as db:
+        _seed(db, status="ACTIVE")
+        db.commit()
+
+    registered = False
+
+    def register_after_snapshot_query(_conn, _cursor, statement, _params, _context, _many):
+        nonlocal registered
+        if registered or "registration_effective_from" not in statement or "FROM devices" not in statement:
+            return
+        registered = True
+        with sqlite3.connect(db_path, timeout=3) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("""INSERT INTO devices
+                (device_id, ip_address, status, trust_score, registration_effective_from)
+                VALUES ('esp32_02', '192.0.2.2', 'normal', 100, ?)""", (END,))
+            writer.execute("""INSERT INTO device_policy_revisions (
+                device_id, revision, effective_from, registration_state,
+                policy_profile, expected_publish_interval_seconds,
+                publish_count_max, payload_size_max_bytes, packet_rate_max_pps,
+                byte_rate_max_bytes_per_second, created_at, created_by, reason
+            ) VALUES ('esp32_02', 1, ?, 'PENDING', 'periodic-sensor-v1', 5,
+                      15, 5120, 10, 2500, ?, 'test', 'concurrent registration')""",
+                (END, START))
+
+    event.listen(engine, "after_cursor_execute", register_after_snapshot_query)
+    try:
+        with session_factory() as db:
+            row = build_mqtt_log_row(
+                "iot/esp32_01/sensor", '{"device_id":"esp32_01"}',
+                received_at=T0 + timedelta(seconds=2),
+            )
+            insert_mqtt_log(db, row)
+            db.commit()
+    finally:
+        event.remove(engine, "after_cursor_execute", register_after_snapshot_query)
+
+    assert registered
+    with session_factory() as db:
+        assert db.execute(text("SELECT COUNT(*) FROM mqtt_logs")).scalar_one() == 1
+        assert db.execute(text("SELECT COUNT(*) FROM device_policy_revisions")).scalar_one() == 2
+
+
+def test_mqtt_rule_stage_keeps_microsecond_before_cutoff_in_original_window(
+    session_factory,
+):
+    before_cutoff = T1 - timedelta(microseconds=1)
+    with session_factory() as db:
+        _seed(db, status="ACTIVE")
+        db.execute(text("""INSERT INTO devices
+            (device_id, ip_address, status, trust_score, registration_effective_from)
+            VALUES ('esp32_02', '192.0.2.2', 'normal', 100, :start)"""),
+            {"start": START})
+        _revision(db, device_id="esp32_02", status="ACTIVE")
+        for received_at in (before_cutoff, T1):
+            db.execute(text("""INSERT INTO mqtt_logs
+                (device_id, topic, payload, payload_size, received_at,
+                 is_json_valid, is_topic_valid)
+                VALUES ('esp32_01', 'iot/esp32_01/sensor',
+                        '{"device_id":"esp32_02"}', 24, :received_at, 1, 1)"""),
+                {"received_at": received_at.isoformat().replace("+00:00", "Z")})
+        db.commit()
+
+    with session_factory() as db:
+        with db.begin():
+            first = MqttMessageRuleStage().run_until(
+                db, cycle_range_start=T0, cycle_cutoff=T1,
+            )
+        assert first.created_event_count == 1
+        with db.begin():
+            second = MqttMessageRuleStage().run_until(
+                db, cycle_range_start=T1, cycle_cutoff=T2,
+            )
+        assert second.created_event_count == 1
+        windows = db.execute(text("""SELECT analysis_window_start, mqtt_log_id
+            FROM detection_events ORDER BY mqtt_log_id""")).all()
+        assert [row[0] for row in windows] == [START, END]
+        assert [row[1] for row in windows] == [1, 2]
 
 
 def test_pending_predictor_receives_feature_and_event_is_recorded_without_response(

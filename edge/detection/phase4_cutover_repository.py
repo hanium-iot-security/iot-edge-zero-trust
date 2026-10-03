@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 from db.migration_runner import connect_database
 from edge.detection import checkpoint_repository as checkpoints
+from edge.detection.phase4_time import parse_db_utc
 from edge.packet.pcap_naming import format_utc_iso
 
 
@@ -88,32 +89,33 @@ def _validate_mqtt_timestamps(
 
     allowed_before = cutover_at + timedelta(seconds=10)
     params = {"allowed_before": format_utc_iso(allowed_before)}
-    future_count = int(
-        connection.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM mqtt_logs
-            WHERE unixepoch(received_at) >= unixepoch(:allowed_before)
-            """,
-            params,
-        ).fetchone()["count"]
-    )
-    if future_count == 0:
-        return
-
-    first = connection.execute(
+    # unixepoch() may round the last microsecond of the open window into the
+    # boundary. Use it only to narrow candidates, then compare exact UTC time.
+    candidates = connection.execute(
         """
         SELECT id, received_at
         FROM mqtt_logs
         WHERE unixepoch(received_at) >= unixepoch(:allowed_before)
-        ORDER BY unixepoch(received_at) ASC, id ASC
-        LIMIT 1
         """,
         params,
-    ).fetchone()
+    ).fetchall()
+    future = [
+        row for row in candidates
+        if parse_db_utc(row["received_at"], "received_at", allow_subseconds=True)
+        >= allowed_before
+    ]
+    if not future:
+        return
+    first = min(
+        future,
+        key=lambda row: (
+            parse_db_utc(row["received_at"], "received_at", allow_subseconds=True),
+            row["id"],
+        ),
+    )
     raise ValueError(
         "mqtt_logs contains timestamps beyond the allowed open window: "
-        f"count={future_count} id={first['id']} "
+        f"count={len(future)} id={first['id']} "
         f"received_at={first['received_at']} "
         f"allowed_before={format_utc_iso(allowed_before)}"
     )
@@ -202,15 +204,19 @@ def _max_mqtt_log_id_before(
 ) -> int | None:
     if completed_window_end is None:
         return None
-    row = connection.execute(
+    rows = connection.execute(
         """
-        SELECT MAX(id) AS max_id
+        SELECT id, received_at
         FROM mqtt_logs
-        WHERE unixepoch(received_at) < unixepoch(:completed_window_end)
+        WHERE unixepoch(received_at) <= unixepoch(:completed_window_end)
+        ORDER BY id DESC
         """,
         {"completed_window_end": format_utc_iso(completed_window_end)},
-    ).fetchone()
-    return int(row["max_id"]) if row["max_id"] is not None else None
+    )
+    for row in rows:
+        if parse_db_utc(row["received_at"], "received_at", allow_subseconds=True) < completed_window_end:
+            return int(row["id"])
+    return None
 
 
 def _max_feature_log_id_through(

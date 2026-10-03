@@ -51,10 +51,10 @@ MVP에서는 기기가 `isolated` 상태가 된 이후 추가 보안 이벤트�
 | event_type | score_delta | 비고 |
 | --- | ---: | --- |
 | `DEVICE_ID_MISMATCH` | -25 | 기기 신원 불일치 |
-| `ABNORMAL_PUBLISH_RATE` | -20 | 10초 Window의 `publish_count > 15` |
+| `ABNORMAL_PUBLISH_RATE` | -20 | 10초 Window의 `publish_count >` 당시 기기 정책 `publish_count_max` |
 | `ABNORMAL_TOPIC` | -20 | 허용되지 않은 topic 접근 |
 | `LARGE_PAYLOAD` | -15 | payload 크기 초과 |
-| `AI_ANOMALY` | -15 | Isolation Forest 이상 탐지 |
+| `AI_ANOMALY` | -15 | Isolation Forest 이상 탐지, `TRUST_AI_MODE=enforce` 기준 |
 | `MALFORMED_PAYLOAD` | -10 | 깨진 JSON 또는 필수 필드 누락 |
 | `UNKNOWN_DEVICE` | 0 | Trust Score 계산 대상 아님 |
 

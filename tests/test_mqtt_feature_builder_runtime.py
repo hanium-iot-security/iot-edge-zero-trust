@@ -84,7 +84,10 @@ def _insert_mqtt_log(db, *, received_at: datetime, device_id: str = DEVICE_ID) -
             "topic": f"iot/{device_id}/sensor",
             "payload": payload,
             "payload_size": len(payload),
-            "received_at": format_db_utc(received_at),
+            "received_at": (
+                received_at.isoformat(timespec="microseconds").replace("+00:00", "Z")
+                if received_at.microsecond else format_db_utc(received_at)
+            ),
         },
     )
     db.commit()
@@ -166,6 +169,38 @@ def test_closed_window_source_becomes_feature(SessionLocal):
         checkpoint = _checkpoint(db)
         assert checkpoint["last_completed_window_end"] == "2026-07-25T12:00:10Z"
         assert checkpoint["last_processed_id"] == 2
+
+
+def test_microsecond_before_cutoff_is_processed_in_its_original_window(SessionLocal):
+    before_cutoff = WINDOW_0_END - timedelta(microseconds=1)
+    with SessionLocal() as db:
+        first_id = _insert_mqtt_log(db, received_at=before_cutoff)
+        second_id = _insert_mqtt_log(db, received_at=WINDOW_0_END)
+
+    first = run_producer_cycle(
+        session_factory=SessionLocal,
+        now=WINDOW_0_END + timedelta(seconds=1),
+    )
+    assert (first.selected_count, first.created_feature_count, first.late_source_count) == (
+        1, 1, 0,
+    )
+    assert first.last_processed_id_after == first_id
+    with SessionLocal() as db:
+        assert _feature_windows(db) == [("2026-07-25T12:00:00Z", "2026-07-25T12:00:10Z")]
+
+    second = run_producer_cycle(
+        session_factory=SessionLocal,
+        now=WINDOW_1_END + timedelta(seconds=1),
+    )
+    assert (second.selected_count, second.created_feature_count, second.late_source_count) == (
+        1, 1, 0,
+    )
+    assert second.last_processed_id_after == second_id
+    with SessionLocal() as db:
+        assert _feature_windows(db) == [
+            ("2026-07-25T12:00:00Z", "2026-07-25T12:00:10Z"),
+            ("2026-07-25T12:00:10Z", "2026-07-25T12:00:20Z"),
+        ]
 
 
 # --- 빈 Window -------------------------------------------------------------

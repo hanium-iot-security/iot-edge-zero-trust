@@ -2,7 +2,7 @@
 
 기준 브랜치 `codex/phase8-hyunsoo`, 최초 기준 커밋 `559fa41fcd5cdf4deb74219a902ca91a9ec8095b`. 작업 시작 전 `review-pr24`는 깨끗한 상태였다. 로컬에 원격 설정은 없었고, 기존 reflog의 GitHub URL에서 develop을 직접 fetch해 기준 커밋을 확보했다. 최초 fetch 후 `origin/develop`은 `c8ea2bc`였으며, 작업 브랜치는 요청한 `559fa41`에서 생성했다. Git이 표시한 `559fa41` 작성 시각은 2026-08-28 20:01:38 +09:00로, 요청문에 적힌 2026-09-30과 다르다.
 
-2026-10-02 로컬 통합: 최신 develop `aa3660f`와 #84(계약), #86(MQTT 원본 유효성), #87(Migration 007·정책 저장소)를 **로컬 브랜치에만** 병합했다. 원격 PR 승인·병합, push, 운영 DB 변경은 하지 않았다. 병합 전 현수 작업은 `.worktrees/phase8-preserve-20261002` 사본과 `phase8-hyunsoo-before-pr-integration-2026-10-02` stash로 보존했다. Subscriber와 Feature 수집기의 충돌은 두 변경을 함께 반영해 해결했다. 현수 변경은 현재 미커밋 작업 트리에 남아 있다.
+2026-10-02 최초 로컬 통합: develop `aa3660f`와 #84(계약), #86(MQTT 원본 유효성), #87(Migration 007·정책 저장소)를 로컬 브랜치에 병합했다. 이때 원격 PR 승인·병합, push, 운영 DB 변경은 하지 않았다. 병합 전 현수 작업은 `.worktrees/phase8-preserve-20261002` 사본과 `phase8-hyunsoo-before-pr-integration-2026-10-02` stash로 보존했다. Subscriber와 Feature 수집기의 충돌은 두 변경을 함께 반영해 해결했다. 이후 현수 변경은 `6f9a17d`로 커밋·push했다.
 
 | 작업 ID | 수정 파일 | 재현 결함·해결 | 로컬 판정 |
 | --- | --- | --- | --- |
@@ -27,6 +27,22 @@ $env:PATH='C:\Users\Hyunsoo\AppData\Local\Programs\Git\bin;'+$env:PATH
 ```
 
 최종 결과: **2393 passed, 13 skipped, 3 warnings** (143.21초). Windows에서 Firewall wrapper 테스트가 Git Bash를 쓰도록 PATH를 지정했다. skipped 테스트를 통과로 계산하지 않는다. 운영 DB 복사본과 Pi 실기기 검증은 이 결과에 포함되지 않는다.
+
+## 2026-10-03 PR 리뷰 보완
+
+- #84의 리뷰 수정 `125e564`를 한때 `f605f4f`로 cherry-pick했다. 이후 #84·#86·#87이 develop에 병합되어, 현수 브랜치를 최신 develop `7ab389a` 위에 rebase했다. 동일한 #84 패치는 upstream에 있어 rebase에서 중복 커밋을 생략했다. #87의 후속 `c681fb9`와 develop의 별도 #89 AI 관측 코드도 기준에 포함됐으며, 현수 PR의 의존 코드 중복 diff를 제거했다. 이전 이력은 로컬 `backup/phase8-pr88-before-rebase`에 보존했다.
+- `load_policy_resolver()`는 `devices`와 `device_policy_revisions`를 한 SQLite SELECT의 스냅샷으로 읽는다. 별도 SELECT 사이 신규 등록이 완료되어 정상 revision을 orphan으로 오판하고 Subscriber의 Raw 저장을 중단하던 경합을 실제 WAL 동시 등록 fixture로 재현·검증했다.
+- SQLite 3.40.1에서 `unixepoch('2026-09-30T00:00:09.999999Z')`와 `unixepoch('2026-09-30T00:00:10Z')`가 같은 정수 초로 반환됨을 확인했다. MQTT Feature·Rule 조회와 Phase 4 cutover는 SQL에서 경계 초를 후보로 포함한 뒤 Python에서 원본 마이크로초 UTC 시각으로 정확한 반열린 구간을 판정한다. 09.999999초 Raw가 원래 Window의 Feature·Rule에 들어가고 10.000000초 Raw는 다음 Window에만 들어가는 경계 테스트를 추가했다.
+
+```powershell
+.venv\Scripts\python.exe -m pytest -q --tb=short tests/test_phase4_cutover_repository.py tests/test_packet_capture_safety.py tests/test_phase8_trust_gates.py tests/test_mqtt_feature_builder_runtime.py
+$env:PATH='C:\Users\Hyunsoo\AppData\Local\Programs\Git\bin;'+$env:PATH
+.venv\Scripts\python.exe -m pytest -q --tb=short tests backend/tests
+```
+
+rebase 전 관련 검증: **89 passed, 5 skipped**. rebase 전 전체 Windows 로컬 회귀: **2400 passed, 15 skipped, 3 warnings** (440.29초). Linux 2406개 통과는 리뷰어가 보고한 별도 결과이며 이 변경 후 재실행 결과가 아니다.
+
+최신 develop `7ab389a` 위에서는 #89 AI 관측 테스트 fixture에 실제 ACTIVE 정책 revision을 추가했다. 정책이 없는 ACTIVE 기기는 `POLICY_UNAVAILABLE`로 처리하는 Phase 8 경계를 유지하고, #89의 관측 동작을 변경하지 않았다. 구형 Trust 테스트는 Phase 4/v2 DB의 쓰기 전 거부를 확인하도록 조정했다. 관련 Orchestrator·Trust·AI 회귀는 **122 passed**다. 같은 최신 기준에서 전체 Windows 로컬 회귀를 다시 실행한 결과는 **2495 passed, 15 skipped, 3 warnings** (470.65초)이다. Pi·운영 DB 복사본·Runtime Firewall 실기기 상태·Pico G2는 여전히 **미검증**이다.
 
 ## 의존성 및 판정 경계
 

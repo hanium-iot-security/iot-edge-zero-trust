@@ -6,7 +6,6 @@ import json
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from backend.app.config import Settings, settings
@@ -41,11 +40,21 @@ def database(tmp_path, monkeypatch):
 
 
 def _device(db, score=100, status="normal"):
+    registered_at = _utc(START - timedelta(seconds=10))
     db.execute(
-        text("INSERT INTO devices (device_id, ip_address, trust_score, status) "
-             "VALUES ('esp32_01', '192.168.0.21', :score, :status)"),
-        {"score": score, "status": status},
+        text("INSERT INTO devices (device_id, ip_address, trust_score, status, "
+             "registration_effective_from) "
+             "VALUES ('esp32_01', '192.168.0.21', :score, :status, :registered_at)"),
+        {"score": score, "status": status, "registered_at": registered_at},
     )
+    db.execute(text("""INSERT INTO device_policy_revisions (
+        device_id, revision, effective_from, registration_state, policy_profile,
+        expected_publish_interval_seconds, publish_count_max,
+        payload_size_max_bytes, packet_rate_max_pps,
+        byte_rate_max_bytes_per_second, created_at, created_by, reason
+    ) VALUES ('esp32_01', 1, :registered_at, 'ACTIVE', 'periodic-sensor-v1',
+              5, 15, 5120, 10, 2500, :registered_at, 'test', 'AI fixture')"""),
+        {"registered_at": registered_at})
 
 
 def _event(db, event_type="AI_ANOMALY", *, detector_type="AI", family="AI_ONLY",
@@ -327,8 +336,8 @@ def test_legacy_trust_update_cannot_bypass_observation_policy(database, monkeypa
         assert _snapshot(db) == before
 
 
-def test_legacy_guard_serializes_with_first_observation_commit(database, monkeypatch):
-    """A first observation cannot commit between the legacy guard and scoring."""
+def test_legacy_guard_blocks_phase4_before_first_observation(database, monkeypatch):
+    """The legacy path is rejected before candidate reads, even without observations."""
     from edge.trust import trust_score_service as legacy
 
     path, factory = database
@@ -336,27 +345,11 @@ def test_legacy_guard_serializes_with_first_observation_commit(database, monkeyp
         _device(db)
         event_id = _event(db, "AI_PACKET_ANOMALY")
 
-    class RetryLegacyAfterObservation(RuntimeError):
-        pass
-
-    fetch_candidates = legacy._fetch_candidate_events
-
-    def observe_after_guard(connection):
-        candidates = fetch_candidates(connection)
-        assert [row["id"] for row in candidates] == [event_id]
-        # Interleave a real v2 transaction on another SQLite connection exactly
-        # where the old legacy guard had already checked for observation rows.
-        with pytest.raises(OperationalError, match="locked"):
-            with factory.begin() as observer:
-                observer.execute(text("PRAGMA busy_timeout=0"))
-                _run(observer, ai_mode="observe")
-        # End this legacy attempt without scoring, then let observation win the
-        # next transaction. The retried legacy call must re-read the guard.
-        raise RetryLegacyAfterObservation
-
+    def unexpected_candidate_read(_connection):
+        raise AssertionError("legacy candidate query ran on a Phase 4/v2 database")
     with monkeypatch.context() as scoped:
-        scoped.setattr(legacy, "_fetch_candidate_events", observe_after_guard)
-        with pytest.raises(RetryLegacyAfterObservation):
+        scoped.setattr(legacy, "_fetch_candidate_events", unexpected_candidate_read)
+        with pytest.raises(legacy.LegacyTrustPathBlockedError):
             update_trust_scores(path)
 
     with factory.begin() as db:
@@ -366,7 +359,7 @@ def test_legacy_guard_serializes_with_first_observation_commit(database, monkeyp
     with factory() as db:
         before = _snapshot(db)
         assert _event_row(db, event_id)["processing_reason"] == OBSERVED
-    with pytest.raises(RuntimeError, match="observation records"):
+    with pytest.raises(legacy.LegacyTrustPathBlockedError):
         update_trust_scores(path)
     with factory() as db:
         assert _snapshot(db) == before
