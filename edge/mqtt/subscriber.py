@@ -23,6 +23,7 @@ from edge.features.feature_utils import extract_payload_device_id, payload_size
 from edge.mqtt.identity import (
     classify_mqtt_identity,
     fetch_registered_device_ids,
+    payload_validity_from_log_row,
 )
 from edge.mqtt.topic_utils import (
     extract_device_id_candidate_from_topic,
@@ -128,7 +129,12 @@ def insert_mqtt_log(db: Session, row: dict[str, Any]) -> int:
     )
     if row["device_id"]:
         registered_devices = fetch_registered_device_ids(db)
-        identity = classify_mqtt_identity(row["topic"], row["payload"], registered_devices)
+        identity = classify_mqtt_identity(
+            row["topic"],
+            row["payload"],
+            registered_devices,
+            is_payload_valid=payload_validity_from_log_row(row),
+        )
         if identity.is_normal_telemetry:
             db.execute(
                 text(
