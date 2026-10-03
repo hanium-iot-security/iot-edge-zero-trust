@@ -21,6 +21,7 @@ from typing import Any, Mapping
 
 from edge.policy.device_policy import (
     ALLOWED_STATE_TRANSITIONS,
+    POLICY_FIELDS,
     STATE_PENDING,
     DeviceIdConflictError,
     DeviceIpConflictError,
@@ -164,17 +165,12 @@ def write_transaction(connection: sqlite3.Connection) -> Iterator[None]:
 def _revision_from_row(row: Any) -> PolicyRevision:
     return PolicyRevision(
         device_id=row[0],
-        revision=int(row[1]),
+        revision=validate_revision_number(row[1], "revision"),
         effective_from=row[2],
         registration_state=row[3],
-        policy=DevicePolicy(
-            policy_profile=row[4],
-            expected_publish_interval_seconds=float(row[5]),
-            publish_count_max=int(row[6]),
-            payload_size_max_bytes=int(row[7]),
-            packet_rate_max_pps=float(row[8]),
-            byte_rate_max_bytes_per_second=float(row[9]),
-        ),
+        # Validate stored values before conversion. A damaged integer field
+        # must not silently turn 15.5 into an apparently valid threshold of 15.
+        policy=validate_policy(dict(zip(POLICY_FIELDS, row[4:10]))),
         created_at=row[10],
         created_by=row[11],
         reason=row[12],
@@ -255,21 +251,21 @@ def get_policy_snapshot(
     now = require_aware(server_time if server_time is not None else utc_now(), "server_time")
     if not device_exists(connection, device_id):
         raise DeviceNotFoundError(f"Device {device_id!r} is not registered")
-    latest = get_latest_revision(connection, device_id)
-    if latest is None:
-        raise PolicyUnavailableError(f"Device {device_id!r} has no policy revision")
-    first = _fetch_revision(connection, "device_id = ? AND revision = 1", (device_id,))
-    registered_from = connection.execute(
-        "SELECT registration_effective_from FROM devices WHERE device_id = ?", (device_id,)
-    ).fetchone()[0]
-    snapshot = PolicySnapshot(
-        device_id=device_id,
-        server_time=format_utc_millis(now),
-        latest_revision=latest.revision,
-        current=get_revision_effective_at(connection, device_id, now),
-        pending=get_pending_revision(connection, device_id, now),
-    )
     try:
+        latest = get_latest_revision(connection, device_id)
+        if latest is None:
+            raise PolicyUnavailableError(f"Device {device_id!r} has no policy revision")
+        first = _fetch_revision(connection, "device_id = ? AND revision = 1", (device_id,))
+        registered_from = connection.execute(
+            "SELECT registration_effective_from FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()[0]
+        snapshot = PolicySnapshot(
+            device_id=device_id,
+            server_time=format_utc_millis(now),
+            latest_revision=latest.revision,
+            current=get_revision_effective_at(connection, device_id, now),
+            pending=get_pending_revision(connection, device_id, now),
+        )
         if first is None:
             raise ValueError("Initial policy revision is missing")
         for revision in (first, latest, snapshot.current, snapshot.pending):

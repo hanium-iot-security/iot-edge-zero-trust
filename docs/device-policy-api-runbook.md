@@ -15,8 +15,11 @@ P8-04의 로컬 API 구현을 운영에 적용할 때 사용한다. 이 API는 B
    `registration_effective_from=null`인 기존 기기는 초기 등록 시각을 새로 만들어 덮어쓰지 않는다.
 3. **경로·권한:** API·Rule/Trust·Worker가 동일한 SQLite를 사용하도록 확인한다.
    API와 Worker/Recovery가 동일한 `FIREWALL_LOCK_PATH`를 사용하며 해당 파일·디렉터리에
-   필요한 쓰기 권한이 있어야 한다. 비활성화에는 Worker가 만든 fresh Runtime snapshot이
-   필요하다. API에 sudo/iptables 실행 권한을 추가하지 않는다.
+   필요한 쓰기 권한이 있어야 한다. 비활성화에는 별도
+   `firewall-runtime-snapshot.service/timer`가 만든 fresh Runtime snapshot이 필요하다.
+   [Runtime 관측 서비스 배포 절차](firewall-runtime-verifier.md)에 따라 서비스·타이머를
+   설치하고 API와 같은 snapshot 경로 및 관측 유효 시간을 확인한다.
+   API에 sudo/iptables 실행 권한을 추가하지 않는다.
 4. **등록 설정:** 실제 DHCP 예약 LAN을 `DEVICE_REGISTRATION_CIDR`에 지정한다.
    Pi/관리 주소는 `CAPTURE_INTERFACE_IP`, `FIREWALL_PROTECTED_IPS`,
    `PACKET_RULE_EXCLUDED_PEER_IPS`와 함께 확인한다. 공란/잘못된 설정은 두 POST가 503,

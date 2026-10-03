@@ -229,6 +229,44 @@ def test_invalid_existing_policy_refuses_write_before_commit(api_client, kind):
     assert rows(db_path, "SELECT * FROM device_policy_revisions") == before
 
 
+@pytest.mark.parametrize("field,value", [
+    ("expected_publish_interval_seconds", "corrupt-text"),
+    ("publish_count_max", "corrupt-text"),
+    ("payload_size_max_bytes", "corrupt-text"),
+    ("packet_rate_max_pps", "corrupt-text"),
+    ("byte_rate_max_bytes_per_second", "corrupt-text"),
+    ("publish_count_max", 15.5),
+    ("payload_size_max_bytes", 5120.5),
+])
+def test_corrupt_stored_numbers_keep_reads_available_and_refuse_write(api_client, field, value):
+    client, db_path, _ = api_client
+    write(db_path, "INSERT INTO devices(device_id,ip_address) VALUES('broken','192.168.0.8')")
+    values = {
+        "device_id": "broken", "revision": 1, "effective_from": "2026-10-02T00:00:00Z",
+        "registration_state": "ACTIVE", **POLICY, field: value,
+        "created_at": "2026-10-02T00:00:00.000Z", "created_by": "fixture", "reason": "damaged import",
+    }
+    # Normal migration/repository writes reject these values. Bypass CHECKs only
+    # in this temporary DB to model a damaged import, not a supported write path.
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute("INSERT INTO device_policy_revisions(" + ",".join(values) + ") VALUES(" +
+                           ",".join("?" for _ in values) + ")", tuple(values.values()))
+    before = rows(db_path, "SELECT * FROM device_policy_revisions")
+    detail = client.get("/api/devices/broken")
+    listing = client.get("/api/devices")
+    assert detail.status_code == listing.status_code == 200
+    assert listing.json() == {"items": [detail.json()], "total": 1}
+    assert detail.json()["registration_state"] is None
+    assert detail.json()["auto_response_eligible"] is False
+    assert detail.json()["auto_response_exclusion_reason"] == "POLICY_UNAVAILABLE"
+    assert_business_error(client.get("/api/devices/broken/policy"), 503, "POLICY_UNAVAILABLE")
+    response = client.post("/api/devices/broken/policy-revisions", json=revision(), headers=ADMIN_HEADERS)
+    assert_business_error(response, 503, "POLICY_UNAVAILABLE")
+    assert rows(db_path, "SELECT * FROM device_policy_revisions") == before
+    assert rows(db_path, "SELECT status,trust_score FROM devices") == [("normal", 100)]
+
+
 @pytest.mark.parametrize("wait", [-1, float("nan"), float("inf")])
 def test_invalid_lock_wait_fails_before_mutation(api_client, monkeypatch, wait):
     client, db_path, _ = api_client

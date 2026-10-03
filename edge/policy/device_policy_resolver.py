@@ -33,6 +33,7 @@ RESOLUTION_POLICY_UNAVAILABLE = "POLICY_UNAVAILABLE"
 REASON_NOT_REGISTERED = "DEVICE_NOT_REGISTERED_AT_WINDOW"
 REASON_NO_REVISION = "NO_POLICY_REVISION"
 REASON_NO_EFFECTIVE_REVISION = "NO_EFFECTIVE_REVISION_AT_WINDOW"
+REASON_INVALID_POLICY_REVISION = "INVALID_POLICY_REVISION"
 
 
 @dataclass(frozen=True)
@@ -138,7 +139,18 @@ def resolve_device_policy(
             reason=REASON_NOT_REGISTERED,
         )
 
-    revision = get_revision_effective_at(connection, device_id, window_start)
+    try:
+        revision = get_revision_effective_at(connection, device_id, window_start)
+    except DevicePolicyValidationError:
+        return DevicePolicyResolution(
+            resolution=RESOLUTION_POLICY_UNAVAILABLE,
+            device_id=device_id,
+            device_policy_revision=None,
+            effective_from=None,
+            registration_state=None,
+            policy=None,
+            reason=REASON_INVALID_POLICY_REVISION,
+        )
     if revision is None:
         any_revision = connection.execute(
             "SELECT 1 FROM device_policy_revisions WHERE device_id = ? LIMIT 1",

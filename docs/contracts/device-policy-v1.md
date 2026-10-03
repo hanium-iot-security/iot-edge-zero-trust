@@ -166,6 +166,8 @@ registered_device_by_ip_at(connection, source_ip, window_start_utc) -> device_id
 
 등록 효력 전도 NOT_REGISTERED에 포함한다. 등록된 기기의 revision이 누락되거나
 모순되면 POLICY_UNAVAILABLE로 구분한다.
+저장된 정책 숫자값의 형식·범위가 손상되면 `reason=INVALID_POLICY_REVISION`과
+null 정책을 반환하며, 정수 값을 잘라내거나 기본값으로 보정하지 않는다.
 MQTT는 Topic ID·Payload ID **양쪽 모두** 당시 등록 집합과 대조한다.
 PENDING/DISABLED도 등록된 식별자다. 자동 대응 제외와 UNKNOWN을 혼동하지 않는다.
 Packet IP도 당시 등록 효력으로 조회한다. resolver 결과는 관측 정책이고, Trust는
