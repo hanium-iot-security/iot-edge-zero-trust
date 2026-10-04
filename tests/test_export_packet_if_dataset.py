@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,8 @@ from edge.phase5.contracts import (
     run_manifest_sha256,
 )
 from edge.packet.capture_policy import CapturePolicy
+from edge.packet.capture_session_repository import get_packet_feature_ready_through
+from edge.packet.segment_gap_recovery import apply_segment_gap_plan, build_segment_gap_plan
 
 
 SESSION_ID = "11111111-1111-4111-8111-111111111111"
@@ -463,6 +466,74 @@ def test_export_rejects_feature_and_segment_window_mismatch(
                 output_path=output_path,
                 session_ids=[SESSION_ID],
             )
+
+    assert not output_path.exists()
+    assert not output_path.with_suffix(".manifest.json").exists()
+
+
+def test_export_rejects_completed_session_with_runtime_approved_failed_gap(
+    SessionLocal,
+    tmp_path: Path,
+) -> None:
+    first_start = "2026-07-26T10:00:00Z"
+    gap_start = "2026-07-26T10:00:10Z"
+    gap_end = "2026-07-26T10:00:20Z"
+    tail_end = "2026-07-26T10:00:30Z"
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01", "192.168.0.4")
+        session_pk = _insert_capture_session(db, SESSION_ID, status="RUNNING")
+        for segment_id, window_start, window_end in (
+            (1, first_start, gap_start),
+            (2, gap_start, gap_end),
+            (3, gap_end, tail_end),
+        ):
+            _insert_segment(db, session_pk=session_pk, segment_id=segment_id,
+                            window_start=window_start, window_end=window_end)
+            if segment_id != 2:
+                _insert_packet_feature(
+                    db, feature_id=segment_id, segment_id=segment_id,
+                    device_id="esp32_01", peer_ip="192.168.0.4", direction="INBOUND",
+                    window_start=window_start, window_end=window_end,
+                )
+        db.execute(text("UPDATE packet_capture_segments SET status = 'FAILED', "
+                        "error_code = 'PARTIAL_CAPTURE', error_message = 'preserved capture loss', "
+                        "captured_duration_seconds = 2.0 WHERE id = 2"))
+        for detector in ("packet_rule", "packet_if"):
+            db.execute(text("INSERT INTO detector_checkpoints VALUES "
+                            "(:detector, 'packet_feature_logs', 1, :boundary, :boundary)"),
+                       {"detector": detector, "boundary": gap_start})
+        db.commit()
+        database_path = Path(db.get_bind().url.database)
+
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        plan = build_segment_gap_plan(
+            connection, capture_session_id=SESSION_ID, failed_segment_id=2,
+            approved_by="test", reason="Explicit runtime recovery for preserved capture loss",
+            repository_commit="a" * 40, database_path=str(database_path.resolve()),
+            backup_path=str((tmp_path / "backup.db").resolve()),
+            preserved_pcap_path=str((tmp_path / "segment-2.pcap").resolve()),
+            pcap_sha256="b" * 64,
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        apply_segment_gap_plan(connection, plan, backup_sha256="c" * 64)
+        connection.execute("UPDATE detector_checkpoints SET last_processed_id = 3, "
+                           "last_completed_window_end = ?, updated_at = ? "
+                           "WHERE source_table = 'packet_feature_logs'", (tail_end, tail_end))
+        connection.execute("UPDATE packet_capture_sessions SET status = 'COMPLETED', ended_at = ? "
+                           "WHERE session_id = ?", (tail_end, SESSION_ID))
+        connection.commit()
+
+    output_path = tmp_path / "approved-gap.csv"
+    with SessionLocal() as db:
+        readiness = get_packet_feature_ready_through(db, session_id=SESSION_ID)
+        assert readiness.packet_feature_ready_through == datetime(
+            2026, 7, 26, 10, 0, 30, tzinfo=timezone.utc,
+        )
+        assert db.execute(text("SELECT status FROM packet_capture_segments WHERE id = 2")).scalar_one() == "FAILED"
+        assert db.execute(text("SELECT COUNT(*) FROM packet_segment_gap_recoveries")).scalar_one() == 1
+        with pytest.raises(ValueError, match="ineligible Segment for Packet IF export"):
+            _export(db, output_path=output_path, session_ids=[SESSION_ID])
 
     assert not output_path.exists()
     assert not output_path.with_suffix(".manifest.json").exists()

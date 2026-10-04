@@ -24,6 +24,12 @@ Packet Stage와 Trust가 대기하는 경우에 사용한다. 자동으로 실�
 승인된 손실을 포함한 Session을 종료한 뒤에도 기존 Session 간 `live-resume`은 같은
 감사 검증으로 Source의 처리 경계를 확인한다. 재시작 시 미승인 구간은 계속 HOLD한다.
 
+탐지 재개를 위한 준비 경계와 학습 자료의 수집 품질은 별도로 검증한다. Packet IF
+Dataset 내보내기는 모든 Segment가 오류 없는 `PROCESSED/EMPTY`인 Session만
+허용한다. 복구를 승인해도 `FAILED`를 포함한 Session은 학습용으로 내보내지 않는다.
+유지보수 중 수신을 일시 정지했다면 메시지 순서·재연결·저장 오류를 확인하고,
+기록 시각이 지연될 수 있는 해당 Session을 정상 학습·성능 평가 자료에서 제외한다.
+
 ## 작업 순서
 
 1. API·MQTT 수집·Capture는 유지하고 Detection Orchestrator와 Packet Extractor
@@ -66,6 +72,10 @@ venv/bin/python -m edge.detection.run_packet_segment_gap_recovery execute \
 Execute는 실제 POSIX Runtime Lock이 필요하므로 Pi/Linux에서 실행한다. 새 실행은
 새 Plan 파일과 작업 디렉터리를 사용한다. 같은 Segment는 중복 승인할 수 없다.
 코드·증거·Checkpoint가 변경됐거나 백업 검증이 실패하면 DB 변경 없이 중단한다.
+`database changed during backup`이면 백업과 운영 Writer가 겹친 것이다. MQTT 원본
+수집과 Capture를 유지하면서 Feature Producer·Metrics 등 재개 가능한 Writer를 잠시
+중지하고, 실제 기록 간격을 확인한 뒤 새 Plan으로 실행한다. 충분한 간격이 없으면
+HOLD를 유지한다. 별도 승인 없이 수신을 중지하거나 `data_version` 검사를 해제하지 않는다.
 Commit 후 결과 파일 기록/검증에 실패하면 종료 코드 3, `database_committed=true`,
 `hold_required=true`를 반환한다. 서비스는 중지 상태로 유지하고 Audit·백업·현재 DB를
 대조한다. **자동 백업 복원이나 실패 구간 EMPTY 변경으로 진행하지 않는다.**
