@@ -1,0 +1,6 @@
+# Device/network credentials and real measurement evidence stay local.
+config.py
+*.json
+*.csv
+*.jsonl
+*.log
