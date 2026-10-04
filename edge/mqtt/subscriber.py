@@ -52,10 +52,24 @@ def _format_received_at(value: datetime) -> str:
     return format_db_utc(value)
 
 
+PAYLOAD_DECODE_OK = "OK"
+PAYLOAD_DECODE_INVALID_UTF8 = "INVALID_UTF8"
+
+
 def _decode_payload(payload: str | bytes) -> str:
     if isinstance(payload, bytes):
         return payload.decode("utf-8", errors="replace")
     return payload
+
+
+def _raw_payload(payload: str | bytes) -> tuple[bytes, str]:
+    """수신 원본 바이트와 엄격한 UTF-8 해석 결과(`mqtt_logs.payload_decode_status`)."""
+    raw = payload if isinstance(payload, bytes) else payload.encode("utf-8")
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw, PAYLOAD_DECODE_INVALID_UTF8
+    return raw, PAYLOAD_DECODE_OK
 
 
 def build_mqtt_log_row(
@@ -64,6 +78,7 @@ def build_mqtt_log_row(
     received_at: datetime | None = None,
 ) -> dict[str, Any]:
     payload_text = _decode_payload(payload)
+    payload_raw, payload_decode_status = _raw_payload(payload)
     payload_device_id = extract_payload_device_id(payload)
     strict_topic_device_id = extract_device_id_from_topic(topic)
     topic_device_id_candidate = extract_device_id_candidate_from_topic(topic)
@@ -84,6 +99,8 @@ def build_mqtt_log_row(
         "topic": topic,
         "payload": payload_text,
         "payload_size": payload_size(payload),
+        "payload_raw": payload_raw,
+        "payload_decode_status": payload_decode_status,
         "received_at": _format_received_at(_normalize_received_at(received_at)),
         "is_json_valid": 1 if is_json_valid else 0,
         "is_topic_valid": 1 if is_topic_valid else 0,
@@ -125,7 +142,8 @@ def insert_mqtt_log(db: Session, row: dict[str, Any]) -> int:
         if resolver is not None and identity.attributed_device_id is not None
         else None
     )
-    raw_row = dict(row)
+    # 원본 컬럼이 없는 호출자(직접 만든 row)는 NULL로 저장한다.
+    raw_row = {"payload_raw": None, "payload_decode_status": None, **row}
     if registration is not None and registration.status == "DISABLED":
         errors = [part for part in (row.get("error_message"), "disabled_device_communication") if part]
         raw_row["error_message"] = ", ".join(errors)
@@ -137,6 +155,8 @@ def insert_mqtt_log(db: Session, row: dict[str, Any]) -> int:
                 topic,
                 payload,
                 payload_size,
+                payload_raw,
+                payload_decode_status,
                 received_at,
                 is_json_valid,
                 is_topic_valid,
@@ -147,6 +167,8 @@ def insert_mqtt_log(db: Session, row: dict[str, Any]) -> int:
                 :topic,
                 :payload,
                 :payload_size,
+                :payload_raw,
+                :payload_decode_status,
                 :received_at,
                 :is_json_valid,
                 :is_topic_valid,

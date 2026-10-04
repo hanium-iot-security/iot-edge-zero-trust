@@ -28,6 +28,11 @@ Migration 007 (`device_policy_revisions`)은 기기 등록 메타데이터와 �
 `edge.policy.device_policy_repository.diagnose_device_ip_conflicts`로 진단한다.
 Migration 008 (`packet_segment_gap_recovery`)은 같은 Capture Session 안의 손실 Window를
 관리자 승인으로 재개한 감사 기록을 추가한다. 실패 Segment·기존 이력과 Migration 005는 보존한다.
+Migration 009 (`mqtt_raw_payload`)는 `mqtt_logs`에 수신 원본 바이트(`payload_raw`)와 UTF-8 해석
+결과(`payload_decode_status`)를 추가한다. 기존 row는 원본이 없어 NULL로 남으며 backfill하지 않는다.
+**009를 적용한 뒤에 Subscriber를 재시작한다.** 새 Subscriber는 이 컬럼에 저장하므로 009가 없는 DB에서는
+저장이 실패하고(오류 로그만 남고 해당 메시지는 저장되지 않는다) 수신 증적이 유실된다. 009는 컬럼 추가와
+Trigger만 포함하고 기존 컬럼의 값은 바꾸지 않는다.
 
 적용과 복구: 007은 컬럼 추가를 포함하며 되돌리는(down) Migration이 없다. 운영 DB에는 먼저
 일관된 백업(SQLite backup API 등, 쓰기 중 파일 하나만 복사하지 않는다)을 만든 뒤 **복사본에서**
@@ -138,6 +143,8 @@ ACTIVE revision 1을 만든다. 이때 `registration_effective_from`은 NULL로 
 | topic | TEXT | MQTT topic |
 | payload | TEXT | 수신 payload를 UTF-8로 해석한 문자열. 잘못된 UTF-8 바이트는 U+FFFD로 치환돼 있어 원본 바이트와 같지 않음 |
 | payload_size | INTEGER | 수신 원본 payload의 byte 크기(문자 수나 치환 후 크기가 아님) |
+| payload_raw | BLOB | Migration 009. 수신한 payload 바이트 원본. 009 이전 row는 NULL. 저장 후 변경 불가(API로 노출하지 않음) |
+| payload_decode_status | TEXT | Migration 009. 원본을 엄격한 UTF-8로 해석할 수 있으면 `OK`, 아니면 `INVALID_UTF8`. 009 이전 row는 NULL(알 수 없음) |
 | received_at | DATETIME | 수신 시각. 신규 Subscriber는 UTC `YYYY-MM-DDTHH:MM:SSZ`, DB 기본값은 `CURRENT_TIMESTAMP` |
 | is_json_valid | INTEGER | `0` 또는 `1`. 수신 원본 바이트가 UTF-8 JSON 객체이고 `device_id`가 있을 때만 `1` |
 | is_topic_valid | INTEGER | `0` 또는 `1` |
@@ -146,7 +153,12 @@ ACTIVE revision 1을 만든다. 이때 `registration_effective_from`은 NULL로 
 저장된 `payload` 문자열은 치환된 값일 수 있어 다시 JSON으로 읽으면 정상처럼 보입니다. 그래서
 Subscriber(`last_seen_at` 갱신)와 Feature 집계는 `is_json_valid = 0`인 메시지에서 Payload Device ID를
 추출하지 않고 Topic으로만 귀속하며, 이런 메시지는 `last_seen_at`을 갱신하지 않습니다.
-MQTT Rule의 Identity 판정은 아직 이 해석을 쓰지 않고(P8-05), 원본 바이트 보존은 후속 Migration에서 추가합니다.
+MQTT Rule의 Identity 판정은 아직 이 해석을 쓰지 않습니다(P8-05).
+
+`payload_raw`와 `payload_decode_status`는 함께 저장하며(둘 다 NULL이거나 둘 다 값이 있음), `payload_raw`는
+BLOB이고 길이가 `payload_size`와 같아야 합니다. 어긋난 값은 Trigger가 거부합니다.
+`payload_decode_status`는 JSON 유효성(`is_json_valid`)과 별개입니다. 정상 UTF-8이지만 JSON이 아닌
+메시지도 `OK`입니다.
 
 신규 Subscriber는 한 메시지에서 생성한 UTC `Z` 문자열 하나를 `mqtt_logs.received_at`과
 `devices.last_seen_at`에 동일하게 저장합니다. 기존 DB의 공백 형식에는 서로 다른 의미가
