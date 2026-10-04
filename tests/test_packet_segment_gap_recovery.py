@@ -292,3 +292,85 @@ def test_apply_requires_caller_transaction(evidence):
     plan = build_segment_gap_plan(conn, **kwargs)
     with pytest.raises(SegmentGapRecoveryError, match="caller"):
         apply_segment_gap_plan(conn, plan, backup_sha256="c" * 64)
+
+
+def _consume_two_approved_gaps_and_close(seed, conn, kwargs, tmp_path):
+    apply(conn, build_segment_gap_plan(conn, **kwargs))
+    conn.execute("UPDATE detector_checkpoints SET last_processed_id=2,last_completed_window_end=?,updated_at=? "
+                 "WHERE source_table='packet_feature_logs'", (utc(40), utc(40)))
+    conn.commit()
+    apply(conn, build_segment_gap_plan(conn, **plan_kwargs(seed, tmp_path, second=True)))
+    conn.execute("UPDATE detector_checkpoints SET last_processed_id=3,last_completed_window_end=?,updated_at=? "
+                 "WHERE source_table='packet_feature_logs'", (utc(60), utc(60)))
+    conn.execute("UPDATE packet_capture_sessions SET status='COMPLETED',ended_at=? WHERE session_id=?",
+                 (utc(60), seed["capture_session_id"]))
+    conn.commit()
+
+
+def test_old_recovery_readiness_matches_runtime_after_two_audited_gaps_and_shutdown(evidence, tmp_path):
+    from edge.detection.packet_checkpoint_recovery_repository import calculate_packet_feature_readiness
+    from edge.packet.capture_session_repository import get_packet_feature_ready_through
+
+    seed, conn, kwargs = evidence
+    failed_before = [dict(row) for row in conn.execute("SELECT * FROM packet_capture_segments WHERE status='FAILED' ORDER BY id")]
+    _consume_two_approved_gaps_and_close(seed, conn, kwargs, tmp_path)
+    old_ready = calculate_packet_feature_readiness(conn, seed["capture_session_id"])
+    engine = create_engine("sqlite:///" + str(seed["database_path"]))
+    with Session(engine) as db:
+        runtime_ready = get_packet_feature_ready_through(db, session_id=seed["capture_session_id"])
+    engine.dispose()
+    assert old_ready.packet_feature_ready_through == runtime_ready.packet_feature_ready_through == BASE + timedelta(seconds=60)
+    assert old_ready.full_ready
+    assert old_ready.blocking_reasons == old_ready.live_resume_blocking_reasons == ()
+    assert [dict(row) for row in conn.execute("SELECT * FROM packet_capture_segments WHERE status='FAILED' ORDER BY id")] == failed_before
+
+
+def test_old_live_resume_accepts_closed_audited_source_without_losing_ready_through(evidence, tmp_path):
+    from edge.detection.packet_checkpoint_recovery import build_recovery_plan, LIVE_RESUME_MODE
+
+    seed, conn, kwargs = evidence
+    _consume_two_approved_gaps_and_close(seed, conn, kwargs, tmp_path)
+    target = "22222222-2222-4222-8222-222222222222"
+    cursor = conn.execute("INSERT INTO packet_capture_sessions(session_id,capture_interface,started_at,first_window_start,status) "
+                          "VALUES (?,'eth0',?,?,'RUNNING')", (target, utc(70), utc(70)))
+    cursor = conn.execute("INSERT INTO packet_capture_segments(capture_session_id,file_name,capture_interface,window_start,window_end,status) "
+                          "VALUES (?,'new-running.pcap','eth0',?,?,'EMPTY')", (cursor.lastrowid, utc(70), utc(80)))
+    conn.commit()
+    for detector in ("packet_rule", "packet_if"):
+        plan = build_recovery_plan(
+            conn, repository_state={"repository_root": str(tmp_path), "repository_commit": "a" * 40},
+            database_path=seed["database_path"], detector_name=detector,
+            current_session_id=seed["capture_session_id"], target_session_id=target,
+            approved_by="woomin", reason="Approved rejoin after source audit consumption", lock_entries=(),
+            mode=LIVE_RESUME_MODE,
+        )
+        assert "CURRENT_CHECKPOINT_NOT_AT_READY_THROUGH" not in plan["blocking_reasons"]
+        assert plan["can_execute"]
+        assert plan["current_session"]["packet_feature_ready_through"] == utc(60)
+        assert plan["checkpoint"]["after"]["last_completed_window_end"] == utc(70)
+
+
+@pytest.mark.parametrize("tamper", ["unapproved", "plan", "failed_snapshot", "rewound_checkpoint", "bad_feature"])
+def test_old_recovery_still_blocks_unapproved_or_changed_gap(evidence, tmp_path, tamper):
+    from edge.detection.packet_checkpoint_recovery_repository import calculate_packet_feature_readiness
+
+    seed, conn, kwargs = evidence
+    if tamper != "unapproved":
+        _consume_two_approved_gaps_and_close(seed, conn, kwargs, tmp_path)
+        if tamper == "plan":
+            conn.execute("UPDATE packet_segment_gap_recoveries SET plan_json='{}' WHERE failed_segment_id=?",
+                         (seed["first_failed_segment_id"],))
+        elif tamper == "failed_snapshot":
+            conn.execute("UPDATE packet_capture_segments SET error_message='changed' WHERE id=?", (seed["first_failed_segment_id"],))
+        elif tamper == "rewound_checkpoint":
+            conn.execute("UPDATE detector_checkpoints SET last_completed_window_end=? WHERE detector_name='packet_if'", (utc(10),))
+        else:
+            conn.execute("INSERT INTO packet_feature_logs(capture_segment_id,peer_ip,direction,window_start,window_end,packet_count,total_bytes,avg_packet_size,max_packet_size) "
+                         "VALUES (?,'192.168.0.9','INBOUND',?,?,1,10,10,10)",
+                         (seed["first_failed_segment_id"], utc(10), utc(20)))
+        conn.commit()
+    readiness = calculate_packet_feature_readiness(conn, seed["capture_session_id"])
+    assert readiness.packet_feature_ready_through == BASE + timedelta(seconds=10)
+    assert not readiness.full_ready
+    assert "NON_TERMINAL_OR_ERROR" in readiness.blocking_reasons
+    assert "FAILED_OR_EXTRACTOR_ERROR" in readiness.live_resume_blocking_reasons

@@ -21,6 +21,9 @@ Packet Stage와 Trust가 대기하는 경우에 사용한다. 자동으로 실�
 보존한다. Orchestrator는 MQTT·Trust를 승인 경계까지 먼저 처리한 다음 정상 Tail을
 이어 처리한다. 이는 패킷 손실 동안의 탐지가 완료됐다는 의미가 아니다.
 
+승인된 손실을 포함한 Session을 종료한 뒤에도 기존 Session 간 `live-resume`은 같은
+감사 검증으로 Source의 처리 경계를 확인한다. 재시작 시 미승인 구간은 계속 HOLD한다.
+
 ## 작업 순서
 
 1. API·MQTT 수집·Capture는 유지하고 Detection Orchestrator와 Packet Extractor

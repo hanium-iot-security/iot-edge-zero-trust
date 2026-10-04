@@ -273,15 +273,17 @@ def _list_segment_feature_counts(
 ) -> list[sqlite3.Row]:
     return connection.execute(
         """
-        SELECT pcsg.id AS segment_id,
-               pcsg.window_start, pcsg.window_end, pcsg.status, pcsg.error_code,
-               COUNT(pfl.id) AS feature_count
+        SELECT pcsg.*, pcsg.id AS segment_id,
+               COUNT(pfl.id) AS feature_count,
+               SUM(CASE WHEN pfl.id IS NOT NULL AND (
+                   pfl.window_start != pcsg.window_start
+                   OR pfl.window_end != pcsg.window_end
+               ) THEN 1 ELSE 0 END) AS invalid_feature_count
         FROM packet_capture_segments pcsg
         LEFT JOIN packet_feature_logs pfl ON pfl.capture_segment_id = pcsg.id
         JOIN packet_capture_sessions pcs ON pcs.id = pcsg.capture_session_id
         WHERE pcs.session_id = ?
-        GROUP BY pcsg.id, pcsg.window_start, pcsg.window_end,
-                 pcsg.status, pcsg.error_code
+        GROUP BY pcsg.id
         ORDER BY pcsg.window_start ASC, pcsg.id ASC
         """,
         (session_id,),
@@ -295,7 +297,8 @@ def _last_segment_window_end(rows: Sequence[sqlite3.Row]) -> datetime | None:
 
 
 def _live_resume_blocking_reasons(
-    rows: Sequence[sqlite3.Row], first_window_start: datetime
+    rows: Sequence[sqlite3.Row], first_window_start: datetime,
+    connection: sqlite3.Connection | None = None,
 ) -> tuple[str, ...]:
     """Validate the complete observed RUNNING-session shape.
 
@@ -318,7 +321,11 @@ def _live_resume_blocking_reasons(
 
         status = str(row["status"])
         feature_count = int(row["feature_count"])
-        if status == "FAILED" or row["error_code"] is not None:
+        approved_gap = connection is not None and _approved_gap(connection, row)
+        if approved_gap:
+            if ready_tail_started:
+                reasons.append("TERMINAL_AFTER_READY_TAIL")
+        elif status == "FAILED" or row["error_code"] is not None:
             reasons.append("FAILED_OR_EXTRACTOR_ERROR")
         elif status in {"PROCESSED", "EMPTY"}:
             if ready_tail_started:
@@ -332,8 +339,20 @@ def _live_resume_blocking_reasons(
             if feature_count != 0:
                 reasons.append("FEATURE_COUNT_MISMATCH")
 
+        if int(row["invalid_feature_count"]) != 0:
+            reasons.append("FEATURE_COUNT_MISMATCH")
+
         expected = end
     return tuple(dict.fromkeys(reasons))
+
+
+def _approved_gap(connection: sqlite3.Connection, row: sqlite3.Row) -> bool:
+    """An existing exact audit is coverage evidence, never normal capture data."""
+    if row["status"] != "FAILED" or row["error_code"] != "PARTIAL_CAPTURE" or row["feature_count"] != 0:
+        return False
+    from edge.packet.segment_gap_recovery import approved_segment_gap
+
+    return approved_segment_gap(connection, dict(row)) is not None
 
 
 def calculate_packet_feature_readiness(
@@ -364,7 +383,7 @@ def calculate_packet_feature_readiness(
     consumed_segment_ids: list[int] = []
     blocking_reasons: list[str] = []
     rows = _list_segment_feature_counts(connection, session_id)
-    for row in rows:
+    for index, row in enumerate(rows):
         start = parse_db_utc(row["window_start"], "window_start")
         if start < expected:
             blocking_reasons.append("SEGMENT_BEFORE_OR_OVERLAPPING_PREFIX")
@@ -374,17 +393,22 @@ def calculate_packet_feature_readiness(
             break
         status = str(row["status"])
         count = int(row["feature_count"])
-        if status not in {"PROCESSED", "EMPTY"} or row["error_code"] is not None:
+        if not _approved_gap(connection, row) and (
+            status not in {"PROCESSED", "EMPTY"} or row["error_code"] is not None
+        ):
             blocking_reasons.append("NON_TERMINAL_OR_ERROR")
             break
         if (status == "PROCESSED" and count == 0) or (
             status == "EMPTY" and count != 0
-        ):
+        ) or int(row["invalid_feature_count"]) != 0:
             blocking_reasons.append("FEATURE_COUNT_MISMATCH")
             break
         end = parse_db_utc(row["window_end"], "window_end")
         if end != start + timedelta(seconds=10):
             blocking_reasons.append("INVALID_WINDOW_DURATION")
+            break
+        if index + 1 < len(rows) and parse_db_utc(rows[index + 1]["window_start"], "window_start") < end:
+            blocking_reasons.append("SEGMENT_BEFORE_OR_OVERLAPPING_PREFIX")
             break
         segment_count += 1
         feature_row_count += count
@@ -403,7 +427,7 @@ def calculate_packet_feature_readiness(
         and len(consumed_segment_ids) == len(set(consumed_segment_ids))
         and not blocking_reasons
     )
-    live_resume_reasons = _live_resume_blocking_reasons(rows, first)
+    live_resume_reasons = _live_resume_blocking_reasons(rows, first, connection)
     return RecoverySessionReadiness(
         session_id,
         first,
