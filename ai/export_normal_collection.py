@@ -13,6 +13,7 @@ import math
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import statistics
 import sys
 from uuid import UUID
@@ -120,8 +121,9 @@ def _bounded(rows, predicate, report, label, reject_outside=False):
     return selected
 
 
-def _metadata(manifest):
-    _require(manifest["schema_version"] == SCHEMA_VERSION and manifest["status"] == "RAW_CAPTURED",
+def _metadata(manifest, *, allow_completed=False):
+    states = ("RAW_CAPTURED", "CANDIDATE_QC_PASSED") if allow_completed else ("RAW_CAPTURED",)
+    _require(manifest["schema_version"] == SCHEMA_VERSION and manifest["status"] in states,
              "candidate_schema_or_state")
     _require(manifest["training_approved"] is False
              and manifest["whole_capture_session_approved"] is False, "approval_must_remain_false")
@@ -324,17 +326,50 @@ def _write(root, name, data, columns=None):
             handle.write("\n")
 
 
-def export_normal_collection(package_dir: Path) -> dict:
+def _new_output_dir(root: Path, output_dir: Path) -> Path:
+    path = Path(output_dir).absolute()
+    # Resolve only after rejecting dangling symlinks and Windows junctions.
+    for part in (path, *path.parents):
+        try:
+            info = part.lstat()
+        except FileNotFoundError:
+            continue
+        _require(not stat.S_ISLNK(info.st_mode)
+                 and not (getattr(info, "st_file_attributes", 0)
+                          & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)), "output_symlink")
+    path = path.resolve()
+    _require(not path.is_relative_to(root), "output_must_be_outside_package")
+    _require(not path.exists(), "output_must_be_new")
+    path.mkdir(parents=True, exist_ok=False)
+    return path
+
+
+def export_normal_collection(package_dir: Path, *, output_dir: Path | None = None) -> dict:
     root = Path(package_dir).resolve()
     report = {"schema_version": SCHEMA_VERSION, "status": "HOLD", "training_approved": False,
               "whole_capture_session_approved": False, "provenance_status": "UNCONFIRMED",
               "approval_blockers": ["firmware_provenance_unconfirmed", "official_dataset_admission_pending"],
               "scope": "Bounded candidate content QC only; no training or whole-session approval.",
               "hold_reasons": [], "mqtt_devices": {}}
-    raw, features, packets, events = [], [], [], []
+    report["counts"] = {"mqtt_raw": 0, "mqtt_features": 0, "packet_features": 0,
+                        "ai_observations": 0, "applied_events": 0}
+    # Decide where writes are permitted before QC can create any output files.
+    # A completed package must never be overwritten by a repeated export.
     try:
         manifest = json.loads(_path(root, "manifest.json").read_text(encoding="utf-8"))
-        start, end, ids = _metadata(manifest)
+        _require(isinstance(manifest, dict), "invalid_manifest")
+        if output_dir is None:
+            _require(manifest.get("status") == "RAW_CAPTURED", "in_place_requires_raw_captured")
+            destination = root
+        else:
+            destination = _new_output_dir(root, output_dir)
+    except SAFE_ERRORS as exc:
+        report["hold_reasons"].append(
+            f"preflight:{exc if isinstance(exc, CandidateQCError) else type(exc).__name__}")
+        return report
+    raw, features, packets, events = [], [], [], []
+    try:
+        start, end, ids = _metadata(manifest, allow_completed=output_dir is not None)
         report.update({key: manifest[key] for key in ("run_id", "start_utc", "end_utc",
                        "capture_session_pk", "source_capture_group_id", "code_commit")})
         _require(manifest["snapshot"]["path"] == "after.db", "snapshot_name")
@@ -399,9 +434,9 @@ def export_normal_collection(package_dir: Path) -> dict:
     for name, data, columns in (("mqtt-features.csv", features, MQTT_COLUMNS),
             ("packet-features.csv", packets, PACKET_COLUMNS), ("mqtt-raw.jsonl", serialized, None),
             ("events.json", events, None)):
-        _stage(report, f"output:{name}", lambda: _write(root, name, data, columns))
+        _stage(report, f"output:{name}", lambda: _write(destination, name, data, columns))
     report["status"] = "HOLD" if report["hold_reasons"] else "PASS"
-    _stage(report, "output:qc-report.json", lambda: _write(root, "qc-report.json", report))
+    _stage(report, "output:qc-report.json", lambda: _write(destination, "qc-report.json", report))
     if report["hold_reasons"]:
         report["status"] = "HOLD"
     return report
@@ -410,8 +445,12 @@ def export_normal_collection(package_dir: Path) -> dict:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package-dir", type=Path, required=True)
-    report = export_normal_collection(parser.parse_args(argv).package_dir)
+    parser.add_argument("--output-dir", type=Path, help="New directory outside the source package for read-only re-QC")
+    args = parser.parse_args(argv)
+    report = export_normal_collection(args.package_dir, output_dir=args.output_dir)
     print(f"Candidate content QC: {report['status']}; training_approved=false; whole_session_approved=false")
+    if report["hold_reasons"]:
+        print("Hold reasons: " + "; ".join(report["hold_reasons"]))
     return 0 if report["status"] == "PASS" else 2
 
 

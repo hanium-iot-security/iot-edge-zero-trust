@@ -33,6 +33,11 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def tree_hashes(root):
+    return {path.relative_to(root).as_posix(): digest(path)
+            for path in root.rglob("*") if path.is_file()}
+
+
 def insert(db, table, **values):
     return db.execute(f"INSERT INTO {table}({','.join(values)}) VALUES({','.join('?' for _ in values)})",
                       tuple(values.values())).lastrowid
@@ -152,6 +157,14 @@ def csv_rows(root, filename):
         return list(csv.DictReader(handle))
 
 
+def mark_completed(root):
+    assert export_normal_collection(root)["status"] == "PASS"
+    manifest = json.loads((root / "manifest.json").read_text())
+    manifest["status"] = "CANDIDATE_QC_PASSED"
+    save_manifest(root, manifest)
+    return manifest
+
+
 def test_bounded_pico_and_ai_observations_are_kept_without_training_approval(package):
     before = digest(package / "after.db")
     report = export_normal_collection(package)
@@ -249,8 +262,10 @@ def test_unverified_snapshot_and_malformed_manifest_fail_closed(package):
     (package / "manifest.json").write_text(json.dumps(manifest))
     assert export_normal_collection(package)["status"] == "HOLD"
     (package / "manifest.json").write_text('{"private-input": "secret-marker"')
+    before = tree_hashes(package)
     report = export_normal_collection(package)
     assert report["status"] == "HOLD" and "secret-marker" not in json.dumps(report)
+    assert tree_hashes(package) == before
 
 
 def test_snapshot_trust_change_holds_with_a_valid_updated_checksum(package):
@@ -271,3 +286,190 @@ def test_output_symlink_cannot_write_outside_package(package, tmp_path):
         pytest.skip("Host does not permit symlink creation")
     assert export_normal_collection(package)["status"] == "HOLD"
     assert outside.read_text() == "unchanged"
+
+
+@pytest.mark.parametrize("status", ["CANDIDATE_QC_PASSED", "HOLD", "HOLD_INCOMPLETE", "CAPTURING", "UNKNOWN", None])
+def test_in_place_export_refuses_non_raw_states_without_changing_any_source_file(package, status, capsys):
+    manifest = mark_completed(package)
+    if status is None:
+        del manifest["status"]
+    else:
+        manifest["status"] = status
+    save_manifest(package, manifest)
+    before = tree_hashes(package)
+
+    report = export_normal_collection(package)
+
+    assert report["status"] == "HOLD"
+    assert report["hold_reasons"] == ["preflight:in_place_requires_raw_captured"]
+    assert report["training_approved"] is False and report["whole_capture_session_approved"] is False
+    assert tree_hashes(package) == before
+    assert main(["--package-dir", str(package)]) == 2
+    assert "preflight:in_place_requires_raw_captured" in capsys.readouterr().out
+    assert tree_hashes(package) == before
+
+
+def test_completed_package_reqc_uses_snapshot_and_new_output_without_changing_source(package, tmp_path):
+    mark_completed(package)
+    # Re-QC must rebuild outputs from evidence rather than copy an old CSV or PASS.
+    (package / "mqtt-features.csv").write_text("stale candidate export")
+    (package / "qc-report.json").write_text('{"status":"HOLD"}')
+    before = tree_hashes(package)
+    destination = tmp_path / "rechecked"
+
+    report = export_normal_collection(package, output_dir=destination)
+
+    assert report["status"] == "PASS", report
+    assert report["counts"] == {"mqtt_raw": 12, "mqtt_features": 6, "packet_features": 6,
+                                "ai_observations": 1, "applied_events": 1}
+    assert report["training_approved"] is False and report["whole_capture_session_approved"] is False
+    assert report["provenance_status"] == "UNCONFIRMED"
+    assert len(csv_rows(destination, "mqtt-features.csv")) == 6
+    assert len(csv_rows(destination, "packet-features.csv")) == 6
+    assert json.loads((destination / "qc-report.json").read_text()) == report
+    assert set(tree_hashes(destination)) == {"mqtt-features.csv", "packet-features.csv", "mqtt-raw.jsonl",
+                                            "events.json", "qc-report.json"}
+    assert tree_hashes(package) == before
+
+
+@pytest.mark.parametrize("status", ["RAW_CAPTURED", "CANDIDATE_QC_PASSED"])
+def test_cli_new_output_reqc_keeps_source_unchanged(package, tmp_path, status):
+    if status == "CANDIDATE_QC_PASSED":
+        mark_completed(package)
+    before = tree_hashes(package)
+    destination = tmp_path / "cli-rechecked"
+
+    assert main(["--package-dir", str(package), "--output-dir", str(destination)]) == 0
+
+    assert json.loads((destination / "qc-report.json").read_text())["status"] == "PASS"
+    assert tree_hashes(package) == before
+
+
+@pytest.mark.parametrize("failure", ["snapshot_checksum", "pcap_changed", "feature_changed", "collector_issue",
+                                    "approval_true", "provenance_hash", "incomplete"])
+def test_failed_reqc_writes_hold_only_to_new_output_and_preserves_source(package, tmp_path, failure):
+    manifest = mark_completed(package)
+    if failure == "snapshot_checksum":
+        manifest["snapshot"]["sha256"] = "0" * 64
+        (package / "manifest.json").write_text(json.dumps(manifest))
+    elif failure == "pcap_changed":
+        path = package / manifest["capture_artifacts"][0]["pcap_path"]
+        path.write_bytes(path.read_bytes() + b"changed")
+    elif failure == "feature_changed":
+        mutate_db(package, "UPDATE feature_logs SET publish_count=99 WHERE id=1")
+    else:
+        if failure == "collector_issue":
+            manifest["collection_issues"] = ["checkpoint_timeout"]
+        elif failure == "approval_true":
+            manifest["training_approved"] = True
+        elif failure == "provenance_hash":
+            manifest["firmware_provenance"] = {"status": "CONFIRMED", "path": "manifest.json", "sha256": "0" * 64}
+        elif failure == "incomplete":
+            manifest["status"] = "HOLD_INCOMPLETE"
+        save_manifest(package, manifest)
+    before = tree_hashes(package)
+    destination = tmp_path / "failed-recheck"
+
+    report = export_normal_collection(package, output_dir=destination)
+
+    assert report["status"] == "HOLD" and report["hold_reasons"], report
+    assert report["training_approved"] is False and report["whole_capture_session_approved"] is False
+    assert json.loads((destination / "qc-report.json").read_text()) == report
+    assert tree_hashes(package) == before
+
+
+@pytest.mark.parametrize("kind", ["existing_directory", "existing_file", "same", "nested", "normalized_nested"])
+def test_unsafe_output_directory_is_refused_without_modifying_existing_files(package, tmp_path, kind):
+    mark_completed(package)
+    if kind == "existing_directory":
+        destination = tmp_path / "existing"
+        destination.mkdir()
+        (destination / "mqtt-features.csv").write_text("unchanged existing data")
+    elif kind == "existing_file":
+        destination = tmp_path / "existing-file"
+        destination.write_text("unchanged file")
+    elif kind == "same":
+        destination = package
+    elif kind == "nested":
+        destination = package / "new-output"
+    else:
+        destination = package / "pcap" / ".." / "new-output"
+    before = tree_hashes(tmp_path)
+
+    report = export_normal_collection(package, output_dir=destination)
+
+    assert report["status"] == "HOLD"
+    reason = "output_must_be_new" if kind.startswith("existing") else "output_must_be_outside_package"
+    assert report["hold_reasons"] == ["preflight:" + reason]
+    assert tree_hashes(tmp_path) == before
+    if kind in ("nested", "normalized_nested"):
+        assert not (package / "new-output").exists()
+
+
+@pytest.mark.parametrize("kind", ["directory", "dangling", "ancestor"])
+def test_symlink_output_paths_are_refused_before_resolving_or_writing(package, tmp_path, kind):
+    mark_completed(package)
+    target = tmp_path / "link-target"
+    if kind != "dangling":
+        target.mkdir()
+        (target / "untouched.txt").write_text("unchanged")
+    link = tmp_path / "linked-output"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("Host does not permit symlink creation")
+    destination = link / "new-output" if kind == "ancestor" else link
+    before = tree_hashes(package)
+
+    report = export_normal_collection(package, output_dir=destination)
+
+    assert report["status"] == "HOLD"
+    assert report["hold_reasons"] == ["preflight:output_symlink"]
+    assert tree_hashes(package) == before
+    assert link.is_symlink()
+    if kind == "dangling":
+        assert not target.exists()
+    else:
+        assert tree_hashes(target) == {"untouched.txt": hashlib.sha256(b"unchanged").hexdigest()}
+        assert not (target / "new-output").exists()
+
+
+@pytest.mark.parametrize("kind", ["directory", "ancestor"])
+def test_windows_junction_output_paths_are_refused_without_writing(package, tmp_path, kind):
+    winapi = pytest.importorskip("_winapi")
+    mark_completed(package)
+    target = tmp_path / "junction-target"
+    target.mkdir()
+    (target / "untouched.txt").write_text("unchanged")
+    link = tmp_path / "linked-output"
+    try:
+        winapi.CreateJunction(str(target), str(link))
+    except OSError:
+        pytest.skip("Host does not permit junction creation")
+    try:
+        before = tree_hashes(package)
+        destination = link / "new-output" if kind == "ancestor" else link
+
+        report = export_normal_collection(package, output_dir=destination)
+
+        assert report["status"] == "HOLD"
+        assert report["hold_reasons"] == ["preflight:output_symlink"]
+        assert tree_hashes(package) == before
+        assert tree_hashes(target) == {"untouched.txt": hashlib.sha256(b"unchanged").hexdigest()}
+        assert not (target / "new-output").exists()
+    finally:
+        # Removing the junction itself leaves the separate target intact.
+        link.rmdir()
+
+
+def test_output_preparation_error_preserves_source_and_existing_parent_file(package, tmp_path):
+    mark_completed(package)
+    parent = tmp_path / "parent-file"
+    parent.write_text("unchanged")
+    before = tree_hashes(tmp_path)
+
+    report = export_normal_collection(package, output_dir=parent / "new-output")
+
+    assert report["status"] == "HOLD"
+    assert len(report["hold_reasons"]) == 1 and report["hold_reasons"][0].startswith("preflight:")
+    assert tree_hashes(tmp_path) == before

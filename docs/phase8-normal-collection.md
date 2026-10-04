@@ -83,6 +83,21 @@ Group·운영 Commit·수집 도구 Commit/해시·등록 및 정책 Revision·C
 HOLD로 마감하고 불완전 구간의 Snapshot을 보존한다. SIGKILL·전원 차단은 정상
 마감 절차를 수행할 수 없으므로 기존 증적과 원본 DB를 별도로 검토한다.
 
+완료된 Package는 원본을 유지하고 파일별 SHA256과 압축본 SHA256을 기록해
+백업한다. 기본 Export는 `RAW_CAPTURED` 상태에서만 원본 Directory에 결과를
+작성한다. 완료·HOLD Package의 기본 재실행은 기존 결과를 수정하지 않고 HOLD를
+반환한다. 완료 후보의 재검증은 다음처럼 **새 외부 Directory**를 지정한다.
+
+```bash
+venv/bin/python -m ai.export_normal_collection \
+  --package-dir output/normal-collection-20261004/run-01-<run-id> \
+  --output-dir output/normal-collection-recheck/run-01
+```
+
+재검증은 원본 Snapshot·PCAP·Manifest를 읽고 새 위치에 CSV·QC 결과를 작성한다.
+이미 존재하는 출력 경로, 원본 또는 원본 하위 경로, Symbolic Link 경로는 거부한다.
+재검증이 실패해도 원본 증적은 보존하며, HOLD Package의 학습 적격성을 승인하지 않는다.
+
 ## Phase 9 인계
 
 현재 Capture를 유지해 얻은 네 Run은 동일한 `source_capture_group_id`를 공유한다.
