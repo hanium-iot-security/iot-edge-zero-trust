@@ -8,11 +8,13 @@ point at the live checkout when the collection tool is in a separate checkout.
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 from datetime import datetime, timezone
 import hashlib
 import json
 import math
 from pathlib import Path
+import signal
 import shutil
 import sqlite3
 import subprocess
@@ -58,7 +60,7 @@ def rows(connection, query, args=()):
 
 
 def state(db_path: Path) -> dict:
-    with read_db(db_path) as connection:
+    with closing(read_db(db_path)) as connection:
         revisions = rows(connection, "SELECT * FROM device_policy_revisions ORDER BY device_id,revision")
         devices = rows(connection, "SELECT device_id,ip_address,status,trust_score FROM devices ORDER BY device_id")
         now = utc(time.time())
@@ -86,6 +88,16 @@ def save_json(path: Path, data: dict) -> None:
 
 def git_head(root: Path) -> str:
     return subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+
+
+def backup_snapshot(db_path: Path, snapshot: Path) -> None:
+    # SQLite backup copies a WAL source's journal-mode header. Seal only the
+    # private destination as DELETE so read-only QC needs no -wal/-shm files.
+    with closing(read_db(db_path)) as src, closing(sqlite3.connect(snapshot)) as dst:
+        src.backup(dst, pages=256, sleep=0.01)
+        if dst.execute("PRAGMA journal_mode=DELETE").fetchone()[0] != "delete":
+            raise ValueError("Could not seal standalone snapshot")
+    snapshot.chmod(0o600)
 
 
 def preserve_file(root: Path, filename: str, destination: Path) -> bool:
@@ -118,7 +130,7 @@ def preserve_file(root: Path, filename: str, destination: Path) -> bool:
 
 
 def preserve_segments(root: Path, db_path: Path, package: Path, manifest: dict) -> None:
-    with read_db(db_path) as connection:
+    with closing(read_db(db_path)) as connection:
         segments = rows(connection, "SELECT id,file_name FROM packet_capture_segments WHERE capture_session_id=? AND window_start>=? AND window_end<=? ORDER BY window_start", (manifest["capture_session_pk"], manifest["start_utc"], manifest["end_utc"]))
     artifacts = {item["segment_id"]: item for item in manifest.get("capture_artifacts", [])}
     directory = package / "pcap"
@@ -152,9 +164,7 @@ def finalize(root: Path, db_path: Path, package: Path, manifest: dict, baseline:
             break
         time.sleep(5)
     snapshot = package / "after.db"
-    with read_db(db_path) as src, sqlite3.connect(snapshot) as dst:
-        src.backup(dst, pages=256, sleep=0.01)
-    snapshot.chmod(0o600)
+    backup_snapshot(db_path, snapshot)
     # Validate the actual frozen data rather than an earlier live observation.
     current = state(snapshot)
     save_json(package / "after-state.json", current)
@@ -284,9 +294,7 @@ def collect(root: Path, output: Path, slots: list[tuple[list[str], int]], poll_s
                 snapshot = package / "after.db"
                 try:
                     if not snapshot.exists():
-                        with read_db(db_path) as src, sqlite3.connect(snapshot) as dst:
-                            src.backup(dst, pages=256, sleep=0.01)
-                        snapshot.chmod(0o600)
+                        backup_snapshot(db_path, snapshot)
                     manifest["snapshot"] = {"path": "after.db", "sha256": sha256(snapshot)}
                 except (OSError, sqlite3.Error):
                     manifest["collection_issues"].append("interrupted_snapshot_failed")
@@ -307,9 +315,13 @@ def main() -> int:
     if args.phase8_sequence and args.device:
         parser.error("Choose either --phase8-sequence or --device")
     slots = [(["pico_01"], 1800), (["esp32_01"], 1800), (["esp32_02"], 1800), (["esp32_01", "esp32_02", "pico_01"], 3600)] if args.phase8_sequence else [(args.device, args.duration_seconds)]
+    # A background shell can inherit SIGINT ignored. Both requested stop signals
+    # must enter collect's HOLD/snapshot path rather than terminate abruptly.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     try:
         result = collect(args.project_root, args.output, slots)
-    except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as error:
+    except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(json.dumps({"status": "HOLD", "error_type": type(error).__name__}), flush=True)
         return 2
     return 0 if result["status"] == "CANDIDATE_COLLECTION_COMPLETE" else 2

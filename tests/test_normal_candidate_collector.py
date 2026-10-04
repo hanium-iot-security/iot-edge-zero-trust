@@ -423,3 +423,43 @@ def test_fileless_failed_segment_is_retained_for_qc_without_a_fabricated_artifac
     collector.preserve_segments(project.root, project.db, package, manifest)
     assert manifest["capture_artifacts"] == [{"segment_id": segment_id}]
     assert not list((package / "pcap").iterdir())
+
+
+def test_wal_source_snapshot_is_standalone_without_changing_source(project):
+    snapshot = project.root / "output/sealed.db"
+    snapshot.parent.mkdir()
+    # Keep the live WAL connection open, including a committed uncheckpointed
+    # update, just as the subscriber does while the online backup is taken.
+    with closing(sqlite3.connect(project.db)) as live:
+        assert live.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        live.execute("UPDATE devices SET last_seen_at='2026-10-04T12:01:01Z' WHERE device_id='pico_01'")
+        live.commit()
+        wal = Path(str(project.db) + "-wal")
+        source_wal = wal.read_bytes()
+        collector.backup_snapshot(project.db, snapshot)
+        with closing(collector.read_db(snapshot)) as copied:
+            assert copied.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+            assert copied.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert copied.execute("SELECT last_seen_at FROM devices WHERE device_id='pico_01'").fetchone()[0] == "2026-10-04T12:01:01Z"
+        assert live.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert wal.read_bytes() == source_wal
+        assert not Path(str(snapshot) + "-wal").exists()
+        assert not Path(str(snapshot) + "-shm").exists()
+
+
+def test_cli_requested_stop_enters_hold_instead_of_abrupt_exit(monkeypatch, tmp_path, capsys):
+    import signal
+
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+
+    def requested_stop(*args, **kwargs):
+        signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+
+    monkeypatch.setattr(collector, "collect", requested_stop)
+    monkeypatch.setattr("sys.argv", ["collector", "--output", str(tmp_path / "output"), "--device", "pico_01"])
+    try:
+        assert collector.main() == 2
+        assert json.loads(capsys.readouterr().out)["status"] == "HOLD"
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)

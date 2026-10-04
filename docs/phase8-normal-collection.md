@@ -56,7 +56,9 @@ PCAP와 `.capture.json`은 기본 15초 간격으로 별도 복사한다. 봉인
 기존 증적을 덮어쓰거나 `.tmp` 파일을 정상 PCAP으로 채택하지 않는다.
 
 각 구간 종료 후 활성 Producer·Detector·Trust가 종료 경계를 처리했는지 확인하고,
-SQLite Backup API로 일관된 `after.db`를 만든다. Manifest에는 대상·시간·Capture
+SQLite Backup API로 일관된 `after.db`를 만들고, 백업 대상만 DELETE Journal로
+봉인해 보조 WAL/SHM 파일이 필요 없는 Snapshot으로 보관한다. 운영 DB의 WAL 설정은
+바꾸지 않는다. Manifest에는 대상·시간·Capture
 Group·운영 Commit·수집 도구 Commit/해시·등록 및 정책 Revision·Capture Policy·
 펌웨어 출처 확인 상태·파일 해시를 함께 기록한다. 비밀번호·관리자 키는 포함하지
 않는다. 물리 기기의 펌웨어와 Gateway 소스가 같다는 사실은 소스 해시만으로
@@ -77,6 +79,9 @@ Group·운영 Commit·수집 도구 Commit/해시·등록 및 정책 Revision·C
 `plan.json`과 `progress.json`은 전체 진행 상태, Run별 `manifest.json`과
 `qc-report.json`은 개별 결과다. `training_approved=false`와
 `whole_capture_session_approved=false`는 품질 검증 통과 후에도 유지한다.
+수집 프로세스에 SIGINT 또는 SIGTERM을 보내면 운영 서비스를 유지한 채 후보를
+HOLD로 마감하고 불완전 구간의 Snapshot을 보존한다. SIGKILL·전원 차단은 정상
+마감 절차를 수행할 수 없으므로 기존 증적과 원본 DB를 별도로 검토한다.
 
 ## Phase 9 인계
 
