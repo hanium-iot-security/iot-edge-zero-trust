@@ -10,6 +10,11 @@ from edge.mqtt.subscriber import build_mqtt_log_row, insert_mqtt_log
 from tests.conftest import cleanup_device
 
 
+@pytest.fixture()
+def db_session(db_session_with_raw_payload):
+    return db_session_with_raw_payload
+
+
 def test_build_mqtt_log_row_validates_topic_and_payload() -> None:
     row = build_mqtt_log_row(
         "iot/esp32_01/sensor",

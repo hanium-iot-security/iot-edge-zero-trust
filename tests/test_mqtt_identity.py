@@ -32,6 +32,11 @@ from tests.conftest import cleanup_device
 REGISTERED = {"esp32_01", "esp32_02"}
 
 
+@pytest.fixture()
+def db_session(db_session_with_raw_payload):
+    return db_session_with_raw_payload
+
+
 # ── classify_mqtt_identity (순수 함수, DB 접근 없음) ──────────────────────────
 
 class TestClassifyMqttIdentity:
