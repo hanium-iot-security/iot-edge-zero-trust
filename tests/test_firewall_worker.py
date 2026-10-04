@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import shutil
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -113,7 +114,12 @@ def _rule_key(args: Sequence[str]) -> str:
 @pytest.fixture
 def SessionLocal(tmp_path: Path):
     db_path = tmp_path / "phase4-firewall-worker.db"
-    apply_migrations(db_path, MIGRATIONS_DIR)
+    legacy_migrations = tmp_path / "legacy-migrations"
+    legacy_migrations.mkdir()
+    for path in MIGRATIONS_DIR.glob("*.sql"):
+        if int(path.name.split("_", 1)[0]) <= 6:
+            shutil.copyfile(path, legacy_migrations / path.name)
+    apply_migrations(db_path, legacy_migrations)
     engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     try:

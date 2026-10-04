@@ -347,8 +347,11 @@ def process_pending_rules(
     for row in rows:
         rule_id = int(row["id"])
         try:
+            row = firewall_repository.authorized_automatic_rule(
+                db, rule_id=rule_id, required_status=firewall_repository.PENDING, now=now_utc
+            )
             spec = validate_rule_row(row, policy)
-        except FirewallValidationError as exc:
+        except (FirewallValidationError, firewall_repository.AutomaticResponseBlockedError) as exc:
             _record_validation_failure(db, rule_id=rule_id, now=now_utc, error=str(exc))
             result.validation_failed.append(rule_id)
             logger.error(
@@ -578,8 +581,11 @@ def reconcile(
         # IP가 재할당된 뒤 재부팅되면, 예전 APPLIED Row가 지금은 보호 대상인 IP를
         # 다시 차단할 수 있다.
         try:
+            row = firewall_repository.authorized_automatic_rule(
+                db, rule_id=rule_id, required_status=firewall_repository.APPLIED, now=now_utc
+            )
             spec = validate_rule_row(row, policy)
-        except FirewallValidationError as exc:
+        except (FirewallValidationError, firewall_repository.AutomaticResponseBlockedError) as exc:
             result.validation_failed.append(rule_id)
             logger.error(
                 "Refusing to restore firewall rule that fails validation "
@@ -651,8 +657,11 @@ def plan_pending_rules(
     for row in rows:
         rule_id = int(row["id"])
         try:
+            row = firewall_repository.authorized_automatic_rule(
+                db, rule_id=rule_id, required_status=firewall_repository.PENDING, now=now_utc
+            )
             spec = validate_rule_row(row, policy)
-        except FirewallValidationError as exc:
+        except (FirewallValidationError, firewall_repository.AutomaticResponseBlockedError) as exc:
             planned.append((rule_id, f"VALIDATION_FAILURE: {exc}"))
             continue
         planned.append((rule_id, (spec, build_rule_args(spec, operation=INSERT))))

@@ -21,11 +21,13 @@ from typing import Any, Mapping
 
 from edge.policy.device_policy import (
     ALLOWED_STATE_TRANSITIONS,
+    POLICY_FIELDS,
     STATE_PENDING,
     DeviceIdConflictError,
     DeviceIpConflictError,
     DeviceNotFoundError,
     DevicePolicy,
+    DevicePolicyValidationError,
     IpRegistrationPolicy,
     NoPolicyChangeError,
     PendingRevisionExistsError,
@@ -37,6 +39,7 @@ from edge.policy.device_policy import (
     format_utc_millis,
     format_utc_seconds,
     next_effective_boundary,
+    parse_effective_from,
     require_aware,
     require_lookup_id,
     utc_now,
@@ -120,6 +123,24 @@ class RegisteredDevice:
     revision: PolicyRevision
 
 
+def auto_response_exclusion_reason(snapshot: PolicySnapshot) -> str | None:
+    """Validated current/pending policy's automatic-response eligibility.
+
+    API display and Worker execution share this decision. The caller must first
+    load a valid snapshot; missing or corrupt policy is handled as unavailable.
+    """
+    current, pending = snapshot.current, snapshot.pending
+    if pending is not None and pending.registration_state == "DISABLED":
+        return "DISABLE_REQUESTED_OR_DISABLED"
+    if current is None:
+        return "REGISTRATION_NOT_EFFECTIVE"
+    if current.registration_state == "DISABLED":
+        return "DISABLE_REQUESTED_OR_DISABLED"
+    if current.registration_state != "ACTIVE":
+        return f"CURRENT_{current.registration_state}"
+    return None
+
+
 # ── 트랜잭션 ─────────────────────────────────────────────────────────────────
 
 
@@ -162,17 +183,12 @@ def write_transaction(connection: sqlite3.Connection) -> Iterator[None]:
 def _revision_from_row(row: Any) -> PolicyRevision:
     return PolicyRevision(
         device_id=row[0],
-        revision=int(row[1]),
+        revision=validate_revision_number(row[1], "revision"),
         effective_from=row[2],
         registration_state=row[3],
-        policy=DevicePolicy(
-            policy_profile=row[4],
-            expected_publish_interval_seconds=float(row[5]),
-            publish_count_max=int(row[6]),
-            payload_size_max_bytes=int(row[7]),
-            packet_rate_max_pps=float(row[8]),
-            byte_rate_max_bytes_per_second=float(row[9]),
-        ),
+        # Validate stored values before conversion. A damaged integer field
+        # must not silently turn 15.5 into an apparently valid threshold of 15.
+        policy=validate_policy(dict(zip(POLICY_FIELDS, row[4:10]))),
         created_at=row[10],
         created_by=row[11],
         reason=row[12],
@@ -253,16 +269,37 @@ def get_policy_snapshot(
     now = require_aware(server_time if server_time is not None else utc_now(), "server_time")
     if not device_exists(connection, device_id):
         raise DeviceNotFoundError(f"Device {device_id!r} is not registered")
-    latest = get_latest_revision(connection, device_id)
-    if latest is None:
-        raise PolicyUnavailableError(f"Device {device_id!r} has no policy revision")
-    return PolicySnapshot(
-        device_id=device_id,
-        server_time=format_utc_millis(now),
-        latest_revision=latest.revision,
-        current=get_revision_effective_at(connection, device_id, now),
-        pending=get_pending_revision(connection, device_id, now),
-    )
+    try:
+        latest = get_latest_revision(connection, device_id)
+        if latest is None:
+            raise PolicyUnavailableError(f"Device {device_id!r} has no policy revision")
+        first = _fetch_revision(connection, "device_id = ? AND revision = 1", (device_id,))
+        registered_from = connection.execute(
+            "SELECT registration_effective_from FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()[0]
+        snapshot = PolicySnapshot(
+            device_id=device_id,
+            server_time=format_utc_millis(now),
+            latest_revision=latest.revision,
+            current=get_revision_effective_at(connection, device_id, now),
+            pending=get_pending_revision(connection, device_id, now),
+        )
+        if first is None:
+            raise ValueError("Initial policy revision is missing")
+        for revision in (first, latest, snapshot.current, snapshot.pending):
+            if revision is not None:
+                validate_policy(revision.policy)
+                validate_registration_state(revision.registration_state)
+                parse_effective_from(revision.effective_from)
+                validate_revision_number(revision.revision)
+        # NULL is intentionally preserved for identities registered before 007.
+        if registered_from is not None:
+            parse_effective_from(registered_from, "registration_effective_from")
+            if registered_from != first.effective_from:
+                raise ValueError("Registration and initial policy boundaries disagree")
+    except (DevicePolicyValidationError, ValueError, TypeError) as exc:
+        raise PolicyUnavailableError(f"Device {device_id!r} has invalid policy state") from exc
+    return snapshot
 
 
 def diagnose_device_ip_conflicts(connection: sqlite3.Connection) -> dict[str, list[Any]]:
@@ -507,12 +544,13 @@ def append_policy_revision(
         now = require_aware(clock(), "clock()")
         if not device_exists(connection, device_id):
             raise DeviceNotFoundError(f"Device {device_id!r} is not registered")
-        latest = get_latest_revision(connection, device_id)
+        # Validate existing metadata and policy inside the write transaction,
+        # before inserting anything or returning an error after a commit.
+        snapshot = get_policy_snapshot(connection, device_id, server_time=now)
+        current, pending = snapshot.current, snapshot.pending
+        latest = pending if pending is not None else current
         if latest is None:
-            raise PolicyUnavailableError(f"Device {device_id!r} has no policy revision")
-
-        current = get_revision_effective_at(connection, device_id, now)
-        pending = get_pending_revision(connection, device_id, now)
+            raise PolicyUnavailableError(f"Device {device_id!r} has no effective or pending policy")
         current_number = current.revision if current is not None else None
         pending_number = pending.revision if pending is not None else None
 

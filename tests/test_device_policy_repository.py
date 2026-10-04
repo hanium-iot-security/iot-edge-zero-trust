@@ -52,6 +52,7 @@ from tests.device_policy_support import (
     clock_at,
     count,
     insert_legacy_device,
+    insert_revision_raw,
     open_db,
 )
 
@@ -710,6 +711,34 @@ class TestResolver:
         assert resolution.reason == "NO_POLICY_REVISION"
         assert resolution.policy is None  # 기본값으로 보정하지 않는다
         assert "esp32_01" in registered_device_ids_at(db, self.window(0))
+
+    @pytest.mark.parametrize("field,value", [
+        ("packet_rate_max_pps", "corrupt-text"),
+        ("publish_count_max", 15.5),
+    ])
+    def test_corrupt_stored_policy_returns_unavailable_without_changing_transaction(
+        self, db, field, value
+    ) -> None:
+        insert_legacy_device(db, "broken", "192.168.0.40")
+        # Only this temporary DB bypasses CHECKs to model a damaged import.
+        db.execute("PRAGMA ignore_check_constraints = ON")
+        insert_revision_raw(db, device_id="broken", **{field: value})
+        db.execute("PRAGMA ignore_check_constraints = OFF")
+        before = snapshot_of_tables(db)
+        db.execute("BEGIN")
+
+        resolution = resolve_device_policy(db, "broken", self.window(10))
+
+        assert resolution.resolution == RESOLUTION_POLICY_UNAVAILABLE
+        assert resolution.device_id == "broken"
+        assert resolution.device_policy_revision is None
+        assert resolution.effective_from is None
+        assert resolution.registration_state is None
+        assert resolution.policy is None
+        assert resolution.reason == "INVALID_POLICY_REVISION"
+        assert db.in_transaction
+        db.execute("ROLLBACK")
+        assert snapshot_of_tables(db) == before
 
     def test_late_registration_does_not_claim_earlier_windows(self, db) -> None:
         # V07: 신규 기기 등록 이후에도 과거 Window의 등록 집합은 그대로다.

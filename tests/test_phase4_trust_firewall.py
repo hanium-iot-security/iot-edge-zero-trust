@@ -914,6 +914,9 @@ def test_firewall_repository_retry_and_manual_reset_are_transaction_controlled(
         assert row["status"] == "FAILED"
         assert row["retry_count"] == 3
 
+        # The administrator command starts after the failed Worker transaction.
+        db.commit()
+
         firewall_repository.reset_failed_to_pending(
             db,
             rule_id=rule_id,
