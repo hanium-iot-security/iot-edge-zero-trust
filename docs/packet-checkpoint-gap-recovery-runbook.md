@@ -5,6 +5,10 @@
 - `gap-recovery`(기본값): 기존 `packet_rule`/`packet_if` 절차다. Target은 `COMPLETED`이면서 전체 feature-ready여야 하고 RUNNING Session은 없어야 한다.
 - `live-resume`: `packet_rule`/`packet_if`의 명시적 절차다. 종료 전 Checkpoint와 현재 유일한 RUNNING Target의 `first_window_start` 사이 downtime만 건너뛴다. Target의 `first_window_start` 이후 Packet Feature는 건너뛰지 않고 해당 Detector가 정상 소비한다. 두 Packet Stage가 모두 required이면 각 Detector에 대해 별도 Plan·Execute·Audit가 필요하며 Target과 After 경계가 같아야 한다.
 
+같은 RUNNING Session 중간의 `FAILED/PARTIAL_CAPTURE` 손실은 이 명령의 대상이 아니다.
+Migration 008의 별도 [Packet 손실 구간 승인 복구](packet-segment-gap-recovery-runbook.md)를
+사용하고, 실패 PCAP·상태를 보존한 채 정확히 한 Window만 승인한다.
+
 ## 1. Migration과 사전 격리
 
 1. 운영 절차와 분리하여 Migration 005를 백업·검증 후 먼저 적용한다. Recovery CLI는 Migration을 자동 적용하지 않는다.

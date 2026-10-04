@@ -269,9 +269,9 @@ def get_packet_feature_ready_through(
 ) -> PacketFeatureReadiness | None:
     """Return the contiguous prefix already converted to Packet Features.
 
-    PROCESSED and EMPTY are terminal extractor states. READY is intentionally
-    excluded because the pcap has not been converted yet. A malformed segment
-    state or a missing window stops the prefix instead of skipping ahead.
+    PROCESSED and EMPTY are terminal extractor states. Only an exact failed
+    window with a validated segment-gap audit may extend this prefix. READY,
+    unaudited failures, overlaps, and malformed feature rows stop the prefix.
     """
     session = get_capture_session_by_session_id(db, session_id=session_id)
     if session is None:
@@ -291,48 +291,57 @@ def get_packet_feature_ready_through(
     rows = db.execute(
         text(
             """
-            SELECT
-                pcsg.window_start,
-                pcsg.window_end,
-                pcsg.status,
-                pcsg.error_code,
-                COUNT(pfl.id) AS feature_count
+            SELECT pcsg.*,
+                COUNT(pfl.id) AS feature_count,
+                SUM(CASE WHEN pfl.id IS NOT NULL AND (
+                    pfl.window_start != pcsg.window_start
+                    OR pfl.window_end != pcsg.window_end
+                ) THEN 1 ELSE 0 END) AS invalid_feature_count
             FROM packet_capture_segments pcsg
             LEFT JOIN packet_feature_logs pfl
                 ON pfl.capture_segment_id = pcsg.id
             JOIN packet_capture_sessions pcs
                 ON pcs.id = pcsg.capture_session_id
             WHERE pcs.session_id = :session_id
-            GROUP BY
-                pcsg.id,
-                pcsg.window_start,
-                pcsg.window_end,
-                pcsg.status,
-                pcsg.error_code
+            GROUP BY pcsg.id
             ORDER BY pcsg.window_start ASC, pcsg.id ASC
             """
         ),
         {"session_id": session_id},
-    ).mappings()
+    ).mappings().all()
 
-    for segment in rows:
+    for index, segment in enumerate(rows):
         window_start = _parse_db_utc(segment["window_start"])
+        window_end = _parse_db_utc(segment["window_end"])
         if window_start < expected_window_start:
+            if window_end > expected_window_start:
+                break
             continue
         if window_start > expected_window_start:
+            break
+        if window_end != window_start + timedelta(seconds=10):
+            break
+        if index + 1 < len(rows) and _parse_db_utc(
+            rows[index + 1]["window_start"]
+        ) < window_end:
             break
 
         status = str(segment["status"])
         feature_count = int(segment["feature_count"])
-        if status not in {"PROCESSED", "EMPTY"} or segment["error_code"] is not None:
+        if status == "FAILED" and segment["error_code"] == PARTIAL_CAPTURE:
+            # Import here so the recovery inspector can use repository helpers
+            # without creating an import cycle.
+            from edge.packet.segment_gap_recovery import approved_segment_gap
+
+            if feature_count != 0 or approved_segment_gap(db, segment) is None:
+                break
+        elif status not in {"PROCESSED", "EMPTY"} or segment["error_code"] is not None:
+            break
+        if int(segment["invalid_feature_count"]) != 0:
             break
         if status == "PROCESSED" and feature_count == 0:
             break
         if status == "EMPTY" and feature_count != 0:
-            break
-
-        window_end = _parse_db_utc(segment["window_end"])
-        if window_end != window_start + timedelta(seconds=10):
             break
 
         ready_through = window_end

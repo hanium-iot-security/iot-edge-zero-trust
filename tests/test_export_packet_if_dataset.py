@@ -457,7 +457,7 @@ def test_export_rejects_feature_and_segment_window_mismatch(
         db.commit()
 
         output_path = tmp_path / "mismatched.csv"
-        with pytest.raises(ValueError, match="must match"):
+        with pytest.raises(ValueError, match="contiguous Packet Feature prefix"):
             _export(
                 db,
                 output_path=output_path,

@@ -31,6 +31,7 @@ Test Pack(`tests/fixtures/packet/pcap/`) 수집 절차·검증 기준을 정리�
 | `CAPTURE_INTERFACE` | `eth0` | tcpdump가 리스닝할 인터페이스 |
 | `PCAP_WINDOW_SECONDS` | `10` | Window 길이 (DB CHECK 제약상 10 고정, 다른 값은 실행 즉시 오류) |
 | `PCAP_CAPTURE_FILTER` | `tcp or udp` | tcpdump에 넘기는 BPF filter |
+| `PCAP_BUFFER_SIZE_KIB` | `4096` | tcpdump `-B` Capture Buffer (KiB), 정수 `64..65536`; 범위 밖의 값은 시작 전에 거부 |
 | `PCAP_INCOMING_DIR` | `data/pcap/incoming` | 작성 중 `.pcap.tmp` |
 | `PCAP_READY_DIR` | `data/pcap/ready` | 캡처 완료, Extractor 대기 |
 | `PCAP_PROCESSED_DIR` | `data/pcap/processed` | Extractor 처리 완료 (Extractor 담당) |
@@ -124,6 +125,12 @@ Window 2026-07-15T00:00:20Z~2026-07-15T00:00:30Z는 캡처 시작 전에 만료�
 - tcpdump stderr는 실행 중 계속 비우고 마지막 64 KiB까지만 보관한다. 보고된
   Kernel/Interface Drop이 양수이면 `FAILED`/`PARTIAL_CAPTURE`다. 통계가 없으면
   `null`/`unknown`으로 기록하며 0으로 추정하지 않는다.
+- `PCAP_BUFFER_SIZE_KIB`는 tcpdump의 OS Capture Buffer를 `-B`로 지정한다.
+  기본값은 4096 KiB이며, Buffer 확대는 순간적인 유입량 증가를 완화하기 위한
+  설정이다. CPU·디스크 I/O·스케줄링 부하 원인 해결이나 Drop 0을 보장하지 않는다.
+  배포 후 실제 tcpdump 인자와 Version을 확인하고 같은 부하에서 Window별 Drop·
+  시작 지연·Duration을 측정한다. `-U`·`--immediate-mode`·Filter와 기존 실패 판정은
+  유지하며, Buffer를 키워도 Drop이 관측된 PCAP는 정상 데이터로 승격하지 않는다.
 - 실행 결과는 `ready/<pcap>.capture.json` 또는 `failed/<pcap>.capture.json`에
   Session·Window·PCAP 식별자, 종료 코드, stderr, Drop 통계를 함께 남긴다. 성공
   진단 파일을 저장한 뒤 PCAP를 `ready`로 옮긴다. 진단 파일은 Extractor의 PCAP

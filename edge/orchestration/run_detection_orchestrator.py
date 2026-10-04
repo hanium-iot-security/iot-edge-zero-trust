@@ -16,10 +16,11 @@ Cycle 순서(세부계획 2.4):
 현재 시각을 다시 계산하면 서로 다른 Window의 Event가 한 Trust 계산에 섞입니다.
 
 Packet Rule·Packet IF는 Stage Registry 설정으로 활성화합니다. Packet Stage 앞의 Ready
-Range Gate는 Cycle 범위 전체가 한 Capture Session의 연속 `PROCESSED`·`EMPTY` Prefix인지
-확인합니다. `READY`·`FAILED`·누락 Window 또는 Session Gap이 있으면 Packet Checkpoint와
-Trust를 전진시키지 않습니다. Packet 계층이 Required이면 MQTT Producer Watermark와
-Packet Feature Ready Through 중 이른 시각을 공통 cutoff로 사용합니다. Packet 계층이
+Range Gate는 Cycle 범위 전체가 한 Capture Session의 검증된 Prefix인지 확인합니다.
+공식 감사로 승인된 FAILED Window 하나를 제외하고, `READY`·`FAILED`·누락·겹침 또는
+Session Gap이 있으면 Packet Checkpoint와 Trust를 전진시키지 않습니다. Packet 계층이
+Required이면 MQTT Producer Watermark와 Packet Feature Ready Through 중 이른 시각을
+공통 cutoff로 사용합니다. Packet 계층이
 비활성화됐거나 `required=false`이면 MQTT 단독 Trust Cycle은 기존 계약대로 동작합니다.
 Gap을 정상 데이터로 연결하지 않으며, 운영자가 Gap을 확인하고 새 연속 구간으로 재개하는
 절차는 별도 운영 단계에서 수행합니다.
@@ -53,7 +54,9 @@ from edge.detection.orchestrator import ensure_checkpoint_completed, run_detecti
 from edge.detection.phase4_time import floor_window_start, format_db_utc, parse_db_utc
 from edge.features.collect_feature_logs import MQTT_FEATURE_BUILDER, MQTT_LOGS_SOURCE
 from edge.orchestration.packet_stage_readiness import (
+    PacketFeatureRangeNotReadyError,
     get_packet_feature_readiness_for_range_start,
+    require_packet_feature_ready_range,
 )
 from edge.orchestration.stage_registry import (
     PACKET_RULE,
@@ -96,6 +99,7 @@ class PacketLiveResumeTransition:
     boundary: datetime
     target_session_id: str
     plan_sha256: str
+    mode: str = "live-resume"
 
 
 class UtcFormatter(logging.Formatter):
@@ -428,6 +432,42 @@ def resolve_packet_live_resume_transition(
     if not range_start < boundary <= cutoff:
         return None
 
+    # A segment-gap operation advances both Packet checkpoints atomically.
+    # Validate both rows even when only one Packet stage is required here.
+    from edge.packet.segment_gap_recovery import resolve_segment_gap_transition
+
+    paired_checkpoints = tuple(
+        checkpoints.get_detector_checkpoint(
+            db,
+            detector_name=detector_name,
+            source_table="packet_feature_logs",
+        )
+        for detector_name in PACKET_STAGE_NAMES
+    )
+    if all(checkpoint is not None for checkpoint in paired_checkpoints):
+        segment_gap = resolve_segment_gap_transition(
+            db,
+            boundary,
+            paired_checkpoints,
+        )
+        if segment_gap is not None:
+            try:
+                # The audit permits only its exact failed window. Any older
+                # missing/failed window or overlapping Feature still blocks.
+                require_packet_feature_ready_range(
+                    db,
+                    cycle_range_start=range_start,
+                    cycle_cutoff=boundary,
+                )
+            except PacketFeatureRangeNotReadyError:
+                return None
+            return PacketLiveResumeTransition(
+                boundary=boundary,
+                target_session_id=str(segment_gap["target_session_id"]),
+                plan_sha256=str(segment_gap["plan_sha256"]),
+                mode="segment-gap",
+            )
+
     audits: list[PacketLiveResumeTransition] = []
     for configured, checkpoint in zip(
         required_packet_stages,
@@ -495,8 +535,13 @@ def run_orchestration_cycle(
             if packet_resume_transition is not None:
                 cutoff = packet_resume_transition.boundary
                 logger.info(
-                    "event=PACKET_LIVE_RESUME_CATCHUP range_start=%s "
+                    "event=%s range_start=%s "
                     "resume_boundary=%s target_session_id=%s plan_sha256=%s",
+                    (
+                        "PACKET_SEGMENT_GAP_CATCHUP"
+                        if packet_resume_transition.mode == "segment-gap"
+                        else "PACKET_LIVE_RESUME_CATCHUP"
+                    ),
                     format_db_utc(range_start),
                     format_db_utc(packet_resume_transition.boundary),
                     packet_resume_transition.target_session_id,

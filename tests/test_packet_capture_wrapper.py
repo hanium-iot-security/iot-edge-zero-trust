@@ -12,7 +12,9 @@ import subprocess
 from unittest.mock import Mock, call
 
 import pytest
+from pydantic import ValidationError
 
+from backend.app.config import Settings
 from edge.packet.capture_policy import CapturePolicy
 from edge.packet.capture_runtime import (
     CaptureOutcome,
@@ -34,8 +36,9 @@ SESSION_ID = "550e8400-e29b-41d4-a716-446655440000"
 
 
 @pytest.mark.parametrize("forced_kill", [False, True])
+@pytest.mark.parametrize("buffer_size_kib", [None, 8192])
 def test_tcpdump_immediate_capture_preserves_shutdown_quality(
-    monkeypatch, tmp_path, forced_kill
+    monkeypatch, tmp_path, forced_kill, buffer_size_kib
 ) -> None:
     process = Mock()
     process.stderr = io.BytesIO(b"")
@@ -48,13 +51,15 @@ def test_tcpdump_immediate_capture_preserves_shutdown_quality(
     spawn = Mock(return_value=process)
     monkeypatch.setattr("edge.packet.capture_runtime.subprocess.Popen", spawn)
 
-    result = TcpdumpCaptureProcess(capture_filter="tcp or udp").capture_window(
+    configured = {} if buffer_size_kib is None else {"buffer_size_kib": buffer_size_kib}
+    result = TcpdumpCaptureProcess(capture_filter="tcp or udp", **configured).capture_window(
         interface="eth0", output_path=tmp_path / "window.pcap", window_seconds=10
     )
 
     arguments = spawn.call_args.args[0]
     assert "--immediate-mode" in arguments
     assert "-U" in arguments
+    assert arguments[arguments.index("-B") + 1] == str(buffer_size_kib or 4096)
     assert arguments[-1] == "tcp or udp"
     assert result.completed_full_window is True
     assert result.terminated_cleanly is (not forced_kill)
@@ -232,6 +237,34 @@ class TestCaptureRuntimeConfigFromEnv:
         """5.1 절: 1차 Capture는 TCP/UDP 트래픽으로 한정해야 한다."""
         config = CaptureRuntimeConfig.from_env()
         assert config.capture_filter == "tcp or udp"
+
+    def test_default_capture_buffer_size(self, monkeypatch) -> None:
+        monkeypatch.delenv("PCAP_BUFFER_SIZE_KIB", raising=False)
+        assert Settings(_env_file=None).pcap_buffer_size_kib == 4096
+
+    @pytest.mark.parametrize("size", [64, 8192, 65536])
+    def test_capture_buffer_size_from_environment_reaches_runtime(self, monkeypatch, size) -> None:
+        monkeypatch.setenv("PCAP_BUFFER_SIZE_KIB", str(size))
+        app_settings = Settings(_env_file=None)
+        monkeypatch.setattr("backend.app.config.settings", app_settings)
+        assert CaptureRuntimeConfig.from_env().pcap_buffer_size_kib == size
+
+    @pytest.mark.parametrize("value", ["-1", "0", "63", "65537", "4096.5", "invalid"])
+    def test_rejects_invalid_capture_buffer_environment(self, monkeypatch, value) -> None:
+        monkeypatch.setenv("PCAP_BUFFER_SIZE_KIB", value)
+        with pytest.raises(ValidationError, match="pcap_buffer_size_kib"):
+            Settings(_env_file=None)
+
+
+@pytest.mark.parametrize("size", [0, -1, 63, 65537, True, 4096.5, "8192"])
+def test_capture_buffer_invalid_direct_configuration_is_rejected(tmp_path, size) -> None:
+    with pytest.raises(ValueError, match="pcap_buffer_size_kib"):
+        TcpdumpCaptureProcess(buffer_size_kib=size)
+    with pytest.raises(ValueError, match="pcap_buffer_size_kib"):
+        CaptureRuntimeConfig(
+            "eth0", 10, tmp_path / "incoming", tmp_path / "ready", tmp_path / "failed",
+            pcap_buffer_size_kib=size,
+        )
 
 
 class TestCaptureRuntimeConfigWindowSecondsValidation:

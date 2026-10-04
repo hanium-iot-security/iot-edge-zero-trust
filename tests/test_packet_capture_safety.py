@@ -132,8 +132,14 @@ def test_missing_statistics_remain_unknown_in_diagnostics(tmp_path, monkeypatch)
     assert result.stderr_complete is True
 
 
-def test_observed_packet_loss_is_failed_and_sidecar_preserves_quality(tmp_path):
+@pytest.mark.parametrize("buffer_size_kib", [4096, 65536])
+def test_observed_packet_loss_is_failed_and_sidecar_preserves_quality(tmp_path, buffer_size_kib):
     config = _config(tmp_path)
+    config = CaptureRuntimeConfig(
+        config.capture_interface, config.window_seconds,
+        config.incoming_dir, config.ready_dir, config.failed_dir,
+        pcap_buffer_size_kib=buffer_size_kib,
+    )
     outcome = CaptureOutcome(True, 0, packets_captured=2, packets_received=5, packets_dropped=3)
     result = execute_capture_window(
         _PcapProcess(outcome), config, session_id=SESSION_ID,
@@ -149,6 +155,30 @@ def test_observed_packet_loss_is_failed_and_sidecar_preserves_quality(tmp_path):
     assert metadata["drop_status"] == "observed_loss"
     assert result.diagnostics_path.name.endswith(".capture.json")
     assert not list(config.ready_dir.glob("*.pcap"))
+
+
+def test_capture_cli_passes_configured_buffer_to_tcpdump_process(tmp_path, monkeypatch):
+    database = tmp_path / "capture.db"
+    apply_migrations(db_path=database, migrations_dir="db/migrations")
+    engine = create_engine(f"sqlite:///{database.as_posix()}")
+    config = _config(tmp_path)
+    config = CaptureRuntimeConfig(
+        config.capture_interface, config.window_seconds,
+        config.incoming_dir, config.ready_dir, config.failed_dir,
+        pcap_buffer_size_kib=8192,
+    )
+    constructor = Mock()
+    monkeypatch.setattr(run_packet_capture, "SessionLocal", sessionmaker(bind=engine))
+    monkeypatch.setattr(run_packet_capture.CaptureRuntimeConfig, "from_env", lambda: config)
+    monkeypatch.setattr(run_packet_capture.GracefulShutdown, "install", lambda self: None)
+    monkeypatch.setattr(run_packet_capture, "TcpdumpCaptureProcess", constructor)
+    monkeypatch.setattr(run_packet_capture, "run_capture_loop", Mock(return_value=0))
+    monkeypatch.setattr(sys, "argv", ["run_packet_capture", "--windows", "1"])
+    try:
+        run_packet_capture.main()
+        assert constructor.call_args.kwargs["buffer_size_kib"] == 8192
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.parametrize("exit_code", [0, -15, 1, -9])
