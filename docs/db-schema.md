@@ -26,6 +26,8 @@ Migration 007 (`device_policy_revisions`)은 기기 등록 메타데이터와 �
 추가한다(device-policy-v1). 기존 `devices`의 Trust 필드와 이력은 변경하지 않는다. 기존 `devices`에
 같은 IP가 둘 이상 있으면 007은 유일 인덱스 생성에서 실패하고 전체가 rollback되므로, 적용 전에
 `edge.policy.device_policy_repository.diagnose_device_ip_conflicts`로 진단한다.
+Migration 008 (`packet_segment_gap_recovery`)은 같은 Capture Session 안의 손실 Window를
+관리자 승인으로 재개한 감사 기록을 추가한다. 실패 Segment·기존 이력과 Migration 005는 보존한다.
 
 적용과 복구: 007은 컬럼 추가를 포함하며 되돌리는(down) Migration이 없다. 운영 DB에는 먼저
 일관된 백업(SQLite backup API 등, 쓰기 중 파일 하나만 복사하지 않는다)을 만든 뒤 **복사본에서**
@@ -46,6 +48,30 @@ Detector별 Packet Checkpoint Gap Recovery 감사 Row를 저장한다. `operatio
 | version | INTEGER | migration version, primary key |
 | name | TEXT | migration 이름 |
 | applied_at | DATETIME | 적용 시각, 기본 current timestamp |
+
+## packet_segment_gap_recoveries
+
+정확히 한 `FAILED/PARTIAL_CAPTURE` Window에 대한 승인이다. Packet Rule·Packet IF의
+완료 경계를 **한 트랜잭션**에서 함께 이동하고, 두 Stage의 변경 전/후 Checkpoint를 Plan에
+저장한다. `last_processed_id`는 유지한다. 실패 Segment는 변경하지 않는다.
+
+| 컬럼 | 타입 | 설명 |
+| --- | --- | --- |
+| id / operation_id | INTEGER / TEXT | PK / 유일 작업 ID |
+| capture_session_id | TEXT | Session UUID, `packet_capture_sessions.session_id` FK |
+| failed_segment_id | INTEGER | 원본 실패 Segment FK, 같은 Segment 중복 승인 금지 |
+| window_start / window_end | TEXT | 승인한 10초 손실 구간, UTC `Z` |
+| plan_sha256 / plan_json | TEXT | 실패 Row·두 Checkpoint·승인·증거를 묶은 SHA256 및 Plan |
+| approved_by / reason | TEXT | 명시적 승인자와 재개 사유 |
+| repository_commit / database_path | TEXT | 승인 시 코드 Commit과 DB 경로 |
+| backup_path / backup_sha256 | TEXT | 실행 직전 검증된 SQLite 백업 |
+| preserved_pcap_path / pcap_sha256 | TEXT | 보존한 실패 PCAP와 SHA256 |
+| created_at | TEXT | 감사 Row 생성 시각 |
+
+Readiness는 감사 Row와 Plan·원본 실패 상태·Feature 부재가 일치할 때만 해당 손실 구간을
+통과한다. 다음 미승인 손실·누락·중복 Window는 계속 탐지를 막는다. 008이 없는 DB에서는
+기존 Gate를 유지한다. 적용·HOLD·복구 절차는
+[Packet 손실 구간 승인 복구](packet-segment-gap-recovery-runbook.md)를 따른다.
 
 ## devices
 

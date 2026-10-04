@@ -1,6 +1,7 @@
 from typing import Literal
 from urllib.parse import urlparse
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -53,6 +54,7 @@ class Settings(BaseSettings):
     capture_interface: str = "eth0"
     pcap_window_seconds: int = 10
     pcap_capture_filter: str = "tcp or udp"
+    pcap_buffer_size_kib: int = Field(default=4096, ge=64, le=65536)
     pcap_incoming_dir: str = "data/pcap/incoming"
     pcap_ready_dir: str = "data/pcap/ready"
     pcap_processed_dir: str = "data/pcap/processed"

@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 TERMINATE_GRACE_SECONDS = 5.0
 STDERR_LIMIT_BYTES = 64 * 1024
 STDERR_DRAIN_TIMEOUT_SECONDS = 1.0
+DEFAULT_PCAP_BUFFER_SIZE_KIB = 4096
 
 PARTIAL_CAPTURE = "PARTIAL_CAPTURE"
 
@@ -39,6 +40,11 @@ PCAP_FILE_MISSING = "PCAP_FILE_MISSING"
 # 허용 지연(PCAP_MAX_START_DELAY_SECONDS)을 초과했거나 Window가 이미 끝나버려
 # tcpdump 프로세스를 아예 실행하지 못한 경우.
 LATE_CAPTURE = "LATE_CAPTURE"
+
+
+def _validate_buffer_size_kib(value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or not 64 <= value <= 65536:
+        raise ValueError("pcap_buffer_size_kib must be an integer between 64 and 65536")
 
 
 class CaptureProcessError(RuntimeError):
@@ -147,11 +153,14 @@ class TcpdumpCaptureProcess:
         capture_filter: str | None = None,
         terminate_grace_seconds: float = TERMINATE_GRACE_SECONDS,
         inherited_lock_fds: tuple[int, ...] = (),
+        buffer_size_kib: int = DEFAULT_PCAP_BUFFER_SIZE_KIB,
     ) -> None:
+        _validate_buffer_size_kib(buffer_size_kib)
         self._tcpdump_path = tcpdump_path
         self._capture_filter = capture_filter
         self._terminate_grace_seconds = terminate_grace_seconds
         self._inherited_lock_fds = inherited_lock_fds
+        self._buffer_size_kib = buffer_size_kib
 
     def capture_window(
         self,
@@ -164,6 +173,7 @@ class TcpdumpCaptureProcess:
         # Otherwise the final packets can remain unread when a short window ends.
         args = [
             self._tcpdump_path, "-i", interface, "-w", str(output_path),
+            "-B", str(self._buffer_size_kib),
             "-U", "--immediate-mode",
         ]
         if self._capture_filter:
@@ -229,8 +239,10 @@ class CaptureRuntimeConfig:
     capture_filter: str | None = None
     # 지연 판정에 쓰는 Versioned Capture Policy.
     capture_policy: CapturePolicy = field(default_factory=CapturePolicy)
+    pcap_buffer_size_kib: int = DEFAULT_PCAP_BUFFER_SIZE_KIB
 
     def __post_init__(self) -> None:
+        _validate_buffer_size_kib(self.pcap_buffer_size_kib)
         if not isfinite(self.window_seconds) or self.window_seconds <= 0:
             raise ValueError("window_seconds must be positive")
         if self.window_seconds != 10:
@@ -254,6 +266,7 @@ class CaptureRuntimeConfig:
             failed_dir=Path(settings.pcap_failed_dir),
             capture_filter=settings.pcap_capture_filter,
             capture_policy=CapturePolicy.from_env(),
+            pcap_buffer_size_kib=settings.pcap_buffer_size_kib,
         )
 
     def ensure_directories(self) -> None:

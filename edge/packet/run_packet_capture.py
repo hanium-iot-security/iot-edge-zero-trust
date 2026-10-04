@@ -449,6 +449,7 @@ def main() -> None:
             process = TcpdumpCaptureProcess(
                 tcpdump_path=config.tcpdump_path, capture_filter=config.capture_filter,
                 inherited_lock_fds=inherited_lock_fds,
+                buffer_size_kib=config.pcap_buffer_size_kib,
             )
             config.ensure_directories()
             reconcile_leftover_tmp_files(db, config)

@@ -378,6 +378,26 @@ def _validate_capture_sessions(
             raise ValueError(
                 f"Capture Session has no Segments: {session_id}"
             )
+        # Runtime gap approval permits checkpoint progress, never dataset QC.
+        ineligible_segment = db.execute(
+            text(
+                """
+                SELECT pcsg.id
+                FROM packet_capture_segments pcsg
+                JOIN packet_capture_sessions pcs ON pcs.id = pcsg.capture_session_id
+                WHERE pcs.session_id = :session_id
+                  AND (pcsg.status NOT IN ('PROCESSED', 'EMPTY')
+                       OR pcsg.error_code IS NOT NULL)
+                LIMIT 1
+                """
+            ),
+            {"session_id": session_id},
+        ).scalar_one_or_none()
+        if ineligible_segment is not None:
+            raise ValueError(
+                "Capture Session has an ineligible Segment for Packet IF export: "
+                f"session_id={session_id}, segment_id={ineligible_segment}"
+            )
         readiness = get_packet_feature_ready_through(
             db,
             session_id=session_id,

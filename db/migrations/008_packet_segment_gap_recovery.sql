@@ -1,0 +1,23 @@
+CREATE TABLE packet_segment_gap_recoveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_id TEXT NOT NULL UNIQUE,
+    capture_session_id TEXT NOT NULL,
+    failed_segment_id INTEGER NOT NULL,
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    plan_sha256 TEXT NOT NULL CHECK(length(plan_sha256) = 64),
+    plan_json TEXT NOT NULL,
+    approved_by TEXT NOT NULL CHECK(length(trim(approved_by)) > 0),
+    reason TEXT NOT NULL CHECK(length(trim(reason)) > 0),
+    repository_commit TEXT NOT NULL CHECK(length(repository_commit) = 40),
+    database_path TEXT NOT NULL,
+    backup_path TEXT NOT NULL,
+    backup_sha256 TEXT NOT NULL CHECK(length(backup_sha256) = 64),
+    preserved_pcap_path TEXT NOT NULL,
+    pcap_sha256 TEXT NOT NULL CHECK(length(pcap_sha256) = 64),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(capture_session_id) REFERENCES packet_capture_sessions(session_id) ON DELETE RESTRICT,
+    FOREIGN KEY(failed_segment_id) REFERENCES packet_capture_segments(id) ON DELETE RESTRICT,
+    UNIQUE(capture_session_id, failed_segment_id),
+    CHECK(unixepoch(window_start) IS NOT NULL AND unixepoch(window_end) - unixepoch(window_start) = 10)
+);

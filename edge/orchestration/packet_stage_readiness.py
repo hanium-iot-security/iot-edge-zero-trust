@@ -54,10 +54,10 @@ def require_packet_feature_ready_range(
     cycle_range_start: datetime,
     cycle_cutoff: datetime,
 ) -> PacketFeatureReadiness:
-    """요청 범위가 단일 Session의 연속 PROCESSED/EMPTY Prefix인지 검증합니다.
+    """요청 범위가 단일 Session의 검증된 Packet Feature Prefix인지 검증합니다.
 
-    READY·FAILED·누락 Window 또는 Capture Session Gap을 건너뛰지 않습니다. 이
-    검증을 통과하지 못하면 Packet Stage와 Checkpoint는 실행 전 상태로 유지됩니다.
+    공식 감사로 승인된 단일 FAILED Window만 Prefix에 포함될 수 있습니다. READY,
+    미승인 실패, 누락·겹침 또는 잘못된 Feature가 있으면 Stage 실행 전에 거부합니다.
     """
     range_start, cutoff = validate_cycle_window(
         cycle_range_start=cycle_range_start,
@@ -86,6 +86,55 @@ def require_packet_feature_ready_range(
             f"session_id={readiness.session_id}, "
             f"cutoff={format_db_utc(cutoff)}, "
             f"packet_feature_ready_through={format_db_utc(ready_through)}"
+        )
+    params = {
+        "session_id": readiness.session_id,
+        "range_start": format_db_utc(range_start),
+        "cutoff": format_db_utc(cutoff),
+    }
+    overlapping_session = db.execute(
+        text(
+            """
+            SELECT pcsg.id
+            FROM packet_capture_segments pcsg
+            JOIN packet_capture_sessions pcs ON pcs.id = pcsg.capture_session_id
+            WHERE unixepoch(pcsg.window_start) < unixepoch(:cutoff)
+              AND unixepoch(pcsg.window_end) > unixepoch(:range_start)
+              AND pcs.session_id != :session_id
+            LIMIT 1
+            """
+        ),
+        params,
+    ).first()
+    invalid_feature = db.execute(
+        text(
+            """
+            SELECT pfl.id
+            FROM packet_feature_logs pfl
+            LEFT JOIN packet_capture_segments pcsg ON pcsg.id = pfl.capture_segment_id
+            LEFT JOIN packet_capture_sessions pcs ON pcs.id = pcsg.capture_session_id
+            WHERE (
+                (unixepoch(pfl.window_start) < unixepoch(:cutoff)
+                 AND unixepoch(pfl.window_end) > unixepoch(:range_start))
+                OR (unixepoch(pcsg.window_start) < unixepoch(:cutoff)
+                    AND unixepoch(pcsg.window_end) > unixepoch(:range_start))
+            ) AND (
+                pcsg.id IS NULL OR pcs.session_id != :session_id
+                OR pcsg.status != 'PROCESSED' OR pcsg.error_code IS NOT NULL
+                OR pfl.window_start != pcsg.window_start
+                OR pfl.window_end != pcsg.window_end
+            )
+            LIMIT 1
+            """
+        ),
+        params,
+    ).first()
+    if overlapping_session is not None or invalid_feature is not None:
+        raise PacketFeatureRangeNotReadyError(
+            "Packet Detector range contains overlapping capture segments or "
+            "unapproved Packet Feature rows: "
+            f"session_id={readiness.session_id}, "
+            f"range_start={format_db_utc(range_start)}, cutoff={format_db_utc(cutoff)}"
         )
     return readiness
 
