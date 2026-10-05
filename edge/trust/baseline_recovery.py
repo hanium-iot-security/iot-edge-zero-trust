@@ -232,7 +232,7 @@ def execute_baseline_recovery(
     firewall_release_status: str | None = None,
     preflight: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Reset only selected Device status/score after locked backup validation."""
+    """Validate an online backup before locked revalidation and Device reset."""
 
     if confirm != CONFIRMATION:
         raise BaselineRecoveryError(
@@ -265,40 +265,13 @@ def execute_baseline_recovery(
             ))
         except (RuntimeLockError, OSError) as exc:
             raise BaselineRecoveryHoldError(f"Runtime firewall lock unavailable: {exc}") from exc
-        connection.execute("BEGIN IMMEDIATE")
-        previous_devices = _fetch_target_devices(connection, device_ids)
-        _require_expected_device_state(previous_devices, targets)
-        active_rules = _fetch_active_firewall_rules(
-            connection,
-            device_ids=device_ids,
-            source_ips=[row["ip_address"] for row in previous_devices.values()],
-        )
-        if active_rules:
-            rule_ids = [int(rule["id"]) for rule in active_rules]
-            raise BaselineRecoveryError(
-                "대상 Device 또는 IP에 활성 Firewall Rule이 있습니다: "
-                f"rule_ids={rule_ids}"
-            )
-        pending_release_requests = _fetch_pending_firewall_release_requests(
-            connection,
-            device_ids=device_ids,
-            source_ips=[row["ip_address"] for row in previous_devices.values()],
-        )
-        if pending_release_requests:
-            request_ids = [int(request["id"]) for request in pending_release_requests]
-            raise BaselineRecoveryError(
-                "대상 Device 또는 IP에 처리 중인 Firewall Release Request가 있습니다: "
-                f"request_ids={request_ids}"
-            )
-        pending_events = _fetch_pending_trust_events(connection, device_ids)
-        if pending_events:
-            event_ids = [int(event["id"]) for event in pending_events]
-            raise BaselineRecoveryError(
-                "대상 Device에 Trust Score v2 미처리 Detection Event가 있습니다: "
-                f"event_ids={event_ids}"
-            )
-
+        # A read snapshot rejects an ineligible request before any artifact is
+        # created. Release it before online backup/validation: Capture must be
+        # able to commit its segment and launch the next Window during that I/O.
+        connection.execute("BEGIN")
+        previous_devices = _require_recovery_ready(connection, targets)
         _require_runtime_released(connection, previous_devices)
+        connection.rollback()
 
         artifacts.mkdir(parents=True, exist_ok=True)
         if backup_path.exists() or log_path.exists():
@@ -317,6 +290,20 @@ def execute_baseline_recovery(
                 f"integrity_check={backup_integrity}, "
                 f"foreign_key_violations={backup_foreign_keys}"
             )
+
+        # The online backup is a consistent pre-reset snapshot, not a promise
+        # that unrelated MQTT/Capture rows will stop arriving. Prove that its
+        # recovery targets still contain the approved identity/state as well.
+        with sqlite3.connect(backup_path) as backup_connection:
+            backup_connection.row_factory = sqlite3.Row
+            backup_connection.execute("PRAGMA query_only = ON")
+            backup_devices = _require_recovery_ready(backup_connection, targets)
+            _require_same_device_identity(previous_devices, backup_devices)
+
+        connection.execute("BEGIN IMMEDIATE")
+        current_devices = _require_recovery_ready(connection, targets)
+        _require_same_device_identity(previous_devices, current_devices)
+        _require_runtime_released(connection, current_devices)
 
         for device_id in device_ids:
             result = connection.execute(
@@ -346,9 +333,9 @@ def execute_baseline_recovery(
                 f"integrity_check={integrity_check}, "
                 f"foreign_key_violations={foreign_key_violations}"
             )
-        # Backup/verification may outlive the snapshot TTL. Recheck immediately
+        # Validation may outlive the snapshot TTL. Recheck immediately
         # before commit while Worker and DB writers remain excluded.
-        runtime_check = _require_runtime_released(connection, previous_devices)
+        runtime_check = _require_runtime_released(connection, current_devices)
         connection.commit()
     except Exception as exc:
         if connection.in_transaction:
@@ -796,6 +783,54 @@ def _require_expected_device_state(
     errors = _device_state_errors(devices, expected_trust_scores)
     if errors:
         raise BaselineRecoveryError(errors[0])
+
+
+def _require_recovery_ready(
+    connection: sqlite3.Connection,
+    expected_trust_scores: Mapping[str, int],
+) -> dict[str, sqlite3.Row]:
+    """Check the same safety predicates in preflight, backup and final lock."""
+    device_ids = list(expected_trust_scores)
+    devices = _fetch_target_devices(connection, device_ids)
+    _require_expected_device_state(devices, expected_trust_scores)
+    source_ips = [row["ip_address"] for row in devices.values()]
+    active_rules = _fetch_active_firewall_rules(
+        connection, device_ids=device_ids, source_ips=source_ips,
+    )
+    if active_rules:
+        raise BaselineRecoveryError(
+            "대상 Device 또는 IP에 활성 Firewall Rule이 있습니다: "
+            f"rule_ids={[int(rule['id']) for rule in active_rules]}"
+        )
+    requests = _fetch_pending_firewall_release_requests(
+        connection, device_ids=device_ids, source_ips=source_ips,
+    )
+    if requests:
+        raise BaselineRecoveryError(
+            "대상 Device 또는 IP에 처리 중인 Firewall Release Request가 있습니다: "
+            f"request_ids={[int(request['id']) for request in requests]}"
+        )
+    events = _fetch_pending_trust_events(connection, device_ids)
+    if events:
+        raise BaselineRecoveryError(
+            "대상 Device에 Trust Score v2 미처리 Detection Event가 있습니다: "
+            f"event_ids={[int(event['id']) for event in events]}"
+        )
+    return devices
+
+
+def _require_same_device_identity(
+    expected: Mapping[str, sqlite3.Row],
+    actual: Mapping[str, sqlite3.Row],
+) -> None:
+    changed = [
+        device_id for device_id, device in expected.items()
+        if actual[device_id]["ip_address"] != device["ip_address"]
+    ]
+    if changed:
+        raise BaselineRecoveryError(
+            f"Backup 또는 최종 검증 중 Device IP가 변경됐습니다: device_ids={changed}"
+        )
 
 
 def _device_state_errors(

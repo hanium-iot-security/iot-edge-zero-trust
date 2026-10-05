@@ -16,6 +16,8 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from backend.app.database import SessionLocal
+from edge.detection.phase4_time import parse_db_utc
+from edge.maintenance.processing import dataset_maintenance_windows, overlaps_maintenance
 
 EXPORT_COLUMNS = [
     "device_id",
@@ -51,10 +53,7 @@ def export_normal_features(
         filters.append("fl.device_id = :device_id")
         params["device_id"] = device_id
 
-    limit_clause = ""
-    if limit is not None:
-        limit_clause = "LIMIT :limit"
-        params["limit"] = limit
+    maintenance = dataset_maintenance_windows(db)
 
     rows = db.execute(
         text(
@@ -72,7 +71,6 @@ def export_normal_features(
             JOIN devices d ON d.device_id = fl.device_id
             WHERE {' AND '.join(filters)}
             ORDER BY fl.window_start ASC, fl.id ASC
-            {limit_clause}
             """
         ),
         params,
@@ -85,6 +83,14 @@ def export_normal_features(
         writer = csv.DictWriter(csv_file, fieldnames=EXPORT_COLUMNS)
         writer.writeheader()
         for row in rows:
+            if limit is not None and limit >= 0 and count >= limit:
+                break
+            if maintenance and overlaps_maintenance(
+                maintenance,
+                parse_db_utc(row["window_start"], "window_start"),
+                parse_db_utc(row["window_end"], "window_end"),
+            ):
+                continue
             writer.writerow({column: row[column] for column in EXPORT_COLUMNS})
             count += 1
     return count

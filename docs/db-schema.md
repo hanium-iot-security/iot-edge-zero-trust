@@ -469,6 +469,63 @@ Baseline Recovery를 거부합니다. `FAILED` release request는 감사 이력�
 `SUCCEEDED` 또는 `FAILED`로 종료된 뒤에는 새 요청을 만들 수 있습니다. `PENDING`은
 `processed_at`과 `last_error`가 없어야 하며, `SUCCEEDED`는 `last_error`가 없어야 합니다.
 
+## planned_maintenance_operations / planned_maintenance_resumes
+
+010 migration은 계획 종료 승인과 원자적 Packet 재개의 감사 기록을 추가합니다.
+실제 장애·손실 구간의 기존 Recovery 승인 조건은 변경하지 않습니다.
+
+`planned_maintenance_operations`의 상태는 `REQUESTED → READY → RESUMED`이며,
+종료 준비 실패 시 `REQUESTED` 또는 `READY`에서 `CANCELLED`로 종료합니다.
+활성 `REQUESTED`/`READY` 승인은 전체 DB에 하나만 존재할 수 있습니다.
+
+| 주요 컬럼 | 설명 |
+| --- | --- |
+| operation_id | 계획 종료·다음 재개를 연결하는 고유 UUID |
+| approved_by / reason / requested_at | 관리자 식별 정보·사유·승인 시각; 생성 후 불변 |
+| source_session_id / source_boot_id | 승인 당시 RUNNING Capture Session과 OS boot UUID |
+| required_checkpoints_json | 필수 처리 6개; MQTT IF가 필수로 활성화된 구성은 7개 |
+| source_final_boundary | 정상 종료 Session의 마지막 10초 Window 종료 경계 |
+| source_snapshot_json | 완료 Session·Segment/Feature 개수와 SHA256·Capture Policy |
+| checkpoint_snapshot_json | READY 시점의 참여 Checkpoint 전체 Snapshot |
+| ready_at / expires_at | 처리가 완료된 준비 시각과 7일 재개 승인 만료 시각 |
+| target_session_id / target_boot_id | 승인 한 번으로 연결된 새 Session·새 boot UUID |
+| maintenance_start / maintenance_end | 원본을 보존하는 MQTT·Packet 제외 범위 `[시작, 끝)` |
+| resumed_at | 원자적 재개가 적용된 시각 |
+| cancelled_at / cancellation_reason | 실패한 종료 준비를 재사용하지 않도록 취소한 감사 정보 |
+
+READY는 source가 실제 `COMPLETED`이고, 전체 Segment가 연속·정상으로 처리됐으며,
+필수 Producer·Detector·Trust Checkpoint와 종료 전 미처리 Event가 모두 처리된 경우에만
+기록합니다. 참여 Checkpoint의 완료 경계는 모두 source의 마지막 경계와 같아야 합니다.
+단순 Session 종료나 `SIGTERM`은 다음 부팅의 재개 승인이 아닙니다.
+
+재개는 source의 불변 증적과 Packet pair Snapshot을 다시 확인하고, 다른 boot의
+유일한 새 RUNNING Session의 첫 정상 Packet Feature까지 확인합니다. 승인되지 않은
+중간 Session·FAILED 구간·기존 미처리 데이터를 건너뛰지 않습니다. 정상 MQTT 추가나
+새 Session의 정상 Capture tail 추가는 전체 DB 변경으로 취급하지 않습니다.
+종료 전 시각에 뒤늦게 추가된 미처리 Source Row나 유지보수 구간과 겹치는 기존
+Detection Event가 있으면 자동 재개를 보류합니다. 이미 반영된 감점도 삭제·보상하지
+않으며 기존 장애 Recovery에서 별도로 판단합니다.
+
+`planned_maintenance_resumes`는 operation당 하나의 불변 Audit이며 target Session도
+중복 사용할 수 없습니다. Plan SHA256·JSON, 검증된 Backup 경로·SHA256, 재개 시각을
+보존합니다. 두 Packet Checkpoint의 Window 경계 변경, 승인 소비, 이 Audit 생성은
+같은 Transaction에서 이뤄지며 기존 처리 ID·MQTT/Trust Checkpoint·기기 점수·격리를
+수정하지 않습니다. 동일 실행을 재시도하면 기존 Audit을 확인하고 추가 이동하지
+않습니다. 승인 및 Audit의 삭제·재작성은 Trigger로 금지합니다.
+
+READY를 기록하는 Transaction부터 source Session·Segment·Packet Feature의
+추가·변경·삭제를 Seal Trigger가 차단합니다. 이미 READY였던 승인을 취소해도 이
+원본 봉인은 유지합니다. 새 Session의 Capture/Feature 추가 및 MQTT 수신은 허용하며,
+봉인 전에 실패했던 Session의 기존 장애 Recovery 경로에는 적용하지 않습니다.
+재개 처리는 Migration 010의 Table·Index·Trigger 선언을 검사하며, 봉인 Trigger가
+없거나 다른 선언으로 대체된 경우 보류합니다.
+
+승인이 소비된 유지보수 제외 범위는 이후 target Session의 종료·장애나 Checkpoint
+전진 이후에도 보존합니다. Runtime은 불변 Approval/Plan과 Session·첫 Window 연결을
+검사합니다. 전체 완료 Session의 증적 Hash는 Capture가 멈춘 종료 준비 및 Read-only
+재개 검사에서 확인하고, 실제 재개 Write Transaction은 검증된 봉인과 대상 경계를
+재검증하여 기존 Session 전체를 다시 Hash하지 않습니다.
+
 ## 주요 Index
 
 002 migration은 다음 조회를 위해 index를 추가합니다.

@@ -74,6 +74,8 @@ from edge.trust.trust_score_v2 import (
     resolve_ai_mode,
 )
 from edge.trust.run_firewall_worker import firewall_lock_path
+from edge.maintenance.planned import resolve_planned_transition
+from edge.maintenance.processing import cap_processing_cutoff
 
 logger = logging.getLogger(__name__)
 
@@ -445,6 +447,18 @@ def resolve_packet_live_resume_transition(
         for detector_name in PACKET_STAGE_NAMES
     )
     if all(checkpoint is not None for checkpoint in paired_checkpoints):
+        planned = resolve_planned_transition(db, boundary, paired_checkpoints)
+        if planned is not None:
+            # Finalization already drained the source boundary. Only the recorded
+            # maintenance interval may be crossed, with ordinary MQTT/Trust processing.
+            source_boundary = parse_db_utc(planned["source_final_boundary"], "source_final_boundary")
+            if range_start == source_boundary:
+                return PacketLiveResumeTransition(
+                    boundary=boundary,
+                    target_session_id=str(planned["target_session_id"]),
+                    plan_sha256=str(planned["plan_sha256"]),
+                    mode="planned-maintenance",
+                )
         segment_gap = resolve_segment_gap_transition(
             db,
             boundary,
@@ -522,6 +536,7 @@ def run_orchestration_cycle(
                 MQTT_LOGS_SOURCE,
             )
             return CycleOutcome(status=CYCLE_SKIPPED_NO_WATERMARK)
+        cutoff = cap_processing_cutoff(db, cutoff)
         range_start = resolve_cycle_range_start(db, registry=registry, cutoff=cutoff)
         packet_activation_boundary: datetime | None = None
         packet_resume_transition: PacketLiveResumeTransition | None = None

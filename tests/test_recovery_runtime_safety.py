@@ -272,7 +272,7 @@ def test_worker_lock_is_acquired_before_db_write_lock(recovery_env, monkeypatch)
     assert state(database) == ("isolated", 20)
 
 
-def test_firewall_and_db_locks_cover_verification_through_commit(recovery_env, monkeypatch):
+def test_firewall_lock_covers_backup_and_db_lock_covers_final_verification(recovery_env, monkeypatch):
     database, _, runner, tmp_path = recovery_env
     capture_firewall_runtime_snapshot(runner, snapshot_path=settings.firewall_runtime_snapshot_path)
     original = baseline_recovery._create_backup
@@ -284,11 +284,24 @@ def test_firewall_and_db_locks_cover_verification_through_commit(recovery_env, m
         with pytest.raises(baseline_recovery.BaselineRecoveryHoldError, match="lock"):
             recover(database, tmp_path / "second-recovery")
         with sqlite3.connect(database, timeout=0) as other:
-            with pytest.raises(sqlite3.OperationalError, match="locked"):
-                other.execute("BEGIN IMMEDIATE")
+            other.execute("BEGIN IMMEDIATE")
+            other.rollback()
         original(database_path, backup)
 
     monkeypatch.setattr(baseline_recovery, "_create_backup", probe_locks)
+    original_verify = baseline_recovery._verify_database_connection
+
+    def probe_final_lock(connection):
+        if connection.in_transaction:
+            with pytest.raises(RuntimeLockError):
+                with single_instance_lock(Path(settings.firewall_lock_path)):
+                    pytest.fail("Worker must not enter Recovery transaction")
+            with sqlite3.connect(database, timeout=0) as other:
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    other.execute("BEGIN IMMEDIATE")
+        return original_verify(connection)
+
+    monkeypatch.setattr(baseline_recovery, "_verify_database_connection", probe_final_lock)
     assert recover(database, tmp_path / "artifacts")["result"] == "SUCCESS"
 
 

@@ -30,6 +30,7 @@ from edge.detection.rule_detector import (
 from edge.policy.repository import load_policy_resolver
 from edge.policy.resolver import DevicePolicyRevision, POLICY_AVAILABLE
 from edge.trust.trust_policy import POLICY_UNAVAILABLE, incident_family_for_event
+from edge.maintenance.processing import maintenance_windows, overlaps_maintenance, require_processing_cutoff
 
 
 MQTT_FEATURE_RULE_POLICY_VERSION = "mqtt-feature-rule-v1"
@@ -54,6 +55,8 @@ class MqttFeatureRuleStage:
             cycle_cutoff=cycle_cutoff,
         )
         before = _checkpoint_before(db, self.detector_name, self.source_table)
+        require_processing_cutoff(db, cutoff)
+        maintenance = maintenance_windows(db)
         device_ips = _registered_device_ips(db)
         resolver = load_policy_resolver(db)
         rows = _select_feature_rows(
@@ -69,6 +72,8 @@ class MqttFeatureRuleStage:
             last_processed_after = _max_optional_id(last_processed_after, source_id)
             feature_row = dict(row)
             window_start = parse_db_utc(feature_row["window_start"], "window_start")
+            if overlaps_maintenance(maintenance, window_start, parse_db_utc(feature_row["window_end"], "window_end")):
+                continue
             resolution = (
                 resolver.resolve(str(feature_row["device_id"]), window_start)
                 if resolver is not None else None
@@ -189,6 +194,8 @@ class MqttMessageRuleStage:
             cycle_cutoff=cycle_cutoff,
         )
         before = _checkpoint_before(db, self.detector_name, self.source_table)
+        require_processing_cutoff(db, cutoff)
+        maintenance = maintenance_windows(db)
         device_ips = _registered_device_ips(db)
         resolver = load_policy_resolver(db)
         registered_devices = set(device_ips)
@@ -209,6 +216,8 @@ class MqttMessageRuleStage:
             )
             window_start = floor_window_start(received_at.replace(microsecond=0))
             window_end = window_start + timedelta(seconds=WINDOW_SECONDS)
+            if overlaps_maintenance(maintenance, window_start, window_end):
+                continue
             window_registered = (
                 resolver.registered_ids_at(window_start)
                 if resolver is not None else registered_devices
@@ -295,6 +304,8 @@ class MqttIsolationForestStage:
             cycle_cutoff=cycle_cutoff,
         )
         before = _checkpoint_before(db, self.detector_name, self.source_table)
+        require_processing_cutoff(db, cutoff)
+        maintenance = maintenance_windows(db)
         device_ips = _registered_device_ips(db)
         resolver = load_policy_resolver(db)
         rows = _select_feature_rows(
@@ -310,6 +321,8 @@ class MqttIsolationForestStage:
             last_processed_after = _max_optional_id(last_processed_after, source_id)
             feature_row = dict(row)
             window_start = parse_db_utc(feature_row["window_start"], "window_start")
+            if overlaps_maintenance(maintenance, window_start, parse_db_utc(feature_row["window_end"], "window_end")):
+                continue
             resolution = (
                 resolver.resolve(str(feature_row["device_id"]), window_start)
                 if resolver is not None else None

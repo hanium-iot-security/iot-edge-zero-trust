@@ -15,6 +15,7 @@ from edge.detection.detector_contract import (
     validate_cycle_window,
 )
 from edge.detection.phase4_time import parse_db_utc
+from edge.maintenance.processing import require_processing_cutoff
 
 
 SessionFactory = Callable[[], Session]
@@ -44,6 +45,7 @@ def run_detection_cycle(
         db = session_factory()
         try:
             with db.begin():
+                require_processing_cutoff(db, cutoff)
                 result = stage.run_until(
                     db,
                     cycle_range_start=range_start,
