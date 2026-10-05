@@ -19,6 +19,7 @@ import signal
 import stat
 import struct
 import threading
+import time
 from typing import Callable, Protocol
 import subprocess
 
@@ -70,6 +71,10 @@ class CaptureOutcome:
     packets_received: int | None = None
     packets_dropped: int | None = None
     packets_dropped_by_interface: int | None = None
+    # Diagnostic observation only. The persisted capture_process_exited_at
+    # remains the wrapper-return observation, including stderr drain.
+    process_wait_completed_at: datetime | None = None
+    phase_timings_seconds: dict[str, float] = field(default_factory=dict)
 
 
 class _StderrDrain:
@@ -154,6 +159,8 @@ class TcpdumpCaptureProcess:
         terminate_grace_seconds: float = TERMINATE_GRACE_SECONDS,
         inherited_lock_fds: tuple[int, ...] = (),
         buffer_size_kib: int = DEFAULT_PCAP_BUFFER_SIZE_KIB,
+        monotonic: Callable[[], float] = time.monotonic,
+        clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         _validate_buffer_size_kib(buffer_size_kib)
         self._tcpdump_path = tcpdump_path
@@ -161,6 +168,8 @@ class TcpdumpCaptureProcess:
         self._terminate_grace_seconds = terminate_grace_seconds
         self._inherited_lock_fds = inherited_lock_fds
         self._buffer_size_kib = buffer_size_kib
+        self._monotonic = monotonic
+        self._clock = clock
 
     def capture_window(
         self,
@@ -179,6 +188,7 @@ class TcpdumpCaptureProcess:
         if self._capture_filter:
             args.append(self._capture_filter)
 
+        spawn_started = self._monotonic()
         try:
             process = subprocess.Popen(
                 args,
@@ -190,19 +200,23 @@ class TcpdumpCaptureProcess:
         except OSError as exc:
             raise CaptureProcessError(f"failed to start tcpdump on {interface!r}: {exc}") from exc
 
+        spawn_finished = self._monotonic()
         drain = _StderrDrain(process.stderr)
         drain.thread.start()
+        setup_finished = self._monotonic()
         full_window = False
         forced_kill = False
         stop_requested_at = None
+        termination_wait_seconds = 0.0
         try:
             try:
                 exit_code = process.wait(timeout=window_seconds)
             except subprocess.TimeoutExpired:
+                capture_wait_finished = self._monotonic()
                 # An independent exit racing with the timeout is not our stop.
                 exit_code = process.poll()
                 if exit_code is None:
-                    stop_requested_at = datetime.now(timezone.utc)
+                    stop_requested_at = self._clock()
                     process.terminate()
                     full_window = True
                     try:
@@ -211,20 +225,35 @@ class TcpdumpCaptureProcess:
                         forced_kill = True
                         process.kill()
                         exit_code = process.wait(timeout=self._terminate_grace_seconds)
+                termination_wait_seconds = self._monotonic() - capture_wait_finished
+            else:
+                capture_wait_finished = self._monotonic()
+            process_wait_completed_at = self._clock()
         except BaseException:
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=self._terminate_grace_seconds)
             drain.finish()
             raise
+        drain_started = self._monotonic()
         diagnostics = drain.finish()
+        drain_finished = self._monotonic()
         return CaptureOutcome(
             completed_full_window=full_window, exit_code=exit_code,
             terminated_cleanly=(
                 full_window and not forced_kill and exit_code in (0, -signal.SIGTERM)
                 and diagnostics["stderr_complete"]
             ),
-            stop_requested_at=stop_requested_at, **diagnostics,
+            stop_requested_at=stop_requested_at,
+            process_wait_completed_at=process_wait_completed_at,
+            phase_timings_seconds={
+                "spawn_seconds": spawn_finished - spawn_started,
+                "stderr_setup_seconds": setup_finished - spawn_finished,
+                "capture_wait_seconds": capture_wait_finished - setup_finished,
+                "termination_wait_seconds": termination_wait_seconds,
+                "stderr_drain_seconds": drain_finished - drain_started,
+            },
+            **diagnostics,
         )
 
 
@@ -292,6 +321,8 @@ class CaptureWindowResult:
     start_delay_seconds: float | None = None
     captured_duration_seconds: float | None = None
     diagnostics_path: Path | None = None
+    process_wait_completed_at: datetime | None = None
+    phase_timings_seconds: dict[str, float] = field(default_factory=dict)
 
 
 def execute_capture_window(
@@ -304,6 +335,7 @@ def execute_capture_window(
     capture_started_at: datetime | None = None,
     policy: CapturePolicy | None = None,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> CaptureWindowResult:
     """한 Window(10초)를 캡처하고 결과를 파일 이동 + Timing Metadata로 반환합니다.
 
@@ -383,6 +415,7 @@ def execute_capture_window(
         window_seconds=window_seconds,
     )
     capture_process_exited_at = process_exited_at_fallback()
+    phase_timings = dict(outcome.phase_timings_seconds)
 
     if outcome.stop_requested_at is not None:
         # 실제 관측값 (TcpdumpCaptureProcess가 process.terminate() 직전에 기록).
@@ -405,9 +438,12 @@ def execute_capture_window(
         and outcome.exit_code in (0, -signal.SIGTERM)
         and outcome.stderr_complete is not False and not packet_loss
     )
+    validation_started = monotonic()
     file_validation_error = _pcap_file_error(tmp_path) if clean_exit and tmp_path.exists() else None
+    phase_timings["pcap_validation_seconds"] = monotonic() - validation_started
 
     def with_diagnostics(result: CaptureWindowResult) -> CaptureWindowResult:
+        persistence_started = monotonic()
         directory = config.ready_dir if result.success else config.failed_dir
         path = directory / f"{ready_filename}.capture.json"
         drop_status = (
@@ -440,7 +476,10 @@ def execute_capture_window(
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        return replace(result, diagnostics_path=path)
+        phase_timings["sidecar_persist_seconds"] = monotonic() - persistence_started
+        return replace(result, diagnostics_path=path,
+                       process_wait_completed_at=outcome.process_wait_completed_at,
+                       phase_timings_seconds=dict(phase_timings))
 
     if clean_exit and tmp_path.exists() and file_validation_error is None:
         _effective_start, _effective_end, captured_duration_seconds = compute_effective_capture_window(
@@ -463,6 +502,7 @@ def execute_capture_window(
         ))
         # Publish READY only after diagnostic evidence has been persisted. A
         # failed publication must not leave a sidecar claiming success.
+        publication_started = monotonic()
         try:
             _atomic_rename_same_filesystem(tmp_path, final_path)
         except OSError as publish_error:
@@ -475,13 +515,16 @@ def execute_capture_window(
                     f"({cleanup_error}); startup reconciliation must retract the sidecar"
                 ) from cleanup_error
             raise
-        return result
+        phase_timings["pcap_publish_seconds"] = monotonic() - publication_started
+        return replace(result, phase_timings_seconds=dict(phase_timings))
 
     # PARTIAL_CAPTURE(파일은 있으나 조기 종료)와 PCAP_FILE_MISSING(파일이 아예
     # 생성되지 않음)을 구분한다. move 전에 확인해야 한다 -- 성공 시
     # _move_to_failed가 tmp_path를 옮겨버려서 이후엔 존재 여부를 알 수 없다.
     file_was_created = tmp_path.exists()
+    publication_started = monotonic()
     final_path = _move_to_failed(tmp_path, config.failed_dir / ready_filename)
+    phase_timings["pcap_publish_seconds"] = monotonic() - publication_started
 
     if not file_was_created:
         # 파일이 아예 생성되지 않았으므로 실제로 캡처된 데이터는 없다 (0초).

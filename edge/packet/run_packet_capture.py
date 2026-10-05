@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta, timezone
 import logging
+import json
 from pathlib import Path
 import signal
 import sys
@@ -259,6 +260,7 @@ def run_capture_loop(
     max_windows: int | None = None,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> int:
     """first_window_start부터 연속으로 10초 Window를 캡처합니다.
 
@@ -278,6 +280,7 @@ def run_capture_loop(
     """
     window_start = first_window_start
     windows_captured = 0
+    previous_window_timing = None
 
     def _close_current_session(now: datetime, status: str) -> None:
         repo.close_session(db, session_pk, now, status)
@@ -305,9 +308,9 @@ def run_capture_loop(
         db.commit()
         logger.warning(
             "LATE_CAPTURE segment 생성: window=%s~%s start_delay_seconds=%s; "
-            "Session을 FAILED로 마감하고 다음 경계에서 새 Session으로 전환",
+            "Session을 FAILED로 마감하고 다음 경계에서 새 Session으로 전환; previous_window_timing=%s",
             format_utc_iso(missed_window_start), format_utc_iso(missed_window_end),
-            start_delay_seconds,
+            start_delay_seconds, json.dumps(previous_window_timing, sort_keys=True, separators=(",", ":")),
         )
         # 허용 지연을 초과한 Window는 ... 부모 packet_capture_sessions.status=FAILED로
         # 마감한다. (COMPLETED가 아니라 FAILED로 마감해야 Phase 4 Cutover/모니터링에서
@@ -350,6 +353,7 @@ def run_capture_loop(
                 capture_started_at=capture_started_at,
                 policy=config.capture_policy,
                 clock=clock,
+                monotonic=monotonic,
             )
 
             if result.error_code == LATE_CAPTURE:
@@ -361,6 +365,7 @@ def run_capture_loop(
                 )
                 continue
 
+            insert_started = monotonic()
             if result.success:
                 repo.insert_ready_segment(
                     db,
@@ -375,7 +380,6 @@ def run_capture_loop(
                     start_delay_seconds=result.start_delay_seconds,
                     captured_duration_seconds=result.captured_duration_seconds,
                 )
-                logger.info("READY segment 생성: %s", result.file_name)
             else:
                 repo.insert_failed_segment(
                     db,
@@ -392,9 +396,24 @@ def run_capture_loop(
                     start_delay_seconds=result.start_delay_seconds,
                     captured_duration_seconds=result.captured_duration_seconds,
                 )
-                logger.warning("FAILED segment 생성: %s (%s)", result.file_name, result.error_code)
 
+            insert_finished = monotonic()
             db.commit()
+            commit_finished = monotonic()
+            phase_timings = {**result.phase_timings_seconds,
+                             "db_insert_seconds": insert_finished - insert_started,
+                             "db_commit_seconds": commit_finished - insert_finished}
+            previous_window_timing = {
+                "session_id": session_id, "window_start": format_utc_iso(window_start),
+                "window_end": format_utc_iso(window_end), "timing_seconds": phase_timings,
+                "process_wait_completed_at": (
+                    result.process_wait_completed_at.isoformat() if result.process_wait_completed_at is not None else None),
+            }
+            timing = json.dumps(previous_window_timing, sort_keys=True, separators=(",", ":"))
+            if result.success:
+                logger.info("READY segment 생성: %s timing=%s", result.file_name, timing)
+            else:
+                logger.warning("FAILED segment 생성: %s (%s) timing=%s", result.file_name, result.error_code, timing)
             window_start = window_end
             windows_captured += 1
 
