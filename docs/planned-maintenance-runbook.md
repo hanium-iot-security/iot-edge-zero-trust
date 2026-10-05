@@ -6,7 +6,8 @@
 
 - 이 기능의 Migration을 적용하고 MQTT Subscriber, Feature Producer, Orchestrator와 함께 같은 버전을 배포한다. 일부 파일만 배포하면 사용하지 않는다.
 - 현재 배포 `.env`의 Stage와 Checkpoint가 지원 프로필이어야 한다. MQTT Feature Builder·MQTT Rule 둘·Packet Rule/IF·Trust의 6개를 기본으로 하고, MQTT IF를 활성화했다면 required에도 포함해 7개 Checkpoint를 drain한다. 활성화된 Stage가 required에서 빠져 있으면 종료 승인이나 서비스 정지 전에 HOLD한다. 평상시 Orchestrator의 optional Stage 처리 방식은 변경하지 않는다.
-- Capture의 종료 유예 시간, Subscriber의 버퍼 flush, Orchestrator의 유지보수 drain cap을 확인한다. 종료 시 제한 시간을 넘기거나 강제 종료되면 READY로 인정하지 않는다.
+- Capture의 종료 유예 시간, Subscriber의 메시지 저장 완료, Orchestrator의 유지보수 drain cap을 확인한다. 종료 시 제한 시간을 넘기거나 강제 종료되면 READY로 인정하지 않는다.
+- Subscriber의 정상 종료 처리를 포함한 버전을 배포한다. 기존 SIGTERM 기본 종료(status 15)는 저장 완료를 보장하지 않는다. 종료 검사는 `Result=success`와 `ExecMainStatus=0`을 유지하며, 현재 메시지 저장이나 Orchestrator Cycle이 끝나기 전에 성공으로 처리하지 않는다. Python 초기 Import 단계는 이 종료 처리보다 앞서므로, 실제 검증 전 서비스 준비와 Checkpoint 전진을 확인한다.
 - SQLite DB·서비스 경로·Runtime Lock 설정이 실제 배포와 일치해야 한다. 실행은 Linux root 권한만 허용한다. `--approved-by`는 표시용 이름이며 권한 인증을 대체하지 않는다.
 - `resume`은 온라인 일관 백업·SHA256·무결성·FK 검사를 짧은 변경 트랜잭션보다 먼저 수행한다. 백업 저장 공간을 확보한다. 백업이 실패하면 승인을 소비하지 않는다.
 
@@ -20,7 +21,7 @@ sudo venv/bin/python -m edge.maintenance.run_planned_maintenance prepare-stop \
   --approved-by woomin --reason "planned daily shutdown"
 ```
 
-이 명령은 현재 RUNNING Session·Boot ID·관리자·승인 시각을 먼저 연결해 REQUESTED를 기록한다. 그 뒤 Capture가 현재 Window를 마칠 때까지 기다리고 Subscriber를 정상 종료해 이미 받은 버퍼를 기록한다. Feature·탐지·Trust·Firewall Worker는 그동안 drain을 계속한다. **원본 메시지나 Capture Segment는 삭제하지 않는다.**
+이 명령은 현재 RUNNING Session·Boot ID·관리자·승인 시각을 먼저 연결해 REQUESTED를 기록한다. 그 뒤 Capture가 현재 Window를 마칠 때까지 기다리고 Subscriber를 정상 종료해 실행 중인 메시지 저장 Callback과 Commit을 마친다. Feature·탐지·Trust·Firewall Worker는 그동안 drain을 계속한다. **원본 메시지나 Capture Segment는 삭제하지 않는다.** 종료·재개 사이 수신 공백은 유지보수 제외 구간으로 기록하며, 아직 읽지 않은 네트워크 버퍼의 무손실 저장을 보장하는 절차는 아니다.
 
 현재 Session의 정상 품질·연속성과 필수 Checkpoint의 마지막 경계 완료를 확인한 뒤 처리 서비스와 Timer를 멈춘다. 공유 Runtime Lock과 DB 트랜잭션 안에서 한 번 더 검증하고 READY를 기록한다. `COMPLETED` Session이나 SIGTERM만으로 READY를 만들지 않는다. READY의 유효 기간은 7일이다.
 

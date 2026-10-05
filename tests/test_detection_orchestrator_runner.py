@@ -7,11 +7,14 @@ PENDING까지 한 흐름으로 이어지는지 확인합니다.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 from shutil import copyfile
+import signal
+from threading import Event
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -35,6 +38,7 @@ from edge.features.run_mqtt_feature_builder import (
     bootstrap_producer_checkpoint,
     run_producer_cycle,
 )
+from edge.orchestration import run_detection_orchestrator as runner
 from edge.orchestration.run_detection_orchestrator import (
     CYCLE_COMPLETED,
     CYCLE_SKIPPED_NO_NEW_WINDOW,
@@ -1747,6 +1751,178 @@ def test_single_instance_lock_is_reusable_after_release(tmp_path: Path):
 
 
 # --- Loop ------------------------------------------------------------------
+
+
+@pytest.fixture
+def restore_shutdown_handlers():
+    previous = {signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def test_shutdown_handler_avoids_logging_and_event_locks(
+    monkeypatch, restore_shutdown_handlers,
+):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("signal handlers must not acquire logging or Event locks")
+
+    monkeypatch.setattr(runner.logger, "info", forbidden)
+    monkeypatch.setattr(Event, "set", forbidden)
+    shutdown = GracefulShutdown()
+    shutdown.install()
+
+    signal.raise_signal(signal.SIGTERM)
+
+    assert shutdown.requested
+
+
+def test_shutdown_wait_handles_signal_with_bounded_polling(
+    monkeypatch, restore_shutdown_handlers,
+):
+    elapsed = [0.0]
+    sleeps = []
+    shutdown = GracefulShutdown()
+    shutdown.install()
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        elapsed[0] += seconds
+        signal.raise_signal(signal.SIGTERM)
+
+    monkeypatch.setattr(runner.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(runner.time, "sleep", sleep)
+
+    assert shutdown.wait(60)
+    assert sleeps == [0.1]
+
+
+def test_shutdown_wait_respects_deadline_without_signal(monkeypatch):
+    elapsed = [0.0]
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        elapsed[0] += seconds
+
+    monkeypatch.setattr(runner.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(runner.time, "sleep", sleep)
+    shutdown = GracefulShutdown()
+
+    assert not shutdown.wait(0.25)
+    assert sleeps == pytest.approx([0.1, 0.1, 0.05])
+    assert not shutdown.wait(0)
+    assert not shutdown.wait(-1)
+    shutdown.request(signal.SIGTERM, None)
+    assert shutdown.wait(0)
+
+
+@pytest.mark.parametrize("signal_during", ["registry", "lock"])
+def test_loop_sigterm_during_initialization_exits_cleanly_without_cycle(
+    monkeypatch, registry, restore_shutdown_handlers, signal_during,
+):
+    events = []
+
+    def unhandled_shutdown(_signum, _frame):
+        raise AssertionError("loop shutdown handler must exist before initialization")
+
+    signal.signal(signal.SIGTERM, unhandled_shutdown)
+
+    def load_registry():
+        events.append("registry")
+        if signal_during == "registry":
+            signal.raise_signal(signal.SIGTERM)
+        return registry
+
+    @contextmanager
+    def acquire_lock(_path):
+        events.append("locked")
+        if signal_during == "lock":
+            signal.raise_signal(signal.SIGTERM)
+        try:
+            yield
+        finally:
+            events.append("released")
+
+    monkeypatch.setattr(runner, "configure_logging", lambda: None)
+    monkeypatch.setattr(runner, "load_stage_registry", load_registry)
+    monkeypatch.setattr(runner, "single_instance_lock", acquire_lock)
+    monkeypatch.setattr(runner, "run_orchestration_cycle", lambda **_kwargs: events.append("cycle"))
+
+    assert runner.main(["--loop", "--interval", "0.01"]) == 0
+    assert events == ["registry", "locked", "released"]
+
+
+def test_loop_sigterm_drains_current_cycle_and_returns_zero(
+    monkeypatch, SessionLocal, registry, restore_shutdown_handlers,
+):
+    with SessionLocal() as db:
+        _flood_window(db, window_index=0)
+    run_producer_cycle(session_factory=SessionLocal, now=BASE + timedelta(seconds=11))
+    calls = []
+    feature_rule = registry.stages[0].stage
+    original_stage = feature_rule.run_until
+
+    def signal_in_stage(db, **kwargs):
+        calls.append("feature-rule")
+        signal.raise_signal(signal.SIGTERM)
+        return original_stage(db, **kwargs)
+
+    def run_cycle(**kwargs):
+        calls.append("cycle")
+        kwargs["session_factory"] = SessionLocal
+        return run_orchestration_cycle(**kwargs)
+
+    @contextmanager
+    def acquire_lock(_path, **kwargs):
+        if kwargs:
+            with _lock(_path, **kwargs):
+                yield
+            return
+        try:
+            yield
+        finally:
+            calls.append("released")
+
+    monkeypatch.setattr(feature_rule, "run_until", signal_in_stage)
+    monkeypatch.setattr(runner, "configure_logging", lambda: None)
+    monkeypatch.setattr(runner, "load_stage_registry", lambda: registry)
+    monkeypatch.setattr(runner, "single_instance_lock", acquire_lock)
+    monkeypatch.setattr(runner, "run_orchestration_cycle", run_cycle)
+
+    assert runner.main(["--loop", "--interval", "60"]) == 0
+    assert calls == ["cycle", "feature-rule", "released"]
+    with SessionLocal() as db:
+        cutoff = BASE + timedelta(seconds=10)
+        assert _completed(db, MQTT_FEATURE_RULE, "feature_logs") == cutoff
+        assert _completed(db, MQTT_MESSAGE_RULE, "mqtt_logs") == cutoff
+        assert _completed(db, TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE) == cutoff
+        assert _scalar(db, "SELECT COUNT(*) FROM detection_events WHERE processed_at IS NULL") == 0
+        assert _scalar(db, "SELECT trust_score FROM devices WHERE device_id='esp32_02'") == 80
+
+
+@pytest.mark.parametrize("mode", ["--once", "--status"])
+def test_non_loop_cli_does_not_install_shutdown_handlers(monkeypatch, registry, mode):
+    calls = []
+
+    def unexpected_install(_self):
+        raise AssertionError("only the service loop owns shutdown handlers")
+
+    @contextmanager
+    def acquire_lock(_path):
+        yield
+
+    monkeypatch.setattr(GracefulShutdown, "install", unexpected_install)
+    monkeypatch.setattr(runner, "configure_logging", lambda: None)
+    monkeypatch.setattr(runner, "load_stage_registry", lambda: registry)
+    monkeypatch.setattr(runner, "single_instance_lock", acquire_lock)
+    monkeypatch.setattr(runner, "run_orchestration_cycle", lambda **_kwargs: calls.append("once"))
+    monkeypatch.setattr(runner, "print_checkpoint_status", lambda: calls.append("status"))
+
+    assert runner.main([mode]) == 0
+    assert calls == [mode.removeprefix("--")]
 
 
 def test_loop_stops_after_max_cycles(SessionLocal, registry):
