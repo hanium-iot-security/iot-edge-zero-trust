@@ -35,7 +35,7 @@ JSON 결과가 `READY`인 경우에만 관리자가 OS를 정상 종료한다. �
 
 ```bash
 sudo venv/bin/python -m edge.maintenance.run_planned_maintenance resume \
-  --artifact-dir data/recovery/planned --timeout 120 --verify-timeout 120
+  --artifact-dir output/planned-maintenance --timeout 120 --verify-timeout 120
 ```
 
 재개는 READY의 승인과 종료 Session을 다시 검증하고, 다른 Boot ID에서 유일한 새 RUNNING Session 및 첫 정상 Packet Feature를 기다린다. 온라인 백업을 만든 뒤 서비스 전체 실행 중 Lock을 보유하는 Orchestrator만 잠시 정상 정지한다. Capture·Subscriber는 계속 실행한다. Orchestrator·Manual Detector·Extractor의 공유 Lock을 먼저, Firewall Lock을 마지막으로 확보하고 대상·Checkpoint·승인·연속성을 재확인한다. 시간·Boot ID 검사도 쓰기 트랜잭션 전에 끝낸다. **Packet Rule·IF의 Window 경계 두 개, 감사 기록, 승인 사용 완료를 한 트랜잭션으로 반영**한다. Orchestrator는 성공·실패 후 원래 활성 상태로 복귀시키며 기존 처리 ID·MQTT/Trust Checkpoint·점수·격리는 보존한다.
@@ -68,6 +68,8 @@ sudo venv/bin/python -m edge.maintenance.run_planned_maintenance cancel \
 CLI와 실제 Pi 검증을 완료한 후 `infra/systemd/planned-maintenance-resume.service`를 설치·활성화한다. 단순 `After=` 대신 명령이 시간 동기화·새 Session·Feature 준비 상태를 직접 검사한다. 실패하면 Journal에 남기고 자동 반복하지 않는다. 운영 설정 경로가 다르면 Unit 경로부터 수정한다. 전체 Unit을 설치했다고 실장비 검증이 완료된 것은 아니다.
 
 root로 실행되는 부팅 Unit은 `sudo`의 원래 사용자 소유권 정보가 없으므로, Unit의 Git 환경 설정에서 배포 저장소 한 경로만 `safe.directory`로 지정한다. 전역 Git 설정이나 소유권·Git-ignore 검사는 변경하지 않는다. 배포 경로를 바꾸면 WorkingDirectory·ExecStart·환경 파일 경로와 함께 `GIT_CONFIG_VALUE_0`도 일치시킨다.
+
+CLI 기본값과 부팅 Unit은 Git에서 디렉터리 전체를 제외하는 `output/planned-maintenance`에 백업을 저장한다. `data/recovery/planned`는 디렉터리 재포함 규칙 때문에 첫 백업 후 재실행 시 경로 검사를 통과하지 못할 수 있다. 기존 백업·감사 기록은 이동하거나 삭제하지 않고 원래 경로에 보존한다. 사용자 지정 경로도 생성 전후 모두 Git-ignored 조건을 충족해야 한다.
 
 ## 적용 취소·이전 버전 복귀
 

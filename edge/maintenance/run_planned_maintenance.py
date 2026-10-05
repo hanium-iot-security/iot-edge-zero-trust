@@ -525,7 +525,7 @@ def build_parser():
         child = commands.add_parser(name)
         child.add_argument("--operation-id")
         if name == "resume":
-            child.add_argument("--artifact-dir", type=Path, default=Path("data/recovery/planned"))
+            child.add_argument("--artifact-dir", type=Path, default=Path("output/planned-maintenance"))
             child.add_argument("--timeout", type=float, default=120)
             child.add_argument("--verify-timeout", type=float, default=120)
     prepare = commands.add_parser("prepare-stop")
