@@ -534,3 +534,16 @@ def test_boot_unit_never_powers_off_or_restarts_approval_loop():
     assert "User=root" in unit and "Restart=no" in unit
     assert "--verify-timeout" in unit and "TimeoutStartSec=480" in unit
     assert "poweroff" not in unit and "reboot" not in unit
+
+
+def test_boot_unit_git_trust_is_limited_to_the_deployed_repository():
+    lines = Path("infra/systemd/planned-maintenance-resume.service").read_text().splitlines()
+    root = next(line.removeprefix("WorkingDirectory=") for line in lines if line.startswith("WorkingDirectory="))
+    environment = dict(line.removeprefix("Environment=").split("=", 1)
+                       for line in lines if line.startswith("Environment="))
+    assert environment == {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": root,
+    }
+    assert root == "/home/pi/iot-edge-zero-trust"
