@@ -3,7 +3,9 @@ from contextlib import contextmanager
 from datetime import timedelta
 import json
 from pathlib import Path
+import shlex
 import sqlite3
+import subprocess
 
 import pytest
 
@@ -547,3 +549,23 @@ def test_boot_unit_git_trust_is_limited_to_the_deployed_repository():
         "GIT_CONFIG_VALUE_0": root,
     }
     assert root == "/home/pi/iot-edge-zero-trust"
+
+
+def test_default_resume_artifacts_remain_ignored_after_first_backup(tmp_path):
+    root = tmp_path / "repository"
+    root.mkdir()
+    (root / ".gitignore").write_text(Path(".gitignore").read_text())
+    subprocess.run(["git", "init", "--quiet", str(root)], check=True)
+    default = cli.build_parser().parse_args(["resume"]).artifact_dir
+    unit = Path("infra/systemd/planned-maintenance-resume.service").read_text()
+    command = shlex.split(next(line.removeprefix("ExecStart=")
+                              for line in unit.splitlines() if line.startswith("ExecStart=")))
+    assert Path(command[command.index("--artifact-dir") + 1]) == default
+    directory = cli.safety.validate_generated_path(root, default, field_name="artifact_dir")
+    directory.mkdir(parents=True)
+    (directory / "first-backup.db").write_bytes(b"private backup fixture")
+    assert cli.safety.validate_generated_path(root, default, field_name="artifact_dir") == directory
+    legacy = root / "data/recovery/planned"
+    legacy.mkdir(parents=True)
+    with pytest.raises(cli.safety.PacketCheckpointRecoveryError, match="artifact_dir must be Git-ignored"):
+        cli.safety.validate_generated_path(root, legacy, field_name="artifact_dir")
