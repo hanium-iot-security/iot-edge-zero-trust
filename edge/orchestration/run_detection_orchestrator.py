@@ -36,7 +36,6 @@ import json
 import logging
 from pathlib import Path
 import signal
-from threading import Event
 import time
 
 from sqlalchemy import text
@@ -111,25 +110,31 @@ class UtcFormatter(logging.Formatter):
 
 
 class GracefulShutdown:
-    """Signal-backed shutdown state with an interruptible wait."""
+    """Signal-backed flag with no lock or I/O inside the signal handler."""
 
     def __init__(self) -> None:
-        self._event = Event()
+        self._requested = False
 
     @property
     def requested(self) -> bool:
-        return self._event.is_set()
+        return self._requested
 
-    def request(self, signum: int, _frame: object | None) -> None:
-        logger.info("Shutdown signal received (signum=%s)", signum)
-        self._event.set()
+    def request(self, _signum: int, _frame: object | None) -> None:
+        # Event.set or logging can reenter a lock held by this same thread.
+        self._requested = True
 
     def install(self) -> None:
         signal.signal(signal.SIGTERM, self.request)
         signal.signal(signal.SIGINT, self.request)
 
     def wait(self, timeout: float) -> bool:
-        return self._event.wait(timeout)
+        deadline = time.monotonic() + max(0.0, timeout)
+        while not self.requested:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return self.requested
+            time.sleep(min(0.1, remaining))
+        return True
 
 
 def resolve_lock_path(app_settings: Settings = settings) -> Path:
@@ -870,6 +875,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print_checkpoint_status()
         return 0
 
+    shutdown = GracefulShutdown()
+    if args.loop:
+        # systemd considers the service active during model loading and lock
+        # acquisition too. Remember a stop request before any cycle can start.
+        shutdown.install()
+
     registry = load_stage_registry()
     logger.info(
         "Orchestrator stages enabled=%s required=%s packet_layer_enabled=%s trust_ai_mode=%s",
@@ -890,8 +901,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.interval is not None
                 else settings.orchestrator_interval_seconds
             )
-            shutdown = GracefulShutdown()
-            shutdown.install()
             completed = run_orchestrator_loop(
                 registry=registry,
                 shutdown=shutdown,

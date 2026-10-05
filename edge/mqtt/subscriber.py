@@ -5,8 +5,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import logging
 from pathlib import Path
+import signal
 import sys
-from typing import Any
+from threading import Event, Thread
+from typing import Any, Callable
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -220,8 +222,67 @@ def apply_mqtt_credentials(client: mqtt.Client, *, username: str, password: str)
         client.username_pw_set(username, password or None)
 
 
-def main() -> None:
+def run_mqtt_loop(client: mqtt.Client, *, shutdown_requested: Callable[[], bool]) -> None:
+    """Stop receiving, then join the current callback before reporting success.
+
+    Paho's loop_forever retains its normal reconnect behavior. Its worker must
+    finish (including any database commit) before this function returns. A dead
+    network worker or failed callback is a service failure, not a clean stop.
+    """
+    finished = Event()
+    failures: list[BaseException] = []
+
+    def receive() -> None:
+        try:
+            client.loop_forever()
+        except BaseException as exc:
+            failures.append(exc)
+        else:
+            if not shutdown_requested():
+                failures.append(RuntimeError("MQTT network loop stopped unexpectedly"))
+        finally:
+            finished.set()
+
+    worker = Thread(target=receive, name="mqtt-subscriber", daemon=False)
+    started = False
+    try:
+        if not shutdown_requested():
+            worker.start()
+            started = True
+            while not shutdown_requested() and not finished.wait(0.1):
+                pass
+    finally:
+        try:
+            result = client.disconnect()
+            if result not in (mqtt.MQTT_ERR_SUCCESS, mqtt.MQTT_ERR_NO_CONN):
+                raise RuntimeError(f"MQTT disconnect failed: {result}")
+        finally:
+            if started:
+                worker.join()
+    if failures:
+        raise RuntimeError("MQTT receiver failed") from failures[0]
+
+
+def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    stopping = False
+
+    def request_stop(_signum: int, _frame: object) -> None:
+        # No logging, DB calls, or Event lock acquisition inside a signal handler.
+        nonlocal stopping
+        stopping = True
+
+    previous_handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+    for sig in previous_handlers:
+        signal.signal(sig, request_stop)
+    try:
+        return _main(shutdown_requested=lambda: stopping)
+    finally:
+        for sig, previous in previous_handlers.items():
+            signal.signal(sig, previous)
+
+
+def _main(*, shutdown_requested: Callable[[], bool]) -> int:
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     apply_mqtt_credentials(
         client,
@@ -231,9 +292,10 @@ def main() -> None:
 
     def on_connect(client: mqtt.Client, _userdata, _flags, reason_code, _properties) -> None:
         if getattr(reason_code, "is_failure", False):
-            logger.error("MQTT broker 연결 실패: reason_code=%s", reason_code)
-            return
-        client.subscribe(settings.mqtt_subscribe_topic)
+            raise RuntimeError(f"MQTT broker connection rejected: {reason_code}")
+        result, _mid = client.subscribe(settings.mqtt_subscribe_topic)
+        if result != mqtt.MQTT_ERR_SUCCESS:
+            raise RuntimeError(f"MQTT subscription failed: {result}")
         logger.info("MQTT broker 연결 완료: %s:%s, topic=%s", settings.mqtt_host, settings.mqtt_port, settings.mqtt_subscribe_topic)
 
     def on_message(_client: mqtt.Client, _userdata, message: mqtt.MQTTMessage) -> None:
@@ -242,12 +304,15 @@ def main() -> None:
             logger.info("mqtt_logs 저장 완료: id=%s topic=%s", log_id, message.topic)
         except Exception:
             logger.exception("MQTT message 저장 실패: topic=%s", message.topic)
+            raise
 
     client.on_connect = on_connect
     client.on_message = on_message
     client.connect(settings.mqtt_host, settings.mqtt_port, keepalive=60)
-    client.loop_forever()
+    run_mqtt_loop(client, shutdown_requested=shutdown_requested)
+    logger.info("MQTT subscriber stopped after receiver drain")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
