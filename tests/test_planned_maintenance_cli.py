@@ -429,8 +429,9 @@ def test_required_stage_registry_includes_optional_required_mqtt_if_and_rejects_
     rows = [item for item in planned.REQUIRED_CHECKPOINTS if item[0] not in ("mqtt_feature_builder", "trust_score_v2")]
 
     def registry(_settings):
-        return SimpleNamespace(required_stages=[SimpleNamespace(stage=SimpleNamespace(detector_name=name,source_table=source))
-                                               for name, source in rows])
+        stages = [SimpleNamespace(stage=SimpleNamespace(detector_name=name, source_table=source), required=True)
+                  for name, source in rows]
+        return SimpleNamespace(stages=stages, required_stages=stages)
 
     monkeypatch.setattr(cli, "load_stage_registry", registry)
     assert set(instance.required_checkpoints()) == set(planned.REQUIRED_CHECKPOINTS)
@@ -439,6 +440,23 @@ def test_required_stage_registry_includes_optional_required_mqtt_if_and_rejects_
     rows.remove(("packet_if", "packet_feature_logs"))
     with pytest.raises(cli.MaintenanceHold, match="supported"):
         instance.required_checkpoints()
+
+
+def test_optional_enabled_mqtt_if_rejects_shutdown_before_approval_or_service_stop(runner, monkeypatch):
+    from types import SimpleNamespace
+    instance, system, _ = runner
+    monkeypatch.setattr(instance, "required_checkpoints", cli.MaintenanceRunner.required_checkpoints.__get__(instance))
+    required = [SimpleNamespace(stage=SimpleNamespace(detector_name=name, source_table=source), required=True)
+                for name, source in planned.REQUIRED_CHECKPOINTS
+                if name not in ("mqtt_feature_builder", "trust_score_v2")]
+    optional = SimpleNamespace(stage=SimpleNamespace(detector_name="mqtt_if", source_table="feature_logs"), required=False)
+    monkeypatch.setattr(cli, "load_stage_registry", lambda _settings: SimpleNamespace(
+        stages=required + [optional], required_stages=required))
+    with pytest.raises(cli.MaintenanceHold, match="all enabled stages must be required"):
+        prepare(instance)
+    assert instance.status()["operation"] is None
+    assert system.events == ["authenticate"]
+    assert all(system.services.values())
 
 
 def test_firewall_lock_order_is_after_coordinator_even_if_path_sorts_first(runner):

@@ -5,7 +5,7 @@
 ## 배포 전 확인
 
 - 이 기능의 Migration을 적용하고 MQTT Subscriber, Feature Producer, Orchestrator와 함께 같은 버전을 배포한다. 일부 파일만 배포하면 사용하지 않는다.
-- 현재 배포 `.env`의 required Stage와 Checkpoint가 지원 프로필이어야 한다. MQTT Feature Builder·MQTT Rule 둘·Packet Rule/IF·Trust의 6개를 기본으로 하고, required MQTT IF가 추가된 경우 그 Checkpoint도 drain한다.
+- 현재 배포 `.env`의 Stage와 Checkpoint가 지원 프로필이어야 한다. MQTT Feature Builder·MQTT Rule 둘·Packet Rule/IF·Trust의 6개를 기본으로 하고, MQTT IF를 활성화했다면 required에도 포함해 7개 Checkpoint를 drain한다. 활성화된 Stage가 required에서 빠져 있으면 종료 승인이나 서비스 정지 전에 HOLD한다. 평상시 Orchestrator의 optional Stage 처리 방식은 변경하지 않는다.
 - Capture의 종료 유예 시간, Subscriber의 버퍼 flush, Orchestrator의 유지보수 drain cap을 확인한다. 종료 시 제한 시간을 넘기거나 강제 종료되면 READY로 인정하지 않는다.
 - SQLite DB·서비스 경로·Runtime Lock 설정이 실제 배포와 일치해야 한다. 실행은 Linux root 권한만 허용한다. `--approved-by`는 표시용 이름이며 권한 인증을 대체하지 않는다.
 - `resume`은 온라인 일관 백업·SHA256·무결성·FK 검사를 짧은 변경 트랜잭션보다 먼저 수행한다. 백업 저장 공간을 확보한다. 백업이 실패하면 승인을 소비하지 않는다.

@@ -213,6 +213,10 @@ class MaintenanceRunner:
         registry = load_stage_registry(self.settings)
         required = {(item.stage.detector_name, item.stage.source_table)
                     for item in registry.required_stages}
+        enabled = {(item.stage.detector_name, item.stage.source_table)
+                   for item in registry.stages}
+        if enabled - required:
+            raise MaintenanceHold("all enabled stages must be required shutdown barriers for planned maintenance")
         required.update((("mqtt_feature_builder", "mqtt_logs"),
                          ("trust_score_v2", "detection_events")))
         canonical = set(self.core.REQUIRED_CHECKPOINTS)
