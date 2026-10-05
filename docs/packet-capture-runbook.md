@@ -152,6 +152,36 @@ Window 2026-07-15T00:00:20Z~2026-07-15T00:00:30Z는 캡처 시작 전에 만료�
 통계, 정상 중지·재시작과 자식 프로세스 정리를 확인한다. 로컬 합성 테스트와 실제
 장비 검증 결과를 구분해 기록한다.
 
+### 3.5 Capture 지연 계측 로그
+
+`READY segment 생성`과 `FAILED segment 생성` 로그에는 DB commit 성공 후
+`timing=<JSON>`을 남긴다. JSON의 Session·Window 식별자로 해당 구간을 확인하고,
+`timing_seconds`의 다음 항목을 비교한다. 소요 시간은 monotonic clock으로 측정한
+초(`seconds`) 단위이며, DB·진단 sidecar에 별도로 기록하지 않는다.
+
+| 구간 | `timing_seconds` 항목 |
+| --- | --- |
+| tcpdump 시작·stderr 수집 준비 | `spawn_seconds`, `stderr_setup_seconds` |
+| Window 대기·종료 처리·stderr 마무리 | `capture_wait_seconds`, `termination_wait_seconds`, `stderr_drain_seconds` |
+| PCAP 검증·기존 sidecar 저장·PCAP 이동 | `pcap_validation_seconds`, `sidecar_persist_seconds`, `pcap_publish_seconds` |
+| Segment INSERT·DB commit | `db_insert_seconds`, `db_commit_seconds` |
+
+`process_wait_completed_at`은 프로세스 `wait()` 완료 직후, stderr 마무리 전의 UTC
+관측 시각이다. 진단용으로만 사용하며, 기존 DB의 `capture_process_exited_at`은
+stderr 마무리를 포함한 Wrapper 반환 관측 시각을 유지한다. Sidecar 스키마·추가
+파일 쓰기·fsync 횟수·Capture 적격 기준과 FAILED 판정은 바뀌지 않는다.
+
+Runtime은 직전 commit 완료 Window의 계측값 하나만 메모리에 보관한다.
+`LATE_CAPTURE` 로그의 `previous_window_timing`을 보면 직전 INSERT·commit 등에서
+지연이 있었는지 살펴볼 수 있다. 이는 놓친 Window의 계측값이 아니며, 첫 Window
+전에는 `null`일 수 있다. LATE 구간의 FAILED 기록·Session 전환·복구 승인 조건은
+그대로 적용한다.
+
+`stderr_drain_seconds`는 종료 후 `finish()` 대기 시간이며, 실행 중인 수집 Thread의
+전체 수명이 아니다. JSON 생성·logger 처리 시간도 계측에 포함하지 않으므로 단계
+합계를 전체 지연으로 단정하지 않는다. 이 로그는 원인 확인을 돕는 계측이며,
+장시간 Capture 지연이 해결됐다는 뜻은 아니다.
+
 ## 4. Test Pack (`tests/fixtures/packet/pcap/`)
 
 Extractor(정종민) 및 Capture 자체 개발·회귀 테스트가 실제 장비 없이도 병렬로 진행될 수
