@@ -1,5 +1,4 @@
 import axios from "axios";
-
 import {
   mockSummary,
   mockDevices,
@@ -14,27 +13,21 @@ import {
   mockFirewallRules,
   mockHealth,
 } from "../mockData";
-
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ||
   "http://localhost:8000/api";
-
 const USE_MOCK =
   import.meta.env.VITE_USE_MOCK === "true";
-
 const IS_DEV = import.meta.env.DEV;
-
 if (IS_DEV) {
   console.log("[ENV CHECK]", {
     API_BASE_URL,
     USE_MOCK,
   });
 }
-
 /* =========================================================
    Common Helpers
    ========================================================= */
-
 /**
  * undefined, null, 빈 문자열인 Query Parameter를 제거합니다.
  * false와 0은 유효한 값이므로 유지합니다.
@@ -49,7 +42,6 @@ function removeEmptyParams(params = {}) {
     )
   );
 }
-
 /**
  * 숫자형 Pagination 값을 안전하게 변환합니다.
  */
@@ -63,11 +55,9 @@ function normalizePagination(
   const parsedLimit = Number(
     params.limit
   );
-
   const parsedOffset = Number(
     params.offset
   );
-
   return {
     limit:
       Number.isFinite(
@@ -75,7 +65,6 @@ function normalizePagination(
       ) && parsedLimit > 0
         ? parsedLimit
         : defaultLimit,
-
     offset:
       Number.isFinite(
         parsedOffset
@@ -84,7 +73,6 @@ function normalizePagination(
         : defaultOffset,
   };
 }
-
 /**
  * 배열을 API의 items/total 구조로 Pagination합니다.
  */
@@ -97,7 +85,6 @@ function paginateMockItems(
     Array.isArray(items)
       ? items
       : [];
-
   const {
     limit,
     offset,
@@ -107,7 +94,6 @@ function paginateMockItems(
       defaultLimit,
     }
   );
-
   return {
     items: safeItems.slice(
       offset,
@@ -116,7 +102,6 @@ function paginateMockItems(
     total: safeItems.length,
   };
 }
-
 /**
  * Axios 오류를 화면에 표시할 안전한 메시지로 변환합니다.
  */
@@ -126,19 +111,15 @@ function createApiErrorMessage(
   if (axios.isCancel(error)) {
     return "요청이 취소되었습니다.";
   }
-
   const status =
     error.response?.status;
-
   const detail =
     error.response?.data?.detail;
-
   if (
     typeof detail === "string"
   ) {
     return detail;
   }
-
   if (
     Array.isArray(detail)
   ) {
@@ -150,74 +131,64 @@ function createApiErrorMessage(
         )
         .filter(Boolean)
         .join(", ");
-
     if (validationMessage) {
       return validationMessage;
     }
   }
-
+  if (
+    detail &&
+    typeof detail === "object" &&
+    !Array.isArray(detail)
+  ) {
+    const objectMessage = [
+      detail.message,
+      detail.reason,
+      detail.error,
+      detail.detail,
+    ].find(
+      (value) =>
+        typeof value === "string" &&
+        value.trim()
+    );
+    if (objectMessage) {
+      return objectMessage.trim();
+    }
+  }
   if (
     error.code === "ERR_NETWORK" ||
     !error.response
   ) {
     return "백엔드 서버에 연결할 수 없습니다.";
   }
-
   if (status === 401) {
     return "관리자 인증에 실패했습니다.";
   }
-
   if (status === 404) {
     return "요청한 데이터를 찾을 수 없습니다.";
   }
-
   if (status === 409) {
-    if (
-      detail &&
-      typeof detail === "object" &&
-      !Array.isArray(detail)
-    ) {
-      const objectMessage = [
-        detail.message,
-        detail.reason,
-        detail.error,
-        detail.detail,
-      ].find(
-        (value) =>
-          typeof value === "string" &&
-          value.trim()
-      );
-
-      if (objectMessage) {
-        return objectMessage.trim();
-      }
-    }
-
     return "현재 상태에서는 요청을 수행할 수 없습니다.";
   }
-
   if (status === 422) {
     return "요청 조건을 확인해 주세요.";
   }
-
+  if (status === 503) {
+    return "관리자 기능을 사용할 수 없습니다.";
+  }
   if (
     status &&
     status >= 500
   ) {
     return "서버에서 데이터를 처리하지 못했습니다.";
   }
-
   if (status) {
     return `API 요청에 실패했습니다. (${status})`;
   }
-
   return "API 요청에 실패했습니다.";
 }
-
 /* =========================================================
    Common GET Request
    ========================================================= */
-
 /**
  * 공통 GET 요청 함수
  */
@@ -229,7 +200,6 @@ async function request(
 ) {
   const validParams =
     removeEmptyParams(params);
-
   if (USE_MOCK) {
     if (IS_DEV) {
       console.log(
@@ -238,10 +208,8 @@ async function request(
         validParams
       );
     }
-
     return mockData;
   }
-
   try {
     const response =
       await axios.get(
@@ -249,17 +217,14 @@ async function request(
         {
           params:
             validParams,
-
           headers: {
             Accept:
               "application/json",
           },
-
           signal:
             options.signal,
         }
       );
-
     if (IS_DEV) {
       console.log(
         "[API]",
@@ -268,14 +233,12 @@ async function request(
         response.data
       );
     }
-
     return response.data;
   } catch (error) {
     const message =
       createApiErrorMessage(
         error
       );
-
     if (IS_DEV) {
       console.error(
         "[API ERROR]",
@@ -283,48 +246,38 @@ async function request(
           path,
           params:
             validParams,
-
           status:
             error.response
               ?.status,
-
           response:
             error.response
               ?.data,
         }
       );
     }
-
     const apiError =
       new Error(message);
-
     apiError.status =
       error.response?.status ??
       null;
-
     apiError.code =
       error.code ??
       null;
-
     apiError.responseData =
       error.response?.data ??
       null;
-
     apiError.isCanceled =
       axios.isCancel(
         error
       ) ||
       error.name ===
       "CanceledError";
-
     throw apiError;
   }
 }
-
 /* =========================================================
    Phase 6-B Command Request
    ========================================================= */
-
 /**
  * 관리자 Command용 공통 요청 함수
  *
@@ -342,12 +295,12 @@ async function commandRequest(
     params = {},
     adminKey = "",
     signal,
+    timeout,
     mockData = undefined,
   } = {}
 ) {
   const validParams =
     removeEmptyParams(params);
-
   if (USE_MOCK) {
     if (IS_DEV) {
       console.log(
@@ -360,7 +313,6 @@ async function commandRequest(
         }
       );
     }
-
     /**
      * Phase 6-B 계약:
      * Mock 화면을 실제 Release / Recovery 성공 증적으로
@@ -374,29 +326,22 @@ async function commandRequest(
     ) {
       return mockData;
     }
-
     throw new Error(
-      "Mock 모드에서는 실제 Firewall Release / Recovery Command를 실행하지 않습니다."
+      "Mock 모드에서는 실제 관리자 Write Command를 실행하지 않습니다."
     );
   }
-
   try {
     const response =
       await axios({
         method,
-
         url:
           `${API_BASE_URL}${path}`,
-
         data,
-
         params:
           validParams,
-
         headers: {
           Accept:
             "application/json",
-
           ...(data !==
             undefined
             ? {
@@ -404,7 +349,6 @@ async function commandRequest(
                 "application/json",
             }
             : {}),
-
           ...(adminKey
             ? {
               "X-Recovery-Admin-Key":
@@ -412,10 +356,9 @@ async function commandRequest(
             }
             : {}),
         },
-
         signal,
+        ...(timeout ? { timeout } : {}),
       });
-
     /**
      * Secret이나 Command Body를
      * Console에 출력하지 않습니다.
@@ -431,14 +374,12 @@ async function commandRequest(
         }
       );
     }
-
     return response.data;
   } catch (error) {
     const message =
       createApiErrorMessage(
         error
       );
-
     /**
      * Admin Key, Request Body,
      * confirm 값은 Error Log에도 출력하지 않습니다.
@@ -449,48 +390,38 @@ async function commandRequest(
         {
           method,
           path,
-
           status:
             error.response
               ?.status,
-
           response:
             error.response
               ?.data,
         }
       );
     }
-
     const apiError =
       new Error(message);
-
     apiError.status =
       error.response?.status ??
       null;
-
     apiError.code =
       error.code ??
       null;
-
     apiError.responseData =
       error.response?.data ??
       null;
-
     apiError.isCanceled =
       axios.isCancel(
         error
       ) ||
       error.name ===
       "CanceledError";
-
     throw apiError;
   }
 }
-
 /* =========================================================
    Dashboard
    ========================================================= */
-
 export function getSummary(
   options = {}
 ) {
@@ -501,11 +432,9 @@ export function getSummary(
     options
   );
 }
-
 /* =========================================================
    Devices
    ========================================================= */
-
 export function getDevices(
   params = {},
   options = {}
@@ -515,7 +444,6 @@ export function getDevices(
     offset: 0,
     ...params,
   };
-
   let filteredItems =
     Array.isArray(
       mockDevices.items
@@ -524,7 +452,6 @@ export function getDevices(
         ...mockDevices.items,
       ]
       : [];
-
   if (
     queryParams.status
   ) {
@@ -535,7 +462,6 @@ export function getDevices(
           queryParams.status
       );
   }
-
   if (
     queryParams.device_id
   ) {
@@ -546,13 +472,11 @@ export function getDevices(
           queryParams.device_id
       );
   }
-
   const pagedMockData =
     paginateMockItems(
       filteredItems,
       queryParams
     );
-
   return request(
     "/devices",
     pagedMockData,
@@ -571,12 +495,10 @@ export function getDeviceDetail(
       )
     );
   }
-
   const encodedDeviceId =
     encodeURIComponent(
       deviceId
     );
-
   const mockDevice =
     Array.isArray(
       mockDevices.items
@@ -587,13 +509,89 @@ export function getDeviceDetail(
           deviceId
       ) ?? null
       : null;
-
   return request(
     `/devices/${encodedDeviceId}`,
     mockDevice,
     {},
     options
   );
+}
+export async function createDevice(
+  payload,
+  adminKey,
+  options = {}
+) {
+  if (!payload?.device_id) {
+    throw new Error("Device ID가 필요합니다.");
+  }
+  if (!String(adminKey ?? "").trim()) {
+    throw new Error("관리자 Key를 입력해 주세요.");
+  }
+  const response = await commandRequest(
+    "POST",
+    "/devices",
+    {
+      data: payload,
+      adminKey,
+      signal: options.signal,
+      timeout: options.timeout ?? 15_000,
+    }
+  );
+  return response;
+}
+export function getDevicePolicy(
+  deviceId,
+  options = {}
+) {
+  if (!deviceId) {
+    return Promise.reject(
+      new Error("정책을 조회할 Device ID가 필요합니다.")
+    );
+  }
+  const encodedDeviceId =
+    encodeURIComponent(deviceId);
+  return request(
+    `/devices/${encodedDeviceId}/policy`,
+    null,
+    {},
+    options
+  );
+}
+export async function createDevicePolicyRevision(
+  deviceId,
+  payload,
+  adminKey,
+  options = {}
+) {
+  if (!deviceId) {
+    throw new Error("정책을 변경할 Device ID가 필요합니다.");
+  }
+  if (
+    payload?.expected_revision === null ||
+    payload?.expected_revision === undefined ||
+    payload?.expected_revision === ""
+  ) {
+    throw new Error("현재 Policy Revision을 확인할 수 없습니다.");
+  }
+  if (!String(payload?.reason ?? "").trim()) {
+    throw new Error("정책 변경 사유를 입력해 주세요.");
+  }
+  if (!String(adminKey ?? "").trim()) {
+    throw new Error("관리자 Key를 입력해 주세요.");
+  }
+  const encodedDeviceId =
+    encodeURIComponent(deviceId);
+  const response = await commandRequest(
+    "POST",
+    `/devices/${encodedDeviceId}/policy-revisions`,
+    {
+      data: payload,
+      adminKey,
+      signal: options.signal,
+      timeout: options.timeout ?? 15_000,
+    }
+  );
+  return response;
 }
 export function getIsolatedDevices(
   params = {},
@@ -607,11 +605,9 @@ export function getIsolatedDevices(
     options
   );
 }
-
 /* =========================================================
    MQTT
    ========================================================= */
-
 export function getMqttLogs(
   params = {},
   options = {}
@@ -621,14 +617,12 @@ export function getMqttLogs(
     offset: 0,
     ...params,
   };
-
   const pagedMockData =
     paginateMockItems(
       mockMqttLogs.items,
       queryParams,
       10
     );
-
   return request(
     "/mqtt-logs",
     pagedMockData,
@@ -636,11 +630,9 @@ export function getMqttLogs(
     options
   );
 }
-
 /* =========================================================
    MQTT Feature Logs
    ========================================================= */
-
 export function getFeatureLogs(
   params = {},
   options = {}
@@ -650,14 +642,12 @@ export function getFeatureLogs(
     offset: 0,
     ...params,
   };
-
   const pagedMockData =
     paginateMockItems(
       mockFeatureLogs.items,
       queryParams,
       10
     );
-
   return request(
     "/feature-logs",
     pagedMockData,
@@ -665,11 +655,9 @@ export function getFeatureLogs(
     options
   );
 }
-
 /* =========================================================
    Detection Events
    ========================================================= */
-
 export function getEvents(
   params = {},
   options = {}
@@ -679,7 +667,6 @@ export function getEvents(
     offset: 0,
     ...params,
   };
-
   let filteredItems =
     Array.isArray(
       mockEvents.items
@@ -688,7 +675,6 @@ export function getEvents(
         ...mockEvents.items,
       ]
       : [];
-
   if (
     queryParams.device_id
   ) {
@@ -699,7 +685,6 @@ export function getEvents(
           queryParams.device_id
       );
   }
-
   if (
     queryParams.event_type
   ) {
@@ -710,7 +695,6 @@ export function getEvents(
           queryParams.event_type
       );
   }
-
   if (
     queryParams.incident_family
   ) {
@@ -721,7 +705,6 @@ export function getEvents(
           queryParams.incident_family
       );
   }
-
   if (
     queryParams.severity
   ) {
@@ -732,7 +715,6 @@ export function getEvents(
           queryParams.severity
       );
   }
-
   if (
     queryParams.applied_to_score !==
     undefined
@@ -746,7 +728,6 @@ export function getEvents(
       "1" ||
       queryParams.applied_to_score ===
       "true";
-
     filteredItems =
       filteredItems.filter(
         (event) =>
@@ -756,13 +737,11 @@ export function getEvents(
           appliedValue
       );
   }
-
   const pagedMockData =
     paginateMockItems(
       filteredItems,
       queryParams
     );
-
   return request(
     "/detection-events",
     pagedMockData,
@@ -770,11 +749,9 @@ export function getEvents(
     options
   );
 }
-
 /* =========================================================
    Isolation History
    ========================================================= */
-
 export function getIsolationHistory(
   params = {},
   options = {}
@@ -784,7 +761,6 @@ export function getIsolationHistory(
     offset: 0,
     ...params,
   };
-
   let filteredItems =
     Array.isArray(
       mockIsolationHistory.items
@@ -793,7 +769,6 @@ export function getIsolationHistory(
         ...mockIsolationHistory.items,
       ]
       : [];
-
   if (
     queryParams.device_id
   ) {
@@ -804,13 +779,11 @@ export function getIsolationHistory(
           queryParams.device_id
       );
   }
-
   const pagedMockData =
     paginateMockItems(
       filteredItems,
       queryParams
     );
-
   return request(
     "/isolation/history",
     pagedMockData,
@@ -818,11 +791,9 @@ export function getIsolationHistory(
     options
   );
 }
-
 /* =========================================================
    Trust Score
    ========================================================= */
-
 export function getTrustScoreSummary(
   params = {},
   options = {}
@@ -832,14 +803,12 @@ export function getTrustScoreSummary(
     offset: 0,
     ...params,
   };
-
   const pagedMockData =
     paginateMockItems(
       mockTrustScoreSummary.items,
       queryParams,
       100
     );
-
   return request(
     "/trust-score/summary",
     pagedMockData,
@@ -847,7 +816,6 @@ export function getTrustScoreSummary(
     options
   );
 }
-
 export function getTrustScoreCompensations(
   params = {},
   adminKey = "",
@@ -858,19 +826,15 @@ export function getTrustScoreCompensations(
     offset: 0,
     ...params,
   };
-
   return commandRequest(
     "GET",
     "/trust-score/compensations",
     {
       params:
         queryParams,
-
       adminKey,
-
       signal:
         options.signal,
-
       mockData: {
         items: [],
         total: 0,
@@ -878,7 +842,6 @@ export function getTrustScoreCompensations(
     }
   );
 }
-
 export function getTrustScoreHistory(
   deviceId,
   params = {},
@@ -891,49 +854,38 @@ export function getTrustScoreHistory(
       )
     );
   }
-
   const encodedDeviceId =
     encodeURIComponent(
       deviceId
     );
-
   const queryParams = {
     limit: 20,
     offset: 0,
     ...params,
   };
-
   const history =
     mockTrustScoreHistories[
     deviceId
     ] || {
       device_id:
         deviceId,
-
       current_score:
         null,
-
       items: [],
-
       total: 0,
     };
-
   const pagedItems =
     paginateMockItems(
       history.items,
       queryParams
     );
-
   const pagedMockData = {
     ...history,
-
     items:
       pagedItems.items,
-
     total:
       pagedItems.total,
   };
-
   return request(
     `/trust-score/${encodedDeviceId}/history`,
     pagedMockData,
@@ -944,7 +896,6 @@ export function getTrustScoreHistory(
 /* =========================================================
    Packet Feature Logs
    ========================================================= */
-
 export function getPacketFeatureLogs(
   params = {},
   options = {}
@@ -954,7 +905,6 @@ export function getPacketFeatureLogs(
     offset: 0,
     ...params,
   };
-
   let filteredItems =
     Array.isArray(
       mockPacketFeatureLogs.items
@@ -963,7 +913,6 @@ export function getPacketFeatureLogs(
         ...mockPacketFeatureLogs.items,
       ]
       : [];
-
   if (
     queryParams.direction
   ) {
@@ -974,7 +923,6 @@ export function getPacketFeatureLogs(
           queryParams.direction
       );
   }
-
   if (
     queryParams.device_id
   ) {
@@ -985,7 +933,6 @@ export function getPacketFeatureLogs(
           queryParams.device_id
       );
   }
-
   if (
     queryParams.capture_eligible !==
     undefined
@@ -999,7 +946,6 @@ export function getPacketFeatureLogs(
       "1" ||
       queryParams.capture_eligible ===
       "true";
-
     filteredItems =
       filteredItems.filter(
         (item) =>
@@ -1009,13 +955,11 @@ export function getPacketFeatureLogs(
           eligibleValue
       );
   }
-
   const pagedMockData =
     paginateMockItems(
       filteredItems,
       queryParams
     );
-
   return request(
     "/packet-feature-logs",
     pagedMockData,
@@ -1023,11 +967,9 @@ export function getPacketFeatureLogs(
     options
   );
 }
-
 /* =========================================================
    Gateway Metrics
    ========================================================= */
-
 export function getGatewayMetrics(
   params = {},
   options = {}
@@ -1037,7 +979,6 @@ export function getGatewayMetrics(
     offset: 0,
     ...params,
   };
-
   const refreshedItems = (
     mockGatewayMetrics.items ||
     []
@@ -1049,20 +990,17 @@ export function getGatewayMetrics(
       index === 0
         ? {
           ...item,
-
           collected_at:
             new Date().toISOString(),
         }
         : item
   );
-
   const pagedMockData =
     paginateMockItems(
       refreshedItems,
       queryParams,
       1
     );
-
   return request(
     "/gateway-metrics",
     pagedMockData,
@@ -1070,11 +1008,9 @@ export function getGatewayMetrics(
     options
   );
 }
-
 /* =========================================================
    Firewall Rules
    ========================================================= */
-
 export function getFirewallRules(
   params = {},
   options = {}
@@ -1084,7 +1020,6 @@ export function getFirewallRules(
     offset: 0,
     ...params,
   };
-
   let filteredItems =
     Array.isArray(
       mockFirewallRules.items
@@ -1093,7 +1028,6 @@ export function getFirewallRules(
         ...mockFirewallRules.items,
       ]
       : [];
-
   if (
     queryParams.status
   ) {
@@ -1104,7 +1038,6 @@ export function getFirewallRules(
           queryParams.status
       );
   }
-
   if (
     queryParams.device_id
   ) {
@@ -1115,7 +1048,6 @@ export function getFirewallRules(
           queryParams.device_id
       );
   }
-
   if (
     queryParams.source_ip
   ) {
@@ -1126,13 +1058,11 @@ export function getFirewallRules(
           queryParams.source_ip
       );
   }
-
   const pagedMockData =
     paginateMockItems(
       filteredItems,
       queryParams
     );
-
   return request(
     "/firewall-rules",
     pagedMockData,
@@ -1140,11 +1070,9 @@ export function getFirewallRules(
     options
   );
 }
-
 /* =========================================================
    Phase 6-B Firewall Release Request
    ========================================================= */
-
 /**
  * APPLIED Firewall Rule의 Release Request를 생성합니다.
  *
@@ -1182,23 +1110,19 @@ export async function createFirewallReleaseRequest(
       "Firewall Rule ID가 필요합니다."
     );
   }
-
   const trimmedReason =
     String(
       reason ?? ""
     ).trim();
-
   if (!trimmedReason) {
     throw new Error(
       "Firewall 해제 사유를 입력해 주세요."
     );
   }
-
   const trimmedConfirmation =
     String(
       confirmation ?? ""
     ).trim();
-
   if (
     !trimmedConfirmation
   ) {
@@ -1206,10 +1130,8 @@ export async function createFirewallReleaseRequest(
       "Firewall 해제 확인 문구를 입력해 주세요."
     );
   }
-
   const expectedConfirmation =
     `RELEASE-FIREWALL-RULE-${ruleId}`;
-
   if (
     trimmedConfirmation !==
     expectedConfirmation
@@ -1218,7 +1140,6 @@ export async function createFirewallReleaseRequest(
       `확인 문구 ${expectedConfirmation}을 정확히 입력해 주세요.`
     );
   }
-
   if (
     !String(
       adminKey ?? ""
@@ -1228,34 +1149,26 @@ export async function createFirewallReleaseRequest(
       "관리자 Key를 입력해 주세요."
     );
   }
-
   const encodedRuleId =
     encodeURIComponent(
       ruleId
     );
-
   const response =
     await commandRequest(
       "POST",
-
       `/firewall-rules/${encodedRuleId}/release-requests`,
-
       {
         data: {
           reason:
             trimmedReason,
-
           confirm:
             trimmedConfirmation,
         },
-
         adminKey,
-
         signal:
           options.signal,
       }
     );
-
   /**
    * Backend 201 Response:
    *
@@ -1276,7 +1189,6 @@ export async function createFirewallReleaseRequest(
     response
   );
 }
-
 /**
  * Firewall Release Request 상태 단건 조회
  *
@@ -1297,30 +1209,23 @@ export function getFirewallReleaseRequest(
       )
     );
   }
-
   const encodedRequestId =
     encodeURIComponent(
       requestId
     );
-
   return commandRequest(
     "GET",
-
     `/firewall-release-requests/${encodedRequestId}`,
-
     {
       adminKey,
-
       signal:
         options.signal,
     }
   );
 }
-
 /* =========================================================
    Phase 6-B Recovery
    ========================================================= */
-
 /**
  * Recovery Preflight
  *
@@ -1350,12 +1255,10 @@ export function recoveryPreflight(
       )
     );
   }
-
   const trustScore =
     Number(
       expected_trust_score
     );
-
   if (
     !Number.isFinite(
       trustScore
@@ -1367,7 +1270,6 @@ export function recoveryPreflight(
       )
     );
   }
-
   if (
     !String(
       adminKey ?? ""
@@ -1379,28 +1281,21 @@ export function recoveryPreflight(
       )
     );
   }
-
   return commandRequest(
     "POST",
-
     "/recovery/preflight",
-
     {
       data: {
         device_id,
-
         expected_trust_score:
           trustScore,
       },
-
       adminKey,
-
       signal:
         options.signal,
     }
   );
 }
-
 /**
  * Recovery Execute
  *
@@ -1427,12 +1322,10 @@ export function executeRecovery(
       )
     );
   }
-
   const trustScore =
     Number(
       expected_trust_score
     );
-
   if (
     !Number.isFinite(
       trustScore
@@ -1444,12 +1337,10 @@ export function executeRecovery(
       )
     );
   }
-
   const trimmedReason =
     String(
       reason ?? ""
     ).trim();
-
   if (!trimmedReason) {
     return Promise.reject(
       new Error(
@@ -1457,15 +1348,12 @@ export function executeRecovery(
       )
     );
   }
-
   const trimmedConfirmation =
     String(
       confirmation ?? ""
     ).trim();
-
   const expectedConfirmation =
     "RESET-TO-NORMAL-100";
-
   if (
     trimmedConfirmation !==
     expectedConfirmation
@@ -1476,7 +1364,6 @@ export function executeRecovery(
       )
     );
   }
-
   if (
     !String(
       adminKey ?? ""
@@ -1488,34 +1375,25 @@ export function executeRecovery(
       )
     );
   }
-
   return commandRequest(
     "POST",
-
     "/recovery/execute",
-
     {
       data: {
         device_id,
-
         expected_trust_score:
           trustScore,
-
         reason:
           trimmedReason,
-
         confirm:
           trimmedConfirmation,
       },
-
       adminKey,
-
       signal:
         options.signal,
     }
   );
 }
-
 /**
  * Recovery History
  *
@@ -1532,20 +1410,15 @@ export function getRecoveryHistory(
 ) {
   return commandRequest(
     "GET",
-
     "/recovery/history",
-
     {
       params,
-
       adminKey,
-
       signal:
         options.signal,
     }
   );
 }
-
 /**
  * Recovery History Detail
  */
@@ -1561,30 +1434,23 @@ export function getRecoveryHistoryDetail(
       )
     );
   }
-
   const encodedOperationId =
     encodeURIComponent(
       operationId
     );
-
   return commandRequest(
     "GET",
-
     `/recovery/history/${encodedOperationId}`,
-
     {
       adminKey,
-
       signal:
         options.signal,
     }
   );
 }
-
 /* =========================================================
    Health
    ========================================================= */
-
 export function getHealth(
   options = {}
 ) {
@@ -1595,7 +1461,6 @@ export function getHealth(
     options
   );
 }
-
 export {
   API_BASE_URL,
   USE_MOCK,

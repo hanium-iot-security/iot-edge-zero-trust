@@ -2,22 +2,99 @@
   width: 100%;
   max-width: 100%;
   min-width: 0;
-
   margin: 0 auto;
 
+  /* ========================================
+     SOURCE STATE
+     ======================================== */
+  .source-state-note {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 0 0 14px;
+    padding: 10px 12px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background: var(--color-slate-50);
+    font-size: 12px;
+    line-height: 1.5;
+
+    strong {
+      flex: 0 0 auto;
+    }
+
+    span {
+      color: var(--color-slate-600);
+    }
+  }
+
+  .source-state-stale {
+    border-color: #fde68a;
+    background: #fffbeb;
+
+    strong {
+      color: var(--color-warning);
+    }
+  }
+
+  .source-state-error {
+    border-color: #fecaca;
+    background: #fef2f2;
+
+    strong {
+      color: var(--color-danger);
+    }
+  }
+
+  .section-unavailable {
+    display: flex;
+    min-height: 110px;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    border: 1px dashed var(--border-color);
+    border-radius: 9px;
+    background: var(--color-slate-50);
+    color: var(--color-slate-500);
+    font-size: 13px;
+    text-align: center;
+  }
+
+  .data-count.unavailable {
+    color: var(--color-slate-400);
+  }
+
+  .registration-state-guide {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 0 0 20px;
+    padding: 11px 13px;
+    border: 1px solid #bfdbfe;
+    border-radius: 8px;
+    background: #eff6ff;
+    font-size: 12px;
+    line-height: 1.5;
+
+    strong {
+      flex: 0 0 auto;
+      color: var(--color-slate-900);
+    }
+
+    span {
+      color: var(--color-slate-600);
+    }
+  }
 
   /* ========================================
      STATUS
      ======================================== */
-
   .status-grid {
     display: grid;
-
-    grid-template-columns:
-      repeat(2, minmax(0, 1fr));
-
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 20px;
-
     margin-bottom: 24px;
   }
 
@@ -27,115 +104,83 @@
 
   .mini-grid {
     display: grid;
-
-    grid-template-columns:
-      repeat(2, minmax(0, 1fr));
-
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 16px;
-
     margin-bottom: 0;
   }
 
   .status-footer {
     margin: 18px 0 0;
-
     color: var(--color-slate-500);
-
     font-size: 12px;
   }
-
 
   /* ========================================
      API HEALTH
      ======================================== */
-
   .health-grid {
     display: grid;
-
-    grid-template-columns:
-      repeat(3, minmax(0, 1fr));
-
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 12px;
   }
 
   .health-item {
     min-width: 0;
-
     padding: 14px;
-
     border: 1px solid var(--border-color);
     border-radius: 2px;
-
     background: var(--color-slate-50);
 
     span {
       display: block;
-
       margin-bottom: 7px;
-
       color: var(--color-slate-500);
-
       font-size: 16px;
       font-weight: 700;
     }
 
     strong {
       display: block;
-
       overflow-wrap: anywhere;
-
       color: var(--color-slate-900);
-
       font-size: 16px;
     }
   }
 
-
   /* ========================================
      CHART
      ======================================== */
-
   .chart-wrap {
     width: 100%;
     min-width: 0;
-
     overflow: hidden;
   }
 
   .chart-loading {
     display: flex;
-
     min-height: 320px;
-
     align-items: center;
     justify-content: center;
-
     color: var(--color-slate-500);
   }
-
 
   /* ========================================
      TABLE
      ======================================== */
-
   .table-panel {
     width: 100%;
     max-width: 100%;
     min-width: 0;
-
     overflow: hidden;
   }
 
   .table-scroll {
     display: block;
-
     width: 100%;
     max-width: 100%;
     min-width: 0;
-
     overflow-x: auto;
     overflow-y: hidden;
-
     -webkit-overflow-scrolling: touch;
 
     > * {
@@ -143,18 +188,13 @@
     }
   }
 
-
   /* ========================================
      TRUST SCORE
      ======================================== */
-
   .score-cell {
     display: flex;
-
     min-width: 92px;
-
     flex-direction: column;
-
     gap: 6px;
 
     > strong {
@@ -165,19 +205,14 @@
   .score-bar {
     width: 100%;
     height: 6px;
-
     overflow: hidden;
-
     border-radius: var(--radius-pill);
-
     background: var(--color-slate-200);
   }
 
   .score-fill {
     height: 100%;
-
     border-radius: inherit;
-
     background: var(--color-primary);
   }
 
@@ -197,34 +232,48 @@
     background: var(--color-slate-900);
   }
 
+  .score-context {
+    color: var(--color-slate-500);
+    font-size: 10px;
+    line-height: 1.35;
+    text-align: right;
+  }
 
   /* ========================================
      TABLE CELLS
      ======================================== */
+  .registration-cell {
+    display: flex;
+    min-width: 145px;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+
+    small {
+      color: var(--color-slate-500);
+      font-size: 10px;
+      line-height: 1.35;
+      white-space: normal;
+    }
+  }
 
   .event-name,
   .topic-cell {
     display: block;
-
     max-width: 320px;
-
     overflow: hidden;
-
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .delta-negative {
     color: var(--color-danger);
-
     font-weight: 700;
   }
-
 
   /* ========================================
      TABLE ROW STATUS
      ======================================== */
-
   .row-warning {
     background: #fffbeb;
 
@@ -249,15 +298,12 @@
     }
   }
 
-
   /* ========================================
      RESPONSIVE
      ======================================== */
-
   @media (max-width: 1280px) {
     .health-grid {
-      grid-template-columns:
-        repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
   }
 
@@ -271,6 +317,12 @@
     .mini-grid,
     .health-grid {
       grid-template-columns: 1fr;
+    }
+
+    .source-state-note,
+    .registration-state-guide {
+      flex-direction: column;
+      gap: 3px;
     }
   }
 }
