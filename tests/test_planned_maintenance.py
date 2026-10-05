@@ -185,6 +185,48 @@ def test_unfinished_stage_cannot_authorize_shutdown(db, stage):
     assert get_operation(conn, operation["operation_id"])["status"] == "REQUESTED"
 
 
+def test_consumed_outbound_tail_allows_stop_and_resume_with_distinct_packet_ids(db):
+    conn, _, directory = db
+    outbound = conn.execute(
+        "INSERT INTO packet_feature_logs(capture_segment_id,device_id,peer_ip,direction,window_start,window_end,"
+        "packet_count,total_bytes,avg_packet_size,max_packet_size) VALUES (2,'esp32_01','192.168.0.4','OUTBOUND',?,?,2,100,50,50)",
+        (utc(10), utc(20)),
+    ).lastrowid
+    conn.execute("UPDATE detector_checkpoints SET last_processed_id=? WHERE detector_name='packet_if'", (outbound,))
+    conn.commit()
+    operation = ready(conn)
+    assert operation["status"] == "READY"
+    plan = resume_plan(conn, operation)
+    assert plan["checkpoints"]["packet_rule"]["before"]["last_processed_id"] == 2
+    assert plan["checkpoints"]["packet_if"]["before"]["last_processed_id"] == outbound
+    before = protected(conn)
+    apply(conn, plan, directory)
+    assert protected(conn) == before
+    rows = dict(conn.execute("SELECT detector_name,last_processed_id FROM detector_checkpoints "
+                             "WHERE detector_name IN ('packet_rule','packet_if')"))
+    assert rows == {"packet_rule": 2, "packet_if": outbound}
+
+
+@pytest.mark.parametrize("direction,lagging_detector", [("INBOUND", "packet_rule"), ("OUTBOUND", "packet_if")])
+def test_unconsumed_packet_tail_still_holds_required_detector(db, direction, lagging_detector):
+    conn, _, _ = db
+    operation = stop_request(conn)
+    close_source(conn)
+    tail = conn.execute(
+        "INSERT INTO packet_feature_logs(capture_segment_id,device_id,peer_ip,direction,window_start,window_end,"
+        "packet_count,total_bytes,avg_packet_size,max_packet_size) VALUES (2,'esp32_01','192.168.0.9',?,?,?,2,100,50,50)",
+        (direction, utc(10), utc(20)),
+    ).lastrowid
+    if lagging_detector == "packet_rule":
+        conn.execute("UPDATE detector_checkpoints SET last_processed_id=? WHERE detector_name='packet_if'", (tail,))
+    conn.commit()
+    before = protected(conn)
+    with transaction(conn), pytest.raises(PlannedMaintenanceError, match=f"Unconsumed pre-maintenance source rows: {lagging_detector}"):
+        finalize_stop(conn, operation["operation_id"], now=utc(25))
+    assert protected(conn) == before
+    assert get_operation(conn, operation["operation_id"])["status"] == "REQUESTED"
+
+
 @pytest.mark.parametrize("change", ["FAILED", "READY", "no_timing", "gap", "unconsumed", "pending_event", "null_window_event"])
 def test_bad_source_or_pending_event_stays_requested(db, change):
     conn, source_pk, _ = db

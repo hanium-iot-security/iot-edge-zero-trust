@@ -232,7 +232,10 @@ def _fully_drained(db, checkpoints, boundary, *, exact_boundaries=True):
                 raise PlannedMaintenanceError("Unconsumed MQTT source has an invalid received_at.") from exc
             _require(not pending, f"Unconsumed pre-maintenance source rows: {detector}.")
             continue
-        pending = _one(db, f"SELECT MAX(id) AS last_id FROM {source} WHERE unixepoch(window_end)<=unixepoch(:end)",
+        # Packet Rule consumes only INBOUND rows; its source ID need not match
+        # Packet IF, which also consumes OUTBOUND rows without inferring on them.
+        scope = " AND direction='INBOUND'" if detector == "packet_rule" and source == "packet_feature_logs" else ""
+        pending = _one(db, f"SELECT MAX(id) AS last_id FROM {source} WHERE unixepoch(window_end)<=unixepoch(:end){scope}",
                        {"end": boundary})["last_id"]
         _require(pending is None or (row["last_processed_id"] is not None and row["last_processed_id"] >= pending),
                  f"Unconsumed pre-maintenance source rows: {detector}.")

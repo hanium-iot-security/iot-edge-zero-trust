@@ -25,6 +25,8 @@ sudo venv/bin/python -m edge.maintenance.run_planned_maintenance prepare-stop \
 
 현재 Session의 정상 품질·연속성과 필수 Checkpoint의 마지막 경계 완료를 확인한 뒤 처리 서비스와 Timer를 멈춘다. 공유 Runtime Lock과 DB 트랜잭션 안에서 한 번 더 검증하고 READY를 기록한다. `COMPLETED` Session이나 SIGTERM만으로 READY를 만들지 않는다. READY의 유효 기간은 7일이다.
 
+원본 처리 완료 검사는 탐지기별 조회 범위를 따른다. Packet Rule은 INBOUND, Packet IF는 전체 방향의 처리 ID를 확인하므로 같은 Window를 완료해도 두 ID가 다를 수 있다. 미처리 INBOUND와 IF의 미처리 OUTBOUND는 계속 종료를 막으며, 원본 봉인·해시에는 전체 방향을 포함한다.
+
 JSON 결과가 `READY`인 경우에만 관리자가 OS를 정상 종료한다. 명령 자체는 poweroff/reboot를 실행하지 않는다. 실패하면 CANCELLED로 승인을 무효화하고 원래 활성 서비스의 복귀를 시도한다. `HOLD`와 서비스 복귀 실패가 표시되면 기록을 확인한다. 복귀된 Capture의 새 Session을 이전 승인으로 자동 건너뛰지 않는다.
 
 ## 다음 부팅에서 재개
