@@ -202,12 +202,17 @@ def start_new_session(
     now: datetime,
     *,
     fallback_gap_start: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> tuple[int, str, datetime]:
     """새 Session을 생성하고 first_window_start·Capture Gap을 기록합니다.
 
     fallback_gap_start: 이 interface에 대해 DB에 기록된 Segment가 전혀 없을 때
     Gap 시작점으로 사용할 값입니다. 만료된 Window로 인해 Session이 전환되는 경우,
     놓친 window_start를 여기로 넘기면 "이전 Segment가 하나도 없어 Gap을 계산 못 하는" 상황에서도 공백이 누락되지 않습니다.
+
+    Runtime은 clock을 전달하여 Session INSERT의 대기가 끝난 시각으로 첫 경계를
+    계산한다. 이미 저장한 경계는 이후 commit이 지연돼도 변경하지 않는다.
+    clock이 없는 직접 호출은 명시한 now를 사용하는 기존 동작을 유지한다.
 
     Returns:
         (session_pk, session_id, first_window_start)
@@ -220,7 +225,8 @@ def start_new_session(
         started_at=now,
     )
 
-    first_window_start = next_utc_boundary(now, config.window_seconds)
+    boundary_now = clock() if clock is not None else now
+    first_window_start = next_utc_boundary(boundary_now, config.window_seconds)
     repo.set_first_window_start(db, session_pk, first_window_start)
 
     previous_window_end = repo.find_last_segment_window_end(db, config.capture_interface)
@@ -308,7 +314,7 @@ def run_capture_loop(
         # 지연으로 인한 전환과 정상 종료를 구분할 수 있다.)
         _close_current_session(now, "FAILED")
         session_pk, session_id, window_start = start_new_session(
-            db, config, now, fallback_gap_start=missed_window_end
+            db, config, clock(), fallback_gap_start=missed_window_end, clock=clock
         )
 
     try:
@@ -456,9 +462,9 @@ def main() -> None:
             reconcile_orphan_ready_files(db, config)
             reconcile_orphan_failed_files(db, config)
 
-            now = datetime.now(timezone.utc)
-            reconcile_stale_running_sessions(db, config, now)
-            session_pk, session_id, first_window_start = start_new_session(db, config, now)
+            clock = lambda: datetime.now(timezone.utc)
+            reconcile_stale_running_sessions(db, config, clock())
+            session_pk, session_id, first_window_start = start_new_session(db, config, clock(), clock=clock)
 
             windows_captured = run_capture_loop(
                 db,
@@ -469,6 +475,7 @@ def main() -> None:
                 first_window_start=first_window_start,
                 shutdown=shutdown,
                 max_windows=args.windows,
+                clock=clock,
             )
             logger.info("Capture Runtime 종료: windows_captured=%d", windows_captured)
 
