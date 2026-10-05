@@ -24,6 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from ai.packet_if_contract import transform_packet_feature_row
 from edge.detection.phase4_time import parse_db_utc
+from edge.maintenance.processing import dataset_maintenance_windows, overlaps_maintenance
 from edge.packet.capture_policy import CaptureEligibilitySegment, CapturePolicy, is_capture_eligible
 from edge.packet.pcap_naming import parse_pcap_filename
 from edge.policy.device_policy_repository import get_policy_snapshot
@@ -408,6 +409,10 @@ def export_normal_collection(package_dir: Path, *, output_dir: Path | None = Non
             events = _bounded(selected_events, lambda row: _within(row, start, end, "analysis_window_start",
                               "analysis_window_end"), report, "event_bounds", True)
             session = _rows(db, "SELECT * FROM packet_capture_sessions WHERE id=?", (manifest["capture_session_pk"],))[0]
+            _stage(report, "maintenance", lambda: _require(
+                not overlaps_maintenance(dataset_maintenance_windows(db), start, end),
+                "approved_maintenance_interval_overlap",
+            ))
             _stage(report, "policies", lambda: _policies(db, manifest, start, end))
             _stage(report, "mqtt", lambda: _mqtt_qc(raw, features, ids, start, end, report))
             _stage(report, "capture", lambda: _capture_qc(root, manifest, session, segments, packets, start, end, report))

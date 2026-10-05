@@ -38,6 +38,7 @@ from edge.features.collect_feature_logs import (
     produce_mqtt_features_until,
 )
 from edge.runtime_lock import RuntimeLockError, resolve_lock_path, single_instance_lock
+from edge.maintenance.processing import cap_processing_cutoff
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +109,7 @@ def produce_once(
     Checkpoint가 이미 cutoff까지 도달했으면 아무것도 하지 않고 `None`을 반환합니다.
     같은 cutoff로 다시 실행하는 것 자체는 안전하지만, 불필요한 Write와 로그를 줄입니다.
     """
-    cutoff = compute_producer_cutoff(now)
+    cutoff = cap_processing_cutoff(db, compute_producer_cutoff(now))
     completed = checkpoints.get_completed_window_end(
         db,
         detector_name=MQTT_FEATURE_BUILDER,

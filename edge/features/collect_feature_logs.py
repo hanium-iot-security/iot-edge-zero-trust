@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from edge.maintenance.processing import cap_processing_cutoff, maintenance_windows, overlaps_maintenance
 
 from backend.app.config import settings
 from backend.app.database import SessionLocal
@@ -250,7 +251,10 @@ def produce_mqtt_features_until(
     producer_cutoff: datetime,
 ) -> ProducerRunResult:
     """Build mqtt feature windows and checkpoint them in the caller transaction."""
-    cutoff = require_utc_window_boundary(producer_cutoff, "producer_cutoff")
+    cutoff = cap_processing_cutoff(
+        db, require_utc_window_boundary(producer_cutoff, "producer_cutoff")
+    )
+    maintenance = maintenance_windows(db)
     checkpoint = checkpoints.get_detector_checkpoint(
         db,
         detector_name=MQTT_FEATURE_BUILDER,
@@ -312,6 +316,9 @@ def produce_mqtt_features_until(
             )
             continue
         if window_end > cutoff:
+            continue
+        if overlaps_maintenance(maintenance, window_start, window_end):
+            logger.info("event=MAINTENANCE_SOURCE_EXCLUDED source_table=mqtt_logs source_id=%s", source_id)
             continue
         window_registered = (
             resolver.registered_ids_at(window_start)
