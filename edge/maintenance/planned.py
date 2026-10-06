@@ -158,10 +158,11 @@ def _checkpoints(db, required=REQUIRED_CHECKPOINTS):
     return result
 
 
-def _segments(db, session, policy, *, allow_ready=False, feature_rows=None):
+def _segments(db, session, policy, *, allow_ready=False, feature_rows=None, segment_rows=None):
     start = _window(session["first_window_start"])
-    rows = _rows(db, "SELECT * FROM packet_capture_segments WHERE capture_session_id=:id ORDER BY window_start,id",
-                 {"id": session["id"]})
+    rows = (segment_rows if segment_rows is not None else
+            _rows(db, "SELECT * FROM packet_capture_segments WHERE capture_session_id=:id ORDER BY window_start,id",
+                  {"id": session["id"]}))
     _require(rows, "Capture Session has no complete Packet evidence.")
     if feature_rows is None:
         feature_rows = _rows(db, "SELECT f.* FROM packet_feature_logs f JOIN packet_capture_segments s "
@@ -372,12 +373,18 @@ def calculate_plan_sha256(plan):
     return _digest({key: value for key, value in plan.items() if key not in ("plan_sha256", "generated_at")})
 
 
-def _target_evidence(db, operation, target_id, policy):
+def _target_evidence(db, operation, target_id, policy, *, prefix_rows=None, successor_session_id=None):
     target = _session(db, target_id)
     source = _session(db, operation["source_session_id"])
     running = _rows(db, "SELECT session_id FROM packet_capture_sessions WHERE status='RUNNING'")
-    _require(target["status"] == "RUNNING" and len(running) == 1 and running[0]["session_id"] == target_id,
-             "The exact new Capture Session must be uniquely RUNNING.")
+    if prefix_rows is None:
+        _require(successor_session_id is None and target["status"] == "RUNNING"
+                 and len(running) == 1 and running[0]["session_id"] == target_id,
+                 "The exact new Capture Session must be uniquely RUNNING.")
+    else:
+        _require(target["status"] == "FAILED" and len(running) == 1
+                 and running[0]["session_id"] == successor_session_id,
+                 "Failed-prefix recovery requires the exact unique RUNNING successor.")
     _require(target["id"] > source["id"] and target["capture_interface"] == source["capture_interface"],
              "Target must be a new Session on the same capture interface.")
     _require(not _rows(db, "SELECT id FROM packet_capture_sessions WHERE id>:source AND id<:target",
@@ -390,7 +397,7 @@ def _target_evidence(db, operation, target_id, policy):
              "Target begins before completed planned shutdown.")
     _require(target["capture_gap_start"] == operation["source_final_boundary"]
              and target["capture_gap_end"] == boundary, "Target gap does not bind the planned shutdown boundary.")
-    segments = _segments(db, target, policy, allow_ready=True)
+    segments = _segments(db, target, policy, allow_ready=prefix_rows is None, segment_rows=prefix_rows)
     empty_prefix = []
     for first in segments:
         if first["status"] != "EMPTY":
@@ -460,6 +467,12 @@ def _verify_plan(plan):
 
 
 def apply_resume(conn, plan, *, now, backup_path, backup_sha256):
+    _require("failed_prefix_recovery" not in plan, "Use the explicit failed-prefix recovery command.")
+    return _apply_resume(conn, plan, now=now, backup_path=backup_path,
+                         backup_sha256=backup_sha256, inspect=inspect_resume)
+
+
+def _apply_resume(conn, plan, *, now, backup_path, backup_sha256, inspect):
     """Atomically consume approval, update both Packet boundaries and add audit.
 
 Normal tail appends do not invalidate the plan. The stopped source, current
@@ -476,7 +489,7 @@ caller write transaction. A committed retry returns the same audit only.
             audit = _validated_audit(conn, row)
             _require(audit["plan_sha256"] == plan["plan_sha256"], "Consumed approval belongs to another plan.")
             return audit
-        current = inspect_resume(conn, plan["operation_id"], target_session_id=plan["target_session_id"],
+        current = inspect(conn, plan["operation_id"], target_session_id=plan["target_session_id"],
                                  current_boot_id=plan["target_boot_id"], time_synchronized=True, now=now,
                                  verify_source_hashes=False)
         _require(current["plan_sha256"] == plan["plan_sha256"], "Bound resume evidence changed after inspection.")
@@ -543,6 +556,9 @@ def _validated_audit(db, operation, *, check_current_checkpoints=False):
         _require(not prefix_features, "First target EMPTY prefix gained Packet Features.")
     else:
         _require(segment["window_start"] == target["first_window_start"], "First target Packet boundary changed.")
+    if "failed_prefix_recovery" in plan:
+        from edge.maintenance.prefix_recovery import validate_prefix_audit
+        validate_prefix_audit(db, operation, plan)
     current = (_checkpoints(db, tuple((name, row["source_table"]) for name, row in sealed.items()))
                if check_current_checkpoints else None)
     for name in PACKET_DETECTORS:
@@ -563,6 +579,21 @@ def _validated_audit(db, operation, *, check_current_checkpoints=False):
             "maintenance_start": plan["maintenance_start"], "maintenance_end": plan["maintenance_end"],
             "window_start": plan["maintenance_start"], "window_end": plan["maintenance_end"],
             "checkpoints": plan["checkpoints"], "boundary": parse_db_utc(plan["maintenance_end"])}
+
+
+def inspect_prefix_recovery(conn, operation_id, **kwargs):
+    from edge.maintenance.prefix_recovery import inspect_prefix_recovery as inspect
+    return inspect(conn, operation_id, **kwargs)
+
+
+def apply_prefix_recovery(conn, plan, **kwargs):
+    from edge.maintenance.prefix_recovery import apply_prefix_recovery as apply
+    return apply(conn, plan, **kwargs)
+
+
+def check_prefix_drain(conn, operation_id):
+    from edge.maintenance.prefix_recovery import check_prefix_drain as check
+    return check(conn, operation_id)
 
 
 def get_resume_audit(db, operation_id, *, check_current_checkpoints=True):

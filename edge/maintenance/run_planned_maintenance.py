@@ -298,6 +298,174 @@ class MaintenanceRunner:
                 current_boot_id=self.system.boot_id(), time_synchronized=self.system.synchronized(),
                 now=self.now())
 
+    @staticmethod
+    def prefix_identity(approved_by, reason):
+        if not approved_by.strip() or not reason.strip():
+            raise MaintenanceHold("explicit prefix recovery operator and reason are required")
+        return f"root/uid=0; declared={approved_by.strip()}", reason.strip()
+
+    def dry_run_prefix(self, *, operation_id, target_session_id, successor_session_id,
+                       approved_by, reason):
+        """Preview the explicit failed-prefix recovery without consuming approval."""
+        approved_by, reason = self.prefix_identity(approved_by, reason)
+        with connection(self.database, readonly=True) as conn:
+            conn.execute("BEGIN")
+            if self.running_session(conn) != successor_session_id:
+                raise MaintenanceHold("the exact prefix recovery successor must be uniquely RUNNING")
+            return self.core.inspect_prefix_recovery(
+                conn, operation_id, target_session_id=target_session_id,
+                successor_session_id=successor_session_id,
+                approved_by=approved_by, reason=reason,
+                current_boot_id=self.system.boot_id(), time_synchronized=self.system.synchronized(),
+                now=self.now())
+
+    def prefix_retry_audit(self, conn, record, *, target_session_id, successor_session_id,
+                           approved_by, reason):
+        """A committed retry only checks the original recovery and never reapplies it."""
+        audit = self.core.get_resume_audit(conn, record["operation_id"])
+        plan = json.loads(audit["plan_json"])
+        recovery = plan.get("failed_prefix_recovery", {})
+        if (plan["target_session_id"] != target_session_id or
+                plan["target_boot_id"] != self.system.boot_id() or
+                recovery.get("successor_session_id") != successor_session_id or
+                recovery.get("approved_by") != approved_by or recovery.get("reason") != reason):
+            raise ConsumedApprovalHold("consumed approval belongs to another failed-prefix recovery")
+        return audit
+
+    def verify_prefix_drain(self, operation_id, successor_session_id, *, timeout=120):
+        """Wait for real pipeline processing; the failed tail still needs recovery."""
+        deadline, last = self.system.monotonic() + timeout, None
+        while self.system.monotonic() <= deadline:
+            if not all(self.system.active(unit) for unit in (CAPTURE, SUBSCRIBER, *DRAIN_SERVICES)):
+                raise MaintenanceHold("required runtime service stopped during prefix drain verification")
+            with connection(self.database, readonly=True) as conn:
+                conn.execute("BEGIN")
+                record = self.core.get_operation(conn, operation_id)
+                if (record["target_boot_id"] != self.system.boot_id() or
+                        self.running_session(conn) != successor_session_id):
+                    raise MaintenanceHold("boot or successor Session changed during prefix drain verification")
+                failed = conn.execute(
+                    "SELECT COUNT(*) FROM packet_capture_segments seg JOIN packet_capture_sessions ses "
+                    "ON ses.id=seg.capture_session_id WHERE ses.session_id=? AND seg.status='FAILED'",
+                    (successor_session_id,)).fetchone()[0]
+                if failed:
+                    raise MaintenanceHold("successor has a new failed capture segment requiring separate recovery")
+                last = self.core.check_prefix_drain(conn, operation_id)
+            if last.get("result") == "PREFIX_DRAINED_RECOVERY_REQUIRED":
+                return last
+            if last.get("result") != "WAIT":
+                raise MaintenanceHold(f"unexpected prefix drain result: {last.get('result')}")
+            self.system.sleep(1)
+        return {"result": "WAIT", "reason": "healthy prefix processing has not completed",
+                "last_check": last}
+
+    def recover_prefix(self, *, operation_id, target_session_id, successor_session_id,
+                       approved_by, reason, artifact_dir, timeout=30, verify_timeout=120):
+        """Consume only the original downtime approval, then drain preserved data."""
+        self.system.require_admin()
+        self.require_deployment()
+        required = self.required_checkpoints()
+        approved_by, reason = self.prefix_identity(approved_by, reason)
+        with single_instance_lock(self.command_lock, wait_seconds=0):
+            deadline, last_reason, prior = self.system.monotonic() + timeout, "preparing", False
+            while True:
+                try:
+                    with connection(self.database, readonly=True) as conn:
+                        conn.execute("BEGIN")
+                        record = self.core.get_operation(conn, operation_id)
+                        if record["status"] in ("READY", "RESUMED"):
+                            stored = json.loads(record["checkpoint_snapshot_json"])
+                            if {(name, row["source_table"]) for name, row in stored.items()} != set(required):
+                                raise ConsumedApprovalHold("required stage profile changed since shutdown approval")
+                        if self.running_session(conn) != successor_session_id:
+                            raise MaintenanceHold("the exact prefix recovery successor must be uniquely RUNNING")
+                        if record["status"] == "RESUMED":
+                            audit = self.prefix_retry_audit(
+                                conn, record, target_session_id=target_session_id,
+                                successor_session_id=successor_session_id,
+                                approved_by=approved_by, reason=reason)
+                            prior = True
+                        else:
+                            plan = self.core.inspect_prefix_recovery(
+                                conn, operation_id, target_session_id=target_session_id,
+                                successor_session_id=successor_session_id,
+                                approved_by=approved_by, reason=reason,
+                                current_boot_id=self.system.boot_id(),
+                                time_synchronized=self.system.synchronized(), now=self.now())
+                    break
+                except ConsumedApprovalHold as exc:
+                    return {"result": "HOLD", "operation_id": operation_id, "reason": str(exc)}
+                except (MaintenanceHold, self.core.PlannedMaintenanceError) as exc:
+                    last_reason = str(exc)
+                    if self.system.monotonic() >= deadline:
+                        return {"result": "WAIT", "operation_id": operation_id, "reason": last_reason}
+                    self.system.sleep(1)
+            if prior:
+                try:
+                    progress = self.verify_prefix_drain(operation_id, successor_session_id,
+                                                        timeout=verify_timeout)
+                except BaseException as exc:
+                    progress = {"result": "HOLD", "reason": str(exc)}
+                return {"result": "PREFIX_DRAINED_RECOVERY_REQUIRED"
+                        if progress["result"] == "PREFIX_DRAINED_RECOVERY_REQUIRED" else "COMMITTED_HOLD",
+                        "operation_id": operation_id, "audit": audit, "verification": progress,
+                        "reapplied": False}
+            if isinstance(self.system, SystemOperations):
+                artifact_dir = safety.validate_generated_path(self.root, artifact_dir, field_name="artifact_dir")
+            evidence = self.backup(self.database, Path(artifact_dir))
+            with connection(Path(evidence["backup_path"]), readonly=True) as saved:
+                saved.execute("BEGIN")
+                saved_plan = self.core.inspect_prefix_recovery(
+                    saved, operation_id, target_session_id=target_session_id,
+                    successor_session_id=successor_session_id, approved_by=approved_by, reason=reason,
+                    current_boot_id=plan["target_boot_id"], time_synchronized=True, now=self.now())
+                if saved_plan["plan_sha256"] != plan["plan_sha256"]:
+                    raise MaintenanceHold("backup does not match the bound prefix recovery plan")
+            orchestrator_active = self.system.active("detection-orchestrator.service")
+            committed, apply_error, restore_error, result = False, None, None, None
+            try:
+                if orchestrator_active:
+                    self.system.stop("detection-orchestrator.service")
+                with self.protected():
+                    if self.system.boot_id() != plan["target_boot_id"] or not self.system.synchronized():
+                        raise MaintenanceHold("boot identity or time synchronization changed before prefix apply")
+                    with connection(self.database) as conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        if self.running_session(conn) != successor_session_id:
+                            raise MaintenanceHold("successor Session changed before prefix apply")
+                        result = self.core.apply_prefix_recovery(conn, plan, now=self.now(), **evidence)
+                        conn.commit()
+                        committed = True
+            except BaseException as exc:
+                apply_error = exc
+            finally:
+                if orchestrator_active:
+                    try:
+                        self.system.start("detection-orchestrator.service")
+                    except BaseException as exc:
+                        restore_error = exc
+            if restore_error and committed:
+                return {"result": "COMMITTED_HOLD", "operation_id": operation_id, "audit": result,
+                        "reason": f"orchestrator restoration failed: {restore_error}"}
+            if apply_error:
+                with connection(self.database, readonly=True) as inspected:
+                    record = self.core.get_operation(inspected, operation_id)
+                    if record["status"] == "RESUMED":
+                        return {"result": "COMMITTED_HOLD", "operation_id": operation_id,
+                                "audit": self.core.get_resume_audit(inspected, operation_id),
+                                "reason": f"prefix apply response failed: {apply_error}; restore error: {restore_error}"}
+                if restore_error:
+                    raise MaintenanceHold(f"{apply_error}; orchestrator restoration failed: {restore_error}") from apply_error
+                raise apply_error
+            try:
+                progress = self.verify_prefix_drain(operation_id, successor_session_id,
+                                                    timeout=verify_timeout)
+            except BaseException as exc:
+                progress = {"result": "HOLD", "reason": str(exc)}
+            return {"result": "PREFIX_DRAINED_RECOVERY_REQUIRED"
+                    if progress["result"] == "PREFIX_DRAINED_RECOVERY_REQUIRED" else "COMMITTED_HOLD",
+                    "operation_id": operation_id, "audit": result, "verification": progress}
+
     def prepare_stop(self, *, approved_by, reason, timeout=180):
         self.system.require_admin()
         self.require_deployment()
@@ -528,6 +696,17 @@ def build_parser():
             child.add_argument("--artifact-dir", type=Path, default=Path("output/planned-maintenance"))
             child.add_argument("--timeout", type=float, default=120)
             child.add_argument("--verify-timeout", type=float, default=120)
+    for name in ("dry-run-prefix", "recover-prefix"):
+        child = commands.add_parser(name)
+        child.add_argument("--operation-id", required=True)
+        child.add_argument("--target-session-id", required=True)
+        child.add_argument("--successor-session-id", required=True)
+        child.add_argument("--approved-by", required=True)
+        child.add_argument("--reason", required=True)
+        if name == "recover-prefix":
+            child.add_argument("--artifact-dir", type=Path, default=Path("output/planned-maintenance"))
+            child.add_argument("--timeout", type=float, default=30)
+            child.add_argument("--verify-timeout", type=float, default=120)
     prepare = commands.add_parser("prepare-stop")
     prepare.add_argument("--approved-by", required=True)
     prepare.add_argument("--reason", required=True)
@@ -540,7 +719,7 @@ def build_parser():
 
 def main(argv: Sequence[str] | None = None):
     args = build_parser().parse_args(argv)
-    if args.command in ("prepare-stop", "resume", "cancel") and os.name == "posix":
+    if args.command in ("prepare-stop", "resume", "recover-prefix", "cancel") and os.name == "posix":
         def interrupted(_signal, _frame):
             raise KeyboardInterrupt("maintenance command interrupted; inspect approval and audit")
         signal.signal(signal.SIGTERM, interrupted)
@@ -557,6 +736,17 @@ def main(argv: Sequence[str] | None = None):
                                    timeout=args.timeout, verify_timeout=args.verify_timeout)
         elif args.command == "dry-run":
             result = runner.dry_run(args.operation_id)
+        elif args.command == "dry-run-prefix":
+            result = runner.dry_run_prefix(
+                operation_id=args.operation_id, target_session_id=args.target_session_id,
+                successor_session_id=args.successor_session_id,
+                approved_by=args.approved_by, reason=args.reason)
+        elif args.command == "recover-prefix":
+            result = runner.recover_prefix(
+                operation_id=args.operation_id, target_session_id=args.target_session_id,
+                successor_session_id=args.successor_session_id,
+                approved_by=args.approved_by, reason=args.reason,
+                artifact_dir=args.artifact_dir, timeout=args.timeout, verify_timeout=args.verify_timeout)
         elif args.command == "cancel":
             result = runner.cancel(args.operation_id, reason=args.reason)
         else:

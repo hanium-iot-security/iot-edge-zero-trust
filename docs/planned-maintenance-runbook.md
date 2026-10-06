@@ -49,6 +49,31 @@ sudo venv/bin/python -m edge.maintenance.run_planned_maintenance resume \
 
 커밋 이후 서비스 활성 상태·새 FAILED Segment 부재를 확인하고, 최근 45초 안의 필수 Checkpoint가 두 차례 연속 전진하며 ID가 후퇴하지 않아야 `RESUMED` 결과를 반환한다. 점검이 끝나지 않으면 `COMMITTED_HOLD`와 승인 ID·감사를 남긴다. 이미 적용한 승인은 같은 Boot·Session과 감사가 유효한 경우에만 진행 확인을 다시 한다. 확인을 마치면 `ALREADY_RESUMED`를 반환하고 새 전이는 만들지 않는다. 다른 Boot·Session이나 변경된 필수 Stage 프로필에는 `HOLD`하며 기존 장애 복구가 필요하다.
 
+## 첫 재개 Session의 정상 prefix 보존 복구
+
+READY를 소비하기 전에 첫 부팅 Session이 정상 Window를 수집한 뒤 끝의 한 `LATE_CAPTURE`로 FAILED되고 다음 Session으로 넘어갔다면, 일반 `resume`은 계속 대기한다. 이때 첫 Session의 정상 데이터를 버리고 새 RUNNING Session으로 바로 이동하지 않는다. `recover-prefix`는 관리자가 대상·후속 Session·사유를 명시하는 별도 수동 경로이며 부팅 Unit은 이 명령을 자동 실행하지 않는다.
+
+이 경로는 봉인된 종료 Source, 실제 첫 부팅 Session의 정상·연속 prefix, 정확한 미수집 실패 tail, 같은 부팅의 유일한 RUNNING 후속 Session을 함께 검증한다. 첫 Session과 후속 Session 사이 추가 Session·공백·원본 변경이 있으면 HOLD한다. 실패를 정상으로 바꾸거나 정상 prefix를 유지보수 시간에 포함하지 않는다. 사전 검증과 실제 적용 전에 관리자 승인을 받고, 적용 명령에는 그 승인자와 사유를 동일하게 넣는다. `--approved-by`는 권한 인증을 대체하지 않으며 적용은 Linux root만 가능하다.
+
+```bash
+venv/bin/python -m edge.maintenance.run_planned_maintenance dry-run-prefix \
+  --operation-id <READY-승인-ID> --target-session-id <첫-FAILED-Session-UUID> \
+  --successor-session-id <현재-RUNNING-Session-UUID> \
+  --approved-by woomin --reason "Preserve and process the healthy first-boot prefix"
+
+sudo venv/bin/python -m edge.maintenance.run_planned_maintenance recover-prefix \
+  --operation-id <같은-READY-승인-ID> --target-session-id <같은-FAILED-Session-UUID> \
+  --successor-session-id <같은-RUNNING-Session-UUID> \
+  --approved-by woomin --reason "Preserve and process the healthy first-boot prefix" \
+  --artifact-dir output/planned-maintenance --timeout 30 --verify-timeout 120
+```
+
+온라인 백업·SHA·무결성 검사와 복사 DB의 동일 계획 검증을 완료한 뒤 Orchestrator만 잠시 정상 정지한다. Capture·Subscriber는 계속 실행한다. 일반 재개와 같은 공유 Lock·부팅·시간·변경 직전 재검증을 거쳐 두 Packet 경계와 감사·승인 사용을 원자적으로 반영한다. 이동 경계와 유지보수 종료 시각은 **첫 FAILED Session의 첫 Window 시작**이며, 기존 처리 ID·MQTT/Trust 경계·점수·격리·원본을 직접 변경하지 않는다. 기존 승인으로 인정되는 시간은 이 첫 경계까지의 계획 종료 공백뿐이다.
+
+복귀한 실제 처리기가 초기 EMPTY와 정상 prefix를 순서대로 처리한다. `PREFIX_DRAINED_RECOVERY_REQUIRED`는 두 Packet Checkpoint가 정확한 실패 시작 경계에 도달하고 다른 필수 처리·원본 검증도 완료됐다는 뜻이다. 탐지 정상 복귀나 실패 tail 제외 완료를 뜻하지 않는다. 이후 실패 구간을 별도로 승인한 기존 strict live-resume 절차로 첫 FAILED Session에서 후속 RUNNING Session으로 넘기고 정상 Checkpoint 전진을 확인한다. 정상 prefix는 학습·평가 후보에서 통째로 제외하지 않는다.
+
+커밋 후 drain 시간 초과·서비스 복귀 실패·새 부팅/Session/원본 변경은 `COMMITTED_HOLD`다. 적용한 승인을 취소하거나 다시 적용하지 않는다. 같은 대상·후속 Session·복구 승인자·사유로 재실행하면 기존 감사 검증과 read-only drain 확인만 수행하며 새로운 전이를 만들지 않는다. 실제 실패 tail에 대한 승인 없이 Checkpoint를 그 이후로 이동하지 않는다.
+
 ## 조회와 대기
 
 조회는 root 권한 없이 가능하며 DB를 변경하지 않는다.
@@ -88,5 +113,6 @@ CLI 기본값과 부팅 Unit은 Git에서 디렉터리 전체를 제외하는 `o
 - 승인 중복 사용·커밋 응답 유실·재개 도중 중단: 감사 확인, 두 Checkpoint 부분 완료 및 재점프 없음.
 - 백업·무결성 검사 실패: 승인 미소비, 기존 점수·격리 보존.
 - MQTT/Capture 쓰기가 계속되는 재개: 손실·순서 오류와 새로운 FAILED Segment가 없음을 Pi에서 별도로 확인.
+- 첫 부팅 Session의 실패 prefix 복구: 초기 EMPTY와 정상 prefix의 실제 처리, 정확한 실패 시작 경계에서 대기, 별도 tail 복구 전 정상 탐지로 표시하지 않음. 커밋 후 재실행은 감사 확인만 수행.
 
 현재 문서와 테스트는 로컬 구현 검증 범위다. 실장비 서비스 정지·재부팅 및 전원 차단 검증은 운영 승인과 결과 기록을 갖춰 별도로 수행한다.
