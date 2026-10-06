@@ -41,6 +41,10 @@ sudo venv/bin/python -m edge.maintenance.run_planned_maintenance resume \
 
 재개는 READY의 승인과 종료 Session을 다시 검증하고, 다른 Boot ID에서 유일한 새 RUNNING Session 및 첫 정상 Packet Feature를 기다린다. 온라인 백업을 만든 뒤 서비스 전체 실행 중 Lock을 보유하는 Orchestrator만 잠시 정상 정지한다. Capture·Subscriber는 계속 실행한다. Orchestrator·Manual Detector·Extractor의 공유 Lock을 먼저, Firewall Lock을 마지막으로 확보하고 대상·Checkpoint·승인·연속성을 재확인한다. 시간·Boot ID 검사도 쓰기 트랜잭션 전에 끝낸다. **Packet Rule·IF의 Window 경계 두 개, 감사 기록, 승인 사용 완료를 한 트랜잭션으로 반영**한다. Orchestrator는 성공·실패 후 원래 활성 상태로 복귀시키며 기존 처리 ID·MQTT/Trust Checkpoint·점수·격리는 보존한다.
 
+새 Session의 처음 몇 Window가 품질·연속성 검사에 통과한 `EMPTY`라면, 그 이후 최초 `PROCESSED` 구간의 양수 Packet Feature로 준비 상태를 확인한다. `EMPTY`는 집계 대상 트래픽이 없다는 뜻으로 원본 Packet 수가 0이라는 뜻은 아니다. `READY`·실패·누락 구간은 넘어가지 않는다. 재개 경계와 유지보수 종료 시각은 새 Session의 첫 Window 시작을 그대로 사용하므로, 초기 빈 구간과 이후 Feature는 기존 처리기가 순서대로 처리한다. 초기 빈 구간도 감사에 저장하며 적용 전과 적용 후 구간·Feature 변경을 검증한다.
+
+`planned.py`를 배포하면 실행 중인 MQTT Feature Builder를 정상 정지한 뒤 다시 시작해 새 감사 검증을 로드한다. 이전 프로세스의 정상 종료와 새 프로세스의 활성 상태를 확인하며 Capture·Subscriber는 계속 실행한다.
+
 정상 메시지나 정상 Capture 추가를 전체 DB 변경으로 보아 거부하지 않는다. 대신 승인 대상·첫 Window·Source의 봉인된 상태·Checkpoint가 바뀌거나 실패 구간이 있으면 HOLD한다. 승인된 유지보수 시간은 MQTT와 Packet 양쪽의 탐지·정상 학습/평가 후보에서 제외하며 원본은 남긴다. 종료 전에 남은 탐지 이벤트는 먼저 처리한다.
 
 커밋 이후 서비스 활성 상태·새 FAILED Segment 부재를 확인하고, 최근 45초 안의 필수 Checkpoint가 두 차례 연속 전진하며 ID가 후퇴하지 않아야 `RESUMED` 결과를 반환한다. 점검이 끝나지 않으면 `COMMITTED_HOLD`와 승인 ID·감사를 남긴다. 이미 적용한 승인은 같은 Boot·Session과 감사가 유효한 경우에만 진행 확인을 다시 한다. 확인을 마치면 `ALREADY_RESUMED`를 반환하고 새 전이는 만들지 않는다. 다른 Boot·Session이나 변경된 필수 Stage 프로필에는 `HOLD`하며 기존 장애 복구가 필요하다.

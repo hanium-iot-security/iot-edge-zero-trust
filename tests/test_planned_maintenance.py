@@ -570,3 +570,163 @@ def test_missing_or_replaced_seal_trigger_holds_before_checkpoint_changes(db, re
         apply(conn, plan, directory)
     assert [tuple(row) for row in conn.execute("SELECT * FROM detector_checkpoints")] == cps
     assert conn.execute("SELECT count(*) FROM planned_maintenance_resumes").fetchone()[0] == 0
+
+
+def target_with_empty_prefix(conn, *, statuses=("EMPTY", "EMPTY", "PROCESSED")):
+    target_pk = add_session(conn, TARGET, 60, gap=20)
+    segment_ids = []
+    for index, status in enumerate(statuses):
+        segment_id = add_segment(conn, target_pk, 60 + index * 10, status)
+        if status == "EMPTY":
+            conn.execute("UPDATE packet_capture_segments SET packet_count=0 WHERE id=?", (segment_id,))
+        segment_ids.append(segment_id)
+    conn.commit()
+    return segment_ids
+
+
+def inspect_empty_prefix(conn, operation):
+    return inspect_resume(conn, operation["operation_id"], target_session_id=TARGET,
+                          current_boot_id=NEW_BOOT, time_synchronized=True, now=utc(100))
+
+
+def apply_empty_prefix(conn, plan, directory):
+    with transaction(conn):
+        return apply_resume(conn, plan, now=utc(110),
+                            backup_path=str((directory / "backup.db").resolve()), backup_sha256="a" * 64)
+
+
+def test_healthy_empty_prefix_uses_traffic_for_readiness_without_skipping_prefix(db):
+    conn, _, directory = db
+    operation = ready(conn)
+    segments = target_with_empty_prefix(conn)
+    # MQTT arriving during EMPTY Packet Windows is real input, not downtime.
+    for received in (65, 75):
+        conn.execute("INSERT INTO mqtt_logs(device_id,topic,payload,payload_size,received_at) "
+                     "VALUES ('esp32_01','iot/esp32_01/sensor','{}',2,?)", (utc(received),))
+    conn.execute("INSERT INTO feature_logs(device_id,window_start,window_end,publish_count) "
+                 "VALUES ('esp32_01',?,?,1)", (utc(60), utc(70)))
+    conn.commit()
+    before = protected(conn)
+    checkpoints_before = {row["detector_name"]: dict(row)
+                          for row in conn.execute("SELECT * FROM detector_checkpoints")}
+    plan = inspect_empty_prefix(conn, operation)
+    assert plan["maintenance_end"] == utc(60)
+    first = plan["first_target_evidence"]
+    assert first["session"]["first_window_start"] == utc(60)
+    assert first["segment"]["id"] == segments[2]
+    assert first["segment"]["window_start"] == utc(80)
+    assert len(first["empty_prefix"]) == 2
+    assert first["empty_prefix"] == [dict(row) for row in conn.execute(
+        "SELECT * FROM packet_capture_segments WHERE id IN (?,?) ORDER BY window_start,id", segments[:2])]
+    audit = apply_empty_prefix(conn, plan, directory)
+    assert protected(conn) == before
+    assert audit["maintenance_end"] == utc(60)
+    for row in conn.execute("SELECT * FROM detector_checkpoints"):
+        previous = checkpoints_before[row["detector_name"]]
+        if row["detector_name"] in ("packet_rule", "packet_if"):
+            assert row["last_processed_id"] == previous["last_processed_id"] == 2
+            assert row["last_completed_window_end"] == utc(60)
+        else:
+            assert dict(row) == previous
+    assert approved_intervals(conn)[0]["window_end"] == utc(60)
+    changes = conn.total_changes
+    assert apply_empty_prefix(conn, plan, directory) == audit
+    assert conn.total_changes == changes
+    assert conn.execute("SELECT COUNT(*) FROM planned_maintenance_resumes").fetchone()[0] == 1
+
+
+def test_nonempty_first_target_keeps_legacy_evidence_shape_and_committed_audit(db):
+    conn, _, directory = db
+    plan = resume_plan(conn, ready(conn))
+    assert "empty_prefix" not in plan["first_target_evidence"]
+    audit = apply(conn, plan, directory)
+    assert get_resume_audit(conn, plan["operation_id"])["plan_sha256"] == audit["plan_sha256"]
+    assert apply(conn, plan, directory) == audit
+
+
+@pytest.mark.parametrize("statuses", [
+    ("EMPTY",), ("EMPTY", "EMPTY"), ("EMPTY", "READY", "PROCESSED"),
+])
+def test_empty_prefix_cannot_skip_unready_window_or_resume_without_traffic(db, statuses):
+    conn, _, _ = db
+    operation = ready(conn)
+    target_with_empty_prefix(conn, statuses=statuses)
+    before = protected(conn)
+    cps = [tuple(row) for row in conn.execute("SELECT * FROM detector_checkpoints")]
+    with pytest.raises(PlannedMaintenanceError):
+        inspect_empty_prefix(conn, operation)
+    assert protected(conn) == before
+    assert [tuple(row) for row in conn.execute("SELECT * FROM detector_checkpoints")] == cps
+    assert get_operation(conn, operation["operation_id"])["status"] == "READY"
+    assert conn.execute("SELECT COUNT(*) FROM planned_maintenance_resumes").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("change", ["FAILED", "short_duration", "late_start", "missing_first", "missing_middle", "empty_features"])
+def test_unhealthy_or_inconsistent_empty_prefix_holds_before_plan(db, change):
+    conn, _, _ = db
+    operation = ready(conn)
+    segments = target_with_empty_prefix(conn)
+    if change == "FAILED":
+        conn.execute("UPDATE packet_capture_segments SET status='FAILED' WHERE id=?", (segments[0],))
+    elif change == "short_duration":
+        conn.execute("UPDATE packet_capture_segments SET captured_duration_seconds=8.98 WHERE id=?", (segments[0],))
+    elif change == "late_start":
+        conn.execute("UPDATE packet_capture_segments SET start_delay_seconds=1.02 WHERE id=?", (segments[0],))
+    elif change in ("missing_first", "missing_middle"):
+        conn.execute("DELETE FROM packet_capture_segments WHERE id=?", (segments[int(change == "missing_middle")],))
+    else:
+        conn.execute("INSERT INTO packet_feature_logs(capture_segment_id,device_id,peer_ip,direction,window_start,window_end,"
+                     "packet_count,total_bytes,avg_packet_size,max_packet_size) VALUES (?,'esp32_01','192.168.0.4','INBOUND',?,?,1,10,10,10)",
+                     (segments[0], utc(60), utc(70)))
+    conn.commit()
+    with pytest.raises(PlannedMaintenanceError):
+        inspect_empty_prefix(conn, operation)
+    assert get_operation(conn, operation["operation_id"])["status"] == "READY"
+    assert conn.execute("SELECT COUNT(*) FROM planned_maintenance_resumes").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("change", ["segment", "feature"])
+def test_empty_prefix_changes_after_inspection_hold_atomic_apply(db, change):
+    conn, _, directory = db
+    operation = ready(conn)
+    segments = target_with_empty_prefix(conn)
+    plan = inspect_empty_prefix(conn, operation)
+    if change == "segment":
+        # Still eligible; exact bound raw evidence, rather than quality alone,
+        # must detect the change made between inspect and the write lock.
+        conn.execute("UPDATE packet_capture_segments SET captured_duration_seconds=9.5 WHERE id=?", (segments[0],))
+    else:
+        conn.execute("INSERT INTO packet_feature_logs(capture_segment_id,device_id,peer_ip,direction,window_start,window_end,"
+                     "packet_count,total_bytes,avg_packet_size,max_packet_size) VALUES (?,'esp32_01','192.168.0.4','INBOUND',?,?,1,10,10,10)",
+                     (segments[0], utc(60), utc(70)))
+    conn.commit()
+    before = protected(conn)
+    cps = [tuple(row) for row in conn.execute("SELECT * FROM detector_checkpoints")]
+    with pytest.raises(PlannedMaintenanceError):
+        apply_empty_prefix(conn, plan, directory)
+    assert protected(conn) == before
+    assert [tuple(row) for row in conn.execute("SELECT * FROM detector_checkpoints")] == cps
+    assert get_operation(conn, operation["operation_id"])["status"] == "READY"
+    assert conn.execute("SELECT COUNT(*) FROM planned_maintenance_resumes").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("change", ["segment", "feature"])
+def test_committed_empty_prefix_tampering_invalidates_audit_and_exclusions(db, change):
+    conn, _, directory = db
+    operation = ready(conn)
+    segments = target_with_empty_prefix(conn)
+    plan = inspect_empty_prefix(conn, operation)
+    apply_empty_prefix(conn, plan, directory)
+    if change == "segment":
+        conn.execute("UPDATE packet_capture_segments SET captured_duration_seconds=9.5 WHERE id=?", (segments[0],))
+    else:
+        conn.execute("INSERT INTO packet_feature_logs(capture_segment_id,device_id,peer_ip,direction,window_start,window_end,"
+                     "packet_count,total_bytes,avg_packet_size,max_packet_size) VALUES (?,'esp32_01','192.168.0.4','INBOUND',?,?,1,10,10,10)",
+                     (segments[0], utc(60), utc(70)))
+    conn.commit()
+    with pytest.raises(PlannedMaintenanceError):
+        get_resume_audit(conn, plan["operation_id"])
+    with pytest.raises(PlannedMaintenanceError):
+        approved_intervals(conn)
+    assert get_operation(conn, operation["operation_id"])["status"] == "RESUMED"
+    assert conn.execute("SELECT COUNT(*) FROM planned_maintenance_resumes").fetchone()[0] == 1

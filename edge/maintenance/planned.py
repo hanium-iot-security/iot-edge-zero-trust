@@ -391,7 +391,11 @@ def _target_evidence(db, operation, target_id, policy):
     _require(target["capture_gap_start"] == operation["source_final_boundary"]
              and target["capture_gap_end"] == boundary, "Target gap does not bind the planned shutdown boundary.")
     segments = _segments(db, target, policy, allow_ready=True)
-    first = segments[0]
+    empty_prefix = []
+    for first in segments:
+        if first["status"] != "EMPTY":
+            break
+        empty_prefix.append(first)
     _require(first["status"] == "PROCESSED", "The first full new Packet Feature is not ready.")
     features = _rows(db, "SELECT * FROM packet_feature_logs WHERE capture_segment_id=:id ORDER BY id",
                      {"id": first["id"]})
@@ -404,8 +408,11 @@ def _target_evidence(db, operation, target_id, policy):
                       "AND unixepoch(window_end)>unixepoch(:start)",
                       {"start": operation["source_final_boundary"], "end": boundary}),
              "Packet Features inside planned downtime cannot be skipped.")
-    return {"session": {key: target[key] for key in ("id", "session_id", "capture_interface", "started_at", "first_window_start")},
-            "segment": first, "features_sha256": _digest(features), "feature_count": len(features)}
+    evidence = {"session": {key: target[key] for key in ("id", "session_id", "capture_interface", "started_at", "first_window_start")},
+                "segment": first, "features_sha256": _digest(features), "feature_count": len(features)}
+    if empty_prefix:
+        evidence["empty_prefix"] = empty_prefix
+    return evidence
 
 
 def inspect_resume(conn, operation_id, *, target_session_id, current_boot_id, time_synchronized, now,
@@ -522,6 +529,20 @@ def _validated_audit(db, operation, *, check_current_checkpoints=False):
                      {"id": first["segment"]["id"]})
     _require(segment == first["segment"] and _digest(features) == first["features_sha256"]
              and len(features) == first["feature_count"], "First target Packet evidence changed.")
+    empty_prefix = first.get("empty_prefix", [])
+    if empty_prefix:
+        prefix = _rows(db, "SELECT * FROM packet_capture_segments WHERE capture_session_id=:session "
+                       "AND window_start<:ready ORDER BY window_start,id",
+                       {"session": target["id"], "ready": segment["window_start"]})
+        _require(prefix == empty_prefix and prefix[0]["window_start"] == target["first_window_start"]
+                 and all(item["status"] == "EMPTY" for item in prefix), "First target EMPTY prefix changed.")
+        prefix_features = _rows(db, "SELECT f.id FROM packet_feature_logs f JOIN packet_capture_segments s "
+                               "ON s.id=f.capture_segment_id WHERE s.capture_session_id=:session "
+                               "AND s.window_start<:ready LIMIT 1",
+                               {"session": target["id"], "ready": segment["window_start"]})
+        _require(not prefix_features, "First target EMPTY prefix gained Packet Features.")
+    else:
+        _require(segment["window_start"] == target["first_window_start"], "First target Packet boundary changed.")
     current = (_checkpoints(db, tuple((name, row["source_table"]) for name, row in sealed.items()))
                if check_current_checkpoints else None)
     for name in PACKET_DETECTORS:
