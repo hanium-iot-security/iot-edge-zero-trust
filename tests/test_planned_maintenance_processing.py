@@ -2,6 +2,7 @@
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import csv
+from pathlib import Path
 import sqlite3
 from uuid import uuid4
 
@@ -10,14 +11,19 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from ai.export_normal_features import export_normal_features
+from ai.predict_packet_isolation_forest import PacketIFArtifact, PacketIFPrediction
 from db.migration_runner import apply_migrations
 from edge.detection import runtime_checkpoint_repository as checkpoints
 from edge.detection.detector_contract import DetectorRunResult
 from edge.detection.mqtt_adapters import MqttFeatureRuleStage, MqttMessageRuleStage, MqttIsolationForestStage
 from edge.detection.packet_rule_detector import PacketRuleDetectorStage
+from edge.detection.packet_ai_detector import PacketIsolationForestStage
 from edge.features.collect_feature_logs import produce_mqtt_features_until
 from edge.features.run_mqtt_feature_builder import produce_once
-from edge.maintenance.planned import request_stop, finalize_stop, inspect_resume, apply_resume, REQUIRED_CHECKPOINTS
+from edge.maintenance.planned import (
+    PlannedMaintenanceError, request_stop, finalize_stop, inspect_resume,
+    apply_resume, REQUIRED_CHECKPOINTS,
+)
 from edge.maintenance.processing import dataset_maintenance_windows, overlaps_maintenance
 from edge.orchestration.packet_stage_readiness import PacketFeatureReadyStage
 from edge.orchestration.run_detection_orchestrator import run_orchestration_cycle, CYCLE_COMPLETED
@@ -232,6 +238,148 @@ def test_paired_resume_catches_up_mqtt_trust_normally_then_processes_target(prep
         assert db.execute(text("SELECT trust_score FROM devices")).scalar() == 57
         assert db.execute(text("SELECT COUNT(*) FROM detection_events")).scalar() == 1
         assert checkpoints.get_detector_checkpoint(db, detector_name="packet_rule", source_table="packet_feature_logs")["last_processed_id"] == target_packet
+
+
+def resume_with_empty_prefix(path, operation, *, raw_packet_count=16):
+    target, boot = str(uuid4()), str(uuid4())
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        target_pk = insert(conn, "packet_capture_sessions", session_id=target, capture_interface="eth0",
+                           started_at=utc(25), first_window_start=utc(30), status="RUNNING",
+                           capture_gap_start=utc(10), capture_gap_end=utc(30))
+        empty_ids = [insert(conn, "packet_capture_segments", capture_session_id=target_pk,
+                            file_name=f"empty-{start}.pcap", capture_interface="eth0", window_start=utc(start),
+                            window_end=utc(start + 10), status="EMPTY", packet_count=raw_packet_count,
+                            start_delay_seconds=0, captured_duration_seconds=10)
+                     for start in (30, 40)]
+        traffic_id = packet(conn, target_pk, 50)
+        conn.commit()
+        plan = inspect_resume(conn, operation, target_session_id=target, current_boot_id=boot,
+                              time_synchronized=True, now=BASE + timedelta(seconds=65))
+        conn.execute("BEGIN IMMEDIATE")
+        apply_resume(conn, plan, now=BASE + timedelta(seconds=65),
+                     backup_path=str(path.with_suffix(".backup.db")), backup_sha256="a" * 64)
+        conn.commit()
+    return plan, empty_ids, traffic_id
+
+
+def real_packet_if_with_normal_predictions():
+    predicted_rows = []
+
+    def predict_normal(_artifact, rows):
+        predicted_rows.extend(rows)
+        return [PacketIFPrediction("empty-prefix-test", 0.2, -0.2, 0.1, False, ()) for _ in rows]
+
+    policy = CapturePolicy()
+    artifact = PacketIFArtifact(
+        model=None,  # type: ignore[arg-type] -- numerical inference is injected below.
+        model_path=Path("unused-model.joblib"), metadata_path=Path("unused-metadata.json"),
+        training_report_path=Path("unused-training.json"), model_version="empty-prefix-test", threshold=0.1,
+        bundle_sha256="d" * 64, capture_policy=policy, metadata={},
+    )
+    return (PacketIsolationForestStage(artifact=artifact, expected_model_version="empty-prefix-test",
+                                       capture_policy=policy, predict_rows=predict_normal), predicted_rows)
+
+
+@pytest.mark.parametrize("raw_packet_count", [0, 16])
+def test_empty_prefix_resume_pipeline_processes_from_first_boundary_and_preserves_isolation(prepared, raw_packet_count):
+    path, factory, operation = prepared
+    with closing(sqlite3.connect(path)) as conn:
+        # Already isolated devices stay isolated. This test exercises DB state,
+        # not the external iptables worker or hardware access-gap guarantees.
+        insert(conn, "devices", device_id="esp32_02", ip_address="192.168.0.5", status="isolated", trust_score=20)
+        insert_revision_raw(conn, device_id="esp32_02", registration_state="ACTIVE", effective_from=utc(-10))
+        insert(conn, "firewall_rules", device_id="esp32_02", source_ip="192.168.0.5",
+               status="APPLIED", reason="existing isolation")
+        insert(conn, "isolation_history", device_id="esp32_02", action="ISOLATED", trust_score=20)
+        messages(conn, 10, 3, malformed=True)
+        messages(conn, 20, 3, malformed=True)
+        for start in (30, 40, 50):
+            messages(conn, start, 2)
+        conn.commit()
+        protected = {table: conn.execute(f"SELECT * FROM {table} ORDER BY id" if table != "devices"
+                                         else "SELECT * FROM devices ORDER BY device_id").fetchall()
+                     for table in ("devices", "device_policy_revisions", "firewall_rules", "isolation_history", "mqtt_logs")}
+        cp_before = conn.execute("SELECT * FROM detector_checkpoints ORDER BY detector_name").fetchall()
+    plan, empty_ids, traffic_id = resume_with_empty_prefix(path, operation, raw_packet_count=raw_packet_count)
+    assert plan["maintenance_end"] == utc(30)
+    assert plan["first_target_evidence"]["segment"]["window_start"] == utc(50)
+    with factory() as db:
+        for name, source, last_id, boundary, updated in cp_before:
+            row = checkpoints.get_detector_checkpoint(db, detector_name=name, source_table=source)
+            assert row["last_processed_id"] == last_id
+            assert row["last_completed_window_end"] == utc(30 if name in ("packet_rule", "packet_if") else 10)
+        windows = dataset_maintenance_windows(db)
+        assert windows == ((BASE + timedelta(seconds=10), BASE + timedelta(seconds=30)),)
+        assert not overlaps_maintenance(windows, BASE + timedelta(seconds=30), BASE + timedelta(seconds=40))
+    with factory.begin() as db:
+        producer = produce_mqtt_features_until(db, producer_cutoff=BASE + timedelta(seconds=40))
+        assert producer.created_feature_count == 1
+        assert db.execute(text("SELECT window_start FROM feature_logs ORDER BY id")).scalars().all() == [utc(0), utc(30)]
+    ai, predicted_rows = real_packet_if_with_normal_predictions()
+    stages = (MqttFeatureRuleStage(), MqttMessageRuleStage(),
+              PacketFeatureReadyStage(PacketRuleDetectorStage(capture_policy=CapturePolicy())), PacketFeatureReadyStage(ai))
+    registry = StageRegistry(tuple(ConfiguredStage(stage.detector_name, stage, True) for stage in stages))
+    catchup = run_orchestration_cycle(session_factory=factory, registry=registry)
+    assert catchup.status == CYCLE_COMPLETED and catchup.cutoff == BASE + timedelta(seconds=30)
+    assert predicted_rows == []
+    empty_window = run_orchestration_cycle(session_factory=factory, registry=registry)
+    assert empty_window.status == CYCLE_COMPLETED
+    assert empty_window.range_start == BASE + timedelta(seconds=30)
+    assert empty_window.cutoff == BASE + timedelta(seconds=40)
+    assert predicted_rows == []
+    with factory() as db:
+        for name in ("packet_rule", "packet_if"):
+            cp = checkpoints.get_detector_checkpoint(db, detector_name=name, source_table="packet_feature_logs")
+            assert cp["last_processed_id"] == 1  # EMPTY cannot erase or jump the real source ID.
+            assert cp["last_completed_window_end"] == utc(40)
+    with factory.begin() as db:
+        producer = produce_mqtt_features_until(db, producer_cutoff=BASE + timedelta(seconds=60))
+        assert producer.created_feature_count == 2
+        assert db.execute(text("SELECT window_start FROM feature_logs ORDER BY id")).scalars().all() == [utc(0), utc(30), utc(40), utc(50)]
+    processing = run_orchestration_cycle(session_factory=factory, registry=registry)
+    assert processing.status == CYCLE_COMPLETED
+    assert processing.range_start == BASE + timedelta(seconds=40)
+    assert processing.cutoff == BASE + timedelta(seconds=60)
+    assert len(predicted_rows) == 1 and predicted_rows[0]["packet_count"] == 2
+    with factory() as db:
+        for name, source in REQUIRED_CHECKPOINTS:
+            cp = checkpoints.get_detector_checkpoint(db, detector_name=name, source_table=source)
+            assert cp["last_completed_window_end"] == utc(60)
+            if name in ("packet_rule", "packet_if"):
+                assert cp["last_processed_id"] == traffic_id
+        assert db.execute(text("SELECT COUNT(*) FROM detection_events")).scalar() == 0
+        assert db.execute(text("SELECT COUNT(*) FROM trust_score_history")).scalar() == 0
+        for segment in empty_ids:
+            row = db.execute(text("SELECT status,packet_count FROM packet_capture_segments WHERE id=:id"), {"id": segment}).one()
+            assert tuple(row) == ("EMPTY", raw_packet_count)
+            assert db.execute(text("SELECT COUNT(*) FROM packet_feature_logs WHERE capture_segment_id=:id"), {"id": segment}).scalar() == 0
+    with closing(sqlite3.connect(path)) as conn:
+        after = {table: conn.execute(f"SELECT * FROM {table} ORDER BY id" if table != "devices"
+                                    else "SELECT * FROM devices ORDER BY device_id").fetchall()
+                 for table in protected}
+        assert after == protected
+
+
+def test_changed_committed_empty_prefix_holds_producer_before_consuming_mqtt(prepared):
+    path, factory, operation = prepared
+    plan, empty_ids, _ = resume_with_empty_prefix(path, operation)
+    with closing(sqlite3.connect(path)) as conn:
+        messages(conn, 30)
+        insert(conn, "packet_feature_logs", capture_segment_id=empty_ids[0], device_id="esp32_01",
+               peer_ip="192.168.0.4", direction="INBOUND", window_start=utc(30), window_end=utc(40),
+               packet_count=2, total_bytes=100, avg_packet_size=50, max_packet_size=50)
+        conn.commit()
+        before = conn.execute("SELECT * FROM detector_checkpoints ORDER BY detector_name").fetchall()
+        raw = conn.execute("SELECT * FROM mqtt_logs ORDER BY id").fetchall()
+    with pytest.raises(PlannedMaintenanceError, match="EMPTY prefix"):
+        with factory.begin() as db:
+            produce_mqtt_features_until(db, producer_cutoff=BASE + timedelta(seconds=60))
+    with closing(sqlite3.connect(path)) as conn:
+        assert conn.execute("SELECT * FROM detector_checkpoints ORDER BY detector_name").fetchall() == before
+        assert conn.execute("SELECT * FROM mqtt_logs ORDER BY id").fetchall() == raw
+        assert conn.execute("SELECT COUNT(*) FROM feature_logs").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM planned_maintenance_resumes WHERE operation_id=?", (plan["operation_id"],)).fetchone()[0] == 1
 
 
 def test_candidate_qc_holds_on_maintenance_overlap_without_mutating_snapshot(package, monkeypatch):
