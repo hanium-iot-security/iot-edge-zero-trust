@@ -10,8 +10,8 @@
 
 | 파일 | 용도 |
 | --- | --- |
-| `tests/test_phase8_sunwoo_packet_rule_review.py` | P8-05 Packet Rule 기기별 임계값·경계·근거 반례 (V05·V06·V07·V10·V11) |
-| `tests/test_phase8_sunwoo_packet_scenarios.py` | P8-10 Packet 공격/회귀 시나리오: MQTT Rule·Packet Rule → Trust → Firewall 기대 결과 (V08·V09·V12·V23) |
+| `tests/test_phase8_packet_rule_review.py` | P8-05 Packet Rule 기기별 임계값·경계·근거 반례 (V05·V06·V07·V10·V11) |
+| `tests/test_phase8_packet_scenarios.py` | P8-10 Packet 공격/회귀 시나리오: MQTT Rule·Packet Rule → Trust → Firewall 기대 결과 (V08·V09·V12·V23) |
 | `tests/packet_review_support.py` | 위 두 테스트의 Migration 기반 임시 DB Fixture 보조 함수 |
 | `edge/scenarios/packet_review_report.py` | 복사 DB에서 Packet Event·정책 revision·Trust 이력·차단 요청을 대조하는 읽기 전용 CLI |
 
@@ -88,7 +88,7 @@ Recovery 결과(V15·V22)와 함께 확인한다. 이 문서의 로컬 PASS는 P
 ## 5. 실행한 검증
 
 ```bash
-python -m pytest -q tests/test_phase8_sunwoo_packet_rule_review.py tests/test_phase8_sunwoo_packet_scenarios.py
+python -m pytest -q tests/test_phase8_packet_rule_review.py tests/test_phase8_packet_scenarios.py
 python -m pytest -q tests backend/tests
 ```
 
