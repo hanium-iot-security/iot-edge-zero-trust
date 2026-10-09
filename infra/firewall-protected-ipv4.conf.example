@@ -1,0 +1,7 @@
+# Install as /etc/hanium/firewall-protected-ipv4.conf, root:root, mode 0644.
+# /etc/hanium must be root owned and not writable by other users.
+# Add one approved RFC1918 IPv4 per line: router, administration workstation,
+# trusted gateways and other hosts which must retain access to the Pi.
+# At least one real approved address is required before insert is enabled.
+# Actual IPv4 addresses assigned to the Pi are additionally protected at runtime.
+# No guessed addresses are supplied by this template.

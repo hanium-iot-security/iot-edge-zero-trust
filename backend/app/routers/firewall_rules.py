@@ -1,6 +1,9 @@
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from sqlalchemy.orm import Session
 
 from backend.app.database import get_db
@@ -8,7 +11,9 @@ from backend.app.schemas.firewall_release_schema import (
     FirewallReleaseRequestCreate,
     FirewallReleaseRequestResponse,
 )
-from backend.app.schemas.firewall_rule_schema import FirewallRuleListResponse
+from backend.app.schemas.firewall_rule_schema import (
+    FirewallRuleListResponse, FirewallScopeExtensionCreate, FirewallScopeExtensionResponse,
+)
 from backend.app.security import RecoveryAdminContext, require_recovery_admin
 from backend.app.services.firewall_release_request_service import (
     FirewallReleaseRequestDataError,
@@ -19,9 +24,41 @@ from backend.app.services.firewall_rule_query_service import (
     FirewallRuleDataError,
     list_firewall_rules,
 )
+from backend.app.services.firewall_scope_extension_service import (
+    FirewallScopeExtensionError, create_firewall_scope_extension,
+)
+from edge.policy.device_policy import DevicePolicyError
 
 
-router = APIRouter(prefix="/firewall-rules", tags=["firewall-rules"])
+class FirewallManagementRoute(APIRoute):
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def management_handler(request):
+            try:
+                return await handler(request)
+            except RequestValidationError as error:
+                return JSONResponse(status_code=422, content={"detail": [
+                    {key: item[key] for key in ("type", "loc", "msg")} for item in error.errors()
+                ]})
+            except DevicePolicyError:
+                return JSONResponse(status_code=422, content={"detail": "INVALID_SCOPE_EXTENSION_REQUEST"})
+
+        return management_handler
+
+
+router = APIRouter(prefix="/firewall-rules", tags=["firewall-rules"], route_class=FirewallManagementRoute)
+
+
+@router.post("/{source_rule_id}/scope-extension-requests", response_model=FirewallScopeExtensionResponse,
+             status_code=status.HTTP_201_CREATED)
+def post_scope_extension(payload: FirewallScopeExtensionCreate, source_rule_id: int = Path(ge=1, le=9223372036854775807),
+                         db: Session = Depends(get_db), admin: RecoveryAdminContext = Depends(require_recovery_admin)):
+    try:
+        return create_firewall_scope_extension(db, source_rule_id=source_rule_id,
+                                               admin=admin, **payload.model_dump())
+    except FirewallScopeExtensionError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail) from None
 
 
 @router.get("", response_model=FirewallRuleListResponse)

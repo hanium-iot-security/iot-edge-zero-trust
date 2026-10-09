@@ -125,7 +125,7 @@ def test_release_request_rejects_blank_reason_as_validation_error(api_client) ->
     assert _release_request_count(db_path) == 0
 
 
-@pytest.mark.parametrize("status", ["PENDING", "FAILED", "REMOVED"])
+@pytest.mark.parametrize("status", ["PENDING", "REMOVED"])
 def test_release_request_rejects_non_applied_rule(api_client, status: str) -> None:
     client, db_path = api_client
     rule_id = _seed_rule(db_path, status=status)
@@ -137,6 +137,17 @@ def test_release_request_rejects_non_applied_rule(api_client, status: str) -> No
     assert detail["failure_code"] == "FIREWALL_RULE_NOT_APPLIED"
     assert detail["current_status"] == status
     assert _release_request_count(db_path) == 0
+
+
+def test_failed_rule_can_request_exact_audited_cleanup(api_client) -> None:
+    client, db_path = api_client
+    rule_id = _seed_rule(db_path, status="FAILED")
+    response = _post_release_request(client, rule_id)
+    assert response.status_code == 201
+    assert response.json()["item"]["firewall_rule_id"] == rule_id
+    assert response.json()["item"]["requested_by"] == "operator@example"
+    assert _rule_status(db_path, rule_id) == "FAILED"
+    assert _release_request_count(db_path) == 1
 
 
 def test_release_request_returns_404_for_missing_rule(api_client) -> None:

@@ -13,6 +13,7 @@ ExecStart=/home/pi/iot-edge-zero-trust/venv/bin/python -m edge.trust.run_firewal
 # sudo uses the same narrow root-owned firewall wrapper as Firewall Worker.
 # This service code only invokes the wrapper's read-only `list` operation.
 NoNewPrivileges=false
+ReadOnlyPaths=/etc/hanium
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=false

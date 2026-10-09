@@ -34,6 +34,7 @@ def test_snapshot_service_runs_dedicated_read_only_observer_as_pi() -> None:
         "-m edge.trust.run_firewall_runtime_snapshot"
     )
     assert service["NoNewPrivileges"] == "false"
+    assert service["ReadOnlyPaths"] == "/etc/hanium"
 
 
 def test_api_service_keeps_no_new_privileges_enabled() -> None:
@@ -62,3 +63,11 @@ def test_fastapi_composition_root_wires_snapshot_verifier() -> None:
 def test_snapshot_units_use_linux_line_endings() -> None:
     assert b"\r\n" not in SNAPSHOT_SERVICE.read_bytes()
     assert b"\r\n" not in SNAPSHOT_TIMER.read_bytes()
+
+
+def test_worker_and_wrapper_use_root_controlled_protection_configuration():
+    worker = _load_unit(Path("infra/systemd/firewall-worker.service"))["Service"]
+    assert worker["ReadOnlyPaths"] == "/etc/hanium"
+    example = Path("infra/firewall-protected-ipv4.conf.example").read_text()
+    assert "root:root" in example and "0644" in example
+    assert "No guessed addresses" in example

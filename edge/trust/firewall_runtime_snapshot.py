@@ -33,9 +33,11 @@ from edge.trust.firewall_worker import (
     FirewallTransientError,
     IptablesRunner,
 )
+from edge.trust.firewall_scope import MQTT_IPV4_TCP_1883, PI_INPUT_IPV4_ALL, row_scope
 
 
-SNAPSHOT_SCHEMA_VERSION = "firewall-runtime-snapshot-v1"
+LEGACY_SNAPSHOT_SCHEMA_VERSION = "firewall-runtime-snapshot-v1"
+SNAPSHOT_SCHEMA_VERSION = "firewall-runtime-snapshot-v2"
 DEFAULT_MAX_FUTURE_SKEW_SECONDS = 5.0
 
 
@@ -176,6 +178,8 @@ def _parse_managed_rules(stdout: str) -> list[dict[str, Any]]:
         if COMMENT_PREFIX not in line:
             continue
         managed.append(_parse_managed_rule_line(line))
+    if len({item["rule_id"] for item in managed}) != len(managed):
+        raise FirewallRuntimeSnapshotError("Duplicate managed rule identity.")
     managed.sort(key=lambda item: (int(item["rule_id"]), str(item["source_ip"])))
     return managed
 
@@ -197,20 +201,28 @@ def _parse_managed_rule_line(line: str) -> dict[str, Any]:
             f"Managed firewall rule contains unsupported inversion: {line!r}"
         )
 
-    protocol = _option_value(tokens, "-p")
-    source = _option_value(tokens, "-s")
-    dest_port = _option_value(tokens, "--dport")
-    comment = _option_value(tokens, "--comment")
-    action = _option_value(tokens, "-j")
-
-    if protocol != PROTOCOL:
-        raise FirewallRuntimeSnapshotError(
-            f"Managed firewall rule has unexpected protocol: {line!r}"
-        )
-    if dest_port != str(DEST_PORT):
-        raise FirewallRuntimeSnapshotError(
-            f"Managed firewall rule has unexpected destination port: {line!r}"
-        )
+    options = {}
+    for index in range(2, len(tokens), 2):
+        option = tokens[index]
+        if option not in ("-s", "-p", "--dport", "-m", "--comment", "-j") or index + 1 >= len(tokens):
+            raise FirewallRuntimeSnapshotError("Managed rule has an unknown match or scope.")
+        options.setdefault(option, []).append(tokens[index + 1])
+    if any(len(values) != 1 for option, values in options.items() if option != "-m"):
+        raise FirewallRuntimeSnapshotError("Managed rule repeats match options.")
+    protocol = options.get("-p", [None])[0]
+    source = options.get("-s", [None])[0]
+    dest_port = options.get("--dport", [None])[0]
+    comment = options.get("--comment", [None])[0]
+    action = options.get("-j", [None])[0]
+    modules = options.get("-m", [])
+    if protocol == PROTOCOL and dest_port == str(DEST_PORT):
+        scope = MQTT_IPV4_TCP_1883
+        if sorted(modules) not in (["comment"], ["comment", "tcp"]):
+            raise FirewallRuntimeSnapshotError("Managed rule has an unknown legacy match.")
+    elif protocol is None and dest_port is None and modules == ["comment"]:
+        scope = PI_INPUT_IPV4_ALL
+    else:
+        raise FirewallRuntimeSnapshotError("Managed rule has an unknown protocol, port or scope.")
     if action != ACTION:
         raise FirewallRuntimeSnapshotError(
             f"Managed firewall rule has unexpected target: {line!r}"
@@ -221,23 +233,13 @@ def _parse_managed_rule_line(line: str) -> dict[str, Any]:
         )
 
     rule_id_text = comment.removeprefix(COMMENT_PREFIX)
-    if not rule_id_text.isdigit() or int(rule_id_text) <= 0:
+    if not rule_id_text.isdigit() or int(rule_id_text) <= 0 or str(int(rule_id_text)) != rule_id_text:
         raise FirewallRuntimeSnapshotError(
             f"Managed firewall rule has invalid rule id: {line!r}"
         )
 
     source_ip = _single_private_host_ipv4(source, line=line)
-    return {"rule_id": int(rule_id_text), "source_ip": source_ip}
-
-
-def _option_value(tokens: list[str], option: str) -> str | None:
-    try:
-        index = tokens.index(option)
-    except ValueError:
-        return None
-    if index + 1 >= len(tokens):
-        return None
-    return tokens[index + 1]
+    return {"rule_id": int(rule_id_text), "source_ip": source_ip, "scope": scope}
 
 
 def _single_private_host_ipv4(value: str | None, *, line: str) -> str:
@@ -266,7 +268,8 @@ def _single_private_host_ipv4(value: str | None, *, line: str) -> str:
 def _validate_snapshot_payload(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise FirewallRuntimeSnapshotError("Runtime firewall snapshot root must be an object.")
-    if payload.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
+    schema = payload.get("schema_version")
+    if schema not in (SNAPSHOT_SCHEMA_VERSION, LEGACY_SNAPSHOT_SCHEMA_VERSION):
         raise FirewallRuntimeSnapshotError(
             f"Unsupported runtime firewall snapshot schema: {payload.get('schema_version')!r}."
         )
@@ -294,7 +297,17 @@ def _validate_snapshot_payload(payload: Any) -> dict[str, Any]:
             raise FirewallRuntimeSnapshotError("Runtime firewall snapshot contains invalid rule_id.")
         if source_ip is None:
             raise FirewallRuntimeSnapshotError("Runtime firewall snapshot contains invalid source_ip.")
-        normalized_rules.append({"rule_id": rule_id, "source_ip": source_ip})
+        try:
+            scope = row_scope(item)
+            if schema == SNAPSHOT_SCHEMA_VERSION and "scope" not in item:
+                raise ValueError("v2 scope is required")
+            if schema == LEGACY_SNAPSHOT_SCHEMA_VERSION and scope != MQTT_IPV4_TCP_1883:
+                raise ValueError("v1 only represents legacy MQTT rules")
+        except ValueError as error:
+            raise FirewallRuntimeSnapshotError("Runtime firewall snapshot scope is invalid.") from error
+        normalized_rules.append({"rule_id": rule_id, "source_ip": source_ip, "scope": scope})
+    if len({item["rule_id"] for item in normalized_rules}) != len(normalized_rules):
+        raise FirewallRuntimeSnapshotError("Runtime firewall snapshot has duplicate rule identities.")
 
     error = payload.get("error")
     if error is not None and not isinstance(error, str):

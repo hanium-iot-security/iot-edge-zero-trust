@@ -6,7 +6,8 @@ iptables는 DB처럼 Rollback할 수 없으므로 "먼저 PENDING을 남기고 �
 순서를 지켜야 재시도와 복구가 가능합니다.
 
 적용·확인·삭제·Reconciliation은 모두 `build_match_args()`가 만드는 동일한 Match
-Specification(Source IP, TCP, 목적지 Port 1883, Comment, DROP)을 사용합니다.
+Specification(Source IP, 승인된 Scope, Comment, DROP)을 사용합니다. 기존 Scope는
+TCP 목적지 Port 1883이며, 관리자 승인 Scope는 Pi INPUT의 모든 IPv4 트래픽입니다.
 서로 다른 Specification을 쓰면 "적용은 됐는데 확인·삭제가 안 되는" 상태가 생깁니다.
 
 DROP Rule은 `-I INPUT 1`로 Chain 맨 앞에 넣습니다. 뒤에 붙이면 선행 ACCEPT Rule에서
@@ -15,7 +16,6 @@ DROP Rule은 `-I INPUT 1`로 Chain 맨 앞에 넣습니다. 뒤에 붙이면 선
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 import ipaddress
@@ -29,10 +29,11 @@ from sqlalchemy.orm import Session
 
 from edge.detection.phase4_time import require_utc_whole_second
 from edge.trust import firewall_release_repository, firewall_repository
+from edge.trust.firewall_scope import MQTT_IPV4_TCP_1883, PI_INPUT_IPV4_ALL, row_scope
 
 logger = logging.getLogger(__name__)
 
-# Phase 4의 실제 차단 범위는 고정이다. 설정으로 넓히지 않는다.
+# Legacy Scope의 프로토콜/포트는 고정이다. 관리자 확장은 별도 Scope만 허용한다.
 CHAIN = "INPUT"
 PROTOCOL = "tcp"
 DEST_PORT = 1883
@@ -86,6 +87,10 @@ class FirewallRuleSpec:
 
     rule_id: int
     source_ip: str
+    scope: str = MQTT_IPV4_TCP_1883
+
+    def __post_init__(self):
+        row_scope({"scope": self.scope})
 
     @property
     def comment(self) -> str:
@@ -195,6 +200,8 @@ class WrapperIptablesRunner:
             if spec is None:
                 raise ValueError(f"{operation_name} requires a rule spec")
             command += [spec.source_ip, str(spec.rule_id)]
+            if spec.scope != MQTT_IPV4_TCP_1883:
+                command.append(spec.scope)
 
         try:
             completed = subprocess.run(  # noqa: S603 - 인자 배열만 사용하며 shell을 쓰지 않는다
@@ -226,7 +233,7 @@ def build_match_args(spec: FirewallRuleSpec) -> list[str]:
     이 함수 한 곳만 바꾸면 네 경로가 함께 바뀝니다. 경로마다 다른 Specification을
     쓰면 "적용은 됐는데 확인·삭제가 안 되는" 상태가 생깁니다.
     """
-    return [
+    match = [
         "-p",
         PROTOCOL,
         "-s",
@@ -240,6 +247,9 @@ def build_match_args(spec: FirewallRuleSpec) -> list[str]:
         "-j",
         ACTION,
     ]
+    if spec.scope == PI_INPUT_IPV4_ALL:
+        return ["-s", spec.source_ip, "-m", "comment", "--comment", spec.comment, "-j", ACTION]
+    return match
 
 
 def build_rule_args(spec: FirewallRuleSpec, *, operation: str) -> list[str]:
@@ -251,7 +261,7 @@ def build_rule_args(spec: FirewallRuleSpec, *, operation: str) -> list[str]:
     return [operation, CHAIN, *build_match_args(spec)]
 
 
-def validate_rule_row(row: dict[str, Any], policy: FirewallPolicy) -> FirewallRuleSpec:
+def validate_rule_row(row: dict[str, Any], policy: FirewallPolicy, *, for_cleanup: bool = False) -> FirewallRuleSpec:
     """실행 직전에 차단 대상을 다시 검증합니다.
 
     DB CHECK 제약이 이미 protocol·dest_port·action을 강제하지만, 실제 OS 명령을
@@ -261,12 +271,17 @@ def validate_rule_row(row: dict[str, Any], policy: FirewallPolicy) -> FirewallRu
     if rule_id is None:
         raise FirewallValidationError("firewall rule row has no id")
 
-    protocol = str(row.get("protocol", "")).lower()
-    if protocol != PROTOCOL:
-        raise FirewallValidationError(f"unsupported protocol: {row.get('protocol')!r}")
-
-    if int(row.get("dest_port", -1)) != DEST_PORT:
-        raise FirewallValidationError(f"unsupported dest_port: {row.get('dest_port')!r}")
+    try:
+        scope = row_scope(row)
+        if scope == PI_INPUT_IPV4_ALL:
+            if row.get("protocol") is not None or row.get("dest_port") is not None:
+                raise ValueError("wide scope must have null protocol and port")
+        elif str(row.get("protocol", "")).lower() != PROTOCOL or int(row.get("dest_port", -1)) != DEST_PORT:
+            raise ValueError("legacy scope requires TCP port 1883")
+        if isinstance(rule_id, bool) or int(rule_id) <= 0:
+            raise ValueError("invalid rule identity")
+    except (ValueError, TypeError) as error:
+        raise FirewallValidationError(str(error)) from error
 
     action = str(row.get("action", "")).upper()
     if action != ACTION:
@@ -274,10 +289,10 @@ def validate_rule_row(row: dict[str, Any], policy: FirewallPolicy) -> FirewallRu
 
     source_ip = str(row.get("source_ip", ""))
     address = _require_private_ipv4(source_ip)
-    if str(address) in policy.protected_ips:
+    if not for_cleanup and str(address) in policy.protected_ips:
         raise FirewallValidationError(f"protected IP must not be blocked: {source_ip}")
 
-    return FirewallRuleSpec(rule_id=int(rule_id), source_ip=str(address))
+    return FirewallRuleSpec(rule_id=int(rule_id), source_ip=str(address), scope=scope)
 
 
 def rule_exists(runner: IptablesRunner, spec: FirewallRuleSpec) -> bool:
@@ -418,21 +433,30 @@ def release_rule(
     runner: IptablesRunner,
     policy: FirewallPolicy,
     now: datetime,
+    approved_request_id: int | None = None,
 ) -> bool:
-    """APPLIED Rule을 실제로 제거하고 REMOVED로 기록합니다."""
+    """APPLIED 또는 감사 승인된 FAILED Rule을 제거하고 REMOVED로 기록합니다."""
     now_utc = require_utc_whole_second(now, "now")
     row = _get_rule_row(db, rule_id)
     if row is None:
         raise FirewallValidationError(f"firewall rule not found: {rule_id}")
-    if row["status"] != firewall_repository.APPLIED:
+    if row["status"] == firewall_repository.FAILED:
+        request = db.execute(text("SELECT id FROM firewall_release_requests WHERE id=:request_id "
+                                  "AND firewall_rule_id=:rule_id AND status='PENDING'"),
+                             {"request_id": approved_request_id, "rule_id": rule_id}).first()
+        if request is None:
+            raise FirewallValidationError("FAILED cleanup requires an audited pending release request")
+    elif row["status"] != firewall_repository.APPLIED:
         raise FirewallValidationError(
             f"firewall rule is not APPLIED: {rule_id} (status={row['status']})"
         )
 
-    spec = FirewallRuleSpec(rule_id=rule_id, source_ip=str(row["source_ip"]))
+    spec = validate_rule_row(row, policy, for_cleanup=True)
     removed_from_os = False
     if rule_exists(runner, spec):
         delete_rule(runner, spec)
+        if rule_exists(runner, spec):
+            raise FirewallTransientError("exact scoped rule still present after deletion")
         removed_from_os = True
     else:
         logger.warning(
@@ -480,13 +504,14 @@ def process_pending_release_requests(
         rule_id = int(row["firewall_rule_id"])
         rule_status = str(row["rule_status"])
         try:
-            if rule_status == firewall_repository.APPLIED:
+            if rule_status in (firewall_repository.APPLIED, firewall_repository.FAILED):
                 release_rule(
                     db,
                     rule_id=rule_id,
                     runner=runner,
                     policy=policy,
                     now=now_utc,
+                    approved_request_id=request_id,
                 )
                 firewall_release_repository.mark_succeeded(
                     db,
@@ -681,8 +706,10 @@ def _removed_rule_is_verified_absent(
             "protocol": row["rule_protocol"],
             "dest_port": row["rule_dest_port"],
             "action": row["rule_action"],
+            "scope": row_scope(row, "rule_scope"),
         },
         policy,
+        for_cleanup=True,
     )
     return not rule_exists(runner, spec)
 
