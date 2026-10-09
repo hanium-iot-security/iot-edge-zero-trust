@@ -6,20 +6,49 @@
 
 이 Firmware의 구현·Smoke 완료는 공식 정상 Dataset 수집 승인을 의미하지 않는다. Profile별 Pilot 판정과 정책 v1.1 동결 전에는 공식 Train·Validation·Test Session을 시작하지 않는다.
 
+현재 `phase9-normal-pilot-v2`의 P1·P2 단기 예비시험은 승인된 ESP32 한 대만
+전환하고 다른 ESP32·Pico와 운영 Capture를 유지하는 별도 범위다.
+[정상 후보 수집 절차](phase8-normal-collection.md)에 따라 안정화 이후의 UTC
+10초 경계 구간을 사전 고정하며, Upload·재부팅·Profile 전환 시각은 수집 구간에
+포함하지 않는다. 9절의 Capture 재시작·다른 Sender 중지와 10절의 유효 Window
+60개 목표는 기존 Phase 5의 독립 Session Pilot·공식 수집 계약에 적용된다.
+이 단기 예비시험에서는 서비스 중지나 Train·Validation·Test 배정을 하지 않으며,
+동일 Capture Group의 후보는 학습 미승인 상태로 보존한다.
+
+기존 후보 QC의 5초 기준 건수는 P1 Jitter와 맞지 않을 수 있으므로 원래 QC 결과를
+보존하고 Profile별 간격·순번·필드·송수신 대조 결과를 함께 기록한다. 새 버전의
+Profile 0을 다시 Upload한 경우는 P0 송신 동작 복귀로 기록하고, 기존 v1
+바이너리 복원과 구분한다. 복귀 후 Boot Log의 실제 Version·Slot·Profile·Topic과
+5초 간격·필수 필드 송신을 확인한다.
+
 ## 2. Firmware 계약
 
 | 항목 | 계약 |
 | --- | --- |
-| Firmware Version | `phase5-normal-pilot-v1` |
+| Firmware Version | `phase9-normal-pilot-v2` (설정 가능한 한도·간격을 도입한 예비수집 버전) |
+| Firmware Limits Version | `phase9-normal-limits-v1` |
 | Payload Schema Version | `phase5-normal-payload-v1` |
 | Device | `esp32_01`, `esp32_02` |
 | Topic | `iot/{device_id}/sensor` |
 | Client ID | `p5-{device_id}-v1` |
 | 필수 Payload | `device_id`, `sequence`, `uptime_s` |
 | 선택 Payload | 실제 `rssi`, `free_heap` |
-| 최대 Payload | 100 bytes |
+| 최대 Payload | `PHASE5_PAYLOAD_MAX_BYTES`, 기본 128 bytes |
+| MQTT Buffer | `PHASE5_MQTT_BUFFER_BYTES`, 기본 256 bytes |
 
 합성 `temp`·`hum`·`bat` 값은 사용하지 않는다. MQTT Topic과 Payload의 `device_id`는 항상 같아야 한다.
+
+ESP32 Core 3.3.8의 실제 필드 형식에서 필수 Payload의 최악 길이는 65 bytes,
+`rssi` 추가 시 77 bytes, `rssi`·`free_heap` 추가 시 100 bytes다. Compile Gate는
+Profile 0·1에 최소 65 bytes, Profile 2·3에 최소 100 bytes를 요구한다.
+PubSubClient 2.8의 Buffer에는 최대 Header 5 bytes, Topic Length 2 bytes,
+현재 Topic 19 bytes와 설정한 Payload 한도가 모두 들어가야 한다. 기본값에서는
+154 bytes가 필요하므로 256 bytes Buffer가 충분하다. Buffer는 `uint16_t` 범위에
+있어야 하며, 할당 실패 시 연결·송신을 중지한다. 송신 직전 실제 Topic·Payload와
+실제 Buffer 크기도 대조한다. [PubSubClient 2.8 공식 코드](https://github.com/knolleary/pubsubclient/blob/v2.8/src/PubSubClient.cpp#L420-L440).
+
+기존 `phase5-normal-pilot-v1`로 수집한 증적과 공식 Import 계약은 기존 버전을
+유지한다. 새 버전의 예비수집을 기존 버전의 공식 수집으로 표시하지 않는다.
 
 ## 3. Profile 계약
 
@@ -31,6 +60,11 @@
 | `3` | `normal_combined_variation` | 4~6초 | Profile 2와 동일 |
 
 Profile 3은 Profile 1·2의 Pilot 결과가 각각 승인되기 전에는 공식 정상 수집에 사용하지 않는다.
+
+표의 간격은 기본값이다. `PHASE5_FIXED_PUBLISH_INTERVAL_MS`와
+`PHASE5_JITTER_MIN_MS`·`PHASE5_JITTER_MAX_MS`로 설정하며 실제 값을 Boot Log에
+기록한다. 고정 간격은 양의 `uint32_t`, Jitter는 양수·최솟값 ≤ 최댓값이며
+최댓값은 `random(long)`의 배타적 상한을 위해 2,147,483,647보다 작아야 한다.
 
 ## 4. 사전 준비
 
@@ -65,6 +99,11 @@ Copy-Item `
 #define PHASE5_CONFIGURED 1
 #define PHASE5_DEVICE_SLOT 1
 #define PHASE5_NORMAL_PROFILE 0
+#define PHASE5_PAYLOAD_MAX_BYTES 128
+#define PHASE5_MQTT_BUFFER_BYTES 256
+#define PHASE5_FIXED_PUBLISH_INTERVAL_MS 5000UL
+#define PHASE5_JITTER_MIN_MS 4000UL
+#define PHASE5_JITTER_MAX_MS 6000UL
 #define PHASE5_WIFI_SSID "LOCAL_WIFI_SSID"
 #define PHASE5_WIFI_PASSWORD "LOCAL_WIFI_PASSWORD"
 #define PHASE5_MQTT_BROKER "192.168.0.20"
@@ -74,6 +113,7 @@ Copy-Item `
 - ESP32 #1은 `PHASE5_DEVICE_SLOT 1`을 사용하며 `esp32_01`로 파생된다.
 - ESP32 #2는 `PHASE5_DEVICE_SLOT 2`를 사용하며 `esp32_02`로 파생된다.
 - Wi-Fi Password는 문서·커밋·스크린샷·Serial Log에 남기지 않는다.
+- 기존 로컬 Header에 새 한도·간격 설정이 없으면 위 기본값을 사용한다.
 
 로컬 설정이 Git에서 제외되는지 확인한다.
 
@@ -115,8 +155,15 @@ ESP32 #1과 #2를 같은 설정으로 연속 Upload하지 않는다. 두 장비 
 
 ```text
 phase5_normal_collector_boot
-firmware_version=phase5-normal-pilot-v1
+firmware_version=phase9-normal-pilot-v2
 payload_schema_version=phase5-normal-payload-v1
+firmware_limits_version=phase9-normal-limits-v1
+payload_max_bytes=128
+canonical_payload_max_bytes=65 또는 100
+mqtt_buffer_bytes_configured=256
+fixed_publish_interval_ms=5000
+jitter_min_ms=4000
+jitter_max_ms=6000
 device_id=esp32_01 또는 esp32_02
 device_slot=1 또는 2
 normal_profile=0..3
@@ -124,6 +171,7 @@ profile_name=<선택한 Profile 이름>
 mqtt_topic=iot/<device_id>/sensor
 mqtt_client_id=p5-<device_id>-v1
 mqtt_broker=<설정한 Broker>:1883
+mqtt_buffer_bytes_actual=256
 ```
 
 다음도 확인한다.
@@ -131,7 +179,8 @@ mqtt_broker=<설정한 Broker>:1883
 - `wifi_connected ip=`의 실제 IP가 DB 등록 IP와 일치한다.
 - `mqtt_connected`가 출력된다.
 - `mqtt_publish_succeeded`의 Sequence가 단조 증가한다.
-- `payload_size`가 100 이하이다.
+- `payload_size`가 Boot Log의 `payload_max_bytes` 이하이다.
+- `mqtt_buffer_bytes_actual`이 설정값과 같으며 `mqtt_buffer_allocation_failed`가 없다.
 - Password가 Serial에 출력되지 않는다.
 - Profile 3은 `profile_3_requires_profile_1_and_2_pilot_approval` 경고를 출력한다.
 
@@ -139,7 +188,9 @@ mqtt_broker=<설정한 Broker>:1883
 
 - `wifi_connect_timeout`
 - `mqtt_connect_failed`
-- `payload_rejected reason=over_100_bytes`
+- `payload_rejected reason=over_configured_limit`
+- `payload_rejected reason=mqtt_packet_budget`
+- `mqtt_buffer_allocation_failed`
 - `mqtt_publish_failed`
 
 ## 8. MQTT·DB Smoke
@@ -378,6 +429,7 @@ ORDER BY device_id;"
 
 - Git Commit SHA
 - Firmware Version
+- Firmware Limits Version·설정 Payload 한도·설정/실제 MQTT Buffer·실제 고정/Jitter 간격
 - Payload Schema Version
 - Device Slot·Device ID·COM Port·실제 IP
 - Profile 번호·이름
