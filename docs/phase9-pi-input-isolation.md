@@ -129,9 +129,41 @@ host의 기존 link/route는 전후 읽기 fingerprint만 비교한다. 차이�
 
 결과는 `status=PASS`, exit 0, `server_reaped=true`, `remaining_owned_namespaces=[]`, `unconfirmed_namespace_creations=[]`, `cleanup_errors=[]`다. 시험 이후 별도 `ip netns list` 조회도 비어 있었다. host link/route의 전후 읽기 fingerprint는 동일했으며 host INPUT 자체는 이 시험의 관측·인증 대상이 아니다. Wrapper dry-run match를 namespace의 실제 iptables로 적용했고, 사용한 Wrapper SHA256은 `19e4d9632ef431df32b7ec799f69c86cf3d46e044854deae95bf5007be08f5fb`다. 개인 보관 원본 JSON의 SHA256은 `0609ebf295b8aab874fa0e4725fede9c64a04bffb220a66613fbfbd4a9380d86`이며 원본 로그·개인 output은 PR에 포함하지 않는다.
 
-이 결과는 운영 Pi의 특권 Wrapper 보호 파일·실제 Pi 주소 검사·sudoers·Worker/DB 상태 전이·물리 장비·DHCP·재부팅 검증을 대신하지 않는다. 해당 항목과 운영 Migration/배포는 여전히 미검증이다. 운영 Pi의 범용 비대화형 sudo는 허용되지 않았고 최근 SSH 연결도 timeout이었다. 이후 Pi 연결·승인된 관리 권한과 운영 백업을 확인한 뒤 별도 검증한다.
+이 결과는 운영 Pi의 특권 Wrapper 보호 파일·실제 Pi 주소 검사·sudoers·Worker/DB 상태 전이·물리 장비·DHCP·재부팅 검증을 대신하지 않는다. 해당 항목과 운영 Migration/배포는 여전히 미검증이다. WSL 시험 이후 2026/10/9에 Pi SSH를 다시 연결해 읽기 전용 준비 상태와 운영 DB 사본을 확인했다. Pi의 일반 관리자 명령에는 비밀번호가 필요하고, 비대화형 권한은 기존 설치 Wrapper에 한정된다. 이후 관리자 권한으로 Pi 임시 namespace 통신 시험을 실행해 아래 결과를 확인했다. 운영 보호 파일 설치·sudoers·Worker/DB 상태 전이·실물 기기·DHCP·재부팅은 여전히 별도 검증 대상이다.
 
 이후 실제 운영 시험은 보호 경계·별도 시험 근거·운영 백업 확인 후 진행한다. 실제 장비 접근, DHCP 이동, 서비스/보드 재시작, Pi 재부팅 후 복원과 운영 DB 마이그레이션은 각각 별도 검증 상태로 기록한다. 통신이 멈춘 사실만으로 전체 격리·설치 펌웨어·모델 추론·공식 정상 자료 편입을 인증하지 않는다.
+
+### 별도 root Wrapper 보호 시험 — 2026/10/9
+
+앞의 70개 통신 시험과 별도로, 제품 소스 밖에서 검토한 시험 스크립트로 WSL Ubuntu의 새 익명 mount·network namespace에서 Wrapper를 실제 실행했다. `HANIUM_FW_DRY_RUN`을 지정하지 않고 고정 `ip`·`stat`·`iptables` 경로를 사용했다. 이 시험은 보호 조건에 따른 삽입 거부와 정확한 규칙 존재·삭제를 확인하며, 패킷 송수신 시험은 아니다. 환경은 Python 3.14.4, kernel `6.18.33.1-microsoft-standard-WSL2`, iptables `1.8.11 (nf_tables)`, euid 0이었다.
+
+namespace inode가 host와 다르고 생성 당시 값과 같은지 확인한 뒤, private mount propagation과 namespace 안의 `/etc`·`/run` tmpfs를 검증했다. 보호 파일·소유권·권한 변경은 이 tmpfs 안에서만 수행했다. 시험용 Pi 주소 `10.253.95.1`, 대상 `10.253.95.2`, 관리 주소 `10.253.95.254`는 운영 주소가 아니다. 파일 누락·빈 파일·잘못된 주소·소유권·쓰기 권한·심볼릭링크·부모 경로 문제, 관리 주소·로컬 주소 및 삽입 후 보호 목록 변경의 15개 거부 조건을 두 scope에서 확인했다. 정상 insert/check 4개, 보호 대상의 legacy 규칙만 삭제하며 wide 규칙 보존, 보호 파일이 없어진 뒤 wide 규칙 정확한 삭제까지 **36개 모두 PASS**였다. 각 거부는 exit 65와 INPUT 규칙 불변을 함께 확인했다.
+
+전체 결과는 exit 0, `status=PASS`, `child_process_gone=true`, `cleanup_errors=[]`, `observation_errors=[]`이며, 자식 namespace의 마지막 INPUT은 `-P INPUT ACCEPT`였다. host의 `iptables-save`, link/route fingerprint와 `/etc`·`/etc/hanium`·보호 파일·`/run` 메타데이터의 전후 관측은 같았다. Wrapper 소스도 바뀌지 않았다. 익명 namespace와 tmpfs는 자식 종료로 소멸하며, 자식 시험 실행에는 120초 제한과 종료·회수 처리를 두었다. 이 결과는 해당 실행의 관측·정리 근거이며 전원 중단 등 모든 중단 상황의 정리를 인증하지 않는다.
+
+사용한 Wrapper SHA256은 `19e4d9632ef431df32b7ec799f69c86cf3d46e044854deae95bf5007be08f5fb`, 개인 보관 시험 스크립트 SHA256은 `4e30c331cc0e4130fb20f504c2925c183a80ac83b22b741b84dc85ec381b504a`, 원본 결과 JSON SHA256은 `75f23bb2d92c37e17efa223b4b107f7d4d0e5ed2ee15cfed99cec830030ad4aa`다. 개인 시험 스크립트·로그는 PR에 포함하지 않는다. 운영 Pi의 설치 파일 소유권·sudoers·서비스 권한·Worker/DB 상태 전이·실제 기기 통신·DHCP·재부팅은 이 시험으로 검증되지 않았다.
+
+### Pi 준비 점검과 운영 DB 사본 — 2026/10/9
+
+Pi 운영 코드와 원격 develop은 `53ec270219692784ce8864976511a52c962cec35`, Boot ID는 `5f5fc610-af8f-4437-9e2c-ccf2af422c91`다. 수집·특징·탐지·방화벽 관련 기존 서비스 6개가 active였고, API의 `NoNewPrivileges=yes`를 확인했다. 관리자 `192.168.0.3`, 공유기 `192.168.0.1`, Pi `192.168.0.20`을 읽기 관측으로 다시 확인했다. 이 값은 이후 설치 직전에 다시 확인한다.
+
+설치 Wrapper와 `/usr/local/sbin` 부모 경로는 root 소유이고 다른 사용자에게 쓰기를 허용하지 않았다. 설치 파일 SHA256은 `417b567ff27757db93fceeb4609525232298488c9474d1940f263e20e9aad321`이며 아직 기존 MQTT 전용이다. `/etc/hanium`과 새 보호 파일은 없었다. `sudo -n true`는 비밀번호 요구로 거부됐고, 허용된 기존 Wrapper의 `list`는 읽기 성공했다. 당시 실제 INPUT은 기본 ACCEPT이며 관리 규칙은 없었다. snapshot timer는 active, v1 snapshot은 available·error 없음·빈 managed_rules로 최신 관측을 기록했다.
+
+세 센서의 최근 3분 MQTT에는 JSON·토픽 오류가 없었고, ESP32는 메시지당 57바이트, Pico는 129~132바이트였다. 초기 준비 점검에서는 MQTT/Packet 특징과 Packet Rule·IF·Trust 처리 시각이 전진했다. 이 관측은 공식 학습 편입·펌웨어 설치 해시·정상 허용 범위 승인 결과가 아니다.
+
+검토된 `94eecaf186cc826fe6b8efcf9932e6dedc5ff1dd`의 최소 소스만 Pi 별도 시험 폴더에 전달했다. TAR SHA256은 `f10ec790772611183593df0fb5d71290f48c23a9d31fd15b28f2b56e5ce524a8`이며 신규 도구의 단위 검증은 Python 3.10.11에서 **41 passed in 0.22s**, 기본 실행은 DRY_RUN이었다. 이 41개는 가짜 실행기를 사용하는 시험이며 Pi root namespace 실행 결과가 아니다.
+
+**Pi 임시 namespace 실제 시험 — 통과:** 같은 `94eecaf186cc826fe6b8efcf9932e6dedc5ff1dd` 최소 소스로 관리자 권한의 실제 실행을 진행했다. 사후 읽기 확인한 환경은 Python 3.10.11, kernel `6.18.29+rpt-rpi-2712`, iptables `1.8.11 (nf_tables)`다. 7단계 × 2개 source × 5개 probe의 70개 기대 결과를 모두 만족했고 차단 단계의 DROP counter 증가도 확인했다. 결과는 exit 0, `status=PASS`, `host_links_routes_unchanged=true`, `server_reaped=true`, `remaining_owned_namespaces=[]`, `unconfirmed_namespace_creations=[]`, `cleanup_errors=[]`였다. 마지막 단계에는 두 source의 모든 통신이 정상이고 관리 규칙은 없었다. 별도 `ip netns list`도 비어 있었고 기존 운영 Commit·Boot ID·수집 서비스는 유지됐다.
+
+이 실행도 Wrapper dry-run의 고정 match를 새 namespace의 실제 iptables에 적용하는 구조다. 사용 Wrapper SHA256은 `19e4d9632ef431df32b7ec799f69c86cf3d46e044854deae95bf5007be08f5fb`, 개인 보관 결과 JSON SHA256은 `6d4a069cd3893730d3ca886135fc74d3dc74483d4e4d5b420b99c812c26f83f4`다. 관리자 직접 실행의 출력은 별도 개인 기록으로 보관했다. 운영 host INPUT 관측·인증, 특권 Wrapper 보호 파일 검사·설치 sudoers, Worker/DB 상태 전이, 실물 기기·DHCP·재부팅은 이 시험에 포함되지 않는다.
+
+22:42 KST에 운영 DB를 읽기 전용 연결의 SQLite 온라인 backup으로 별도 파일에 보관하고, 그 사본을 다시 복제해 Migration 011을 시험했다. 원본 backup 140,869,632바이트의 SHA256은 `b8e480f570f886a9aee6b56f7396053c3d1c7bf0eada5003cf17bc98abcf689a`다. 사본에서 기존 19개 테이블의 원래 컬럼·모든 행 digest, 방화벽 20행·해제 16행·sequence 20·기존 Migration 기록이 보존됐다. 기존 모든 방화벽 범위는 MQTT로 유지됐다. integrity/FK 검사와 두 번째 Migration no-op·사본 파일 SHA 불변도 통과했다. 보관 원본 SHA는 그대로였고 운영 DB 스키마는 10을 유지했다. 운영 DB 원본·사본과 개인 로그는 PR에 첨부하지 않는다.
+
+이 사본 검증은 운영 Migration 적용·서비스 릴리스·rollback 실행 검증이 아니다. Migration 번호 조율과 실제 배포 직전의 새 일관된 백업·현재 상태 확인은 남아 있다.
+
+후속 조회에서는 **22:42:30~22:42:40 KST의 10초 구간**이 `FAILED/LATE_CAPTURE`로 확인됐다. 캡처 시작이 1.30814초 지연되어 Session 108이 FAILED로 마감됐고, Session 109에서 수집을 이어가고 있다. 해당 실패 segment에는 캡처 파일·특징 데이터가 없다. MQTT 수신과 이후 Packet 수집·특징 처리는 계속되지만 Packet Rule·IF·Trust의 처리 경계는 22:42:30에서 HOLD 중이다. 서비스가 active라는 사실만으로 탐지 전진을 정상으로 표시하지 않는다.
+
+이 실패는 DB backup·사본 검증 작업과 같은 시간대에 발생했다. 당시 DB commit과 sidecar 저장 지연도 관측됐지만, 시험 작업이 캡처 지연에 기여했는지는 확인되지 않았다. 손실 구간을 자동 승인하거나 캡처 지연 기준을 완화하지 않았다. 첫 운영 core dry-run은 보호된 `data/recovery/planned` 경로의 권한 오류로 거부됐으며 `database_committed=false`였다. 이후 관리자 권한의 읽기 전용 조회에서 Rule·IF 모두 `can_execute=true`·차단 사유 없음, ID 유지와 경계 `22:42:30 → 22:42:40 KST`를 확인했다. 계획은 손실 승인 전 초안으로 기록했고 실제 복구는 실행하지 않았다. 정확한 손실 구간 승인 이후 복구와 실제 Rule·IF·Trust 전진 확인은 남아 있다.
 
 ## 이후 운영 설치 순서
 
