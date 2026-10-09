@@ -109,3 +109,5 @@ Root Intent가 없으면 UNKNOWN/HOLD, 증거가 바뀌면 HOLD다. 비공개 Ar
 Pi Python 3.10.11의 별도 output 시험 디렉토리에서 새 API 64개와 기존 모델 로딩·탐지·계약·API·배포 문서 회귀를 함께 실행해 **167개가 통과했다(20.56초)**. 임시 SQLite DB와 가상 서비스·진행 증거를 사용했다. 저장된 모델 바이트·Backup·Root 진행/Journal·DB의 불변, 잘못된 승인·오래된 완료 기록·부분 적용·경로와 권한 거부를 검증했다. 복사한 시험 코드의 TAR SHA를 로컬과 Pi에서 대조한 뒤 실행했다.
 
 운영 API 서비스 배포·재시작, 운영 DB Migration·복구 적용·모델 활성화는 하지 않았다. 운영 Pi의 Commit `53ec270`과 기존 Boot, 관련 서비스 여섯 개의 활성 상태를 별도 읽기 조회에서 확인했다. 이 결과는 실제 운영 복구나 현재 실행 모델의 인증을 대신하지 않는다.
+
+같은 날 새 모델 정보 Service를 운영 Pi의 기존 설정·모델 파일에 읽기 전용으로 실행했다. Packet Bundle은 `packet-if-v2-calib-002-p99-py310`의 `BUNDLE_METADATA_VERIFIED`로 확인됐고 검사 전후 Bundle SHA가 같았다. MQTT는 `LEGACY_CONTRACT_UNAVAILABLE`, 두 모델의 실제 실행 증거는 `UNKNOWN`으로 유지했다. 이는 운영 Artifact 조회 확인이며 운영 HTTP 서비스 배포나 실행 모델 인증은 아니다.
