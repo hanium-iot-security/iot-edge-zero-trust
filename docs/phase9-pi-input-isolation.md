@@ -77,6 +77,12 @@ Wrapper 세 인자 호출은 기존 MQTT scope로 유지한다. 광역 check/ins
 
 로컬 검증은 임시 SQLite DB·가짜 Worker/runtime·Wrapper dry-run만 사용한다. 새/기존 DB, FK·sequence·원자성, UUID 재요청, 승인 이후 IP/정책/해제 변경, FAILED 잔여 정리와 복구 HOLD를 검사한다. 이 결과는 실제 Pi 차단 또는 재부팅 검증을 뜻하지 않는다.
 
+### 2026/10/9 검증 결과
+
+Windows에서 Worker·Wrapper·Snapshot 관련 184개와 DB·API·정책·복구 관련 494개가 통과했다. 두 묶음의 공통 42개를 제외한 동일 소스의 21개 suite를 Pi 별도 디렉토리에서 함께 실행하여 **636 passed in 101.94s**를 확인했다. Linux 시험 소스는 `6b866961af1200192b8fbe3ae83e8b1939d88f1f`, 전송 TAR SHA256은 `782550c692e0b526872ff6fe3a422434c58d57ef7306b703722f3539b01d97b2`다.
+
+임시 DB·가짜 실행기와 실제 Bash Wrapper의 dry-run을 사용했다. FAILED 광역 삽입 잔여 규칙이 있을 때 baseline 복구 HOLD, 정확한 감사 해제, 오래된 관측 HOLD, 후속 관측 이후 정상 복구까지 연결해 검증했다. 시험 전후 운영 코드·Boot ID와 기존 수집/탐지/방화벽 서비스 active 상태는 유지됐다. 실제 특권 iptables 동작·물리 장비·DHCP·재부팅 검증 결과는 아니다.
+
 검토된 별도 Linux namespace 검증 자료가 준비되면 관리자가 격리된 시험 환경에서 실행한다. 운영 DB와 기기를 사용하지 않고 새 namespace의 INPUT에서 두 scope 공존, MQTT 이외 포트/프로토콜 범위, exact ID·scope 삭제, 중복/부분 실패를 확인한다. namespace와 고정 보호 파일·실제 로컬 IPv4 강제 검사는 분리해서 근거를 남긴다. namespace 생성·실제 iptables 시험에 필요한 범용 관리자 권한은 현재 비대화형 sudo로 허용되지 않아 아직 실행하지 않았다. 기존 제한된 root-owned Wrapper sudo의 허용 여부와는 별개다.
 
 이후 실제 운영 시험은 보호 경계·별도 시험 근거·운영 백업 확인 후 진행한다. 실제 장비 접근, DHCP 이동, 서비스/보드 재시작, Pi 재부팅 후 복원과 운영 DB 마이그레이션은 각각 별도 검증 상태로 기록한다. 통신이 멈춘 사실만으로 전체 격리·설치 펌웨어·모델 추론·공식 정상 자료 편입을 인증하지 않는다.
@@ -85,7 +91,7 @@ Wrapper 세 인자 호출은 기존 MQTT scope로 유지한다. 광역 check/ins
 
 다음은 검토용 준비 순서이며 지금 운영에 적용하지 않는다.
 
-1. 원본 DB·WAL과 현재 방화벽 규칙을 보관하고, 원래 서비스별 active 상태와 일시정지 계획을 기록한다. 별도 DB 사본에서 migration 011의 FK/integrity/원래 ID·높은 sequence 보존을 확인한다.
+1. 원래 서비스별 active 상태와 일시정지 계획을 기록한다. 쓰기 서비스 정지 또는 기존 SQLite 온라인 백업 절차로 일관된 DB 사본과 필요한 WAL·현재 방화벽 규칙을 보관한다. 별도 DB 사본에서 migration 011의 FK/integrity/원래 ID·높은 sequence 보존을 확인한다.
 2. 실제 관리자·라우터·Pi IPv4를 재확인하고 root 소유 보호 디렉토리/파일을 먼저 준비한다. 새 Wrapper에서는 기존 MQTT insert도 이 보호 파일의 영향을 받는다. 이후 root:root 0755 Wrapper와 `NOSETENV` sudoers를 검토·설치하고 `visudo`로 확인한다. 관리 API의 기존 `NoNewPrivileges=true`는 유지한다.
-3. 모든 scope의 저장·조회·Worker·snapshot·release를 함께 읽을 수 있는 정합 릴리스를 준비한다. 운영 DB migration과 서비스 배포는 별도 승인·실제 검증 대상으로 기록하고, 사본 테스트 통과만으로 완료 처리하지 않는다.
+3. 모든 scope의 저장·조회·Worker·snapshot·release를 함께 읽을 수 있는 정합 릴리스를 준비한다. 운영 DB migration과 서비스 배포는 별도 실제 검증 대상으로 기록하고, 사본 테스트 통과만으로 완료 처리하지 않는다.
 4. 원래 active였던 서비스만 복귀시켜 읽기 전용 list/snapshot과 기존 MQTT 경로를 확인한다. 그 근거 이후 별도 광역 차단·정확한 해제·DHCP/재시작/재부팅 시험을 진행하고 각각 실제 실행 여부를 남긴다.
