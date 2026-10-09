@@ -182,3 +182,13 @@ Capture 적격성, 이벤트 없는 Trust, 미처리 Trust, 45초 freshness, 미
 두 child의 동일 옵션·기존 엔진 확인 문자열, 파일 이름/Feature/수집 기록이 있는 구간 거부,
 계획 이후 원본 변경, 옵션·감사 변경, 기존 v1 계획, 부분 실패·응답 유실 후 IF만 재개,
 manager의 동일 완료 조건과 원본 보존도 검증한다. 이 검증은 운영 수집·모델·등록 상태에 의존하지 않는다.
+
+2026/10/9의 좁은 FAILED tail 추가 소스는 `842b1123896f6692238ecc0f5fdab268ed94b926`다.
+Windows Python 3.10.11에서 pair·manager **113 passed, 2 skipped**(Linux 전용),
+기존 단일 엔진 FAILED tail **10 passed**를 확인했다. Pi Python 3.10.11의 별도
+시험 디렉토리에서는 pair·manager와 관리자 API 호환성 **157 passed in 27.88s**를 확인했다.
+이 시험은 API 소스 `137ec8e32c6e7c643171affc1dcbdd9e0620109f`에 위 커밋의 pair 모듈·CLI·시험
+세 파일을 덧씌운 사본이며 브랜치를 병합하거나 운영 소스를 바꾸지 않았다.
+전송 TAR SHA256은 `9c8b3e8e808b3ba3ffb75253c28aeb2df9cf1fcae10de8f1b5565daf2429ea4c`다.
+임시 SQLite·가상 서비스·소유한 시험 자식과 잠금을 사용했으며 실제 운영 복구 결과가 아니다.
+HTTP 계획 생성은 기본 false를 유지하고 FAILED opt-in 요청을 허용하지 않는다.
