@@ -69,6 +69,50 @@ def _audits(fixture):
         return [dict(row) for row in db.execute("SELECT * FROM packet_checkpoint_recoveries ORDER BY id")]
 
 
+def test_readonly_verification_preserves_database_bytes(fixture):
+    before = fixture["database"].read_bytes()
+    checked = pair.verify_database_readonly(fixture["database"])
+    assert checked.integrity_check == "ok"
+    assert checked.foreign_key_violations == ()
+    assert fixture["database"].read_bytes() == before
+
+
+def test_readonly_verification_connection_cannot_update(fixture, monkeypatch):
+    original = pair._read_db
+    checked = []
+
+    def read_db(database):
+        db = original(database)
+        assert db.in_transaction
+        assert db.execute("PRAGMA query_only").fetchone()[0] == 1
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            db.execute("UPDATE devices SET trust_score=0")
+        checked.append(db)
+        return db
+
+    monkeypatch.setattr(pair, "_read_db", read_db)
+    assert pair.verify_database_readonly(fixture["database"]).integrity_check == "ok"
+    assert len(checked) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        checked[0].execute("SELECT 1")
+
+
+def test_status_rejects_backup_changed_during_readonly_verification(fixture, monkeypatch):
+    _execute(fixture)
+    original = pair.verify_database_readonly
+
+    def changed(database):
+        result = original(database)
+        if Path(database) != fixture["database"]:
+            with Path(database).open("ab") as stream:
+                stream.write(b"changed-after-readonly-check")
+        return result
+
+    monkeypatch.setattr(pair, "verify_database_readonly", changed)
+    with pytest.raises(core.PacketCheckpointRecoveryError, match="backup changed during verification"):
+        pair.status_pair(plan_file=fixture["output"], db_path=fixture["database"], artifact_dir=fixture["artifacts"])
+
+
 def test_configured_orchestrator_lock_is_bound_and_acquired(fixture, tmp_path, monkeypatch):
     configured = tmp_path / "configured-orchestrator.lock"
     monkeypatch.setattr(pair.settings, "orchestrator_lock_path", str(configured))

@@ -1,0 +1,45 @@
+# Packet Rule → IF recovery manager (Phase 9 follow-up)
+
+This one-shot Linux administrator command manages processing-service stop and restoration around the existing audited pair engine. It supports the existing approved `COMPLETED → RUNNING` live-resume path. It is not the full P9-05 implementation: a hard verification-process deadline, generic FAILED-tail recovery, a management HTTP API, per-detector deadlines, automatic model changes, rollback, and an operating-system watchdog are not implemented.
+
+Run from the approved repository root, using the same Python environment, `.env`, stage settings, Capture policy and custom runtime lock paths as the services. Use the existing pair dry-run to create a fresh approved pair plan first. All paths below refer to new files/directories under the repository's ignored `output/` or another approved artifact directory; create their parent directories beforehand. Do not overwrite tracked source files or use symlinks/junctions.
+
+```text
+python -m edge.detection.run_packet_recovery_pair plan \
+  --pair-plan-file output/pair-plan.json --db-path backend/data/iot_security.db \
+  --artifact-dir output/recovery-artifacts --plan-output output/manager-plan.json
+```
+
+`plan` reads the DB, repository and exact state of the three processing units, then writes only the new manager plan. It performs no DB or service mutation and does not require root. The plan binds the pair SHA, database, source/target sessions, repository, Boot ID, service units and fixed time budgets. Confirm its SHA after reviewing the existing pair's administrator, reason, skip approval and before/after checkpoints. A pair artifact group that already exists without a manager original-state journal is blocked; its original service states cannot be inferred safely.
+
+```text
+sudo <service-python> -m edge.detection.run_packet_recovery_pair apply \
+  --plan-file output/manager-plan.json \
+  --confirm APPLY-PACKET-PAIR-MANAGER:<manager-plan-sha256>
+```
+
+`apply` requires root on Linux. It holds a separate per-database command lock, records the immutable original service states before launching, and starts a detached supervisor with no inherited terminal input/output. The caller can disconnect. A repeated invocation returns the existing running operation rather than starting a second one. PID plus Linux start identity, attempt ID, role and worker nonce identify each launch. An unresolved launch without a proved receipt is held for inspection instead of retried automatically. The supervisor waits up to 15 seconds for the launcher's command lock to release, then retains that lock throughout management and verification.
+
+Only `packet-feature-extractor.timer`, `detection-orchestrator.service` and `packet-feature-extractor.service` are stopped, in that order. Capture and MQTT Subscriber keep running. The manager does not stop arbitrary manual runners; they must use the same approved runtime lock paths and relinquish them before application. The worker acquires the existing pair's union of Orchestrator/manual/extractor locks once. A busy or differently configured lock cannot be bypassed. A stopped service must be confirmed inactive, and service units must report a clean `Result=success`/`ExecMainStatus=0`; an unclean stop causes HOLD.
+
+The default budgets recorded in the manager plan are 35 seconds for each stop command, **120 seconds for the entire Rule → IF pair worker**, 5 seconds for TERM/reap, another 5 seconds for KILL/reap, 35 seconds for each restoration command, and `verify_observation_start_seconds=120`. The last budget is explicitly a soft deadline for starting further observations; an observation already in progress may finish afterward. Integrity checks, SHA reads and DB reconciliation before/after execution and within verification do not have a separate hard process deadline. Service-state and clean-stop reads have separate five-second command limits. The 120-second worker deadline is a real process deadline and is not an engine-specific or stage-specific timeout, nor an upper bound on the entire management operation. A real separate process owns the existing pair operation; after its deadline the supervisor terminates its process group and waits for the child to be reaped. Generic errors and supervisor SIGTERM also attempt this cleanup before considering restoration. Process exit or missing stdout/result files alone never prove a commit or successful recovery.
+
+At startup and after child exit, the manager reconciles the actual DB with the original approved pair. It checks the deterministic child IDs, full audit fields and plan JSON, before/after checkpoint, target identity, current Boot/configuration, repository state and actual backup path/hash/sidecar. Backup integrity/FK and the approved before checkpoint are read using read-only SQLite snapshots; the backup SHA must remain unchanged across verification. It does not adopt another recovery's audit.
+
+- A confirmed absence of both commits permits restoration of original active units.
+- Both complete, verified DB audits permit restoration of original active units. This means the checkpoint changes were applied, not that runtime progress has completed.
+- Rule-only application, uncertain audit/checkpoint state, a live or unreaped child, or a missing original-state journal keeps processing services stopped. Reapplying the same manager plan preserves the original service states and resumes only the unfinished IF using its original CAS.
+- A restoration failure preserves the applied audits and records HOLD. Reapplying a resolved operation can retry restoration using the original journal; it never replaces original active states with the currently stopped states.
+
+Restoration uses the original active units only, in reverse stop order. Originally inactive units remain inactive. The journal separates immutable `original`, latest `requested`, observed `actual`, a durable transition history and `restoration_failures`. Each request is flushed before its service command; each actual outcome is recorded afterward. A failure does not erase earlier attempts. Manager files are under `manager-<manager_id>/` in the artifact directory. Existing pair files remain under `<pair_id>/`: child plans are under `attempt-*/<detector>/plan.json`, while backup/checksum/child result are under the deterministic child ID.
+
+```text
+python -m edge.detection.run_packet_recovery_pair status --plan-file output/manager-plan.json
+python -m edge.detection.run_packet_recovery_pair verify --plan-file output/manager-plan.json
+```
+
+`status` reads actual services, process receipts, full DB audits and checkpoints. It does not control services, write the manager journal, or call the existing progress writer. Its `last_verification` is historical; full application is reported as `APPLIED_VERIFY_REQUIRED` until a fresh verification is performed. `verify` first rejects a live worker, a recorded restoration failure or an unconfirmed original active service; it performs no service control but intentionally updates the existing pair's `progress.json` under its progress lock. The supervisor polls verification after safe restoration, subject to the soft observation-start deadline above. Completion still requires the existing pair gates: same Boot/target and configuration, active required services, eligible contiguous Capture/Feature data, no new FAILED segment, synchronized clock, fresh Rule/IF/Trust boundaries within 45 seconds, actual consumption and two observed advances. A held verification can be retried without executing already applied children.
+
+Successful planning and freshly verified `COMPLETE` return exit 0. Confirmed uncommitted non-completion returns 2; asynchronous launch, partial/uncertain application, restoration failure and applied-but-unverified progress return 3. An asynchronous `apply` exit 3 is not a declaration that the background operation failed; inspect `status` and then `verify`. Never treat `RUNNING` or two applied audits alone as complete recovery.
+
+SSH/client disconnect is covered by the detached supervisor. Host reboot, supervisor SIGKILL, kernel/filesystem failure or external service changes are not covered by an OS watchdog: unresolved launch/live-child/changed-Boot states remain HOLD and require administrator inspection. The command does not guess legacy original states or automatically kill a worker that it cannot identify. Deployment and tests against real services/operational databases have not been performed; local tests use temporary SQLite databases and fake services/processes. Linux-only tests use isolated sleeping subprocesses and temporary lock files, never systemctl or operational DB paths.

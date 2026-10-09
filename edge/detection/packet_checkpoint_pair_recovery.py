@@ -17,7 +17,7 @@ from edge.detection import packet_checkpoint_recovery_repository as repository
 from edge.detection.phase4_time import format_db_utc, parse_db_utc, require_utc_window_boundary
 from edge.orchestration.stage_registry import parse_stage_names
 from edge.packet.capture_policy import CaptureEligibilitySegment, CapturePolicy, is_capture_eligible
-from edge.scripts.phase4_cutover_storage import expected_backup_sha256
+from edge.scripts.phase4_cutover_storage import DatabaseVerification, expected_backup_sha256
 
 SCHEMA = "packet-checkpoint-pair-live-resume-v1"
 DETECTORS = ("packet_rule", "packet_if")
@@ -56,6 +56,17 @@ def _read_db(database):
     connection.execute("PRAGMA query_only=ON")
     connection.execute("BEGIN")
     return connection
+
+
+def verify_database_readonly(database_path: Path) -> DatabaseVerification:
+    """Inspect one read-only SQLite snapshot without creating or writing a DB."""
+    database = Path(database_path).resolve(strict=True)
+    if not database.is_file():
+        raise Error("verification database is not a file")
+    with closing(_read_db(database)) as db:
+        integrity = str(db.execute("PRAGMA integrity_check").fetchone()[0])
+        violations = tuple(tuple(row) for row in db.execute("PRAGMA foreign_key_check").fetchall())
+    return DatabaseVerification(integrity_check=integrity, foreign_key_violations=violations)
 
 
 def _configured_locks(root, database):
@@ -207,12 +218,14 @@ def _validate_audit(db, plan, child, audit, checkpoint, group, readiness):
     if (core.file_sha256(backup) != audit["backup_sha256"] or
             expected_backup_sha256(backup.with_suffix(backup.suffix + ".sha256"), backup) != audit["backup_sha256"]):
         raise Error("child backup checksum mismatch")
-    checked = core.verify_database(backup)
+    checked = verify_database_readonly(backup)
     if checked.integrity_check != "ok" or checked.foreign_key_violations:
         raise Error("child backup integrity failed")
     with closing(_read_db(backup)) as snapshot:
         if not _checkpoint_equal(repository.get_checkpoint(snapshot, child["detector"], SOURCE), before):
             raise Error("child backup does not contain approved before checkpoint")
+    if core.file_sha256(backup) != audit["backup_sha256"]:
+        raise Error("child backup changed during verification")
     if db.execute("SELECT 1 FROM packet_checkpoint_recoveries WHERE detector_name=? AND source_table=? AND id>?",
                   (child["detector"], SOURCE, audit["id"])).fetchone():
         raise Error("another recovery occurred after this child")
@@ -397,7 +410,7 @@ def status_pair(*, plan_file, db_path, artifact_dir):
     _require_configured_locks(plan, database)
     if core.inspect_repository_state(plan["repository_root"]) != plan["repository_state"]:
         raise Error("repository state changed from paired approval")
-    checked = core.verify_database(database)
+    checked = verify_database_readonly(database)
     if checked.integrity_check != "ok" or checked.foreign_key_violations:
         raise Error("live database integrity failed")
     with closing(_read_db(database)) as db:
