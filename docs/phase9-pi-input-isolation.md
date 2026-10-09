@@ -83,7 +83,40 @@ Windows에서 Worker·Wrapper·Snapshot 관련 184개와 DB·API·정책·복구
 
 임시 DB·가짜 실행기와 실제 Bash Wrapper의 dry-run을 사용했다. FAILED 광역 삽입 잔여 규칙이 있을 때 baseline 복구 HOLD, 정확한 감사 해제, 오래된 관측 HOLD, 후속 관측 이후 정상 복구까지 연결해 검증했다. 시험 전후 운영 코드·Boot ID와 기존 수집/탐지/방화벽 서비스 active 상태는 유지됐다. 실제 특권 iptables 동작·물리 장비·DHCP·재부팅 검증 결과는 아니다.
 
-검토된 별도 Linux namespace 검증 자료가 준비되면 관리자가 격리된 시험 환경에서 실행한다. 운영 DB와 기기를 사용하지 않고 새 namespace의 INPUT에서 두 scope 공존, MQTT 이외 포트/프로토콜 범위, exact ID·scope 삭제, 중복/부분 실패를 확인한다. namespace와 고정 보호 파일·실제 로컬 IPv4 강제 검사는 분리해서 근거를 남긴다. namespace 생성·실제 iptables 시험에 필요한 범용 관리자 권한은 현재 비대화형 sudo로 허용되지 않아 아직 실행하지 않았다. 기존 제한된 root-owned Wrapper sudo의 허용 여부와는 별개다.
+### 별도 namespace 실제 시험 자료 — 현재 미실행
+
+`infra/scripts/validate_pi_input_isolation.py`는 stdlib만 사용하는 별도 검증 도구다. 기본 실행과 `--dry-run`은 namespace·프로세스·네트워크 명령을 호출하지 않고 계획 JSON만 출력한다. 실제 실행에는 Linux, euid 0, 정확한 확인 문자열 `CREATE-DISPOSABLE-PI-INPUT-NAMESPACES`가 모두 필요하다. 고정 `/usr/sbin/ip`, `/usr/sbin/iptables`, `/usr/bin/ping`, `/bin/bash`와 현재 Python을 먼저 확인하며, 의존성이 없으면 namespace 생성 전에 실패한다. 임의 바이너리 경로 override와 sudo 호출 기능은 없다.
+
+검토한 소스와 Wrapper의 SHA를 보관한 뒤, 승인된 격리 Linux 시험 환경에서 계획부터 확인한다. 작업 디렉토리는 검토한 repository root다.
+
+```text
+python3 infra/scripts/validate_pi_input_isolation.py --dry-run
+```
+
+아래는 검토용 실제 실행 명령이며 이 문서 작성 중 실행하지 않았다. 이미 승인된 시험 환경의 root에서만 실행한다. 출력 JSON과 stderr의 namespace/PID 생성 기록은 기존 파일을 덮어쓰지 않는 새 시험 기록으로 각각 보관한다.
+
+```text
+python3 infra/scripts/validate_pi_input_isolation.py --execute --confirm CREATE-DISPOSABLE-PI-INPUT-NAMESPACES
+```
+
+도구는 무작위 이름의 Pi/client namespace 두 개를 새로 만든다. 이름이 이미 있으면 거부하고 기존 namespace는 삭제하지 않는다. veth와 peer는 처음부터 두 새 namespace 안에서만 생성하며, 물리 NIC·host INPUT·host route·서비스·DB·`/etc` 파일을 쓰지 않는다. 모든 iptables 호출은 자신이 만든 Pi namespace 안으로 고정한다. 서버와 TCP/UDP/ICMP probe는 부모가 기록한 namespace inode가 현재 inode와 일치하고 host inode와 다름을 확인한 후 listen/send한다. 시험 IP `10.253.94.1/2/3`은 운영 주소·기기 등록값이 아니다. 두 namespace 사이에만 연결되며 host로 연결하거나 default route를 추가하지 않는다.
+
+시험은 source A/B 각각 TCP 1883·9001·22 echo, UDP 9002 echo와 ICMP를 확인한다. 포트 22는 namespace 안의 시험 echo이며 실제 SSH 서비스가 아니다. UDP는 send 성공만으로 통과하지 않고 동일 nonce와 발신 peer의 응답을 요구한다.
+
+1. 두 source의 모든 probe가 정상인 baseline을 확인한다.
+2. 기존 Scope를 A에만 삽입하여 A의 TCP 1883만 차단되고 B와 나머지 probe는 정상인지 확인한다.
+3. 넓은 Scope를 함께 삽입하여 A의 모든 IPv4 probe가 차단되고 B는 정상인지 확인한다.
+4. 넓은 Scope의 exact ID·match만 삭제하고 기존 MQTT 차단이 남는지 확인한다.
+5. 넓은 Scope를 다시 삽입한 뒤 기존 Rule의 exact ID·match만 삭제하고 넓은 차단이 남는지 확인한다.
+6. 마지막 넓은 Rule을 정확히 삭제하여 A/B 전체 정상 복원을 확인한다. 차단 단계마다 해당 Rule의 packet/byte counter가 이번 probe 이후 실제 증가해야 한다.
+
+Wrapper는 `HANIUM_FW_DRY_RUN=1`로 고정 match만 얻으며 그 출력이 Worker와 같은 사양일 때 namespace의 실제 iptables에 전달한다. **운영 Wrapper의 root 소유 보호 파일 검사·실제 Pi 주소 강제 검사·sudoers 호출, Worker 승인·DB 상태 전이, 물리 장비·DHCP·재부팅은 이 도구의 검증 범위가 아니다.** IPv6·FORWARD도 시험하지 않는다. PASS는 위 namespace 동작과 정상 cleanup에만 한정된다.
+
+SIGINT/SIGTERM/SIGHUP는 취소 flag로 기록하여 자원 생성·receipt 기록 사이를 끊지 않는다. 자식 명령도 별도 session으로 실행하여 터미널 Ctrl-C가 생성 명령을 중간에 끊지 않게 한다. 실패·취소 시 자신이 시작한 서버를 terminate, 필요 시 kill 후 유한 시간 wait/reap하고, inode가 여전히 일치하는 자신이 생성한 namespace만 정리한다. 종료/회수 확인이나 삭제 실패는 PASS로 숨기지 않고 exit 1과 남은 이름/PID·오류를 기록한다. 생성 명령이 timeout/비정상 종료되어 성공을 입증하지 못하면 해당 이름을 `unconfirmed_namespace_creations`로 보고하고 자동 채택·삭제하지 않는다. namespace 정체가 바뀌거나 서버가 살아 있는지 불명확하면 자동 삭제하지 않는다. SIGKILL·전원 중단은 정리를 보장할 수 없으므로, 생성 요청/완료 기록의 이름과 inode 및 실제 PID의 namespace를 운영자가 대조한 뒤 별도로 처리한다. 이름 prefix나 재사용된 PID만으로 기존 자원을 일괄 삭제하지 않는다.
+
+host의 기존 link/route는 전후 읽기 fingerprint만 비교한다. 차이가 있거나 사후 관측이 실패하면 결과는 실패이며 자동 복구·삭제하지 않는다. host INPUT 자체는 관측하지 않으므로 불변을 인증하지 않는다. 각 명령과 서버 종료 대기에는 유한 제한시간이 있지만 전체 시험의 hard deadline은 별도 제공하지 않는다.
+
+이 자료 작성 시 실제 root namespace 실행은 **미검증**이다. 운영 Pi의 범용 비대화형 sudo는 허용되지 않았고 최근 SSH 연결도 timeout이었다. 별도 WSL Ubuntu에서 euid 0과 ip/ping/bash를 확인했고 최소 iptables 패키지를 설치했으며, 실제 namespace 실행은 아직 하지 않았다. 운영 Pi의 특권 Wrapper 설치·보호 파일·제한된 sudo 권한 검증과 별개의 시험 환경이다. 실제 실행 전에 고정 경로 사전 검사와 최종 소스 검토가 필요하다.
 
 이후 실제 운영 시험은 보호 경계·별도 시험 근거·운영 백업 확인 후 진행한다. 실제 장비 접근, DHCP 이동, 서비스/보드 재시작, Pi 재부팅 후 복원과 운영 DB 마이그레이션은 각각 별도 검증 상태로 기록한다. 통신이 멈춘 사실만으로 전체 격리·설치 펌웨어·모델 추론·공식 정상 자료 편입을 인증하지 않는다.
 
