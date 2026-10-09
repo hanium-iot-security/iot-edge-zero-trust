@@ -1,7 +1,8 @@
 # Phase 9 관리자 Rule·IF 통합 복구 CLI
 
 이 문서는 로컬 구현의 계약이다. 실제 Pi 복구·배포를 수행했다는 의미가 아니다.
-기존 관리자 API 초안은 여전히 미구현 제안이며, 이 변경은 HTTP API를 추가하지 않는다.
+이 CLI는 HTTP API를 추가하지 않는다. 서비스 자동 관리 기능은
+[별도 manager 명령](phase9-packet-pair-manager.md)을 참조한다.
 
 `python -m edge.detection.run_packet_checkpoint_pair_recovery`는 기존 단일 복구 엔진을
 Rule → IF 순서로 호출한다. 합집합 runtime 잠금을 한 번 획득하고 두 child 작업은
@@ -12,7 +13,14 @@ Rule → IF 순서로 호출한다. 합집합 runtime 잠금을 한 번 획득�
 
 지원 경로는 COMPLETED 원본 Session의 처리를 끝낸 두 Packet checkpoint에서,
 유일한 RUNNING target Session의 첫 경계로 이동하는 기존 `live-resume`이다.
-FAILED 원본 tail, 일반 gap recovery, 새로운 Migration은 이 CLI 범위에 없다.
+추가로 dry-run의 `--allow-failed-current-session`을 명시한 경우에만 기존 단일 엔진의
+**미수집 FAILED 마지막 구간** 경로를 사용한다. 원본은 종료 시각이 있는 FAILED Session이어야
+하며, 이미 처리한 경계에서 시작하는 마지막 10초 구간 하나만 `LATE_CAPTURE`로 실패한
+경우를 허용한다. 해당 구간에 파일 이름·실제 Capture 시작·수집 시간·Packet·Feature가
+없고 두 탐지기가 정상 준비 구간을 모두 소비했는지 단일 엔진이 각각 검사한다.
+기록된 PCAP 파일 이름이 있으나 파일이 사라진 경우나 처리 가능한 Feature가 있는 경우는
+이 예외가 아니며 차단한다. FAILED 기록과 입력 데이터는 그대로 보존한다.
+일반 FAILED 복구, 일반 gap recovery, 새로운 Migration은 이 CLI 범위에 없다.
 원래 checkpoint ID를 보존하고 target 첫 경계만 바꾼다. 백업 이후 재검사,
 조건부 UPDATE, 보호 테이블 검사, DB integrity/FK 검사 등 단일 엔진의 안전 조건은 유지한다.
 
@@ -37,6 +45,13 @@ python -m edge.detection.run_packet_checkpoint_pair_recovery dry-run \
   --approved-by <ADMIN> --reason '<APPROVED_REASON>' \
   --plan-output /srv/iot/recovery/pair-plan.json
 ```
+
+원본이 위 조건에 맞는 FAILED Session이면 dry-run에
+`--allow-failed-current-session`을 추가한다. 기본값은 `false`이며, COMPLETED 원본에
+이 옵션을 넣어도 실행 가능 계획이 되지 않는다. 계획에는 parent와 두 child의
+`allow_failed_current_session`, 각 child의 `failed_current_tail` 증거와
+`UNCAPTURED_FAILED_TAIL_SKIP` 경고가 포함된다. 원본 마지막 구간의 수집 기회를
+건너뛰는 승인이며, 실패 데이터를 정상 학습 자료로 바꾸는 기능은 아니다.
 
 계획의 `can_execute`, `blocking_reasons`, 두 child의 before/after, skip 목록을 검토하고
 실제 출력된 parent `plan_sha256`을 사용한다. 서비스 상태를 읽을 수 없는 Windows
@@ -65,6 +80,10 @@ python -m edge.detection.run_packet_checkpoint_pair_recovery execute \
 필요한 경우 동일 명령에
 `--confirm-skip-processable SKIP-PROCESSABLE-PAIR:<PARENT_PLAN_SHA256>`을 추가한다.
 필요하지 않은 skip 승인을 임의로 추가해도 거부한다.
+FAILED 원본의 예외 허용도 같은 parent SHA 승인에 묶인다. child 실행에는 기존 엔진의
+`APPLY-PACKET-FAILED-TAIL-LIVE-RESUME` 확인 문자열을 전달한다. execute/resume/status에는
+예외 옵션을 다시 받지 않으며, 승인 후 parent 또는 어느 child의 옵션을 바꿀 수 없다.
+옵션이 없던 기존 v1 parent 계획은 두 child가 명시적 `false`인 경우에만 기본 경로로 읽는다.
 
 ## 부분 완료·응답 유실
 
@@ -97,6 +116,7 @@ IF before 조건이 정확히 그대로인지 확인하고 IF만 실행한다. �
 status/resume는 각 child ID의 전체 DB 감사를 계획과 대조한다. detector/table,
 DB/commit, source/target, before/after/updated_at, 승인자/사유, child plan 원문/hash,
 skip 수, 실제 backup 경로/hash/sidecar/백업의 before checkpoint를 확인한다.
+FAILED 원본 예외 옵션과 마지막 구간 증거도 child 계획 원문/hash에 포함되어 감사와 대조된다.
 canonical SHA가 제외하는 값도 별도로 확인한다. 같은 detector+target에 다른
 operation의 감사가 있어도 이 pair의 적용으로 채택하지 않는다.
 
@@ -147,8 +167,9 @@ dry-run 성공은 exit 0이다. execute/resume/status는 `COMPLETE`일 때만 ex
 변경된 계획을 신뢰할 수 없으면 commit 여부도 `null`이다. 감사 전체 검증 실패는
 child `COMMITTED_UNVERIFIED`로 적용 사실과 검증 미완료를 구분한다.
 
-P9-05 전체 중 자식 제한시간·서비스 자동 원상복귀, FAILED tail 지원, 관리자 API는
-후속 미구현 항목이다. 이 CLI의 1차 로컬 구현을 P9-05 전체 완료로 표시하지 않는다.
+서비스 자동 원상복귀와 전체 Rule → IF 자식 제한시간은 별도 manager가 제공한다.
+일반 FAILED 복구, 검증 프로세스의 엄격한 전체 제한시간, OS watchdog과 운영 배포·검증은
+이 변경의 완료 범위가 아니다. 이 CLI 구현을 P9-05 전체 완료로 표시하지 않는다.
 
 ## 로컬 검증
 
@@ -157,4 +178,7 @@ P9-05 전체 중 자식 제한시간·서비스 자동 원상복귀, FAILED tail
 정상 적용, 공유 잠금 1회, 서로 다른 ID, Rule만 commit, child/pair 응답 유실,
 명시적 resume, 반복 실행, stale plan/CAS, 감사·백업 불일치, 실제 ID 소비,
 Capture 적격성, 이벤트 없는 Trust, 미처리 Trust, 45초 freshness, 미전진과
-두 번의 실제 전진을 검증한다. 이 검증은 운영 수집·모델·등록 상태에 의존하지 않는다.
+두 번의 실제 전진을 검증한다. 미수집 FAILED 마지막 구간의 명시적 opt-in, 기본 차단,
+두 child의 동일 옵션·기존 엔진 확인 문자열, 파일 이름/Feature/수집 기록이 있는 구간 거부,
+계획 이후 원본 변경, 옵션·감사 변경, 기존 v1 계획, 부분 실패·응답 유실 후 IF만 재개,
+manager의 동일 완료 조건과 원본 보존도 검증한다. 이 검증은 운영 수집·모델·등록 상태에 의존하지 않는다.

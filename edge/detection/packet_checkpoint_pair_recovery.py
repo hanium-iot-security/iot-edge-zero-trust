@@ -88,6 +88,9 @@ def _load_pair(path):
     pair_id = uuid.UUID(plan["pair_id"])
     if pair_id.version != 4 or str(pair_id) != plan["pair_id"]:
         raise Error("invalid pair identity")
+    allow_failed = plan.get("allow_failed_current_session", False)
+    if type(allow_failed) is not bool:
+        raise Error("failed-current-session approval must be boolean")
     children = plan.get("children", [])
     if [child.get("detector") for child in children] != list(DETECTORS):
         raise Error("paired detectors must be Rule then IF")
@@ -101,7 +104,8 @@ def _load_pair(path):
             if signed[key] != plan[key]:
                 raise Error("child approval binding mismatch")
         if (signed["detector_name"] != child["detector"] or signed["source_table"] != SOURCE
-                or signed.get("allow_failed_current_session") is not False
+                or type(signed.get("allow_failed_current_session")) is not bool
+                or signed["allow_failed_current_session"] != allow_failed
                 or signed["plan_schema_version"] != core.PLAN_SCHEMA_VERSION
                 or signed["checkpoint"]["after"] is not None and (
                     signed["checkpoint"]["after"]["last_completed_window_end"] != plan["boundary"]
@@ -114,7 +118,9 @@ def _load_pair(path):
 
 
 def inspect_pair(*, db_path, repository_root, current_session_id, target_session_id,
-                 approved_by, reason, plan_output):
+                 approved_by, reason, plan_output, allow_failed_current_session=False):
+    if type(allow_failed_current_session) is not bool:
+        raise Error("failed-current-session approval must be boolean")
     if not approved_by.strip() or not reason.strip():
         raise Error("approval principal and reason are required")
     database = core.resolve_database_path(db_path)
@@ -142,6 +148,7 @@ def inspect_pair(*, db_path, repository_root, current_session_id, target_session
                 db, repository_state=state, database_path=database, detector_name=name,
                 current_session_id=current_session_id, target_session_id=target_session_id,
                 approved_by=approved_by, reason=reason, lock_entries=entries, mode=core.LIVE_RESUME_MODE,
+                allow_failed_current_session=allow_failed_current_session,
             ), generated_at=core._utc_now().replace(microsecond=0))
             children.append({"detector": name, "child_operation_id": str(uuid.uuid5(pair_id, name)), "plan": signed})
     first = children[0]["plan"]
@@ -155,7 +162,8 @@ def inspect_pair(*, db_path, repository_root, current_session_id, target_session
     if failed_target:
         blockers.append("PAIR_TARGET_FAILED")
     payload = {key: first[key] for key in ("database_path", "repository_root", "repository_commit", "repository_state",
-               "current_session_id", "target_session_id", "approved_by", "reason", "locks", "mode")}
+               "current_session_id", "target_session_id", "approved_by", "reason", "locks", "mode",
+               "allow_failed_current_session")}
     payload.update(plan_schema_version=SCHEMA, pair_id=str(pair_id), children=children, boundary=boundary,
                    runtime=runtime, target_identity=target_identity,
                    can_execute=not blockers, blocking_reasons=blockers,
@@ -375,7 +383,8 @@ def execute_pair(*, plan_file, db_path, artifact_dir, confirm, confirm_skip_proc
                 core._write_json_atomically(child_file, child["plan"])
                 prepared = core._prepare_recovery_execution(
                     plan_file=child_file, db_path=database, artifact_dir=child_root,
-                    confirm=core.LIVE_RESUME_CONFIRMATION,
+                    confirm=core.FAILED_TAIL_RESUME_CONFIRMATION
+                    if child["plan"]["allow_failed_current_session"] else core.LIVE_RESUME_CONFIRMATION,
                     confirm_skip_processable=core.PROCESSABLE_SKIP_PREFIX + child["plan"]["plan_sha256"]
                     if child["plan"]["summary"]["skips_processable_sessions"] else None,
                     operation_id=child["child_operation_id"])

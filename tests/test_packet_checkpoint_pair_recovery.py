@@ -15,7 +15,7 @@ from edge.detection import run_packet_checkpoint_pair_recovery as cli
 from test_packet_checkpoint_recovery import (
     CURRENT_SESSION, TARGET_SESSION, TARGET_FIRST, CURRENT_READY_THROUGH, PROCESSABLE_SKIP_SESSION,
     _db_utc, _insert_capture_segment, _insert_capture_session, _insert_packet_if_checkpoint,
-    _repository, _seed_valid_recovery_database,
+    _repository, _seed_valid_recovery_database, _add_uncaptured_failed_tail,
 )
 
 
@@ -53,6 +53,31 @@ def fixture(tmp_path, monkeypatch):
     assert plan["can_execute"], plan["blocking_reasons"]
     return dict(database=database, root=root, artifacts=artifacts, runtime=runtime,
                 clock=clock, locks=locks, output=output, plan=plan)
+
+
+
+def _inspect_fixture(fixture, *, allow_failed_current_session=False):
+    output = fixture["output"].with_name("pair-plan-" + str(uuid.uuid4()) + ".json")
+    plan = pair.inspect_pair(db_path=fixture["database"], repository_root=fixture["root"],
+                             current_session_id=CURRENT_SESSION, target_session_id=TARGET_SESSION,
+                             approved_by="admin-fixture", reason="approved local live resume",
+                             plan_output=output, allow_failed_current_session=allow_failed_current_session)
+    return output, plan
+
+
+def _use_failed_tail(fixture):
+    with sqlite3.connect(fixture["database"]) as db:
+        db.row_factory = sqlite3.Row
+        fixture["tail_id"] = _add_uncaptured_failed_tail(db)
+    output, plan = _inspect_fixture(fixture, allow_failed_current_session=True)
+    assert plan["can_execute"], plan["blocking_reasons"]
+    fixture.update(output=output, plan=plan)
+
+
+def _resign(plan, fixture):
+    signed = core.attach_plan_sha256(plan, generated_at=fixture["clock"][0])
+    core._write_json_atomically(fixture["output"], signed)
+    return signed
 
 
 def _kwargs(fixture):
@@ -166,7 +191,7 @@ def _advance(fixture, seconds, *, packet_if_seconds=None, trust_seconds=None):
             _insert_capture_segment(db, session_pk=session_pk, capture_interface="eth-target",
                                     window_start=ready, status="EMPTY")
             ready += timedelta(seconds=10)
-        db.execute("UPDATE packet_capture_segments SET start_delay_seconds=0.1,captured_duration_seconds=9.9")
+        db.execute("UPDATE packet_capture_segments SET start_delay_seconds=0.1,captured_duration_seconds=9.9 WHERE status<>'FAILED'")
         for name, delta in (("packet_rule", seconds), ("packet_if", packet_if_seconds or seconds)):
             boundary = _db_utc(TARGET_FIRST + timedelta(seconds=delta))
             db.execute("UPDATE detector_checkpoints SET last_processed_id=3,last_completed_window_end=?,updated_at=? "
@@ -202,7 +227,10 @@ def test_pair_uses_one_union_lock_and_distinct_durable_child_audits(fixture):
     assert pair.status_pair(**_kwargs(fixture))["operation_status"] != "COMPLETE"
 
 
-def test_partial_failure_requires_resume_and_runs_only_original_pending_if(fixture, monkeypatch):
+@pytest.mark.parametrize("failed_tail", [False, True])
+def test_partial_failure_requires_resume_and_runs_only_original_pending_if(fixture, monkeypatch, failed_tail):
+    if failed_tail:
+        _use_failed_tail(fixture)
     original = core._execute_locked_recovery
     calls = []
 
@@ -227,7 +255,10 @@ def test_partial_failure_requires_resume_and_runs_only_original_pending_if(fixtu
 
 
 @pytest.mark.parametrize("lost_detector", pair.DETECTORS)
-def test_child_commit_result_loss_is_audited_and_not_reapplied(fixture, monkeypatch, lost_detector):
+@pytest.mark.parametrize("failed_tail", [False, True])
+def test_child_commit_result_loss_is_audited_and_not_reapplied(fixture, monkeypatch, lost_detector, failed_tail):
+    if failed_tail:
+        _use_failed_tail(fixture)
     original = core._write_json_atomically
     operation_id = next(child["child_operation_id"] for child in fixture["plan"]["children"] if child["detector"] == lost_detector)
 
@@ -268,7 +299,10 @@ def test_stale_plan_blocks_both_writes(fixture, mutation):
     assert _audits(fixture) == []
 
 
-def test_pending_if_keeps_original_cas_after_rule_commit(fixture, monkeypatch):
+@pytest.mark.parametrize("failed_tail", [False, True])
+def test_pending_if_keeps_original_cas_after_rule_commit(fixture, monkeypatch, failed_tail):
+    if failed_tail:
+        _use_failed_tail(fixture)
     original = core._execute_locked_recovery
     monkeypatch.setattr(core, "_execute_locked_recovery", lambda **prepared: original(**prepared)
                         if prepared["plan"]["detector_name"] == "packet_rule" else (_ for _ in ()).throw(core.PacketCheckpointRecoveryError("hold")))
@@ -474,3 +508,264 @@ def test_pair_execution_remains_posix_only(fixture, monkeypatch):
     with pytest.raises(core.PacketCheckpointRecoveryError, match="POSIX"):
         _execute(fixture)
     assert _audits(fixture) == []
+
+
+def test_failed_source_default_is_blocked_and_completed_default_remains_approved(fixture):
+    assert fixture["plan"]["allow_failed_current_session"] is False
+    assert all(child["plan"]["allow_failed_current_session"] is False for child in fixture["plan"]["children"])
+    with sqlite3.connect(fixture["database"]) as db:
+        db.row_factory = sqlite3.Row
+        _add_uncaptured_failed_tail(db)
+    output, plan = _inspect_fixture(fixture)
+    assert not plan["can_execute"]
+    assert all(name + ":CURRENT_SESSION_NOT_COMPLETED" in plan["blocking_reasons"] for name in pair.DETECTORS)
+    fixture.update(output=output, plan=plan)
+    with pytest.raises(core.PacketCheckpointRecoveryError, match="blocked plan"):
+        _execute(fixture)
+    assert _audits(fixture) == []
+
+
+def test_failed_opt_in_does_not_relax_completed_source_contract(fixture):
+    _, plan = _inspect_fixture(fixture, allow_failed_current_session=True)
+    assert not plan["can_execute"]
+    assert all(name + ":FAILED_TAIL_RESUME_REQUIRES_FAILED_SOURCE_AND_LIVE_MODE" in plan["blocking_reasons"]
+               for name in pair.DETECTORS)
+
+
+def test_failed_pair_delegates_guard_and_exact_confirmation_and_preserves_source(fixture, monkeypatch):
+    build = core.build_recovery_plan
+    calls = []
+
+    def build_child(db, **kwargs):
+        calls.append((kwargs["detector_name"], kwargs["allow_failed_current_session"]))
+        return build(db, **kwargs)
+
+    monkeypatch.setattr(core, "build_recovery_plan", build_child)
+    _use_failed_tail(fixture)
+    assert calls == [(name, True) for name in pair.DETECTORS]
+    assert fixture["plan"]["allow_failed_current_session"] is True
+    tails = [child["plan"]["failed_current_tail"] for child in fixture["plan"]["children"]]
+    assert tails[0] == tails[1] and tails[0]["segment_id"] == fixture["tail_id"]
+    assert all("UNCAPTURED_FAILED_TAIL_SKIP" in child["plan"]["summary"]["warning_codes"]
+               for child in fixture["plan"]["children"])
+    with sqlite3.connect(fixture["database"]) as db:
+        protected = {table: db.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+                     for table in pair.repository.PROTECTED_TABLES}
+    prepare = core._prepare_recovery_execution
+    confirmations = []
+
+    def prepare_child(**kwargs):
+        confirmations.append(kwargs["confirm"])
+        return prepare(**kwargs)
+
+    monkeypatch.setattr(core, "_prepare_recovery_execution", prepare_child)
+    assert _execute(fixture)["operation_status"] == "APPLIED_PENDING_PROGRESS"
+    assert confirmations == [core.FAILED_TAIL_RESUME_CONFIRMATION] * 2
+    assert len(fixture["locks"]) == 1
+    for audit, child in zip(_audits(fixture), fixture["plan"]["children"]):
+        signed = json.loads(audit["plan_json"])
+        assert signed == child["plan"] and signed["allow_failed_current_session"] is True
+        assert signed["failed_current_tail"]["feature_count"] == 0
+        assert audit["last_processed_id_before"] == audit["last_processed_id_after"] == 1
+    with sqlite3.connect(fixture["database"]) as db:
+        assert protected == {table: db.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+                             for table in pair.repository.PROTECTED_TABLES}
+    for seconds, expected in ((10, 0), (20, 1), (30, 2)):
+        _advance(fixture, seconds)
+        result = pair.status_pair(**_kwargs(fixture))
+        assert result["progress_advances"] == expected
+        assert result["operation_status"] == ("COMPLETE" if expected == 2 else "APPLIED_PENDING_PROGRESS")
+
+
+@pytest.mark.parametrize("mutation", ["missing_pcap_name", "captured", "packets", "features", "capture_started",
+                                      "extractor_error", "ended_outside", "extra_tail", "not_at_ready",
+                                      "ready_prefix_gap", "target_failed"])
+def test_failed_tail_pair_reuses_core_rejection_of_unsafe_or_processable_input(fixture, mutation):
+    _use_failed_tail(fixture)
+    with sqlite3.connect(fixture["database"]) as db:
+        db.row_factory = sqlite3.Row
+        tail = fixture["tail_id"]
+        # Only this temporary fixture permits corrupt persisted LATE_CAPTURE rows,
+        # so inspection must reject them independently of the schema CHECK.
+        if mutation in {"missing_pcap_name", "captured", "capture_started"}:
+            db.execute("PRAGMA ignore_check_constraints=ON")
+        if mutation == "missing_pcap_name":
+            # A recorded file name still indicates captured input even if that PCAP is now missing.
+            db.execute("UPDATE packet_capture_segments SET file_name='missing.pcap' WHERE id=?", (tail,))
+        elif mutation == "captured":
+            db.execute("UPDATE packet_capture_segments SET captured_duration_seconds=0.1 WHERE id=?", (tail,))
+        elif mutation == "packets":
+            db.execute("UPDATE packet_capture_segments SET packet_count=1 WHERE id=?", (tail,))
+        elif mutation == "features":
+            db.execute("INSERT INTO packet_feature_logs (capture_segment_id,peer_ip,direction,window_start,window_end,packet_count,total_bytes,avg_packet_size,max_packet_size) "
+                       "SELECT id,'10.0.0.1','INBOUND',window_start,window_end,1,60,60,60 FROM packet_capture_segments WHERE id=?", (tail,))
+        elif mutation == "capture_started":
+            db.execute("UPDATE packet_capture_segments SET actual_capture_started_at=window_start WHERE id=?", (tail,))
+        elif mutation == "extractor_error":
+            db.execute("UPDATE packet_capture_segments SET error_code='EXTRACTOR_ERROR' WHERE id=?", (tail,))
+        elif mutation == "ended_outside":
+            db.execute("UPDATE packet_capture_sessions SET ended_at=? WHERE session_id=?", (_db_utc(TARGET_FIRST), CURRENT_SESSION))
+        elif mutation == "extra_tail":
+            session = db.execute("SELECT id FROM packet_capture_sessions WHERE session_id=?", (CURRENT_SESSION,)).fetchone()[0]
+            _insert_capture_segment(db, session_pk=session, capture_interface="eth-current",
+                                    window_start=CURRENT_READY_THROUGH + timedelta(seconds=10), status="FAILED")
+        elif mutation == "not_at_ready":
+            db.execute("UPDATE detector_checkpoints SET last_completed_window_end=? WHERE detector_name='packet_if'",
+                       (_db_utc(CURRENT_READY_THROUGH - timedelta(seconds=10)),))
+        elif mutation == "ready_prefix_gap":
+            db.execute("UPDATE packet_capture_segments SET status='READY' WHERE window_end=? AND capture_session_id="
+                       "(SELECT id FROM packet_capture_sessions WHERE session_id=?)", (_db_utc(CURRENT_READY_THROUGH), CURRENT_SESSION))
+        else:
+            target = db.execute("SELECT id FROM packet_capture_sessions WHERE session_id=?", (TARGET_SESSION,)).fetchone()[0]
+            _insert_capture_segment(db, session_pk=target, capture_interface="eth-target",
+                                    window_start=TARGET_FIRST + timedelta(seconds=20), status="FAILED")
+    output, plan = _inspect_fixture(fixture, allow_failed_current_session=True)
+    assert not plan["can_execute"] and plan["blocking_reasons"]
+    fixture.update(output=output, plan=plan)
+    with pytest.raises(core.PacketCheckpointRecoveryError, match="blocked plan"):
+        _execute(fixture)
+    assert _audits(fixture) == []
+
+
+def test_failed_tail_changed_after_plan_blocks_both_writes(fixture):
+    _use_failed_tail(fixture)
+    with sqlite3.connect(fixture["database"]) as db:
+        db.execute("UPDATE packet_capture_segments SET packet_count=1 WHERE id=?", (fixture["tail_id"],))
+    with pytest.raises(core.PacketCheckpointRecoveryError, match="canonical plan changed"):
+        _execute(fixture)
+    assert _audits(fixture) == []
+
+
+@pytest.mark.parametrize("value", [1, "true", None])
+def test_failed_opt_in_requires_real_boolean_before_plan_write(fixture, value):
+    with pytest.raises(core.PacketCheckpointRecoveryError, match="must be boolean"):
+        _inspect_fixture(fixture, allow_failed_current_session=value)
+    assert _audits(fixture) == []
+
+
+@pytest.mark.parametrize("mutation", ["parent_false", "parent_integer", "child_false", "child_integer", "child_hash"])
+def test_failed_pair_rejects_opt_in_binding_mutation_even_with_parent_resigned(fixture, mutation):
+    _use_failed_tail(fixture)
+    plan = json.loads(json.dumps(fixture["plan"]))
+    if mutation.startswith("parent_"):
+        plan["allow_failed_current_session"] = False if mutation == "parent_false" else 1
+    else:
+        child = plan["children"][1]
+        child["plan"]["allow_failed_current_session"] = False if mutation in {"child_false", "child_hash"} else 1
+        if mutation != "child_hash":
+            child["plan"] = core.attach_plan_sha256(child["plan"], generated_at=fixture["clock"][0])
+    fixture["plan"] = _resign(plan, fixture)
+    with pytest.raises(core.PacketCheckpointRecoveryError):
+        _execute(fixture)
+    assert _audits(fixture) == []
+
+
+@pytest.mark.parametrize("command", ["execute", "resume", "status"])
+def test_failed_opt_in_is_not_an_execution_or_status_override(fixture, command):
+    common = ["--plan-file", str(fixture["output"]), "--db-path", str(fixture["database"]),
+              "--artifact-dir", str(fixture["artifacts"])]
+    if command != "status":
+        common += ["--confirm", pair.CONFIRM + fixture["plan"]["plan_sha256"]]
+    with pytest.raises(SystemExit) as error:
+        cli.main([command, *common, "--allow-failed-current-session"])
+    assert error.value.code == 2 and _audits(fixture) == []
+
+
+def test_failed_tail_cli_opt_in_is_written_to_original_approval(fixture, capsys):
+    _use_failed_tail(fixture)
+    output = fixture["output"].with_name("cli-failed-plan.json")
+    args = ["dry-run", "--db-path", str(fixture["database"]), "--repository-root", str(fixture["root"]),
+            "--current-session-id", CURRENT_SESSION, "--target-session-id", TARGET_SESSION,
+            "--approved-by", "admin-fixture", "--reason", "reviewed failed capture opportunity",
+            "--plan-output", str(output)]
+    assert cli.main([*args, "--allow-failed-current-session"]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert pair._load_pair(output)[1] == plan
+    assert plan["allow_failed_current_session"] is True
+    assert all(child["plan"]["allow_failed_current_session"] is True for child in plan["children"])
+    assert _audits(fixture) == []
+
+
+def test_failed_opt_in_change_after_partial_commit_is_rejected_by_original_intent(fixture, monkeypatch):
+    _use_failed_tail(fixture)
+    original = core._execute_locked_recovery
+    monkeypatch.setattr(core, "_execute_locked_recovery", lambda **kwargs: original(**kwargs)
+                        if kwargs["plan"]["detector_name"] == "packet_rule" else (_ for _ in ()).throw(pair.Error("IF hold")))
+    assert _execute(fixture)["operation_status"] == "PARTIAL_HOLD"
+    plan = json.loads(json.dumps(fixture["plan"]))
+    plan["allow_failed_current_session"] = False
+    for child in plan["children"]:
+        child["plan"]["allow_failed_current_session"] = False
+        child["plan"] = core.attach_plan_sha256(child["plan"], generated_at=fixture["clock"][0])
+    fixture["plan"] = _resign(plan, fixture)
+    for call in (lambda: _execute(fixture, resume=True), lambda: pair.status_pair(**_kwargs(fixture))):
+        with pytest.raises(core.PacketCheckpointRecoveryError, match="intent missing or changed"):
+            call()
+    assert len(_audits(fixture)) == 1
+
+
+def test_failed_audit_opt_in_cannot_be_changed_to_reuse_applied_child(fixture):
+    _use_failed_tail(fixture)
+    _execute(fixture)
+    with sqlite3.connect(fixture["database"]) as db:
+        signed = json.loads(db.execute("SELECT plan_json FROM packet_checkpoint_recoveries WHERE detector_name='packet_rule'").fetchone()[0])
+        signed["allow_failed_current_session"] = False
+        db.execute("UPDATE packet_checkpoint_recoveries SET plan_json=? WHERE detector_name='packet_rule'", (json.dumps(signed),))
+    with pytest.raises(core.PacketCheckpointRecoveryError, match="audit does not match"):
+        pair.status_pair(**_kwargs(fixture))
+    assert len(_audits(fixture)) == 2
+
+
+def test_pre_opt_in_pair_plan_remains_valid_for_completed_source(fixture):
+    plan = json.loads(json.dumps(fixture["plan"]))
+    plan.pop("allow_failed_current_session")
+    fixture["plan"] = _resign(plan, fixture)
+    assert _execute(fixture)["operation_status"] == "APPLIED_PENDING_PROGRESS"
+    assert len(_audits(fixture)) == 2
+
+
+def test_failed_opt_in_manager_plan_keeps_pair_sha_binding_and_original_budgets(fixture):
+    from edge.detection import packet_checkpoint_pair_manager as manager
+    from test_packet_checkpoint_pair_manager import System
+
+    _use_failed_tail(fixture)
+    system = System(fixture)
+    output = fixture["output"].with_name("failed-manager-plan.json")
+    plan = manager.create_plan(pair_plan_file=fixture["output"], db_path=fixture["database"],
+                               artifact_dir=fixture["artifacts"], plan_output=output, system=system)
+    assert plan["can_execute"] and plan["pair_plan_sha256"] == fixture["plan"]["plan_sha256"]
+    assert plan["budgets"] == manager.BUDGETS
+    assert plan["source_session_id"] == CURRENT_SESSION and plan["target_session_id"] == TARGET_SESSION
+    assert system.actions == [] and _audits(fixture) == []
+    changed = json.loads(json.dumps(fixture["plan"]))
+    changed["reason"] = "new approval"
+    for child in changed["children"]:
+        child["plan"]["reason"] = changed["reason"]
+        child["plan"] = core.attach_plan_sha256(child["plan"], generated_at=fixture["clock"][0])
+    _resign(changed, fixture)
+    with pytest.raises(core.PacketCheckpointRecoveryError, match="pair approval changed"):
+        manager._load_plan(output)
+
+
+def test_failed_tail_manager_preserves_source_and_completes_only_after_real_target_advances(fixture, monkeypatch):
+    from edge.detection import packet_checkpoint_pair_manager as manager
+    from test_packet_checkpoint_pair_manager import System, Processes, launch, run
+
+    _use_failed_tail(fixture)
+    with sqlite3.connect(fixture["database"]) as db:
+        source = db.execute("SELECT * FROM packet_capture_sessions WHERE session_id=?", (CURRENT_SESSION,)).fetchone()
+        tail = db.execute("SELECT * FROM packet_capture_segments WHERE id=?", (fixture["tail_id"],)).fetchone()
+    system = System(fixture)
+    path = fixture["output"].with_name("complete-failed-manager-plan.json")
+    plan = manager.create_plan(pair_plan_file=fixture["output"], db_path=fixture["database"],
+                               artifact_dir=fixture["artifacts"], plan_output=path, system=system)
+    processes = Processes(lambda: _execute(fixture, resume=bool(_audits(fixture))))
+    wrapped = dict(base=fixture, system=system, path=path, plan=plan, processes=processes)
+    assert launch(wrapped)["operation_status"] == "RUNNING"
+    result = run(wrapped, monkeypatch, advance=True)
+    assert result["phase"] == "COMPLETE" and len(_audits(fixture)) == 2
+    assert all(value == "active" for value in system.states.values())
+    assert all(unit in manager.UNITS for _, unit, _ in system.actions)
+    with sqlite3.connect(fixture["database"]) as db:
+        assert db.execute("SELECT * FROM packet_capture_sessions WHERE session_id=?", (CURRENT_SESSION,)).fetchone() == source
+        assert db.execute("SELECT * FROM packet_capture_segments WHERE id=?", (fixture["tail_id"],)).fetchone() == tail

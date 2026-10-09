@@ -15,6 +15,8 @@ def build_parser():
     for name in ("db-path", "repository-root", "current-session-id", "target-session-id",
                  "approved-by", "reason", "plan-output"):
         dry_run.add_argument("--" + name, required=True)
+    dry_run.add_argument("--allow-failed-current-session", action="store_true",
+                         help="approve only the existing uncaptured LATE_CAPTURE tail live-resume contract")
     for name in ("execute", "status", "resume"):
         command = commands.add_parser(name)
         for field in ("plan-file", "db-path", "artifact-dir"):
