@@ -1,0 +1,160 @@
+# Phase 9 관리자 Rule·IF 통합 복구 CLI
+
+이 문서는 로컬 구현의 계약이다. 실제 Pi 복구·배포를 수행했다는 의미가 아니다.
+기존 관리자 API 초안은 여전히 미구현 제안이며, 이 변경은 HTTP API를 추가하지 않는다.
+
+`python -m edge.detection.run_packet_checkpoint_pair_recovery`는 기존 단일 복구 엔진을
+Rule → IF 순서로 호출한다. 합집합 runtime 잠금을 한 번 획득하고 두 child 작업은
+각각 별도 backup/transaction/audit를 만든다. Rule commit 후 IF 실패는 부분 완료이며
+자동 rollback이나 전체 backup 복원을 하지 않는다.
+
+## 지원 경로와 승인
+
+지원 경로는 COMPLETED 원본 Session의 처리를 끝낸 두 Packet checkpoint에서,
+유일한 RUNNING target Session의 첫 경계로 이동하는 기존 `live-resume`이다.
+FAILED 원본 tail, 일반 gap recovery, 새로운 Migration은 이 CLI 범위에 없다.
+원래 checkpoint ID를 보존하고 target 첫 경계만 바꾼다. 백업 이후 재검사,
+조건부 UPDATE, 보호 테이블 검사, DB integrity/FK 검사 등 단일 엔진의 안전 조건은 유지한다.
+
+계획에는 실제 DB 절대 경로, Git commit/상태, 원본/대상 Session, 각 child의 원래
+before(ID/경계/updated_at), 승인자/사유, Boot ID, Stage 구성, CapturePolicy를 기록한다.
+tracked/staged Git 변경이 있는 checkout에서 운영 계획을 만들 수 없다.
+모든 명령은 실제 `repository_root`를 CWD로 두고 서비스와 같은 환경 설정으로 실행한다.
+Settings의 `.env`/`../.env` 검색으로 Stage·Capture·잠금 설정이 달라지지 않도록 한다.
+계획 출력의 부모와 artifact 디렉터리는 미리 존재해야 하고, 저장소 안의 생성 경로와
+runtime 잠금 경로는 Git ignore 대상이어야 한다.
+
+pair UUID를 새로 발급하고 각 child ID를 `uuid5(pair_id, detector_name)`으로 정한다.
+두 ID는 서로 다르며 같은 승인 계획의 재시도에서 유지된다. parent SHA와 함께 승인한다.
+처리 가능한 중간 Session을 건너뛰는 계획은 별도의 parent SHA 승인도 필요하다.
+이는 데이터를 정상 입력으로 만드는 조작이 아니라 기존 skip 계약의 명시적 승인이다.
+
+```sh
+python -m edge.detection.run_packet_checkpoint_pair_recovery dry-run \
+  --db-path /srv/iot/data/iot_security.db \
+  --repository-root /srv/iot/iot-edge-zero-trust \
+  --current-session-id <SOURCE_UUID> --target-session-id <TARGET_UUID> \
+  --approved-by <ADMIN> --reason '<APPROVED_REASON>' \
+  --plan-output /srv/iot/recovery/pair-plan.json
+```
+
+계획의 `can_execute`, `blocking_reasons`, 두 child의 before/after, skip 목록을 검토하고
+실제 출력된 parent `plan_sha256`을 사용한다. 서비스 상태를 읽을 수 없는 Windows
+호스트의 실제 dry-run은 Boot 미확인으로 차단되며, Windows 검증은 fixture 관측을 사용한다.
+execute/resume는 POSIX에서만 허용한다. 공개 CLI에 OS/서비스/잠금 우회 옵션은 없다.
+
+execute/resume 전에 기존 서비스 상태를 기록하고, 기존 운영 절차로 Orchestrator와
+수동 Rule/IF Runner의 잠금을 해제해야 한다. Orchestrator가 lifetime 잠금을
+보유한 채 실행하면 충돌로 차단된다. Capture/MQTT 수집은 유지하고, 적용 뒤에는
+원래 active였던 서비스만 기존 절차로 복귀한 후 status를 관측한다. 이 절차를
+CLI가 자동 수행하지 않는다. 실패 시 새 before를 승인하거나 잠금을 우회하지 않는다.
+
+Orchestrator는 실행 환경의 `ORCHESTRATOR_LOCK_PATH` 설정(빈 값이면 기존 기본값)을
+사용하고 parent/child 계획에 그 절대 경로를 바인딩한다. 실행 시 설정이 달라지면
+차단한다. 수동 Runner와 Extractor는 각각 기존 기본 잠금 경로를 사용해야 한다.
+별도 `--lock-path`로 실행하는 수동 프로세스가 있다면 이 CLI의 운영 규격과 맞추고
+기존 절차로 종료해야 한다. 이 CLI는 임의 custom 잠금 override를 제공하지 않는다.
+
+```sh
+python -m edge.detection.run_packet_checkpoint_pair_recovery execute \
+  --plan-file /srv/iot/recovery/pair-plan.json \
+  --db-path /srv/iot/data/iot_security.db --artifact-dir /srv/iot/recovery/artifacts \
+  --confirm APPLY-PACKET-PAIR-LIVE-RESUME:<PARENT_PLAN_SHA256>
+```
+
+필요한 경우 동일 명령에
+`--confirm-skip-processable SKIP-PROCESSABLE-PAIR:<PARENT_PLAN_SHA256>`을 추가한다.
+필요하지 않은 skip 승인을 임의로 추가해도 거부한다.
+
+## 부분 완료·응답 유실
+
+`artifacts/<pair_id>/intent.json`은 승인 계획 원문이며, 각 `attempt-<uuid>.json`은
+실행 전에 child backup 절대 경로를 기록한다. child plan은
+`attempt-<uuid>/<detector>/plan.json`에, backup/checksum/child result는
+`attempt-<uuid>/<detector>/<child_id>/`에, pair result는 해당 attempt에 저장한다.
+IF backup은 Rule commit 이후 만들어지므로 두 backup hash가 같아야 한다는 조건은 없다.
+
+DB 감사가 stdout/result 파일보다 우선한다. COMMIT 뒤 child/pair result 파일 생성이
+실패해도 적용 사실을 보존한다. JSON의 `database_committed=true` 또는 확인 불가한
+`null`은 rollback 증거로 해석하면 안 된다. 새 pair 계획을 만들어 기존 적용 단계를
+다시 실행하지 않는다.
+
+```sh
+python -m edge.detection.run_packet_checkpoint_pair_recovery status \
+  --plan-file /srv/iot/recovery/pair-plan.json \
+  --db-path /srv/iot/data/iot_security.db --artifact-dir /srv/iot/recovery/artifacts
+
+python -m edge.detection.run_packet_checkpoint_pair_recovery resume \
+  --plan-file /srv/iot/recovery/pair-plan.json \
+  --db-path /srv/iot/data/iot_security.db --artifact-dir /srv/iot/recovery/artifacts \
+  --confirm APPLY-PACKET-PAIR-LIVE-RESUME:<PARENT_PLAN_SHA256>
+```
+
+resume에도 원래 skip 승인이 필요한 경우 동일하게 제공한다. Rule만 적용되면 원래
+IF before 조건이 정확히 그대로인지 확인하고 IF만 실행한다. 새 before로 재계획하지
+않는다. 두 child가 모두 적용되었다면 execute/resume도 검증만 수행한다.
+
+status/resume는 각 child ID의 전체 DB 감사를 계획과 대조한다. detector/table,
+DB/commit, source/target, before/after/updated_at, 승인자/사유, child plan 원문/hash,
+skip 수, 실제 backup 경로/hash/sidecar/백업의 before checkpoint를 확인한다.
+canonical SHA가 제외하는 값도 별도로 확인한다. 같은 detector+target에 다른
+operation의 감사가 있어도 이 pair의 적용으로 채택하지 않는다.
+
+현재 committed checkpoint는 감사 after와 정확히 같거나 입증된 정상 target 처리
+전진이어야 한다. 전진은 10초 경계, runtime updated_at=경계, 준비된 연속 target
+범위, 실제 소비 ID로 검증한다. Rule은 INBOUND, IF는 전체 방향 Feature의 max ID를
+소비하며, EMPTY 구간은 ID가 유지될 수 있다. 후퇴, 같은 경계에서 ID/updated_at 변경,
+다른 복구, target 식별 정보나 Boot/Stage/CapturePolicy 변경은 HOLD한다.
+
+## 실제 완료 확인
+
+감사 두 개만으로는 `COMPLETE`가 되지 않는다. 두 적용 이후 status의 최초 관측이
+기준점이며, 이후 별도 관측 두 번에서 Rule/IF/Trust 경계가 모두 전진해야 한다.
+매 관측의 ID는 후퇴하면 안 된다. Trust 입력 이벤트가 없는 정상 경로에서는 Trust
+ID 증가를 강제하지 않는다. 관측 간격과 각 경계의 현재 시각 대비 지연은 45초 이하다.
+무한 재시도나 자동 polling은 없으며 서비스와 정상 입력이 계속 진행되는 동안 status를
+다시 실행한다.
+
+완료에는 동일 Boot/target, Rule·IF enabled+required, NTP 동기화 확인, 아래 필수
+서비스의 active 관측, 새 FAILED/연속성 오류 없음, 검증 구간의 공통 Capture 적격성,
+실제 Feature ID 소비, Trust cutoff까지 미처리 후보 이벤트 없음이 필요하다.
+Trust 경계는 두 Packet 경계를 넘을 수 없고 Rule/IF/Trust는 MQTT producer 경계를
+넘을 수 없다. 서비스 관측은 읽기만 하며 시작·중지·재시작하지 않는다.
+
+- `packet-capture.service`
+- `packet-feature-extractor.timer`
+- `mqtt-subscriber.service`
+- `mqtt-feature-builder.service`
+- `detection-orchestrator.service`
+
+DB status 읽기는 read-only transaction이다. 연속 관측은 pair 전용 잠금 아래
+`progress.json`에 checksum과 함께 기록한다. 증거가 없거나 바뀌면 이를 자동 복원하지
+않는다. 완료 이후에도 stale/오류/변경을 관측하면 COMPLETE를 계속 주장하지 않는다.
+완료 관측은 임의 DB 관리자가 감사와 입력을 모두 위조할 수 없음을 증명하는 장치가
+아니며, 정상 runtime의 조건과 일치하는 로컬 처리 증거를 확인한다.
+
+| 결과 | 의미 |
+| --- | --- |
+| `PENDING` | 이 pair의 적용 감사 없음 |
+| `PARTIAL_HOLD` | Rule 적용 보존, IF는 원래 조건의 명시적 resume 필요 |
+| `APPLIED_PENDING_PROGRESS` | 두 child 적용 확인, 실제 완료 증거 대기 |
+| `HOLD` | 오류/확인 불가, 적용 사실을 유지하고 원인을 검토 |
+| `COMPLETE` | 두 차례 전진과 완료 조건 확인 |
+
+dry-run 성공은 exit 0이다. execute/resume/status는 `COMPLETE`일 때만 exit 0이다.
+비완료이며 commit 없음이 확인되면 exit 2, commit이 있거나 확인 불가하면 exit 3이다.
+`APPLIED_PENDING_PROGRESS`도 exit 3이며, 아직 전체 복구 완료가 아니다.
+변경된 계획을 신뢰할 수 없으면 commit 여부도 `null`이다. 감사 전체 검증 실패는
+child `COMMITTED_UNVERIFIED`로 적용 사실과 검증 미완료를 구분한다.
+
+P9-05 전체 중 자식 제한시간·서비스 자동 원상복귀, FAILED tail 지원, 관리자 API는
+후속 미구현 항목이다. 이 CLI의 1차 로컬 구현을 P9-05 전체 완료로 표시하지 않는다.
+
+## 로컬 검증
+
+테스트는 임시 DB에 실제 Migration/backup/조건부 UPDATE/감사를 수행하고 임시 Git
+저장소를 사용한다. Linux Boot/서비스/시각/잠금 관측만 fixture로 대체한다.
+정상 적용, 공유 잠금 1회, 서로 다른 ID, Rule만 commit, child/pair 응답 유실,
+명시적 resume, 반복 실행, stale plan/CAS, 감사·백업 불일치, 실제 ID 소비,
+Capture 적격성, 이벤트 없는 Trust, 미처리 Trust, 45초 freshness, 미전진과
+두 번의 실제 전진을 검증한다. 이 검증은 운영 수집·모델·등록 상태에 의존하지 않는다.

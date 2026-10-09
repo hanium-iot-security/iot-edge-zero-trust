@@ -1067,13 +1067,14 @@ def _execute_locked_recovery(
         ) from exc
 
 
-def execute_packet_checkpoint_recovery(
+def _prepare_recovery_execution(
     *,
     plan_file: str | Path,
     db_path: str | Path,
     artifact_dir: str | Path,
     confirm: str,
     confirm_skip_processable: str | None = None,
+    operation_id: str | None = None,
 ) -> dict[str, object]:
     require_execute_platform(_current_platform_name())
     plan_path, plan = _load_plan(plan_file)
@@ -1088,7 +1089,7 @@ def execute_packet_checkpoint_recovery(
     )
     repository_root = Path(str(plan["repository_root"])).resolve(strict=True)
     locks = _locks_from_plan(plan)
-    operation_id = str(uuid.uuid4())
+    operation_id = operation_id or str(uuid.uuid4())
     artifact_root = Path(artifact_dir).expanduser().resolve(strict=False)
     operation_dir = artifact_root / operation_id
     backup_path = operation_dir / "database.backup.db"
@@ -1103,19 +1104,37 @@ def execute_packet_checkpoint_recovery(
     backup_sha256_path = paths["backup_sha256_path"]
     if not isinstance(backup_sha256_path, Path):
         raise PacketCheckpointRecoveryError("backup SHA256 path is invalid")
-    with acquire_recovery_locks(locks):
-        return _execute_locked_recovery(
-            plan_path=plan_path,
-            plan=plan,
-            database=database,
-            artifact_root=artifact_root,
-            operation_id=operation_id,
-            operation_dir=operation_dir,
-            backup_path=backup_path,
-            backup_sha256_path=backup_sha256_path,
-            result_path=result_path,
-            locks=locks,
-        )
+    return dict(
+        plan_path=plan_path,
+        plan=plan,
+        database=database,
+        artifact_root=artifact_root,
+        operation_id=operation_id,
+        operation_dir=operation_dir,
+        backup_path=backup_path,
+        backup_sha256_path=backup_sha256_path,
+        result_path=result_path,
+        locks=locks,
+    )
+
+
+def execute_packet_checkpoint_recovery(
+    *,
+    plan_file: str | Path,
+    db_path: str | Path,
+    artifact_dir: str | Path,
+    confirm: str,
+    confirm_skip_processable: str | None = None,
+) -> dict[str, object]:
+    prepared = _prepare_recovery_execution(
+        plan_file=plan_file,
+        db_path=db_path,
+        artifact_dir=artifact_dir,
+        confirm=confirm,
+        confirm_skip_processable=confirm_skip_processable,
+    )
+    with acquire_recovery_locks(prepared["locks"]):
+        return _execute_locked_recovery(**prepared)
 
 
 def resolve_database_path(db_path: str | Path) -> Path:
