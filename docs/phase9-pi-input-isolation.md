@@ -75,7 +75,7 @@ Wrapper 세 인자 호출은 기존 MQTT scope로 유지한다. 광역 check/ins
 
 ## 검증과 남은 실제 확인
 
-로컬 검증은 임시 SQLite DB·가짜 Worker/runtime·Wrapper dry-run만 사용한다. 새/기존 DB, FK·sequence·원자성, UUID 재요청, 승인 이후 IP/정책/해제 변경, FAILED 잔여 정리와 복구 HOLD를 검사한다. 이 결과는 실제 Pi 차단 또는 재부팅 검증을 뜻하지 않는다.
+기존 단위·회귀 검증은 임시 SQLite DB·가짜 Worker/runtime·Wrapper dry-run을 사용한다. 새/기존 DB, FK·sequence·원자성, UUID 재요청, 승인 이후 IP/정책/해제 변경, FAILED 잔여 정리와 복구 HOLD를 검사한다. 이 결과는 실제 Pi 차단 또는 재부팅 검증을 뜻하지 않는다.
 
 ### 2026/10/9 검증 결과
 
@@ -83,7 +83,7 @@ Windows에서 Worker·Wrapper·Snapshot 관련 184개와 DB·API·정책·복구
 
 임시 DB·가짜 실행기와 실제 Bash Wrapper의 dry-run을 사용했다. FAILED 광역 삽입 잔여 규칙이 있을 때 baseline 복구 HOLD, 정확한 감사 해제, 오래된 관측 HOLD, 후속 관측 이후 정상 복구까지 연결해 검증했다. 시험 전후 운영 코드·Boot ID와 기존 수집/탐지/방화벽 서비스 active 상태는 유지됐다. 실제 특권 iptables 동작·물리 장비·DHCP·재부팅 검증 결과는 아니다.
 
-### 별도 namespace 실제 시험 자료 — 현재 미실행
+### 별도 namespace 실제 시험
 
 `infra/scripts/validate_pi_input_isolation.py`는 stdlib만 사용하는 별도 검증 도구다. 기본 실행과 `--dry-run`은 namespace·프로세스·네트워크 명령을 호출하지 않고 계획 JSON만 출력한다. 실제 실행에는 Linux, euid 0, 정확한 확인 문자열 `CREATE-DISPOSABLE-PI-INPUT-NAMESPACES`가 모두 필요하다. 고정 `/usr/sbin/ip`, `/usr/sbin/iptables`, `/usr/bin/ping`, `/bin/bash`와 현재 Python을 먼저 확인하며, 의존성이 없으면 namespace 생성 전에 실패한다. 임의 바이너리 경로 override와 sudo 호출 기능은 없다.
 
@@ -93,7 +93,7 @@ Windows에서 Worker·Wrapper·Snapshot 관련 184개와 DB·API·정책·복구
 python3 infra/scripts/validate_pi_input_isolation.py --dry-run
 ```
 
-아래는 검토용 실제 실행 명령이며 이 문서 작성 중 실행하지 않았다. 이미 승인된 시험 환경의 root에서만 실행한다. 출력 JSON과 stderr의 namespace/PID 생성 기록은 기존 파일을 덮어쓰지 않는 새 시험 기록으로 각각 보관한다.
+아래 명령은 2026/10/9의 WSL Ubuntu 임시 namespace 시험에서 실행했다. 승인된 격리 시험 환경의 root에서만 사용한다. 출력 JSON과 stderr의 namespace/PID 생성 기록은 기존 파일을 덮어쓰지 않는 새 시험 기록으로 각각 보관한다.
 
 ```text
 python3 infra/scripts/validate_pi_input_isolation.py --execute --confirm CREATE-DISPOSABLE-PI-INPUT-NAMESPACES
@@ -116,7 +116,20 @@ SIGINT/SIGTERM/SIGHUP는 취소 flag로 기록하여 자원 생성·receipt 기�
 
 host의 기존 link/route는 전후 읽기 fingerprint만 비교한다. 차이가 있거나 사후 관측이 실패하면 결과는 실패이며 자동 복구·삭제하지 않는다. host INPUT 자체는 관측하지 않으므로 불변을 인증하지 않는다. 각 명령과 서버 종료 대기에는 유한 제한시간이 있지만 전체 시험의 hard deadline은 별도 제공하지 않는다.
 
-이 자료 작성 시 실제 root namespace 실행은 **미검증**이다. 운영 Pi의 범용 비대화형 sudo는 허용되지 않았고 최근 SSH 연결도 timeout이었다. 별도 WSL Ubuntu에서 euid 0과 ip/ping/bash를 확인했고 최소 iptables 패키지를 설치했으며, 실제 namespace 실행은 아직 하지 않았다. 운영 Pi의 특권 Wrapper 설치·보호 파일·제한된 sudo 권한 검증과 별개의 시험 환경이다. 실제 실행 전에 고정 경로 사전 검사와 최종 소스 검토가 필요하다.
+**2026/10/9 WSL 실제 시험 — 통과:** 검토·커밋된 `4c96760739132b18b33f274d8efbbaa9b4364efc` 소스를 Ubuntu, Python 3.14.4, kernel `6.18.33.1-microsoft-standard-WSL2`, iptables `1.8.11 (nf_tables)`, euid 0에서 실행했다. 신규 도구의 오류·취소·정리 단위 검증은 Windows Python 3.10.11에서 **41 passed in 0.16s**다. WSL 실제 시험은 7단계 × 2개 source × 5개 probe의 70개 기대 결과를 모두 만족했다. 각 차단 단계에서 해당 DROP의 packet/byte counter 증가를 확인했다.
+
+| 단계 | source A | 정상 대조 source B |
+| --- | --- | --- |
+| baseline | 모든 probe 정상 | 모든 probe 정상 |
+| legacy | TCP 1883만 차단 | 모든 probe 정상 |
+| wide / wide_again | 5개 probe 모두 차단 | 모든 probe 정상 |
+| release_wide_preserve_legacy | TCP 1883만 차단 유지 | 모든 probe 정상 |
+| release_legacy_preserve_wide | 5개 probe 모두 차단 유지 | 모든 probe 정상 |
+| restored | 모든 probe 정상, 관리 규칙 없음 | 모든 probe 정상 |
+
+결과는 `status=PASS`, exit 0, `server_reaped=true`, `remaining_owned_namespaces=[]`, `unconfirmed_namespace_creations=[]`, `cleanup_errors=[]`다. 시험 이후 별도 `ip netns list` 조회도 비어 있었다. host link/route의 전후 읽기 fingerprint는 동일했으며 host INPUT 자체는 이 시험의 관측·인증 대상이 아니다. Wrapper dry-run match를 namespace의 실제 iptables로 적용했고, 사용한 Wrapper SHA256은 `19e4d9632ef431df32b7ec799f69c86cf3d46e044854deae95bf5007be08f5fb`다. 개인 보관 원본 JSON의 SHA256은 `0609ebf295b8aab874fa0e4725fede9c64a04bffb220a66613fbfbd4a9380d86`이며 원본 로그·개인 output은 PR에 포함하지 않는다.
+
+이 결과는 운영 Pi의 특권 Wrapper 보호 파일·실제 Pi 주소 검사·sudoers·Worker/DB 상태 전이·물리 장비·DHCP·재부팅 검증을 대신하지 않는다. 해당 항목과 운영 Migration/배포는 여전히 미검증이다. 운영 Pi의 범용 비대화형 sudo는 허용되지 않았고 최근 SSH 연결도 timeout이었다. 이후 Pi 연결·승인된 관리 권한과 운영 백업을 확인한 뒤 별도 검증한다.
 
 이후 실제 운영 시험은 보호 경계·별도 시험 근거·운영 백업 확인 후 진행한다. 실제 장비 접근, DHCP 이동, 서비스/보드 재시작, Pi 재부팅 후 복원과 운영 DB 마이그레이션은 각각 별도 검증 상태로 기록한다. 통신이 멈춘 사실만으로 전체 격리·설치 펌웨어·모델 추론·공식 정상 자료 편입을 인증하지 않는다.
 
