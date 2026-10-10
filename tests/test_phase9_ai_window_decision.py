@@ -64,6 +64,16 @@ def test_missing_and_corrupt_revision_are_distinct() -> None:
     assert decision(0, [AIRevision("esp32_02", 1, "OBSERVE", at(0))], activation=None).reason == "AI_STAGE_NOT_ACTIVATED"
 
 
+def test_future_corrupt_revision_does_not_change_past_off_window() -> None:
+    revisions = [
+        AIRevision("esp32_02", 1, "OFF", at(0)),
+        AIRevision("esp32_02", 2, "ENFORCE", at(20)),
+    ]
+    assert decision(0, revisions).reason == "AI_OFF_AT_WINDOW"
+    assert decision(10, revisions).reason == "AI_OFF_AT_WINDOW"
+    assert decision(20, revisions).reason == "INVALID_AI_REVISION"
+
+
 def test_disabled_is_excluded_but_pending_can_feed_predictor() -> None:
     revisions = [AIRevision("esp32_02", 1, "OBSERVE", at(0))]
     assert decision(0, revisions, state="DISABLED").reason == "DISABLED_AT_WINDOW"

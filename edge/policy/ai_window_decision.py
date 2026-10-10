@@ -18,6 +18,11 @@ AI_OBSERVE = "OBSERVE"
 AI_ALLOWED_MODES = frozenset((AI_OFF, AI_OBSERVE))
 
 
+def require_observe_trust_mode(trust_ai_mode: str) -> None:
+    if trust_ai_mode != "observe":
+        raise ValueError("Phase 9 AI activation requires TRUST_AI_MODE=observe")
+
+
 @dataclass(frozen=True)
 class AIRevision:
     device_id: str
@@ -66,19 +71,20 @@ def decide_ai_window(
                   key=lambda row: (row.effective_from, row.revision))
     if not rows:
         return result("AI_POLICY_UNAVAILABLE")
-    try:
-        for index, row in enumerate(rows, start=1):
-            require_window_start(row.effective_from)
-            if (type(row.revision) is not int or row.revision != index
-                    or row.mode not in AI_ALLOWED_MODES
-                    or (index > 1 and row.effective_from <= rows[index - 2].effective_from)):
-                return result("INVALID_AI_REVISION")
-    except ValueError:
-        return result("INVALID_AI_REVISION")
-
+    # A scheduled or later corrupt revision cannot change the verdict of an
+    # already completed source window. Validate only the historical prefix.
     effective = [row for row in rows if row.effective_from <= window_start]
     if not effective:
         return result("AI_POLICY_NOT_EFFECTIVE")
+    try:
+        for index, row in enumerate(effective, start=1):
+            require_window_start(row.effective_from)
+            if (type(row.revision) is not int or row.revision != index
+                    or row.mode not in AI_ALLOWED_MODES
+                    or (index > 1 and row.effective_from <= effective[index - 2].effective_from)):
+                return result("INVALID_AI_REVISION")
+    except ValueError:
+        return result("INVALID_AI_REVISION")
     current = effective[-1]
     if current.mode == AI_OFF:
         return result("AI_OFF_AT_WINDOW", mode=AI_OFF, revision=current.revision)
