@@ -10,8 +10,9 @@ from typing import Any, Callable
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from backend.app.config import settings
 from edge.detection import runtime_checkpoint_repository as checkpoints
-from edge.detection.ai_detector import DEFAULT_MODEL_PATH, predict_feature_window
+from edge.detection.ai_detector import DEFAULT_MODEL_PATH, load_model, predict_feature_window
 from edge.detection.ai_run_evidence import AICompletionCollector, AICompletionRecord
 from edge.detection.detection_event_writer import write_detection_event
 from edge.detection.detector_contract import DetectorRunResult, validate_cycle_window
@@ -31,7 +32,7 @@ from edge.detection.rule_detector import (
 )
 from edge.policy.repository import load_policy_resolver
 from edge.policy.resolver import DevicePolicyRevision, POLICY_AVAILABLE, PolicyResolution
-from edge.policy.ai_window_decision import AIWindowDecision
+from edge.policy.ai_window_decision import AIWindowDecision, require_observe_trust_mode
 from edge.trust.trust_policy import POLICY_UNAVAILABLE, incident_family_for_event
 from edge.maintenance.processing import maintenance_windows, overlaps_maintenance, require_processing_cutoff
 
@@ -296,7 +297,12 @@ class MqttIsolationForestStage:
         self, *, model_path: Path = DEFAULT_MODEL_PATH,
         ai_window_selector: Callable[[PolicyResolution], AIWindowDecision] | None = None,
         completion_sink: Callable[[Session, tuple[AICompletionRecord, ...]], None] | None = None,
+        trust_ai_mode: str | None = None,
     ) -> None:
+        if ai_window_selector is not None:
+            require_observe_trust_mode(
+                settings.trust_ai_mode if trust_ai_mode is None else trust_ai_mode
+            )
         self.model_path = model_path
         self.ai_window_selector = ai_window_selector
         self.completion_sink = completion_sink
@@ -312,6 +318,10 @@ class MqttIsolationForestStage:
             cycle_range_start=cycle_range_start,
             cycle_cutoff=cycle_cutoff,
         )
+        if self.ai_window_selector is not None:
+            # OFF is a policy decision, not proof that an enabled model stage
+            # is healthy. A missing/broken model must not advance its CP.
+            load_model(self.model_path)
         before = _checkpoint_before(db, self.detector_name, self.source_table)
         require_processing_cutoff(db, cutoff)
         maintenance = maintenance_windows(db)
@@ -333,9 +343,6 @@ class MqttIsolationForestStage:
             window_start = parse_db_utc(feature_row["window_start"], "window_start")
             device_id = str(feature_row["device_id"])
             completion.input(device_id, window_start)
-            if overlaps_maintenance(maintenance, window_start, parse_db_utc(feature_row["window_end"], "window_end")):
-                completion.exclude(device_id, window_start, "MAINTENANCE")
-                continue
             resolution = (
                 resolver.resolve(str(feature_row["device_id"]), window_start)
                 if resolver is not None else None
@@ -346,13 +353,21 @@ class MqttIsolationForestStage:
                     raise RuntimeError("Phase 9 AI policy requires a registration snapshot")
                 ai_decision = self.ai_window_selector(resolution)
                 if not ai_decision.infer:
-                    completion.exclude(device_id, window_start, ai_decision.reason)
+                    completion.exclude(device_id, window_start, ai_decision.reason,
+                                       ai_revision=ai_decision.ai_revision,
+                                       ai_mode=ai_decision.mode)
                     continue
+            if overlaps_maintenance(maintenance, window_start, parse_db_utc(feature_row["window_end"], "window_end")):
+                completion.exclude(device_id, window_start, "MAINTENANCE",
+                                   ai_revision=ai_decision.ai_revision if ai_decision else None,
+                                   ai_mode=ai_decision.mode if ai_decision else None)
+                continue
             result = predict_feature_window(feature_row, self.model_path)
             completion.inferred(
                 device_id, window_start, anomaly=bool(result["is_anomaly"]),
                 model_version=None, bundle_sha256=None,
                 ai_revision=(ai_decision.ai_revision if ai_decision else None),
+                ai_mode=(ai_decision.mode if ai_decision else None),
             )
             if not result["is_anomaly"]:
                 continue
@@ -390,7 +405,11 @@ class MqttIsolationForestStage:
                         "anomaly_score": result["anomaly_score"],
                     },
                     "thresholds": {},
-                    "model_version": self.policy_version,
+                    # The legacy joblib loader does not verify an immutable
+                    # MQTT model version or hash. Keep the detector policy
+                    # version separate from model identity.
+                    "model_version": None,
+                    "detection_policy_version": self.policy_version,
                     "device_ai_revision": (
                         ai_decision.ai_revision if ai_decision is not None else None
                     ),

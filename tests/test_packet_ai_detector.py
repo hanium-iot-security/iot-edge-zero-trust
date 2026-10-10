@@ -16,7 +16,7 @@ from edge.detection import packet_ai_detector
 from edge.detection.packet_ai_detector import PacketIsolationForestStage
 from edge.detection.runtime_checkpoint_repository import get_detector_checkpoint
 from edge.packet.capture_policy import CapturePolicy
-from edge.policy.ai_window_decision import AIRevision, decide_ai_window
+from edge.policy.ai_window_decision import AIRevision, AIWindowDecision, decide_ai_window
 
 
 RANGE_START = datetime(2026, 7, 26, 10, 0, 0, tzinfo=timezone.utc)
@@ -167,6 +167,7 @@ def test_phase9_packet_ai_off_then_observe_uses_source_windows(SessionLocal) -> 
         ai_window_selector=lambda registration: decide_ai_window(
             registration, revisions, stage_activation_from=CUTOFF,
         ),
+        trust_ai_mode="observe",
     )
     with SessionLocal() as db:
         with db.begin():
@@ -175,9 +176,9 @@ def test_phase9_packet_ai_off_then_observe_uses_source_windows(SessionLocal) -> 
         assert model.call_count == 1
         assert result.created_event_count == 1
         assert [(record.window_start, record.inference_count, record.exclusion_counts,
-                 record.ai_revision) for record in result.ai_completion_records] == [
-            (RANGE_START, 0, {"AI_OFF_AT_WINDOW": 1}, None),
-            (CUTOFF, 1, {}, 2),
+                 record.ai_revision, record.ai_mode) for record in result.ai_completion_records] == [
+            (RANGE_START, 0, {"AI_OFF_AT_WINDOW": 1}, 1, "OFF"),
+            (CUTOFF, 1, {}, 2, "OBSERVE"),
         ]
         evidence = json.loads(db.execute(text(
             "SELECT evidence_json FROM detection_events WHERE event_type='AI_PACKET_ANOMALY'"
@@ -187,6 +188,50 @@ def test_phase9_packet_ai_off_then_observe_uses_source_windows(SessionLocal) -> 
             db, detector_name="packet_if", source_table="packet_feature_logs",
         )
         assert checkpoint["last_completed_window_end"] == "2026-07-26T10:00:20Z"
+
+
+def test_phase9_disabled_reason_precedes_capture_quality_exclusion(SessionLocal) -> None:
+    with SessionLocal() as db:
+        _insert_device(db)
+        session_pk = _insert_capture_session(db)
+        _insert_packet_source(
+            db, session_pk=session_pk, feature_id=1, segment_id=1, duration=8.0,
+        )
+        db.commit()
+
+    model = FakeIsolationForest([])
+    stage = PacketIsolationForestStage(
+        artifact=_artifact(model=model),
+        expected_model_version="packet-if-test-v1",
+        capture_policy=CapturePolicy(),
+        ai_window_selector=lambda registration: AIWindowDecision(
+            registration.device_id, registration.window_start, None, None, None,
+            "DISABLED_AT_WINDOW",
+        ),
+        trust_ai_mode="observe",
+    )
+    with SessionLocal() as db:
+        with db.begin():
+            result = stage.run_until(db, cycle_range_start=RANGE_START,
+                                     cycle_cutoff=CUTOFF)
+        assert model.call_count == 0
+        assert result.created_event_count == 0
+        (record,) = result.ai_completion_records
+        assert record.exclusion_counts == {"DISABLED_AT_WINDOW": 1}
+
+
+def test_phase9_packet_ai_rejects_global_enforce_mode() -> None:
+    with pytest.raises(ValueError, match="TRUST_AI_MODE=observe"):
+        PacketIsolationForestStage(
+            artifact=_artifact(model=FakeIsolationForest([])),
+            expected_model_version="packet-if-test-v1",
+            capture_policy=CapturePolicy(),
+            ai_window_selector=lambda registration: AIWindowDecision(
+                registration.device_id, registration.window_start, None, None, None,
+                "AI_OFF_AT_WINDOW",
+            ),
+            trust_ai_mode="enforce",
+        )
 
 
 def test_packet_if_stage_keeps_normal_rows_as_evidence_only_in_source(

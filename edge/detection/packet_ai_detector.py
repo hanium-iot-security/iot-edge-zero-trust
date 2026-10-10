@@ -41,7 +41,7 @@ from edge.packet.capture_policy import (
 )
 from edge.trust.trust_policy import AI_ONLY, AI_PACKET_ANOMALY
 from edge.policy.repository import load_policy_resolver
-from edge.policy.ai_window_decision import AIWindowDecision
+from edge.policy.ai_window_decision import AIWindowDecision, require_observe_trust_mode
 from edge.policy.resolver import PolicyResolution
 
 
@@ -71,7 +71,12 @@ class PacketIsolationForestStage:
         predict_rows: PredictionFunction = predict_packet_feature_rows,
         ai_window_selector: AIWindowSelector | None = None,
         completion_sink: Callable[[Session, tuple[AICompletionRecord, ...]], None] | None = None,
+        trust_ai_mode: str | None = None,
     ) -> None:
+        if ai_window_selector is not None:
+            require_observe_trust_mode(
+                settings.trust_ai_mode if trust_ai_mode is None else trust_ai_mode
+            )
         expected_version = expected_model_version.strip()
         if not expected_version:
             raise ValueError("PACKET_IF_EXPECTED_MODEL_VERSION must be configured")
@@ -111,6 +116,8 @@ class PacketIsolationForestStage:
         completion_sink: Callable[[Session, tuple[AICompletionRecord, ...]], None] | None = None,
     ) -> "PacketIsolationForestStage":
         configured_settings = app_settings or settings
+        if ai_window_selector is not None:
+            require_observe_trust_mode(configured_settings.trust_ai_mode)
         configured_path = (
             str(artifact_dir)
             if artifact_dir is not None
@@ -158,6 +165,7 @@ class PacketIsolationForestStage:
             ),
             ai_window_selector=ai_window_selector,
             completion_sink=completion_sink,
+            trust_ai_mode=configured_settings.trust_ai_mode,
         )
 
     def run_until(
@@ -241,12 +249,6 @@ class PacketIsolationForestStage:
                 source_id,
             )
             _validate_source_window(row)
-            eligibility = _runtime_eligibility(row, self.capture_policy)
-            if not eligibility.eligible:
-                exclusion_reasons[str(eligibility.exclusion_reason)] += 1
-                completion.exclude(row["device_id"], window_start,
-                                   str(eligibility.exclusion_reason))
-                continue
             if self.ai_window_selector is not None:
                 if resolver is None or row["device_id"] is None:
                     exclusion_reasons["AI_REGISTRATION_UNAVAILABLE"] += 1
@@ -258,11 +260,21 @@ class PacketIsolationForestStage:
                 )
                 if not ai_decision.infer:
                     exclusion_reasons[ai_decision.reason] += 1
-                    completion.exclude(row["device_id"], window_start, ai_decision.reason)
+                    completion.exclude(row["device_id"], window_start, ai_decision.reason,
+                                       ai_revision=ai_decision.ai_revision,
+                                       ai_mode=ai_decision.mode)
                     continue
                 row["device_ai_revision"] = ai_decision.ai_revision
                 row["device_ai_mode"] = ai_decision.mode
                 row["ai_approved_start"] = format_db_utc(ai_decision.approved_start)
+            eligibility = _runtime_eligibility(row, self.capture_policy)
+            if not eligibility.eligible:
+                exclusion_reasons[str(eligibility.exclusion_reason)] += 1
+                completion.exclude(row["device_id"], window_start,
+                                   str(eligibility.exclusion_reason),
+                                   ai_revision=row.get("device_ai_revision"),
+                                   ai_mode=row.get("device_ai_mode"))
+                continue
             eligible_source_rows.append(row)
             eligible_rows.append(_prediction_row(row))
 
@@ -284,6 +296,7 @@ class PacketIsolationForestStage:
                 model_version=self.artifact.model_version,
                 bundle_sha256=self.artifact.bundle_sha256,
                 ai_revision=row.get("device_ai_revision"),
+                ai_mode=row.get("device_ai_mode"),
             )
             if not prediction.is_anomaly:
                 continue
