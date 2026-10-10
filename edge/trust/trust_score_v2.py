@@ -50,6 +50,8 @@ PROCESSING_LEGACY_MIGRATION = "LEGACY_MIGRATION"
 PROCESSING_INVALID_INCIDENT_FAMILY = "INVALID_INCIDENT_FAMILY"
 PROCESSING_NO_SCORE_EVENT = "NO_SCORE_EVENT"
 PROCESSING_AI_OBSERVATION = "AI_OBSERVATION_ONLY"
+PROCESSING_AI_OFF_AT_WINDOW = "AI_OFF_AT_WINDOW"
+PROCESSING_INVALID_AI_POLICY_EVIDENCE = "INVALID_AI_POLICY_EVIDENCE"
 AI_OBSERVATION_POLICY_VERSION = "trust-ai-observation-v1"
 AI_EVENT_TYPES = frozenset((AI_ANOMALY, AI_PACKET_ANOMALY))
 PROCESSING_PENDING_AT_WINDOW = "PENDING_AT_WINDOW"
@@ -244,10 +246,32 @@ def apply_trust_score_v2_until(
         if not valid_group:
             continue
 
-        if mode == "observe":
+        phase9_ai_modes = {
+            int(event["id"]): _phase9_ai_mode(event) for event in valid_group
+        }
+        for verdict, reason in (
+            ("OFF", PROCESSING_AI_OFF_AT_WINDOW),
+            ("INVALID", PROCESSING_INVALID_AI_POLICY_EVIDENCE),
+        ):
+            excluded = [
+                event for event in valid_group
+                if phase9_ai_modes[int(event["id"])] == verdict
+            ]
+            if excluded:
+                _mark_events(db, excluded, reason, cutoff, [])
+                excluded_ids = {int(event["id"]) for event in excluded}
+                valid_group = [
+                    event for event in valid_group
+                    if int(event["id"]) not in excluded_ids
+                ]
+        if not valid_group:
+            continue
+
+        if mode == "observe" or "OBSERVE" in phase9_ai_modes.values():
             observed = [
                 event for event in valid_group
                 if event["detector_type"] == "AI" and event["event_type"] in AI_EVENT_TYPES
+                and (mode == "observe" or phase9_ai_modes[int(event["id"])] == "OBSERVE")
             ]
             for event in observed:
                 _record_ai_observation(db, event, cutoff)
@@ -364,6 +388,30 @@ def apply_trust_score_v2_until(
         changes=changes,
         observed_ai_event_count=observed_ai_event_count,
     )
+
+
+def _phase9_ai_mode(event: dict[str, Any]) -> str | None:
+    """Read explicit per-device AI evidence; absent fields are legacy events."""
+    if event["detector_type"] != "AI" or event["event_type"] not in AI_EVENT_TYPES:
+        return None
+    try:
+        evidence = json.loads(event.get("evidence_json") or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(evidence, dict):
+        return None
+    fields = evidence
+    if "device_ai_mode" not in fields and isinstance(evidence.get("model"), dict):
+        fields = evidence["model"]
+    if "device_ai_mode" not in fields or fields["device_ai_mode"] is None:
+        return None
+    revision = fields.get("device_ai_revision")
+    if type(revision) is not int or revision < 1:
+        return "INVALID"
+    selected_mode = fields["device_ai_mode"]
+    if isinstance(selected_mode, str) and selected_mode in {"OFF", "OBSERVE"}:
+        return selected_mode
+    return "INVALID"
 
 
 def _record_ai_observation(db: Session, event: dict[str, Any], cutoff: datetime) -> None:

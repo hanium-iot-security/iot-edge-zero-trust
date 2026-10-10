@@ -218,6 +218,67 @@ def test_observation_requires_ai_detector_type(database):
         assert _event_row(db, event_id)["processing_reason"] == "APPLIED_TO_TRUST"
 
 
+@pytest.mark.parametrize("event_type,evidence", [
+    ("AI_ANOMALY", {"device_ai_mode": "OBSERVE", "device_ai_revision": 2}),
+    ("AI_PACKET_ANOMALY", {"model": {
+        "device_ai_mode": "OBSERVE", "device_ai_revision": 2,
+    }}),
+])
+def test_phase9_observe_evidence_cannot_be_enforced_by_global_mode(
+    database, event_type, evidence,
+):
+    _, factory = database
+    with factory.begin() as db:
+        _device(db, score=35, status="danger")
+        event_id = _event(db, event_type, evidence=json.dumps(evidence))
+        result = _run(db, ai_mode="enforce")
+        row = _event_row(db, event_id)
+        assert result.observed_ai_event_count == 1
+        assert (row["score_delta"], row["applied_to_score"],
+                row["processing_reason"]) == (0, 0, OBSERVED)
+        assert row["processed_at"] is not None
+        _assert_no_enforcement(db, 35, "danger")
+
+
+@pytest.mark.parametrize("mode,revision,reason", [
+    ("OFF", 1, "AI_OFF_AT_WINDOW"),
+    ("OBSERVE", None, "INVALID_AI_POLICY_EVIDENCE"),
+    ("OBSERVE", True, "INVALID_AI_POLICY_EVIDENCE"),
+    ("ENFORCE", 2, "INVALID_AI_POLICY_EVIDENCE"),
+    (["OBSERVE"], 2, "INVALID_AI_POLICY_EVIDENCE"),
+])
+def test_phase9_off_or_corrupt_ai_evidence_cannot_create_response(
+    database, mode, revision, reason,
+):
+    _, factory = database
+    with factory.begin() as db:
+        _device(db, score=35, status="danger")
+        event_id = _event(db, evidence=json.dumps({
+            "device_ai_mode": mode, "device_ai_revision": revision,
+        }))
+        _run(db, ai_mode="enforce")
+        row = _event_row(db, event_id)
+        assert row["processing_reason"] == reason
+        assert row["applied_to_score"] == 0 and row["processed_at"] is not None
+        _assert_no_enforcement(db, 35, "danger")
+
+
+def test_phase9_observe_ai_keeps_same_window_rule_scoring(database):
+    _, factory = database
+    with factory.begin() as db:
+        _device(db, score=80, status="normal")
+        ai_id = _event(db, evidence=json.dumps({
+            "device_ai_mode": "OBSERVE", "device_ai_revision": 2,
+        }))
+        rule_id = _event(db, "ABNORMAL_PUBLISH_RATE", detector_type="RULE",
+                         family="FLOODING", score_delta=-20)
+        result = _run(db, ai_mode="enforce")
+        assert result.changes[0].new_score == 60
+        assert result.changes[0].representative_event_ids == [rule_id]
+        assert _event_row(db, ai_id)["processing_reason"] == OBSERVED
+        assert db.execute(text("SELECT trust_score FROM devices")).scalar_one() == 60
+
+
 def test_observation_and_checkpoint_roll_back_when_rule_enforcement_fails(database):
     _, factory = database
     with factory.begin() as db:
