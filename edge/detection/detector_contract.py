@@ -8,6 +8,7 @@ from typing import Protocol
 
 from sqlalchemy.orm import Session
 
+from edge.detection.ai_run_evidence import AICompletionRecord
 from edge.detection.phase4_time import require_utc_window_boundary
 
 
@@ -24,6 +25,7 @@ class DetectorRunResult:
     completed_window_end_before: datetime | None
     completed_window_end_after: datetime
     capture_session_id: str | None = None
+    ai_completion_records: tuple[AICompletionRecord, ...] = ()
 
 
 class DetectorStage(Protocol):
