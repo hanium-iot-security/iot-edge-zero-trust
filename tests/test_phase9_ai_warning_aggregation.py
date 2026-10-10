@@ -79,3 +79,24 @@ def test_rule_or_normal_event_cannot_enter_observe_warning_count() -> None:
             ledger.ingest(observation(10, 0, event_type=event_type), POLICY,
                           received_at=START)
     assert not ledger.aggregates
+
+
+def test_warning_policy_version_and_packet_detector_have_separate_counts() -> None:
+    ledger = WarningLedger()
+    next_policy = WarningPolicy("warning-dev-v2", window_seconds=60,
+                                count_threshold=3, cooldown_seconds=120)
+    for event_id, seconds in ((1, 0), (2, 10), (3, 20)):
+        assert ledger.ingest(observation(event_id, seconds), POLICY,
+                             received_at=START).notify == (event_id == 3)
+    for event_id, seconds in ((4, 0), (5, 10), (6, 20)):
+        result = ledger.ingest(observation(event_id, seconds), next_policy,
+                               received_at=START)
+    assert result.notify
+    for event_id, seconds in ((7, 0), (8, 10), (9, 20)):
+        result = ledger.ingest(
+            observation(event_id, seconds, detector_name="packet_if",
+                        event_type="AI_PACKET_ANOMALY"),
+            POLICY, received_at=START,
+        )
+    assert result.notify
+    assert len(ledger.last_notification) == 3
