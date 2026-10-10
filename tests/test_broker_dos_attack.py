@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from math import inf, nan
 
 import pytest
@@ -307,7 +307,20 @@ def test_default_burst_remains_detectable_across_a_capture_window_boundary() -> 
         (12, 24),
         (12, 24),
     ]
-    for row in rows:
+    for (window_start, window_end), row in zip(windows, rows, strict=True):
+        # P9-08 Rule consumes the Broker-destination-only SYN metric. The
+        # extractor/storage migration is owned separately, so this fixture
+        # derives that metric from the same source packets explicitly.
+        start_ts = window_start.replace(tzinfo=timezone.utc).timestamp()
+        end_ts = window_end.replace(tzinfo=timezone.utc).timestamp()
+        row["broker_target_syn_count"] = sum(
+            1 for packet in packets
+            if start_ts <= packet.timestamp < end_ts
+            and packet.dst_ip == PI_IP and packet.dst_port == 1883
+            and packet.protocol == "TCP" and packet.tcp_flags is not None
+            and packet.tcp_flags & 0x02 and not packet.tcp_flags & 0x10
+        )
+        assert row["broker_target_syn_count"] == 12
         row["captured_duration_seconds"] = 10.0
         event_types = {
             event["event_type"]

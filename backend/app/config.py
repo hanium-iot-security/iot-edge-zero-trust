@@ -83,7 +83,7 @@ class Settings(BaseSettings):
     packet_rule_broker_dos_tcp_syn_threshold: int = 10
     packet_rule_broker_dos_mqtt_packet_threshold: int = 20
     packet_rule_excluded_peer_ips: str = ""
-    packet_rule_policy_version: str = "packet-rule-policy-v3"
+    packet_rule_policy_version: str = "packet-rule-policy-v4"
 
     # Firewall Worker
     firewall_worker_interval_seconds: float = 5.0
