@@ -28,13 +28,15 @@ P0/P1/P2의 INBOUND Packet 관측 최대 약 0.504pps·65.612B/s는 짧은 개�
 | --- | --- | --- |
 | P9-08 Rate | `edge/detection/packet_rule_detector.py`, `tests/test_phase9_packet_rate_boundaries.py` | SQLite REAL의 십진 표현으로 교차 곱 비교. 115/9.2의 float 오탐을 제거하고 실제 초과를 탐지. 비교만 수정했으며 상한은 그대로다. 로컬 PASS |
 | P9-08 Broker | `packet_rule_detector.py`, `edge/trust/trust_policy.py`, `backend/app/config.py`, Packet Rule 테스트 | 공통 정책 기본 버전 `packet-rule-policy-v4`. 전체 포트 SYN 대신 **Broker 목적지 전용 SYN 패킷 수**를 사용한다. 이 지표가 NULL/컬럼 없음인 과거 행은 Broker DoS로 감점하지 않는다. 옛 결합 조건상 의심 행에는 `BROKER_DOS_EVIDENCE_UNAVAILABLE`·후보 감점 0·구체적 사유를 기록한다. 다른 Port Scan/Rate는 유지. 판정 fixture PASS; Feature 생성·Migration·Pi는 HOLD |
-| P9-03 AI 결정 | `edge/policy/ai_window_decision.py`, MQTT/Packet IF Stage, 관련 테스트 | 원본 UTC Window의 등록·AI revision과 승인 Stage 시작 경계로 추론 가능 여부를 선택한다. OFF/OBSERVE만 허용하고 ENFORCE·손상·미이관·DISABLED를 구별한다. Stage는 선택기를 주입받으면 OFF 추론을 건너뛰고 Checkpoint는 전진한다. 로컬 PASS; 저장 조회·승인 활성화 연결은 HOLD |
+| P9-03 AI 결정 | `edge/policy/ai_window_decision.py`, MQTT/Packet IF Stage, 관련 테스트 | 원본 UTC Window의 등록·AI revision과 승인 Stage 시작 경계로 추론 가능 여부를 선택한다. OFF/OBSERVE만 허용하고 ENFORCE·손상·미이관·DISABLED를 구별한다. Stage는 선택기를 주입받으면 OFF 추론을 건너뛰고 Checkpoint는 전진한다. 순수 함수·주입 시험 PASS; 운영 Stage Registry·저장 조회·승인 활성화 연결은 HOLD |
 | P9-03 반복 경고 | `edge/detection/ai_warning_aggregation.py`, `tests/test_phase9_ai_warning_aggregation.py` | 기기·탐지기·유형·모델·경고 버전, 원본 Window별 W/N/C 집계. 같은 ID/Window 중복 계수 금지, 지연 닫힌 구간 연결, 재시작 상태 재사용, OFF·품질 제외 구분. 순수 판정 PASS; 저장·알림·조회 API는 HOLD |
-| P9-06 실행 근거 | `edge/detection/ai_run_evidence.py`, `detector_contract.py`, MQTT/Packet IF Stage, 관련 테스트 | 기기·Window별 입력/실제 추론/정상/이상/제외, Packet 실제 모델·Bundle, AI revision을 결과에 담는다. `completion_sink`는 Stage와 같은 DB 세션/트랜잭션에서 호출하고 실패 시 Checkpoint와 함께 rollback한다. 무입력은 기기별 정상으로 만들지 않는다. 로컬 PASS; 종민 저장·우민 API는 HOLD |
+| P9-06 실행 근거 | `edge/detection/ai_run_evidence.py`, `detector_contract.py`, MQTT/Packet IF Stage, 관련 테스트 | 기기·원본 Window별 입력/실제 추론/정상/이상/제외와 AI revision·모드를 결과에 담는다. 실제 추론한 Packet Window에는 모델·Bundle을 기록하고 OFF 제외에는 모델 추론 근거를 만들지 않는다. MQTT legacy 모델 식별자는 미확인으로 둔다. `completion_sink`는 Stage와 같은 DB 세션/트랜잭션에서 호출하고 실패 시 Checkpoint와 함께 rollback한다. 무입력은 기기별 정상으로 만들지 않는다. 수집기·주입 시험 PASS; 종민 저장·우민 API와 운영 Stage Registry 연결은 HOLD |
 
 Broker 저장 접점 **제안**: nullable `packet_feature_logs.broker_target_syn_count`는 검증된 IPv4 Broker 주소·목적지 TCP 포트의 SYN=1/ACK=0 **패킷 횟수/10초 Window**이다. 재전송 중복 제거를 하지 않는 이름이다. 다른 포트 SYN, 일반 MQTT packet count, 9001·IPv6는 임의 포함하지 않는다. 종민이 Feature·Migration·NULL 이관·컬럼명을 확정하고 우민이 보호 Broker 주소/포트 설정을 확인해야 한다. 현재 Detector는 컬럼이 없으면 NULL로 투영하므로 새 스키마가 적용되기 전 Broker 판단은 근거 부족이다. Packet IF의 기존 6개 입력은 변경하지 않았다. 기존 Event·Trust 이력은 소급 변경하지 않는다.
 
-AI 저장 접점 **제안**: `device_ai_policy_revisions`의 device_id·양의 revision·OFF/OBSERVE mode·UTC 10초 effective_from을 단일 일관성 snapshot으로 공급해야 한다. Stage 활성화 감사에는 Stage·모델 hash/version·원래 Checkpoint·승인 경계 B·과거 제외 범위/건수·승인자가 필요하다. 제외 감사와 해당 Stage CP 시작 경계는 한 트랜잭션에서 확정하고 적용 전 중단·중복 적용·커밋 후 응답 유실을 구분해야 한다. 현재 선택기는 주입 접점이며 이 승인 저장/원자적 적용 경로를 임의로 대체하지 않는다. 기기별 모드를 실제 운영에 켜기 전 `TRUST_AI_MODE=observe`, MQTT Bundle 검증, required/optional Stage 계약이 필요하다.
+배포 전에는 운영 `PACKET_RULE_POLICY_VERSION` override를 확인해야 한다. 코드 기본 버전은 v4지만 운영 override가 v3이면 새 Broker 판정을 옛 버전으로 잘못 표기할 수 있다. 운영 임계값은 임의로 바꾸지 않고, 실제 Feature 계약·설정·판정 버전을 함께 승인한다.
+
+AI 저장 접점 **제안**: `device_ai_policy_revisions`의 device_id·양의 revision·OFF/OBSERVE mode·UTC 10초 effective_from을 단일 일관성 snapshot으로 공급해야 한다. Stage 활성화 감사에는 Stage·모델 hash/version·원래 Checkpoint·승인 경계 B·과거 제외 범위/건수·승인자가 필요하다. 제외 감사와 해당 Stage CP 시작 경계는 한 트랜잭션에서 확정하고 적용 전 중단·중복 적용·커밋 후 응답 유실을 구분해야 한다. 현재 선택기는 주입 접점이며 이 승인 저장/원자적 적용 경로를 임의로 대체하지 않는다. 선택기를 주입받은 두 IF Stage는 `TRUST_AI_MODE=observe`가 아니면 생성을 거부한다. 운영 활성화에는 이 설정뿐 아니라 MQTT Bundle 검증, required/optional Stage 계약이 필요하다. Trust에는 명시된 기기 OBSERVE/OFF 근거의 무감점 방어를 추가했지만 이것이 승인 감사·원자 적용을 대신하지 않는다.
 
 경고 집계 저장은 원본 이벤트를 변경하지 않고 집계 키·처리한 ID/Window·최근 경계·마지막 알림·억제 수를 원자적으로 보존해야 한다. `WarningLedger`는 저장 소유자가 트랜잭션에서 읽고 저장할 판정 상태다. 알림은 DB commit 뒤에만 발행해야 한다. W/N/C의 운영값은 승인 자료로 아직 확정되지 않았으므로 테스트 값 60초/3회/120초를 운영값으로 사용하지 않는다.
 
@@ -49,28 +51,40 @@ P9-06 저장/조회는 `AICompletionRecord`를 Stage Event·Checkpoint와 같은
 - **P9-05/V22:** 복구 후 서비스 active만으로 완료 판정하지 않는다. #108의 관리자 명령을 통합할 때 동일 Boot/대상에서 필수 처리 경계가 두 차례 실제 전진했는지, 입력/FAILED/품질/신선도를 함께 확인한다. 이 PR의 운영 복구 실행은 미검증이다.
 - **P9-06/V23:** `completion_sink`의 실제 저장 테이블·Migration과 `/api/runtime-status`가 없다. Stage 비활성, 모델 초기화 실패, 무입력, 지연, 관측 만료를 API와 Pi에서 구별하는 시험은 남아 있다.
 - **P9-08/V27~V28:** 종민 Feature·Migration/API, 우민 Broker 대상 설정, 선우 공격 회귀 검토와 승인된 Pi 시험이 필요하다. `broker_target_syn_count` 이름/정의가 달라지면 Detector projection을 확정 계약에 맞춰 수정한다.
-- **P9-09/V39·V41:** #111의 새 `PI_INPUT_IPV4_ALL`은 관리자 확장 범위다. Trust의 기본 자동 격리 `MQTT_IPV4_TCP_1883`을 바꾸지 않았다. 두 범위 중 하나라도 남거나 해제 대기라면 기기 전체 해제·점수 복구 완료로 표시하지 않는 실제 Worker/API 대조는 우민·종민 통합 뒤 검증한다.
+- **P9-09/V39·V41:** #111의 새 `PI_INPUT_IPV4_ALL`은 관리자 확장 범위다. 현 코드의 자동 격리는 TCP 목적지 1883 규격(계획상의 `MQTT_IPV4_TCP_1883`)이며 이를 바꾸지 않았다. 두 범위 중 하나라도 남거나 해제 대기라면 기기 전체 해제·점수 복구 완료로 표시하지 않는 실제 Worker/API 대조는 우민·종민 통합 뒤 검증한다.
 - **P9-10:** 운영 Pi/DB 사본·실제 모델/Stage·Broker 공격·방화벽·재부팅·화면 연결·부하 회귀와 후보 동결은 미검증이다. 정상 수집과 정책 변경·공격·복구 시험을 겹치지 않는다. 한국어 UI 문구 통일은 Phase 10 소유 담당이다.
 
 ## 실행한 로컬 검증
 
 | 계획 검증 | 이번 브랜치 결과 | 남은 선행 작업 |
 | --- | --- | --- |
-| V06 | 로컬 통과: 114/115/116 ÷ 9.2와 상한 12.5의 엄격한 `>` 경계, 기존 Packet·MQTT Rule 회귀 | 당시 운영 revision과 Pi replay |
+| V06 | 부분 통과: 114/115/116 ÷ 9.2와 상한 12.5의 엄격한 `>` 경계, 기존 Packet·MQTT Rule 회귀 | 네 임계값의 기기별 개발 자료 replay·당시 운영 revision/Pi 대조 |
 | V07 | 부분 통과: 기존 Rule·Trust 회귀와 정상 자료 검토 | P0/P1/P2 공식 후보 replay·공격 민감도 평가 |
 | V09 | 부분 통과: Packet 기존 Bundle/6개 입력 회귀; MQTT 1건의 5.0 대체는 기존 Feature 코드 확인 | MQTT Bundle hash·Feature 순서·점수 방향·Threshold 계약 및 QC 대조 |
-| V13 | 로컬 통과: OFF→OBSERVE→OFF 원본 10초 Window, OFF의 AI 추론/이벤트 제외·Stage CP 전진 | 저장 revision/운영 Stage 연결 |
-| V14 | 부분 통과: 미이관·DISABLED·손상 revision 구별 | 모델 누락/hash 오류와 required/optional Stage 통합 |
+| V13 | 순수/주입 시험 통과: OFF→OBSERVE→OFF 원본 10초 Window, OFF의 AI 추론/이벤트 제외·Stage CP 전진 | 저장 revision/운영 Stage 연결 |
+| V14 | 부분 통과: 미이관·DISABLED·손상 revision 구별. MQTT 전부 OFF여도 legacy 모델 누락 시 CP 미전진 | 새 Bundle hash 오류와 required/optional Stage 통합 |
 | V15 | 미검증: 활성화 감사·시작 CP의 원자 저장 계약 부재 | 종민 Migration/승인 적용 경로 |
-| V16 | 로컬 통과: 기존 OBSERVE AI 무감점·무격리 및 Rule 동시 대표 감점 회귀 | 기기별 AI revision을 실제 Trust 경로에 연결 |
+| V16 | 로컬 통과: 기기 OBSERVE evidence가 전역 enforce여도 AI 무감점·무격리, 같은 Window Rule 감점 유지 | 기기별 revision의 실제 저장·Stage 활성화 연결 |
 | V17 | 로컬 판정 통과: N회·중복·쿨다운·지연·재시작 상태·OFF·품질 제외 | 집계 저장/조회/알림의 원자성·운영 W/N/C |
 | V22 | 미검증: 같은 Boot/대상 두 차례 전진의 실제 복구 경로 | 우민 #108 통합·Pi 재부팅 시험 |
-| V23 | 로컬 부분 통과: 0이벤트 정상 추론·OFF/품질 제외·무입력 근거와 CP 트랜잭션 rollback | 저장 Migration·API·Stage 장애/관측 만료 대조 |
+| V23 | 로컬 부분 통과: 0이벤트 정상 추론·OFF/품질 제외·무입력 근거와 CP 트랜잭션 rollback. 기기별 완료 시각은 Cycle cutoff가 아닌 원본 Window 끝 | 저장 Migration·API·Stage 장애/관측 만료 대조 |
 | V27 | 로컬 통과: 다른 포트 스캔+MQTT와 Broker SYN 집중 반례 | 종민 Feature 실제 생성·승인 Broker 설정·Pi 공격 시험 |
 | V28 | 로컬 부분 통과: NULL Broker 지표 근거 부족, Packet IF 6개 입력 불변 | 9001/IPv6/미설정 대상의 실제 Feature·운영 판정 |
 | V39·V41 | 기존 자동 차단 범위 및 AI OBSERVE 무차단 회귀 확인 | #111 범위 동시 존재·부분 해제·Worker/API/Pi 상태 대조 |
 
 여기의 “로컬 통과”는 SQLite fixture·합성 입력의 결과이며 실장비 결과가 아니다. `edge/features/collect_feature_logs.py`는 MQTT 1건 Window의 두 간격 Feature를 5.0초로 채운다. 이는 실측이 아니라 대체값이며, 운영 Feature 행에는 아직 별도의 출처 필드가 없다. 새 MQTT Bundle을 연결할 때 출처 표시 계약을 추가해야 한다.
+
+## 재검토에서 수정한 판정 근거
+
+- 한 Cycle이 여러 Window를 처리할 때 모든 기기 완료 기록에 Cycle cutoff를 쓰면 앞선 기기가 나중 Window까지 처리된 것처럼 보였다. 기기별 `completed_window_end`를 원본 `window_start + 10초`로 바꾸고 무입력 Stage 표지만 cutoff를 사용한다.
+- 미래의 손상된 AI revision을 검증하다 과거의 정상 OFF Window까지 무효화했다. 원본 Window까지 효력이 있는 revision 접두부만 검증한다. 미래 손상은 그 효력 시점부터 제외한다.
+- Packet IF의 Capture 품질 제외와 MQTT IF의 유지보수 제외가 DISABLED·정책 오류를 가렸다. 주입된 AI 결정을 먼저 평가하고 제외 사유·revision·모드를 기록한다. Capture 품질 검사는 추론 가능 Window에 그대로 적용한다.
+- MQTT legacy 이벤트가 탐지 정책 버전 `mqtt-if-v1`을 실제 모델 버전처럼 표시했다. 모델 버전은 미확인으로 두고 탐지 정책 버전을 별도 필드로 남긴다.
+- 전역 Trust 기본값 `enforce`에서 기기 OBSERVE AI 이벤트가 단독 감점될 수 있었다. 명시된 기기 OBSERVE 근거는 AI 감점·격리 0으로 처리하고 Rule 대표 감점은 유지한다. OFF·손상된 기기 AI 근거도 새 자동 대응에서 제외한다. 모드·revision이 없는 기존 AI 이벤트는 기존 전역 Trust 정책을 따른다.
+- 선택기를 주입한 Stage가 전역 enforce 설정으로 생성될 수 있었다. MQTT/Packet IF 생성 시 `TRUST_AI_MODE=observe`를 요구하고, Packet `from_settings`는 모델을 읽기 전에 설정을 검사한다. 저장/API 승인 경로와 운영 Registry 연결은 아직 없다.
+- MQTT IF의 모든 기기가 OFF이면 추론 경로가 없어 모델 파일 누락을 발견하지 못한 채 Checkpoint가 전진했다. 선택기가 활성화된 Stage는 OFF 여부와 무관하게 기존 loader로 모델을 먼저 확인한다. 이는 legacy 파일의 로드 검증이며 새 Bundle hash 검증을 의미하지 않는다.
+
+운영 경로 확인: `stage_registry.py`와 독립 runner는 현재 `ai_window_selector`·`completion_sink`를 주입하지 않는다. 따라서 위 로컬 주입 시험은 실제 기기별 AI 활성화나 실행 기록의 영속화를 증명하지 않는다. AI revision/활성화·경고/완료 저장 Migration과 MQTT Bundle 계약이 확정된 뒤 연결·검증해야 한다. 이 전에는 P9-03·P9-06을 운영 완료로 표시하지 않는다.
 
 ```powershell
 $env:PATH = 'C:\Users\Hyunsoo\AppData\Local\Programs\Git\bin;' + $env:PATH
@@ -78,6 +92,9 @@ $env:PATH = 'C:\Users\Hyunsoo\AppData\Local\Programs\Git\bin;' + $env:PATH
 .venv\Scripts\python.exe -m pytest -q --tb=short tests/test_broker_dos_attack.py tests/test_firewall_rule_wrapper.py
 .venv\Scripts\python.exe -m pytest -q --tb=short tests backend/tests
 .venv\Scripts\python.exe -m pytest -q --tb=short tests/test_packet_ai_detector.py tests/test_phase9_ai_warning_aggregation.py
+.venv\Scripts\python.exe -m pytest -q --tb=short tests/test_phase8_trust_gates.py tests/test_phase9_ai_window_decision.py tests/test_packet_ai_detector.py tests/test_phase9_ai_run_evidence.py tests/test_ai_observation.py
 ```
 
-관련 Rule·Trust·AI·Orchestrator 회귀 **390 passed**, Git Bash Wrapper 단독 **27 passed**. 첫 전체 재실행은 잘못된 `C:\Program Files\Git\bin` 경로 때문에 Windows WSL `bash.exe`가 선택되어 Wrapper 테스트 실패가 발생했고, 45%에서 중단했다. 실제 설치 경로를 사용한 최종 전체 재실행은 **3334 passed, 24 skipped, 3 warnings, 0 failed** (740.53초)였다. 3개 경고는 Starlette/anyio 1건과 Paho MQTT Callback API 2건의 deprecation 경고다. 전체 실행 도중 추가한 Packet IF OFF→OBSERVE Window 시험과 경고 버전 분리 시험은 최종 HEAD의 두 파일 회귀에서 **20 passed**였다. skipped는 PASS에 포함하지 않는다.
+초기 구현 시 관련 Rule·Trust·AI·Orchestrator 회귀 **390 passed**, Git Bash Wrapper 단독 **27 passed**, 전체 **3334 passed / 24 skipped / 3 warnings**였다. 첫 전체 시도의 Git Bash 경로 오류와 재검토 중 추가 결함을 발견해 중단한 두 전체 시도는 PASS로 계산하지 않는다.
+
+재검토 수정 후 위 마지막 집중 명령은 **113 passed**이고, 올바른 Git Bash 경로에서 실행한 최종 전체 명령은 **3352 passed, 24 skipped, 3 warnings, 0 failed** (784.51초)였다. 경고 3개는 Starlette/anyio 1건과 Paho MQTT Callback API 2건의 deprecation 경고다. skipped는 PASS에 포함하지 않는다. 이 결과는 로컬 fixture와 Windows 실행 환경의 회귀이며 Pi 실기기 완료가 아니다.
