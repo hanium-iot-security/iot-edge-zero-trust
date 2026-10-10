@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime
+from decimal import Decimal
 from ipaddress import ip_address
 import logging
 from math import isfinite
@@ -171,16 +172,27 @@ def effective_packets_per_second(packet_count: float, captured_duration_seconds:
     Packet IF의 10초 정규화(normalize_to_ten_second_rate)와 다른 계산식이다 --
     Packet Rule은 "Raw Count가 아니라" 이 값을 그대로 비교 기준으로 쓴다.
     """
-    if captured_duration_seconds <= 0:
-        raise ValueError("captured_duration_seconds must be > 0; caller must filter with is_capture_eligible() first")
-    return packet_count / captured_duration_seconds
+    return float(_decimal_rate(packet_count, captured_duration_seconds))
 
 
 def effective_bytes_per_second(total_bytes: float, captured_duration_seconds: float) -> float:
     """bytes_per_second = total_bytes / captured_duration_seconds."""
-    if captured_duration_seconds <= 0:
-        raise ValueError("captured_duration_seconds must be > 0; caller must filter with is_capture_eligible() first")
-    return total_bytes / captured_duration_seconds
+    return float(_decimal_rate(total_bytes, captured_duration_seconds))
+
+
+def _decimal_rate(count: float, duration: float) -> Decimal:
+    """Compare SQLite decimal values without a rounded binary quotient."""
+    if not isfinite(count) or count < 0:
+        raise ValueError("rate count must be finite and non-negative")
+    if not isfinite(duration) or duration <= 0:
+        raise ValueError("captured_duration_seconds must be finite and > 0")
+    return Decimal(str(count)) / Decimal(str(duration))
+
+
+def _rate_exceeds(count: float, duration: float, threshold: float) -> bool:
+    # 115 / 9.2 is exactly 12.5 in the source decimal units.
+    _decimal_rate(count, duration)
+    return Decimal(str(count)) > Decimal(str(threshold)) * Decimal(str(duration))
 
 
 def detect_packet_rules(
@@ -210,8 +222,9 @@ def detect_packet_rules(
     events: list[dict[str, Any]] = []
     duration = float(row["captured_duration_seconds"])
 
-    packets_per_second = effective_packets_per_second(float(row["packet_count"]), duration)
-    if include_rate_rules and packets_per_second > policy.packet_rate_threshold:
+    packet_count = float(row["packet_count"])
+    packets_per_second = effective_packets_per_second(packet_count, duration)
+    if include_rate_rules and _rate_exceeds(packet_count, duration, policy.packet_rate_threshold):
         events.append(
             {
                 "event_type": PACKET_RATE_ANOMALY,
@@ -221,8 +234,9 @@ def detect_packet_rules(
             }
         )
 
-    bytes_per_second = effective_bytes_per_second(float(row["total_bytes"]), duration)
-    if include_rate_rules and bytes_per_second > policy.byte_rate_threshold:
+    total_bytes = float(row["total_bytes"])
+    bytes_per_second = effective_bytes_per_second(total_bytes, duration)
+    if include_rate_rules and _rate_exceeds(total_bytes, duration, policy.byte_rate_threshold):
         events.append(
             {
                 "event_type": BYTE_RATE_ANOMALY,
