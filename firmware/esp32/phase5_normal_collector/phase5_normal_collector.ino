@@ -16,6 +16,48 @@
 #error "PHASE5_NORMAL_PROFILE must be between 0 and 3."
 #endif
 
+// Defaults also support local configuration headers created before Phase 9.
+#ifndef PHASE5_PAYLOAD_MAX_BYTES
+#define PHASE5_PAYLOAD_MAX_BYTES 128
+#endif
+#ifndef PHASE5_MQTT_BUFFER_BYTES
+#define PHASE5_MQTT_BUFFER_BYTES 256
+#endif
+#ifndef PHASE5_FIXED_PUBLISH_INTERVAL_MS
+#define PHASE5_FIXED_PUBLISH_INTERVAL_MS 5000UL
+#endif
+#ifndef PHASE5_JITTER_MIN_MS
+#define PHASE5_JITTER_MIN_MS 4000UL
+#endif
+#ifndef PHASE5_JITTER_MAX_MS
+#define PHASE5_JITTER_MAX_MS 6000UL
+#endif
+
+// ESP32: sequence/free_heap have 10 digits, uptime_s has 7, RSSI has 4.
+// Both supported device IDs have 8 bytes and their sensor topics have 19.
+static_assert(sizeof(unsigned long) == 4, "Payload bounds require 32-bit unsigned long.");
+#if PHASE5_NORMAL_PROFILE == 2 || PHASE5_NORMAL_PROFILE == 3
+#define PHASE5_CANONICAL_PAYLOAD_MAX_BYTES 100
+#else
+#define PHASE5_CANONICAL_PAYLOAD_MAX_BYTES 65
+#endif
+
+#if PHASE5_PAYLOAD_MAX_BYTES < PHASE5_CANONICAL_PAYLOAD_MAX_BYTES
+#error "PHASE5_PAYLOAD_MAX_BYTES cannot fit this profile's canonical payload."
+#endif
+#if PHASE5_MQTT_BUFFER_BYTES <= 0 || PHASE5_MQTT_BUFFER_BYTES > 65535
+#error "PHASE5_MQTT_BUFFER_BYTES must fit PubSubClient's uint16_t buffer size."
+#endif
+#if PHASE5_MQTT_BUFFER_BYTES < MQTT_MAX_HEADER_SIZE + 2 + 19 + PHASE5_PAYLOAD_MAX_BYTES
+#error "PHASE5_MQTT_BUFFER_BYTES must fit the MQTT header, topic and payload limit."
+#endif
+#if PHASE5_FIXED_PUBLISH_INTERVAL_MS <= 0 || PHASE5_FIXED_PUBLISH_INTERVAL_MS > 0xFFFFFFFFUL
+#error "PHASE5_FIXED_PUBLISH_INTERVAL_MS must be a positive uint32_t interval."
+#endif
+#if PHASE5_JITTER_MIN_MS <= 0 || PHASE5_JITTER_MIN_MS > PHASE5_JITTER_MAX_MS || PHASE5_JITTER_MAX_MS >= 0x7FFFFFFFUL
+#error "Jitter bounds must be positive, ordered and allow an exclusive random(long) upper bound."
+#endif
+
 #if PHASE5_DEVICE_SLOT == 1
 const char* DEVICE_ID = "esp32_01";
 #elif PHASE5_DEVICE_SLOT == 2
@@ -32,14 +74,15 @@ const char* DEVICE_ID = "esp32_02";
 const char* MQTT_USERNAME = DEVICE_ID;
 const char* MQTT_PASSWORD = PHASE5_MQTT_PASSWORD;
 
-const char* FIRMWARE_VERSION = "phase5-normal-pilot-v1";
+const char* FIRMWARE_VERSION = "phase9-normal-pilot-v2";
+const char* FIRMWARE_LIMITS_VERSION = "phase9-normal-limits-v1";
 const char* PAYLOAD_SCHEMA_VERSION = "phase5-normal-payload-v1";
 
 String MQTT_TOPIC = String("iot/") + DEVICE_ID + "/sensor";
 String MQTT_CLIENT_ID = String("p5-") + DEVICE_ID + "-v1";
 
-const unsigned long FIXED_PUBLISH_INTERVAL_MS = 5000UL;
-const unsigned int MAX_PAYLOAD_BYTES = 100;
+const unsigned long FIXED_PUBLISH_INTERVAL_MS = PHASE5_FIXED_PUBLISH_INTERVAL_MS;
+const unsigned int MAX_PAYLOAD_BYTES = PHASE5_PAYLOAD_MAX_BYTES;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000UL;
 const unsigned long WIFI_RETRY_INTERVAL_MS = 5000UL;
 const unsigned long MQTT_RETRY_INTERVAL_MS = 5000UL;
@@ -47,6 +90,7 @@ const unsigned int MQTT_SOCKET_TIMEOUT_SECONDS = 3;
 
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
+bool mqttBufferReady = false;
 
 unsigned long sequenceNumber = 0;
 unsigned long lastPublishAtMs = 0;
@@ -62,7 +106,7 @@ unsigned long chooseNextPublishIntervalMs() {
   if (PHASE5_NORMAL_PROFILE == 0 || PHASE5_NORMAL_PROFILE == 2) {
     return FIXED_PUBLISH_INTERVAL_MS;
   }
-  return static_cast<unsigned long>(random(4000, 6001));
+  return static_cast<unsigned long>(random(PHASE5_JITTER_MIN_MS, PHASE5_JITTER_MAX_MS + 1UL));
 }
 
 String buildCanonicalPayload(unsigned long sequence) {
@@ -106,6 +150,20 @@ void printBootContract() {
   Serial.println(FIRMWARE_VERSION);
   Serial.print("payload_schema_version=");
   Serial.println(PAYLOAD_SCHEMA_VERSION);
+  Serial.print("firmware_limits_version=");
+  Serial.println(FIRMWARE_LIMITS_VERSION);
+  Serial.print("payload_max_bytes=");
+  Serial.println(MAX_PAYLOAD_BYTES);
+  Serial.print("canonical_payload_max_bytes=");
+  Serial.println(PHASE5_CANONICAL_PAYLOAD_MAX_BYTES);
+  Serial.print("mqtt_buffer_bytes_configured=");
+  Serial.println(PHASE5_MQTT_BUFFER_BYTES);
+  Serial.print("fixed_publish_interval_ms=");
+  Serial.println(FIXED_PUBLISH_INTERVAL_MS);
+  Serial.print("jitter_min_ms=");
+  Serial.println(PHASE5_JITTER_MIN_MS);
+  Serial.print("jitter_max_ms=");
+  Serial.println(PHASE5_JITTER_MAX_MS);
   Serial.print("device_id=");
   Serial.println(DEVICE_ID);
   Serial.print("device_slot=");
@@ -182,8 +240,19 @@ bool publishNormalTelemetry() {
   String payload = buildCanonicalPayload(nextSequence);
 
   if (payload.length() > MAX_PAYLOAD_BYTES) {
-    Serial.print("payload_rejected reason=over_100_bytes size=");
-    Serial.println(payload.length());
+    Serial.print("payload_rejected reason=over_configured_limit size=");
+    Serial.print(payload.length());
+    Serial.print(" limit=");
+    Serial.println(MAX_PAYLOAD_BYTES);
+    return false;
+  }
+
+  unsigned long packetBytes = MQTT_MAX_HEADER_SIZE + 2UL + MQTT_TOPIC.length() + payload.length();
+  if (!mqttBufferReady || packetBytes > mqttClient.getBufferSize()) {
+    Serial.print("payload_rejected reason=mqtt_packet_budget required=");
+    Serial.print(packetBytes);
+    Serial.print(" buffer=");
+    Serial.println(mqttClient.getBufferSize());
     return false;
   }
 
@@ -215,7 +284,14 @@ void setup() {
 
   randomSeed(esp_random());
   mqttClient.setServer(PHASE5_MQTT_BROKER, PHASE5_MQTT_PORT);
-  mqttClient.setBufferSize(256);
+  mqttBufferReady = mqttClient.setBufferSize(PHASE5_MQTT_BUFFER_BYTES) &&
+                    mqttClient.getBufferSize() == PHASE5_MQTT_BUFFER_BYTES;
+  Serial.print("mqtt_buffer_bytes_actual=");
+  Serial.println(mqttClient.getBufferSize());
+  if (!mqttBufferReady) {
+    Serial.println("mqtt_buffer_allocation_failed");
+    return;
+  }
   mqttClient.setSocketTimeout(MQTT_SOCKET_TIMEOUT_SECONDS);
 
   connectWifiWithTimeout();
@@ -230,6 +306,10 @@ void setup() {
 }
 
 void loop() {
+  if (!mqttBufferReady) {
+    delay(250);
+    return;
+  }
   unsigned long currentTimeMs = millis();
 
   if (WiFi.status() != WL_CONNECTED) {

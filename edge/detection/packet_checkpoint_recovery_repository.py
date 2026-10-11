@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import hashlib
+import json
 import sqlite3
 from typing import Mapping, Sequence
 
@@ -438,3 +440,101 @@ def calculate_packet_feature_readiness(
         tuple(blocking_reasons),
         live_resume_reasons,
     )
+
+
+
+def failed_target_tail_evidence(
+    session: Mapping[str, object],
+    segments: Sequence[Mapping[str, object]],
+    features: Sequence[Mapping[str, object]],
+) -> dict[str, object] | None:
+    """Prove one uncaptured final tail after the target's entire normal prefix.
+
+    This evidence authorizes replay only through the tail start. It never makes
+    the FAILED window ready, consumes that window, or grants a later transition.
+    """
+    try:
+        if session["status"] != "FAILED" or session["ended_at"] is None or len(segments) < 2:
+            return None
+        prefix, tail = segments[:-1], segments[-1]
+        expected = parse_db_utc(session["first_window_start"])
+        counts = {row["id"]: 0 for row in segments}
+        by_id = {row["id"]: row for row in segments}
+        if len(by_id) != len(segments):
+            return None
+        for feature in features:
+            segment = by_id.get(feature["capture_segment_id"])
+            if (segment is None or segment["status"] != "PROCESSED" or segment["error_code"] is not None
+                    or feature["window_start"] != segment["window_start"]
+                    or feature["window_end"] != segment["window_end"]):
+                return None
+            counts[segment["id"]] += 1
+        for segment in prefix:
+            start, end = parse_db_utc(segment["window_start"]), parse_db_utc(segment["window_end"])
+            if (start != expected or end != start + timedelta(seconds=10)
+                    or start.second % 10 != 0 or start.microsecond != 0
+                    or segment["status"] not in {"PROCESSED", "EMPTY"} or segment["error_code"] is not None
+                    or segment["capture_interface"] != session["capture_interface"]
+                    or (segment["status"] == "PROCESSED" and counts[segment["id"]] == 0)
+                    or (segment["status"] == "EMPTY" and counts[segment["id"]] != 0)):
+                return None
+            expected = end
+        start, end = parse_db_utc(tail["window_start"]), parse_db_utc(tail["window_end"])
+        ended = parse_db_utc(session["ended_at"])
+        if (tail["status"] != "FAILED" or tail["error_code"] != "LATE_CAPTURE"
+                or start != expected or end != start + timedelta(seconds=10) or not start <= ended <= end
+                or tail["capture_interface"] != session["capture_interface"]
+                or tail["file_name"] is not None or tail["actual_capture_started_at"] is not None
+                or tail["capture_stop_requested_at"] is not None or tail["capture_process_exited_at"] is not None
+                or tail["captured_duration_seconds"] != 0 or tail["packet_count"] not in (None, 0)
+                or counts[tail["id"]] != 0):
+            return None
+        return {"session_id": session["session_id"], "session_status": session["status"],
+                "ended_at": session["ended_at"], "segment_id": tail["id"],
+                **{key: tail[key] for key in ("window_start", "window_end", "error_code", "file_name",
+                    "actual_capture_started_at", "capture_stop_requested_at", "capture_process_exited_at",
+                    "start_delay_seconds", "captured_duration_seconds", "packet_count")},
+                "feature_count": 0}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def bounded_replay_target_evidence(
+    session: Mapping[str, object],
+    segments: Sequence[Mapping[str, object]],
+    features: Sequence[Mapping[str, object]],
+    *, allow_failed_target_session: bool = False,
+) -> dict[str, object] | None:
+    """Bind the entire closed input, while optionally replaying only a proven prefix."""
+    if type(allow_failed_target_session) is not bool:
+        raise ValueError("failed-target-session approval must be boolean")
+    failed_tail = failed_target_tail_evidence(session, segments, features) if allow_failed_target_session else None
+    if allow_failed_target_session and failed_tail is None:
+        return None
+    manifest = {"segments": [dict(row) for row in segments],
+                "features": [dict(row) for row in features]}
+    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return {"target_identity": dict(session),
+            "replay_start": session["first_window_start"],
+            "replay_end": failed_tail["window_start"] if failed_tail is not None else segments[-1]["window_end"] if segments else None,
+            "segment_count": len(segments) - (1 if failed_tail is not None else 0), "feature_row_count": len(features),
+            "input_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+            **({"total_segment_count": len(segments), "failed_target_tail": failed_tail} if failed_tail is not None else {})}
+
+
+def get_bounded_replay_target_evidence(
+    connection: sqlite3.Connection, session_id: str,
+    *, allow_failed_target_session: bool = False,
+) -> dict[str, object] | None:
+    session = get_capture_session(connection, session_id)
+    if session is None:
+        return None
+    segments = connection.execute(
+        "SELECT * FROM packet_capture_segments WHERE capture_session_id=? ORDER BY window_start,id",
+        (session["id"],),
+    ).fetchall()
+    features = connection.execute(
+        "SELECT f.* FROM packet_feature_logs f JOIN packet_capture_segments g ON g.id=f.capture_segment_id "
+        "WHERE g.capture_session_id=? ORDER BY f.id", (session["id"],),
+    ).fetchall()
+    return bounded_replay_target_evidence(dict(session), segments, features, allow_failed_target_session=allow_failed_target_session)

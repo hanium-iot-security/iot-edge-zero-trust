@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     recovery_admin_api_key: str = ""
     recovery_admin_principal: str = "recovery-admin"
     recovery_artifact_dir: str = "data/recovery/baseline"
+    # Packet pair HTTP only plans/reads/verifies. Applying remains a root CLI.
+    packet_pair_repository_root: str = ""
+    packet_pair_plan_dir: str = "output/phase9-packet-pair-api/plans"
+    packet_pair_artifact_dir: str = "data/recovery/packet-pair"
+    packet_pair_manager_plan_dir: str = "output/phase9-packet-pair-api/manager-plans"
     # Empty/invalid LAN configuration keeps device-policy writes unavailable.
     device_registration_cidr: str = ""
 
