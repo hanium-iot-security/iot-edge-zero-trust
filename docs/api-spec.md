@@ -272,9 +272,10 @@ Root 프로세스 시작을 하지 않으며 `iot-edge-api.service`의 `NoNewPri
 `{detail:{code: "...", verification: "UNKNOWN"}}`이며 내부 경로·상세 OS 오류를
 노출하지 않습니다. 인증 오류는 위 문자열 형식을 사용합니다.
 
-현재 구현은 모델 원본 조회와 복구 계획/감사 검증의 첫 범위입니다. 운영 HTTP 서비스
-배포·재시작은 하지 않았습니다. 별도 Pi 시험과 운영 Artifact의 Service 직접 읽기
-확인을 운영 HTTP 검증이나 실제 실행 모델 인증으로 표시하지 않습니다. 실제 Runtime
+현재 구현은 모델 원본 조회와 복구 계획/감사 검증의 첫 범위입니다. 2026/10/11의
+운영 API 적용·HTTP 확인 기록은 아래 전용 문서를 참조합니다. 이후 manager 통합
+후보의 운영 배포는 별도 검증 대상입니다. Artifact 검사나 정상 HTTP 응답을 실제
+실행 모델 인증으로 표시하지 않습니다. 실제 Runtime
 발행, 기기별 OFF/OBSERVE 저장·적용, 모델 활성화·중단·후보 평가와 Frontend 연결은
 후속이며 P9-06 전체 완료가 아닙니다. 검증 기록과 세부 계약은
 [모델 정보·복구 관리 API](phase9-model-management-api.md)를 참조합니다.
