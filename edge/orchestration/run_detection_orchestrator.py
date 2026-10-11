@@ -345,7 +345,11 @@ def _bounded_replay_audit_matches(db: Session, candidate, plan: dict, boundary: 
         verify_plan_sha256(plan)
         evidence = plan["bounded_replay"]
         before, after = plan["checkpoint"]["before"], plan["checkpoint"]["after"]
-        if (candidate["status"] != "COMPLETED" or plan["target_session_id"] != candidate["target_capture_session_id"]
+        allow_failed_target = plan.get("allow_failed_target_session", False)
+        if type(allow_failed_target) is not bool:
+            return False
+        expected_status = "FAILED" if allow_failed_target else "COMPLETED"
+        if (candidate["status"] != expected_status or plan["target_session_id"] != candidate["target_capture_session_id"]
                 or plan["current_session_id"] != candidate["current_capture_session_id"]
                 or plan["detector_name"] != candidate["detector_name"]
                 or plan["source_table"] != candidate["source_table"]
@@ -365,9 +369,12 @@ def _bounded_replay_audit_matches(db: Session, candidate, plan: dict, boundary: 
         features = list(db.execute(text("SELECT f.* FROM packet_feature_logs f JOIN packet_capture_segments g "
                                        "ON g.id=f.capture_segment_id WHERE g.capture_session_id=:id ORDER BY f.id"),
                                    {"id": session["id"]}).mappings())
-        actual = bounded_replay_target_evidence(session, segments, features)
-        if any(evidence.get(key) != value for key, value in actual.items()):
+        actual = bounded_replay_target_evidence(
+            session, segments, features, allow_failed_target_session=allow_failed_target)
+        if actual is None or any(evidence.get(key) != value for key, value in actual.items()):
             return False
+        if allow_failed_target:
+            return plan.get("failed_target_tail") == actual["failed_target_tail"]
         return (session["ended_at"] is not None and actual["replay_end"] is not None
                 and parse_db_utc(session["ended_at"]) >= parse_db_utc(actual["replay_end"])
                 and all(row["status"] in {"PROCESSED", "EMPTY"} and row["error_code"] is None
@@ -398,7 +405,7 @@ def _resolve_packet_stage_live_resume_audit(
               AND pcr.last_processed_id_before IS :last_processed_id
               AND pcr.last_processed_id_after IS :last_processed_id
               AND pcs.first_window_start = :boundary
-              AND pcs.status IN ('RUNNING', 'COMPLETED')
+              AND pcs.status IN ('RUNNING', 'COMPLETED', 'FAILED')
             ORDER BY pcr.id DESC
             """
         ),
@@ -425,7 +432,7 @@ def _resolve_packet_stage_live_resume_audit(
         if plan["mode"] == "bounded-replay" and not _bounded_replay_audit_matches(db, candidate, plan, boundary, range_start):
             continue
         target_session_id = str(candidate["target_capture_session_id"])
-        if not _target_has_live_resume_ready_shape(
+        if (plan["mode"] != "bounded-replay" or candidate["status"] != "FAILED") and not _target_has_live_resume_ready_shape(
             db,
             session_id=target_session_id,
             first_window_start=boundary,

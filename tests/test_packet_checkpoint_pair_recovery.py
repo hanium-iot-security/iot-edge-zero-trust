@@ -890,3 +890,240 @@ def test_cli_bounded_replay_terminal_is_success(replay_fixture, capsys):
     assert cli.main(["status", "--plan-file", str(f["output"]), "--db-path", str(f["database"]),
                      "--artifact-dir", str(f["artifacts"])]) == 0
     assert json.loads(capsys.readouterr().out)["operation_status"] == "REPLAY_COMPLETE"
+
+
+
+def _close_target_with_uncaptured_tail(fixture):
+    replay_end = TARGET_FIRST + timedelta(seconds=20)
+    with sqlite3.connect(fixture["database"]) as db:
+        session_pk = db.execute("SELECT id FROM packet_capture_sessions WHERE session_id=?", (TARGET_SESSION,)).fetchone()[0]
+        db.execute("UPDATE packet_capture_sessions SET status='FAILED',ended_at=? WHERE id=?",
+                   (_db_utc(replay_end + timedelta(seconds=1)), session_pk))
+        tail_id = _insert_capture_segment(db, session_pk=session_pk, capture_interface="eth-target",
+                                          window_start=replay_end, status="FAILED")
+        db.execute("UPDATE packet_capture_segments SET file_name=NULL,captured_duration_seconds=0,error_code='LATE_CAPTURE' WHERE id=?",
+                   (tail_id,))
+    fixture["target_tail_id"] = tail_id
+    return tail_id
+
+
+def _inspect_failed_target(fixture, **options):
+    output = fixture["output"].with_name("failed-target-plan-" + str(uuid.uuid4()) + ".json")
+    plan = pair.inspect_pair(db_path=fixture["database"], repository_root=fixture["root"],
+                             current_session_id=CURRENT_SESSION, target_session_id=TARGET_SESSION,
+                             approved_by="admin-fixture", reason="process preserved prefix; do not skip target tail",
+                             plan_output=output, **options)
+    return output, plan
+
+
+@pytest.fixture
+def failed_target_replay_fixture(replay_fixture):
+    f = replay_fixture
+    _close_target_with_uncaptured_tail(f)
+    output, plan = _inspect_failed_target(f, mode=core.BOUNDED_REPLAY_MODE, allow_failed_target_session=True)
+    assert plan["can_execute"], plan["blocking_reasons"]
+    f.update(output=output, plan=plan)
+    return f
+
+
+def test_failed_target_prefix_requires_separate_explicit_bounded_opt_in(replay_fixture):
+    f = replay_fixture
+    _close_target_with_uncaptured_tail(f)
+    for options in ({}, {"mode": core.BOUNDED_REPLAY_MODE}, {"allow_failed_target_session": True}):
+        _, rejected = _inspect_failed_target(f, **options)
+        assert rejected["can_execute"] is False
+        assert rejected["blocking_reasons"]
+    output, plan = _inspect_failed_target(f, mode=core.BOUNDED_REPLAY_MODE, allow_failed_target_session=True)
+    assert plan["can_execute"] is True and plan["allow_failed_current_session"] is False
+    assert plan["failed_target_tail"]["segment_id"] == f["target_tail_id"]
+    assert plan["bounded_replay"]["replay_end"] == _db_utc(TARGET_FIRST + timedelta(seconds=20))
+    assert plan["bounded_replay"]["segment_count"] == 2
+    assert plan["bounded_replay"]["total_segment_count"] == 3
+    assert all(c["plan"]["allow_failed_target_session"] is True and
+               c["plan"]["failed_target_tail"] == plan["failed_target_tail"] for c in plan["children"])
+    assert pair._load_pair(output)[1] == plan
+    assert _audits(f) == []
+
+
+def test_failed_target_replay_finishes_only_actual_preserved_prefix_and_keeps_tail(failed_target_replay_fixture):
+    f = failed_target_replay_fixture
+    with sqlite3.connect(f["database"]) as db:
+        original = db.execute("SELECT * FROM packet_capture_sessions WHERE session_id=?", (TARGET_SESSION,)).fetchone()
+        tail = db.execute("SELECT * FROM packet_capture_segments WHERE id=?", (f["target_tail_id"],)).fetchone()
+    assert _execute(f)["operation_status"] == "APPLIED_PENDING_PROGRESS"
+    assert pair.status_pair(**_kwargs(f))["operation_status"] != "REPLAY_COMPLETE"
+    _finish_replay(f, trust_pending=True)
+    assert pair.status_pair(**_kwargs(f))["operation_status"] != "REPLAY_COMPLETE"
+    _finish_replay(f)
+    complete = pair.status_pair(**_kwargs(f))
+    assert complete["operation_status"] == "REPLAY_COMPLETE" and complete["live_recovery_complete"] is False
+    assert complete["replay_end"] == f["plan"]["failed_target_tail"]["window_start"]
+    assert len(_audits(f)) == 2
+    assert all(json.loads(audit["plan_json"])["allow_failed_target_session"] is True for audit in _audits(f))
+    assert _execute(f, resume=True)["operation_status"] == "REPLAY_COMPLETE"
+    assert len(_audits(f)) == 2
+    with sqlite3.connect(f["database"]) as db:
+        assert db.execute("SELECT * FROM packet_capture_sessions WHERE session_id=?", (TARGET_SESSION,)).fetchone() == original
+        assert db.execute("SELECT * FROM packet_capture_segments WHERE id=?", (f["target_tail_id"],)).fetchone() == tail
+
+
+def test_failed_target_partial_response_loss_resumes_only_missing_if(failed_target_replay_fixture, monkeypatch):
+    f = failed_target_replay_fixture
+    original = core._execute_locked_recovery
+    calls = []
+    def lose_response(**prepared):
+        name = prepared["plan"]["detector_name"]
+        calls.append(name)
+        result = original(**prepared)
+        if name == "packet_rule":
+            raise RuntimeError("response lost after real Rule COMMIT")
+        return result
+    monkeypatch.setattr(core, "_execute_locked_recovery", lose_response)
+    assert _execute(f)["operation_status"] == "PARTIAL_HOLD"
+    assert len(_audits(f)) == 1 and calls == ["packet_rule"]
+    assert _execute(f, resume=True)["operation_status"] == "APPLIED_PENDING_PROGRESS"
+    assert calls == ["packet_rule", "packet_if"] and len(_audits(f)) == 2
+    _finish_replay(f)
+    assert pair.status_pair(**_kwargs(f))["operation_status"] == "REPLAY_COMPLETE"
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", None])
+def test_failed_target_approval_requires_literal_boolean(replay_fixture, value):
+    with pytest.raises(core.PacketCheckpointRecoveryError, match="failed-target-session approval must be boolean"):
+        _inspect_failed_target(replay_fixture, mode=core.BOUNDED_REPLAY_MODE, allow_failed_target_session=value)
+
+
+@pytest.mark.parametrize("mutation", ["parent_flag", "child_flag", "parent_tail", "child_tail"])
+def test_failed_target_parent_child_approval_and_tail_are_sha_bound(failed_target_replay_fixture, mutation):
+    f = failed_target_replay_fixture
+    plan = json.loads(json.dumps(f["plan"]))
+    if mutation == "parent_flag":
+        plan["allow_failed_target_session"] = False
+    elif mutation == "child_flag":
+        plan["children"][0]["plan"]["allow_failed_target_session"] = False
+    elif mutation == "parent_tail":
+        plan["failed_target_tail"]["segment_id"] += 1
+    else:
+        plan["children"][0]["plan"]["failed_target_tail"]["segment_id"] += 1
+    for child in plan["children"]:
+        child["plan"] = core.attach_plan_sha256(child["plan"], generated_at=f["clock"][0])
+    f["plan"] = _resign(plan, f)
+    with pytest.raises(core.PacketCheckpointRecoveryError, match="contract mismatch|tail binding mismatch"):
+        _execute(f)
+    assert _audits(f) == []
+
+
+@pytest.mark.parametrize("phase", ["before", "after"])
+@pytest.mark.parametrize("mutation", ["prefix", "tail", "closed_end"])
+def test_failed_target_prefix_and_exact_tail_cannot_change(failed_target_replay_fixture, phase, mutation):
+    f = failed_target_replay_fixture
+    if phase == "after":
+        _execute(f)
+        _finish_replay(f)
+    with sqlite3.connect(f["database"]) as db:
+        if mutation == "prefix":
+            db.execute("UPDATE packet_feature_logs SET total_bytes=total_bytes+1 WHERE capture_segment_id IN "
+                       "(SELECT id FROM packet_capture_segments WHERE capture_session_id=(SELECT id FROM packet_capture_sessions WHERE session_id=?))",
+                       (TARGET_SESSION,))
+        elif mutation == "tail":
+            db.execute("UPDATE packet_capture_segments SET error_message='changed exact tail' WHERE id=?", (f["target_tail_id"],))
+        else:
+            db.execute("UPDATE packet_capture_sessions SET ended_at=? WHERE session_id=?",
+                       (_db_utc(TARGET_FIRST + timedelta(seconds=22)), TARGET_SESSION))
+    with pytest.raises(core.PacketCheckpointRecoveryError, match="bounded replay target or fixed input changed"):
+        pair.status_pair(**_kwargs(f)) if phase == "after" else _execute(f)
+    assert len(_audits(f)) == (2 if phase == "after" else 0)
+
+
+def test_cli_failed_target_opt_in_is_separate_and_terminal_status_succeeds(replay_fixture, capsys):
+    f = replay_fixture
+    _close_target_with_uncaptured_tail(f)
+    output = f["output"].with_name("cli-failed-target-prefix.json")
+    args = ["dry-run", "--db-path", str(f["database"]), "--repository-root", str(f["root"]),
+            "--current-session-id", CURRENT_SESSION, "--target-session-id", TARGET_SESSION,
+            "--approved-by", "admin-fixture", "--reason", "preserve normal prefix",
+            "--plan-output", str(output), "--mode", core.BOUNDED_REPLAY_MODE, "--allow-failed-target-session"]
+    assert cli.main(args) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["allow_failed_target_session"] is True and plan["allow_failed_current_session"] is False
+    f.update(output=output, plan=plan)
+    _execute(f)
+    _finish_replay(f)
+    assert cli.main(["status", "--plan-file", str(output), "--db-path", str(f["database"]),
+                     "--artifact-dir", str(f["artifacts"])]) == 0
+    assert json.loads(capsys.readouterr().out)["operation_status"] == "REPLAY_COMPLETE"
+
+
+
+def test_failed_target_prefix_does_not_authorize_follow_on_source_tail_skip(failed_target_replay_fixture):
+    f = failed_target_replay_fixture
+    _execute(f)
+    _finish_replay(f)
+    next_session = str(uuid.uuid4())
+    next_start = TARGET_FIRST + timedelta(seconds=30)
+    with sqlite3.connect(f["database"]) as db:
+        session_pk = _insert_capture_session(db, session_id=next_session, capture_interface="eth-target",
+                                             first_window_start=next_start, status="RUNNING")
+        _insert_capture_segment(db, session_pk=session_pk, capture_interface="eth-target",
+                                window_start=next_start, status="EMPTY")
+        db.execute("UPDATE packet_capture_segments SET start_delay_seconds=0.1,captured_duration_seconds=9.9 WHERE id=?",
+                   (db.execute("SELECT MAX(id) FROM packet_capture_segments").fetchone()[0],))
+    options = dict(db_path=f["database"], repository_root=f["root"], current_session_id=TARGET_SESSION,
+                   target_session_id=next_session, approved_by="admin-fixture", reason="separately inspect source loss")
+    blocked = pair.inspect_pair(**options, plan_output=f["output"].with_name("unapproved-follow-on.json"))
+    assert blocked["can_execute"] is False and blocked["allow_failed_current_session"] is False
+    approved = pair.inspect_pair(**options, allow_failed_current_session=True,
+                                 plan_output=f["output"].with_name("separately-approved-follow-on.json"))
+    assert approved["can_execute"], approved["blocking_reasons"]
+    assert approved["allow_failed_target_session"] is False
+    assert all(c["plan"]["failed_current_tail"]["segment_id"] == f["target_tail_id"] for c in approved["children"])
+    assert len(_audits(f)) == 2
+
+
+def test_failed_source_and_target_prefix_approvals_are_independent(replay_fixture):
+    f = replay_fixture
+    _close_target_with_uncaptured_tail(f)
+    with sqlite3.connect(f["database"]) as db:
+        source_pk = db.execute("SELECT id FROM packet_capture_sessions WHERE session_id=?", (CURRENT_SESSION,)).fetchone()[0]
+        ready = CURRENT_READY_THROUGH
+        tail_start = TARGET_FIRST - timedelta(seconds=10)
+        while ready < tail_start:
+            _insert_capture_segment(db, session_pk=source_pk, capture_interface="eth-current",
+                                    window_start=ready, status="EMPTY")
+            ready += timedelta(seconds=10)
+        db.execute("UPDATE detector_checkpoints SET last_completed_window_end=?,updated_at=? WHERE detector_name IN ('packet_rule','packet_if')",
+                   (_db_utc(tail_start), _db_utc(tail_start)))
+        db.execute("UPDATE packet_capture_sessions SET status='FAILED',ended_at=? WHERE id=?",
+                   (_db_utc(tail_start + timedelta(seconds=1)), source_pk))
+        source_tail = _insert_capture_segment(db, session_pk=source_pk, capture_interface="eth-current",
+                                             window_start=tail_start, status="FAILED")
+        db.execute("UPDATE packet_capture_segments SET file_name=NULL,captured_duration_seconds=0,error_code='LATE_CAPTURE' WHERE id=?",
+                   (source_tail,))
+    _, blocked = _inspect_failed_target(f, mode=core.BOUNDED_REPLAY_MODE, allow_failed_target_session=True)
+    assert blocked["can_execute"] is False
+    output, approved = _inspect_failed_target(f, mode=core.BOUNDED_REPLAY_MODE,
+                                             allow_failed_target_session=True, allow_failed_current_session=True)
+    assert approved["can_execute"], approved["blocking_reasons"]
+    for child in approved["children"]:
+        signed = child["plan"]
+        assert signed["failed_current_tail"]["segment_id"] == source_tail
+        assert signed["failed_target_tail"]["segment_id"] == f["target_tail_id"]
+        assert core.recovery_execute_confirmation(signed) == core.FAILED_TARGET_PREFIX_BOUNDED_REPLAY_CONFIRMATION
+    f.update(output=output, plan=approved)
+    assert _execute(f)["operation_status"] == "APPLIED_PENDING_PROGRESS" and len(_audits(f)) == 2
+
+
+def test_existing_default_bounded_pair_without_new_optional_fields_remains_executable(replay_fixture):
+    f = replay_fixture
+    plan = json.loads(json.dumps(f["plan"]))
+    plan.pop("allow_failed_target_session")
+    plan.pop("failed_target_tail", None)
+    for child in plan["children"]:
+        child["plan"].pop("allow_failed_target_session")
+        child["plan"].pop("failed_target_tail")
+        child["plan"] = core.attach_plan_sha256(child["plan"], generated_at=f["clock"][0])
+    f["plan"] = _resign(plan, f)
+    assert pair._load_pair(f["output"])[1] == f["plan"]
+    assert _execute(f)["operation_status"] == "APPLIED_PENDING_PROGRESS"
+    _finish_replay(f)
+    assert pair.status_pair(**_kwargs(f))["operation_status"] == "REPLAY_COMPLETE"

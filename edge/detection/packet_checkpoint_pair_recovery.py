@@ -99,6 +99,11 @@ def _load_pair(path):
     allow_failed = plan.get("allow_failed_current_session", False)
     if type(allow_failed) is not bool:
         raise Error("failed-current-session approval must be boolean")
+    allow_failed_target = plan.get("allow_failed_target_session", False)
+    if type(allow_failed_target) is not bool:
+        raise Error("failed-target-session approval must be boolean")
+    if allow_failed_target and plan["mode"] != core.BOUNDED_REPLAY_MODE:
+        raise Error("failed-target prefix approval requires bounded replay")
     children = plan.get("children", [])
     if [child.get("detector") for child in children] != list(DETECTORS):
         raise Error("paired detectors must be Rule then IF")
@@ -114,6 +119,8 @@ def _load_pair(path):
         if (signed["detector_name"] != child["detector"] or signed["source_table"] != SOURCE
                 or type(signed.get("allow_failed_current_session")) is not bool
                 or signed["allow_failed_current_session"] != allow_failed
+                or type(signed.get("allow_failed_target_session", False)) is not bool
+                or signed.get("allow_failed_target_session", False) != allow_failed_target
                 or signed["plan_schema_version"] != core.PLAN_SCHEMA_VERSION
                 or signed["checkpoint"]["after"] is not None and (
                     signed["checkpoint"]["after"]["last_completed_window_end"] != plan["boundary"]
@@ -122,6 +129,9 @@ def _load_pair(path):
         if plan["mode"] == core.BOUNDED_REPLAY_MODE and (
                 signed.get("bounded_replay") != plan.get("bounded_replay") or not plan.get("bounded_replay")):
             raise Error("child bounded replay binding mismatch")
+        if (signed.get("failed_target_tail") != plan.get("failed_target_tail")
+                or allow_failed_target and not plan.get("failed_target_tail")):
+            raise Error("child failed target tail binding mismatch")
     if (plan["skips_processable"] != any(child["plan"]["summary"]["skips_processable_sessions"] for child in children)
             or plan["can_execute"] and any(not child["plan"]["can_execute"] for child in children)):
         raise Error("paired executability or skip summary mismatch")
@@ -129,11 +139,14 @@ def _load_pair(path):
 
 
 def inspect_pair(*, db_path, repository_root, current_session_id, target_session_id,
-                 approved_by, reason, plan_output, allow_failed_current_session=False, mode=core.LIVE_RESUME_MODE):
+                 approved_by, reason, plan_output, allow_failed_current_session=False,
+                 allow_failed_target_session=False, mode=core.LIVE_RESUME_MODE):
     if mode not in (core.LIVE_RESUME_MODE, core.BOUNDED_REPLAY_MODE):
         raise Error("unsupported paired recovery mode")
     if type(allow_failed_current_session) is not bool:
         raise Error("failed-current-session approval must be boolean")
+    if type(allow_failed_target_session) is not bool:
+        raise Error("failed-target-session approval must be boolean")
     if not approved_by.strip() or not reason.strip():
         raise Error("approval principal and reason are required")
     database = core.resolve_database_path(db_path)
@@ -162,6 +175,7 @@ def inspect_pair(*, db_path, repository_root, current_session_id, target_session
                 current_session_id=current_session_id, target_session_id=target_session_id,
                 approved_by=approved_by, reason=reason, lock_entries=entries, mode=mode,
                 allow_failed_current_session=allow_failed_current_session,
+                allow_failed_target_session=allow_failed_target_session,
             ), generated_at=core._utc_now().replace(microsecond=0))
             children.append({"detector": name, "child_operation_id": str(uuid.uuid5(pair_id, name)), "plan": signed})
     first = children[0]["plan"]
@@ -172,13 +186,16 @@ def inspect_pair(*, db_path, repository_root, current_session_id, target_session
         blockers.append("PAIR_BOUNDARY_MISMATCH")
     if not runtime.get("boot_id"):
         blockers.append("RUNTIME_BOOT_UNCONFIRMED")
-    if failed_target:
+    if failed_target and not (mode == core.BOUNDED_REPLAY_MODE and allow_failed_target_session):
         blockers.append("PAIR_TARGET_FAILED")
     payload = {key: first[key] for key in ("database_path", "repository_root", "repository_commit", "repository_state",
                "current_session_id", "target_session_id", "approved_by", "reason", "locks", "mode",
                "allow_failed_current_session")}
+    payload["allow_failed_target_session"] = allow_failed_target_session
     if mode == core.BOUNDED_REPLAY_MODE:
         payload["bounded_replay"] = first["bounded_replay"]
+        if allow_failed_target_session:
+            payload["failed_target_tail"] = first["failed_target_tail"]
     payload.update(plan_schema_version=REPLAY_SCHEMA if mode == core.BOUNDED_REPLAY_MODE else SCHEMA,
                    pair_id=str(pair_id), children=children, boundary=boundary,
                    runtime=runtime, target_identity=target_identity,
@@ -294,9 +311,16 @@ def _states(db, plan, group):
     running = repository.list_running_capture_sessions(db)
     readiness = repository.calculate_packet_feature_readiness(db, plan["target_session_id"])
     if plan["mode"] == core.BOUNDED_REPLAY_MODE:
-        if (target is None or target["status"] != "COMPLETED" or len(running) > 1
-                or readiness is None or not readiness.full_ready
-                or core._bounded_replay_evidence(db, plan["target_session_id"]) != plan["bounded_replay"]
+        allow_failed_target = plan.get("allow_failed_target_session", False)
+        evidence = core._bounded_replay_evidence(
+            db, plan["target_session_id"], allow_failed_target_session=allow_failed_target)
+        expected_status = "FAILED" if allow_failed_target else "COMPLETED"
+        if (target is None or target["status"] != expected_status or len(running) > 1
+                or readiness is None
+                or (not allow_failed_target and not readiness.full_ready)
+                or readiness.packet_feature_ready_through != parse_db_utc(plan["bounded_replay"]["replay_end"])
+                or evidence != plan["bounded_replay"]
+                or allow_failed_target and evidence.get("failed_target_tail") != plan.get("failed_target_tail")
                 or target["first_window_start"] != plan["boundary"]
                 or any(target[key] != value for key, value in plan["target_identity"].items())):
             raise Error("bounded replay target or fixed input changed")

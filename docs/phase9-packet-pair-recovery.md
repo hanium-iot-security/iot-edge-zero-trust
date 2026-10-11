@@ -242,3 +242,26 @@ Orchestrator·Trust를 실행했다. Rule144931/IF144932와 필수 MQTT·Trust�
 실제 모델의 정확도, 운영 서비스 정지·복귀, 운영 DB 복구나 현재 수집의 실시간 완료를
 검증한 것은 아니다. 원본 DB·PCAP 압축본의 크기·전체 SHA256은 시험 후에도 같았다.
 운영 배포와 새로운 전원 종료 구간의 재개 승인은 별도로 남아 있다.
+
+
+## 종료된 FAILED Session의 정상 구간만 재처리
+
+`bounded-replay --allow-failed-target-session`은 정상 구간이 연속으로 보존돼 있고
+마지막 한 구간만 파일·실제 수집 시각·특징 데이터가 없는 `LATE_CAPTURE`일 때 사용할 수 있다.
+기본값은 false다. 대상 Session과 실패 구간은 FAILED로 보존하며, 정상 구간과 실패 구간의
+원본 행 전체를 계획 SHA에 묶는다. `replay_end`는 실패 구간의 시작이다.
+
+이 옵션으로 정상 구간을 처리해 `REPLAY_COMPLETE`가 되어도 실패 구간을 건너뛰거나
+다음 RUNNING Session으로 이동하는 승인은 포함되지 않는다. 다음 Session 재개에는
+실제로 정상 구간을 모두 소비한 뒤 별도 `live-resume --allow-failed-current-session`
+계획과 해당 손실 구간 승인이 필요하다. 앞선 Session을 건너뛰는 범용 복구는 지원하지 않는다.
+
+단일 엔진의 확인 문자열은 `APPLY-PACKET-FAILED-TARGET-PREFIX-BOUNDED-REPLAY`다.
+Pair의 확인 문자열은 기존 bounded prefix에 새 계획 SHA를 붙인다. 부모와 두 자식 계획은
+동일한 target 옵션·실패 증거를 포함해야 한다. 이전 계획에 새 false 필드가 없어도 기존
+SHA와 감사 원문은 보존하며, 실행 재검증에서만 기본값을 비교한다.
+
+2026/10/11 로컬 Python 3.10 회귀에서 단일 엔진 233개 통과·Linux 전용 6개 제외,
+Orchestrator 79개 통과, pair 115개 통과를 확인했다. 실패 구간의 입력 존재·연속성·
+원본 변경·SHA·CAS·옵션 변조와 부분 적용 후 IF만 재개하는 경로를 검사했다.
+이 기록은 운영 DB의 실제 복구 완료 기록이 아니다.
