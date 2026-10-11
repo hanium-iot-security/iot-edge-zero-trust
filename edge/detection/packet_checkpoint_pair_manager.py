@@ -397,13 +397,13 @@ def supervise(plan_file, *, system=None, processes=None, monotonic=None, sleep=N
             while now() < deadline:
                 try:
                     journal["verification"] = verify(plan_file=plan_file, system=system, processes=processes)
-                    if journal["verification"]["operation_status"] == "COMPLETE":
-                        journal["phase"] = "COMPLETE"
+                    if journal["verification"]["operation_status"] in pair.COMPLETE_STATUSES:
+                        journal["phase"] = journal["verification"]["operation_status"]
                         break
                 except Exception as error:
                     journal["verification"] = {"operation_status": "HOLD", "error": type(error).__name__}
                 pause(min(10, max(0, deadline - now())))
-            if journal["phase"] != "COMPLETE":
+            if journal["phase"] not in pair.COMPLETE_STATUSES:
                 journal["phase"] = "APPLIED_VERIFY_HOLD"
             _save(journal_path, journal)
         return journal
@@ -429,6 +429,6 @@ def worker(plan_file, worker_token):
     states, _ = _reconcile(plan)
     signed = pair._load_pair(plan["pair_plan_file"])[1]
     return pair.execute_pair(plan_file=plan["pair_plan_file"], db_path=plan["database_path"],
-                             artifact_dir=plan["artifact_dir"], confirm=pair.CONFIRM + plan["pair_plan_sha256"],
+                             artifact_dir=plan["artifact_dir"], confirm=pair.confirmation_prefix(signed) + signed["plan_sha256"],
                              confirm_skip_processable=pair.SKIP_CONFIRM + signed["plan_sha256"] if signed["skips_processable"] else None,
                              resume=any(value == "APPLIED" for value in states.values()))

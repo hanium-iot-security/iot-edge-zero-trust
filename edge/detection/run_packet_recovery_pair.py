@@ -49,7 +49,7 @@ def main(argv=None):
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     if args.command == "plan":
         return 0 if result.get("can_execute") else 2
-    if result.get("operation_status") == "COMPLETE" or result.get("phase") == "COMPLETE":
+    if result.get("operation_status") in manager.pair.COMPLETE_STATUSES or result.get("phase") in manager.pair.COMPLETE_STATUSES:
         return 0
     return 2 if result.get("database_committed") is False else 3
 
