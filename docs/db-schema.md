@@ -43,6 +43,12 @@ sequence와 기존 Release FK를 보존한다. 완료 뒤 되돌리는 down Migr
 않으므로 운영 적용 전 일관된 백업과 사본 검증이 필요하다. 운영 DB의 011 적용/배포는 아직
 미실행 상태이며 로컬 검증을 운영 적용으로 표시하지 않는다.
 
+Migration 012 (`device_ai_policy_revisions`)는 기기별 AI 모드(OFF/OBSERVE) 불변 이력 테이블을
+추가한다. 기존 기기의 모드는 만들지 않으며, 운영자 승인 목록으로
+`python -m db.backfill_device_ai_policies --db <복사본> --manifest <목록.json>`(기본 dry-run)을
+실행하기 전까지 기존 기기는 AI 설정 누락 상태다. 배포 순서는 012 적용 → 승인 목록 이관 →
+이 설정을 읽는 API·탐지기 배포다. 012만 적용해서는 기존 동작이 바뀌지 않는다.
+
 적용과 복구: 007은 컬럼 추가를 포함하며 되돌리는(down) Migration이 없다. 운영 DB에는 먼저
 일관된 백업(SQLite backup API 등, 쓰기 중 파일 하나만 복사하지 않는다)을 만든 뒤 **복사본에서**
 Migration과 backfill dry-run을 확인하고 적용한다. 적용 중 오류가 나면 Migration 전체가 rollback되어
@@ -142,6 +148,37 @@ ACTIVE revision 1을 만든다. 이때 `registration_effective_from`은 NULL로 
 등록 판정을 바꾸지 않고, 그 Window의 정책은 추정하지 않는다(`POLICY_UNAVAILABLE`).
 새 개발 DB는 `python db/create_tables.py` 뒤 `python db/seed_devices.py`가 기기와 초기 revision을
 한 트랜잭션으로 만든다.
+
+## device_ai_policy_revisions
+
+기기별 AI 모드 Revision을 쌓는 불변 이력이다. 등록 상태·정책 값(`device_policy_revisions`)과 별개의
+설정이며 행을 수정하거나 삭제할 수 없다(트리거). 변경은 새 revision으로만 한다.
+
+| 컬럼 | 타입 | 설명 |
+| --- | --- | --- |
+| id | INTEGER | primary key autoincrement |
+| device_id | TEXT | `devices(device_id)` FK, `ON DELETE RESTRICT` |
+| revision | INTEGER | 기기별 1부터 연속 증가(이전 revision + 1) |
+| mode | TEXT | `OFF` 또는 `OBSERVE`. ENFORCE는 저장할 수 없음 |
+| effective_from | TEXT | 효력 시작 시각. UTC `YYYY-MM-DDTHH:MM:SSZ`, 정수 초, 10초 경계. 이전 revision보다 커야 함 |
+| created_at | TEXT | 작성 시각(UTC `Z`, 소수 초 허용) |
+| created_by | TEXT | 서버 인증 결과의 작성자(1~128자) |
+| reason | TEXT | 변경 사유 1~500자 |
+
+`UNIQUE(device_id, revision)`, `UNIQUE(device_id, effective_from)`를 둔다. 신규 등록은 기기·정책
+revision 1과 같은 트랜잭션에서 **OFF revision 1**을 같은 효력 시각으로 만든다. 예정 revision은
+기기당 최대 1개이고 효력은 엄격히 다음 UTC 10초 경계다. 이 규칙과 "DISABLED 기기를 OBSERVE로 바꿀 수
+없음"은 서버 시각이나 다른 테이블이 필요해 `edge/policy`가 검사한다. 전역 `TRUST_AI_MODE` 확인은
+설정을 변경하는 API의 책임이다.
+
+설정이 없거나 손상된 기기는 OFF로 간주하지 않는다. 저장소는 `AI_POLICY_UNAVAILABLE`(API 503)을 알리고
+`resolve_ai_mode`는 그 Window의 AI를 제외할 근거를 반환한다. 다른 기기와 Raw·Feature·Rule 처리에는
+영향이 없다. Window 시작 시각에 효력이 있던 revision을 사용하므로 OFF→OBSERVE 전환이 과거 OFF
+구간을 되살리지 않는다.
+
+기존 기기의 초기 모드는 승인 목록(`device-ai-policy-backfill-v1`)으로만 만든다. DB의 모든 기기가 목록에
+있어야 하며 하나라도 빠지면 아무것도 변경하지 않는다. 이미 revision이 있는 기기는 건너뛰므로 재실행해도
+덮어쓰지 않는다. 이관 효력 시각 이전 Window는 설정 누락으로 남는다.
 
 ## mqtt_logs
 
