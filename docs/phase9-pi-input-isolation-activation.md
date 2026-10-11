@@ -72,3 +72,24 @@ sudo systemd-analyze verify /etc/systemd/system/firewall-worker.service /etc/sys
 API가 201/PENDING을 반환한 것만으로 차단 완료로 표시하지 않는다. Worker의 exact match 후 APPLIED와 runtime snapshot v2를 함께 확인한다. wide는 Pi의 INPUT IPv4 전체이며 IPv6·FORWARD·다른 서버 통신을 인증하지 않는다. 넓은 규칙 해제는 해당 wide Rule ID의 `release-requests`와 감사·runtime 부재 확인을 사용한다. 기존 MQTT 규칙은 별개이며 자동 해제되지 않는다.
 
 광역 승인 입력 UI, 관리자 정책 revision 선택/confirmation 화면은 아직 없다. 기존 정확한 해제/이력 화면과 NULL 필드 표시만 호환된다. 실제 차단·정확한 해제·DHCP 이동·서비스 재시작·재부팅 복원은 각각 별도 승인·증거가 필요하다.
+
+## 실물 시험을 시작하기 전에 남은 준비
+
+ESP32 #2 한 대의 실제 MQTT 발행만 늘려 최초 격리를 확인하고, ESP32 #1과 Pico는 정상 대조 기기로 유지하는 범위를 우선 검토한다. 기존 `RUN_DEMO`의 식별자 위조·잘못된 JSON·UDP 공격을 함께 실행할 필요는 없다. `RUN MQTT_FLOOD`는 본인 principal/topic으로 정상 JSON 40건을 50ms 간격으로 발행한다. 개별 명령은 10초 분석 윈도우를 자동 정렬하지 않으므로, 매 실행의 실제 수신·대표 Rule 이벤트·Trust 처리를 확인하고 다음 실행 여부를 결정한다. 응답이 불명확한 명령을 재전송하거나 예상 감점만으로 격리 성공을 판정하지 않는다. 현재 관측된 Trust 80에서 격리에 이르는 횟수는 실제 적용 정책과 대표 이벤트를 보고 정하며 시작 점수를 임의로 변경하지 않는다.
+
+같은 물리 ESP32에서 MQTT·TCP·UDP·ICMP의 전후 응답을 확인할 시험 앱은 아직 준비되지 않았다. 기존 UDP send 성공값만으로 Pi에 도착하거나 응답했다고 판단하지 않는다. 준비할 probe는 Pi 고정 주소에 한정하며 TCP 응답, UDP nonce와 응답 발신주소, ICMP echo 응답을 기록한다. 대상 IP·현재 기기 IP·기기 식별자와 자체 MQTT principal/topic을 먼저 확인한다. PC에서 ESP32의 device_id만 사용해 대신 발행한 결과는 해당 ESP32 source IP의 격리 시험이 아니다. 필요한 임시 UDP 응답 서비스·probe 횟수·포트·종료 및 회수도 시험 범위에 포함해 확정한다.
+
+| 단계 | 같은 시험 기기에서 확인할 결과 |
+|---|---|
+| 차단 전 | MQTT 실제 수신과 TCP/UDP/ICMP 응답 성공 |
+| 실제 Rule·Trust·Worker의 MQTT 격리 | MQTT 차단·1883 exact rule 확인, 다른 세 probe는 계속 성공 |
+| 관리자 wide 확장 후 | 두 Rule ID의 APPLIED·runtime v2 확인, 네 통신 차단 |
+| wide ID만 정확 해제 후 | wide runtime 부재, 원본 MQTT 규칙 유지, TCP/UDP/ICMP 복귀 |
+| 원본 MQTT ID 별도 해제 후 | 두 규칙의 DB·runtime 부재와 MQTT 수신 복귀 |
+| 정상 앱·제품 복구 후 | 감사가 있는 정상 상태 복구, 세 기기 최신 수신과 필수 처리 전진 |
+
+두 방화벽 규칙을 해제해도 기기 Trust·상태는 자동 초기화되지 않는다. 실제 runtime 관측·미처리 이벤트 등 기존 preflight가 모두 통과한 경우에만 별도로 승인한 `POST /api/recovery/execute`의 정상/100 복구를 사용한다. 시험 시작 전 관측이 정상/80이었다고 해서 직접 DB에 80을 되쓰지 않는다. 시험 후 예상 상태와 정상/100 복구 범위는 실행 전에 명시한다. wide 해제, MQTT 해제, 기기 상태 복구, 앱 복원은 각각 별도 완료 근거를 남긴다.
+
+10/9에 보존한 P0 원본은 1,048,576바이트이며 SHA256은 `0432c96be74ebccb75bfa274ac35bd578c9e8edf88229d54ab7a5d40de6b84e4`다. 복원한 앱은 offset `0x10000`, 937,984바이트, SHA256 `03714a517d1c5acdd5a59ca95e03155f14eb17a04d41bb1a9668febfba957c22`였고 당시 앱 digest·P0 부팅·정상 MQTT를 확인했다. 이는 당시 앱 구간의 복원 근거이며 현재 설치 펌웨어나 전체 flash/NVS/partition의 복원 증명은 아니다. 새 시험 전에 현재 물리 기기·serial mapping·칩/partition/app 범위와 새 백업을 확인한다. 보존 앱 바이트로 복귀하고 재컴파일본을 원본이라고 부르지 않는다. 과거 COM5 고정 업로드 도구나 RTS reset이 있는 관측 스크립트를 그대로 실행하지 않는다. 개인 백업 바이너리와 기기별 비밀 설정은 저장소에 올리지 않는다.
+
+이 절차는 준비 상태다. 시험 앱 구현·컴파일, 현재 기기 확인, 새 설치 대기 예산, 실제 host 설치·물리 통신·복구는 아직 실행하지 않았다. DHCP 이동과 서비스 재시작·재부팅 복원도 위 기본 통신 시험의 통과와 구분해 후속으로 검증한다.
