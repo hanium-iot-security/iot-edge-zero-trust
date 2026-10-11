@@ -1,6 +1,7 @@
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 import hashlib
+import errno
 import importlib
 import inspect
 import json
@@ -9,6 +10,7 @@ from pathlib import Path
 import shlex
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 
@@ -4584,3 +4586,168 @@ def test_failed_target_prefix_id_evidence_uses_rule_inbound_and_if_all_input_row
         assert not plan["can_execute"] and reason in plan["blocking_reasons"]
     else:
         assert plan["can_execute"], plan["blocking_reasons"]
+
+
+
+def _moving_pcap_repository(tmp_path):
+    root = _repository(tmp_path)
+    ready, processed = root / "data" / "pcap" / "ready", root / "data" / "pcap" / "processed"
+    for directory in (ready, processed):
+        directory.mkdir(parents=True)
+        (directory / ".gitkeep").write_bytes(b"")
+    (root / ".gitignore").write_text("data/pcap/ready/*\ndata/pcap/processed/*\n!data/pcap/ready/.gitkeep\n!data/pcap/processed/.gitkeep\n", encoding="utf-8")
+    _git(root, "add", ".gitignore", "data")
+    _git(root, "commit", "-m", "ignore live PCAP files, retain directory markers")
+    pcap = ready / "capture.pcap"
+    pcap.write_bytes(b"original captured packets")
+    return root, pcap, processed / pcap.name
+
+
+def _repository_stat_hook(monkeypatch, hook):
+    original_scan = os.scandir
+    scanned = []
+
+    class HookedEntry:
+        def __init__(self, entry):
+            self.entry = entry
+
+        def __getattr__(self, name):
+            return getattr(self.entry, name)
+
+        def stat(self, *args, **kwargs):
+            replacement = hook(self.entry)
+            # Windows DirEntry caches metadata from enumeration. Force an
+            # actual path stat so the real rename reproduces Linux's ENOENT.
+            return replacement if replacement is not None else os.stat(self.entry.path, *args, **kwargs)
+
+    @contextmanager
+    def hooked_scan(directory):
+        scanned.append(Path(directory))
+        with original_scan(directory) as entries:
+            yield (HookedEntry(entry) for entry in entries)
+
+    monkeypatch.setattr(packet_checkpoint_recovery.os, "scandir", hooked_scan)
+    return scanned
+
+
+def test_repository_scan_retries_actual_ignored_ready_to_processed_pcap_move(tmp_path, monkeypatch):
+    root, ready, processed = _moving_pcap_repository(tmp_path)
+    moved = []
+
+    def move_before_stat(entry):
+        if Path(entry.path) == ready and not moved:
+            ready.replace(processed)
+            moved.append(True)
+
+    scanned = _repository_stat_hook(monkeypatch, move_before_stat)
+    state = packet_checkpoint_recovery.inspect_repository_state(root)
+    assert moved == [True] and scanned.count(root) == 2
+    assert not ready.exists() and processed.read_bytes() == b"original captured packets"
+    assert state["untracked_inventory"] == [] and state["tracked_worktree_clean"] is True
+
+
+def test_repository_scan_retries_whole_git_observation_and_rejects_tracked_deletion(tmp_path, monkeypatch):
+    root, _, _ = _moving_pcap_repository(tmp_path)
+    tracked = root / "tracked.txt"
+    deleted = []
+
+    def delete_after_git_diff(entry):
+        if Path(entry.path) == tracked and not deleted:
+            tracked.unlink()
+            deleted.append(True)
+
+    scanned = _repository_stat_hook(monkeypatch, delete_after_git_diff)
+    with pytest.raises(PacketCheckpointRecoveryError, match="tracked/staged"):
+        packet_checkpoint_recovery.inspect_repository_state(root)
+    assert deleted == [True] and scanned.count(root) == 2
+
+
+def test_repository_scan_fails_closed_after_three_real_pcap_move_attempts(tmp_path, monkeypatch):
+    root, ready, processed = _moving_pcap_repository(tmp_path)
+    moves = []
+
+    def keep_moving_before_stat(entry):
+        path = Path(entry.path)
+        if path in (ready, processed):
+            path.replace(processed if path == ready else ready)
+            moves.append(path)
+
+    scanned = _repository_stat_hook(monkeypatch, keep_moving_before_stat)
+    with pytest.raises(PacketCheckpointRecoveryError, match="filesystem changed repeatedly"):
+        packet_checkpoint_recovery.inspect_repository_state(root)
+    assert len(moves) == 3 and scanned.count(root) == 3
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_repository_scan_retry_does_not_bypass_reappearing_nonregular_entry(tmp_path, monkeypatch, kind):
+    root, ready, processed = _moving_pcap_repository(tmp_path)
+    moved = []
+    unsafe = root / "unexpected-entry"
+    original_lstat = Path.lstat
+
+    def unsafe_metadata(value):
+        mode = stat.S_IFLNK if kind == "symlink" else stat.S_IFIFO
+        return os.stat_result((mode | 0o600, *tuple(value)[1:]))
+
+    def move_then_nonregular(entry):
+        if Path(entry.path) == ready and not moved:
+            ready.replace(processed)
+            # Reappear only after the first traversal has been invalidated.
+            unsafe.write_bytes(b"type metadata is injected for cross-platform testing")
+            moved.append(True)
+        if Path(entry.path) == unsafe:
+            return unsafe_metadata(entry.stat(follow_symlinks=False))
+
+    def nonregular_lstat(path):
+        result = original_lstat(path)
+        return unsafe_metadata(result) if path == unsafe else result
+
+    scanned = _repository_stat_hook(monkeypatch, move_then_nonregular)
+    monkeypatch.setattr(Path, "lstat", nonregular_lstat)
+    with pytest.raises(PacketCheckpointRecoveryError, match="regular file"):
+        packet_checkpoint_recovery.inspect_repository_state(root)
+    assert moved == [True] and scanned.count(root) == 2
+
+
+@pytest.mark.parametrize("failure", ["inventory_disappears", "inventory_changes", "stat_permission", "git_disappears"])
+def test_repository_scan_retry_is_limited_to_traversal_enoent(tmp_path, monkeypatch, failure):
+    root, ready, _ = _moving_pcap_repository(tmp_path)
+    source = root / "untracked-source.py"
+    source.write_bytes(b"original source")
+    scanned = _repository_stat_hook(monkeypatch, lambda entry: None)
+    original_hash = packet_checkpoint_recovery._sha256_open_regular_file
+    if failure in ("inventory_disappears", "inventory_changes"):
+        def change_during_hash(path, expected):
+            if path != source:
+                return original_hash(path, expected)
+            if failure == "inventory_disappears":
+                source.unlink()
+                return original_hash(path, expected)
+            digest = original_hash(path, expected)
+            source.write_bytes(b"changed source with a different size")
+            return digest
+        monkeypatch.setattr(packet_checkpoint_recovery, "_sha256_open_regular_file", change_during_hash)
+        error = FileNotFoundError if failure == "inventory_disappears" else PacketCheckpointRecoveryError
+        with pytest.raises(error):
+            packet_checkpoint_recovery.inspect_repository_state(root)
+        assert scanned.count(root) == 1
+    elif failure == "stat_permission":
+        def deny_stat(entry):
+            if Path(entry.path) == ready:
+                raise PermissionError(errno.EACCES, "PCAP metadata access denied", str(ready))
+        scanned = _repository_stat_hook(monkeypatch, deny_stat)
+        with pytest.raises(PermissionError):
+            packet_checkpoint_recovery.inspect_repository_state(root)
+        assert scanned.count(root) == 1
+    else:
+        original_git = packet_checkpoint_recovery._git
+        attempts = []
+        def missing_git(repo, *args):
+            attempts.append(args)
+            if args[0] == "diff":
+                raise FileNotFoundError(errno.ENOENT, "Git executable disappeared")
+            return original_git(repo, *args)
+        monkeypatch.setattr(packet_checkpoint_recovery, "_git", missing_git)
+        with pytest.raises(FileNotFoundError):
+            packet_checkpoint_recovery.inspect_repository_state(root)
+        assert len(attempts) == 2 and scanned.count(root) == 0
