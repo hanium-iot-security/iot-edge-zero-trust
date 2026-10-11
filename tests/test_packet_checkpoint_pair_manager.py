@@ -52,6 +52,7 @@ class Process:
         self.owner, self.pid, self.callback = owner, pid, callback
         self.waits = []
         self.executed = False
+        self.returncode = None
 
     def wait(self, timeout):
         self.waits.append(timeout)
@@ -64,7 +65,24 @@ class Process:
         if self.owner.force_kill and len(self.waits) == 2:
             raise subprocess.TimeoutExpired("pair worker", timeout)
         self.owner.live.discard(self.pid)
+        self.returncode = 0
         return 0
+
+    def kill(self):
+        self.owner.live.discard(self.pid)
+        self.executed = True
+
+    def communicate(self, timeout):
+        self.waits.append(timeout)
+        self.executed = True
+        if self.owner.verifier_timeout:
+            raise subprocess.TimeoutExpired("verifier", timeout)
+        value = self.callback()
+        if self.owner.verifier_transform:
+            value = self.owner.verifier_transform(value)
+        self.owner.live.discard(self.pid)
+        self.returncode = 0
+        return json.dumps(value).encode(), None
 
 
 class Processes:
@@ -72,6 +90,10 @@ class Processes:
         self.callback = callback
         self.launches, self.terminations, self.live = [], [], set()
         self.timeout = self.force_kill = False
+        self.verifier_timeout = False
+        self.verifier_transform = None
+        self.lingering_group = self.stuck_group = False
+        self.system = None
 
     def identity(self, pid):
         return "fixture-start-" + str(pid)
@@ -85,8 +107,23 @@ class Processes:
         self.live.add(process.pid)
         return process
 
+    def launch_verifier(self, path, token):
+        process = Process(self, os.getpid(), lambda: manager.verifier(path, token, system=self.system, processes=self))
+        self.launches.append(("verifier", process))
+        self.live.add(process.pid)
+        return process
+
+    def group_gone(self, process):
+        pid = process["pid"] if isinstance(process, dict) else process.pid
+        return pid not in self.live and not self.lingering_group
+
+    def wait_group(self, process, timeout):
+        return self.group_gone(process)
+
     def terminate(self, process, force=False):
         self.terminations.append((process.pid, force))
+        if force and not self.stuck_group:
+            self.lingering_group = False
 
 
 @pytest.fixture
@@ -97,6 +134,7 @@ def fixture(recovery_fixture):
     plan = manager.create_plan(pair_plan_file=base["output"], db_path=base["database"],
                                artifact_dir=base["artifacts"], plan_output=path, system=system)
     processes = Processes(lambda: _execute(base, resume=bool(_audits(base))))
+    processes.system = system
     return dict(base=base, system=system, path=path, plan=plan, processes=processes)
 
 
@@ -106,6 +144,7 @@ def launch(fixture):
 
 
 def run(fixture, monkeypatch, advance=False):
+    fixture["processes"].system = fixture["system"]
     elapsed = [0]
     if advance:
         fixture["processes"].callback = lambda: (_execute(fixture["base"]), _advance(fixture["base"], 20))
@@ -427,8 +466,9 @@ def test_verify_cannot_hide_restoration_failure_or_live_worker(fixture, monkeypa
         manager.verify(plan_file=fixture["path"], system=fixture["system"], processes=fixture["processes"])
     fixture["processes"].live.discard(12345)
     fixture["system"].set_state(manager.UNITS[-1], "inactive")
-    with pytest.raises(manager.Error, match="active service restoration"):
-        manager.verify(plan_file=fixture["path"], system=fixture["system"], processes=fixture["processes"])
+    result = manager.verify(plan_file=fixture["path"], system=fixture["system"], processes=fixture["processes"])
+    assert result["operation_status"] == "APPLIED_VERIFY_HOLD"
+    assert result["error"] == "PacketCheckpointRecoveryError"
 
 
 def test_cli_launch_and_applied_pending_are_not_completion(fixture, monkeypatch, capsys):
@@ -448,6 +488,7 @@ def test_linux_deadline_forces_process_group_and_reaps_without_operational_comma
     process = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
     try:
+        processes.own(process)
         assert process.stdout.readline() == b"READY\n"
         receipt = {"pid": process.pid, "start_identity": processes.identity(process.pid)}
         assert processes.alive(receipt)
@@ -480,3 +521,304 @@ def test_linux_command_lock_blocks_other_process_and_releases(tmp_path):
         assert blocked.returncode == 23
     acquired = subprocess.run([sys.executable, "-c", code, str(lock)], timeout=5, capture_output=True)
     assert acquired.returncode == 0
+
+
+def test_verifier_timeout_is_bounded_without_service_reapply(fixture, monkeypatch):
+    launch(fixture)
+    original_verify = manager.verify
+    run(fixture, monkeypatch)
+    monkeypatch.setattr(manager, "verify", original_verify)
+    fixture["processes"].verifier_timeout = True
+    before = list(fixture["system"].actions)
+    plan_bytes = fixture["path"].read_bytes()
+    result = manager.verify(plan_file=fixture["path"], system=fixture["system"],
+                            processes=fixture["processes"], timeout=0.01, monotonic=lambda: 0)
+    assert result["operation_status"] == "APPLIED_VERIFY_HOLD"
+    assert result["error"] == "TimeoutExpired"
+    assert fixture["system"].actions == before
+    assert fixture["path"].read_bytes() == plan_bytes
+    assert len(_audits(fixture["base"])) == 2
+    journal = manager._journal(fixture["plan"])
+    assert journal["verifier_direct_reaped"] and journal["verifier_group_gone"]
+    assert journal["verifier_reaped"]
+    assert fixture["processes"].launches[-1][1].waits[0] <= 0.01
+
+
+@pytest.mark.parametrize("field,value", [("verification_token", "old-token"),
+                                        ("approval_sha256", "old-sha"),
+                                        ("attempt_id", "old-attempt")])
+def test_stale_verifier_response_cannot_complete(fixture, monkeypatch, field, value):
+    launch(fixture)
+    original_verify = manager.verify
+    run(fixture, monkeypatch)
+    monkeypatch.setattr(manager, "verify", original_verify)
+    def corrupt(response):
+        response[field] = value
+        response["result"]["operation_status"] = "COMPLETE"
+        return response
+    fixture["processes"].verifier_transform = corrupt
+    result = manager.verify(plan_file=fixture["path"], system=fixture["system"], processes=fixture["processes"])
+    assert result["operation_status"] == "APPLIED_VERIFY_HOLD"
+    assert len(_audits(fixture["base"])) == 2
+
+
+def test_reaped_worker_with_lingering_group_must_kill_before_restore(fixture, monkeypatch):
+    fixture["processes"].lingering_group = True
+    launch(fixture)
+    result = run(fixture, monkeypatch)
+    assert result["worker_direct_reaped"] and result["worker_group_gone"] and result["worker_reaped"]
+    assert [force for _, force in fixture["processes"].terminations] == [False, True]
+    assert all(value == "active" for value in fixture["system"].states.values())
+
+
+def test_uncertain_worker_group_keeps_processing_stopped(fixture, monkeypatch):
+    fixture["processes"].lingering_group = fixture["processes"].stuck_group = True
+    launch(fixture)
+    result = run(fixture, monkeypatch)
+    assert result["worker_direct_reaped"]
+    assert not result["worker_group_gone"] and not result["worker_reaped"]
+    assert result["phase"] == "COMMITTED_OR_UNKNOWN_HOLD"
+    assert len(_audits(fixture["base"])) == 2
+    assert not any(action == "start" for action, *_ in fixture["system"].actions)
+
+
+def test_expired_verification_budget_never_launches(fixture, monkeypatch):
+    launch(fixture)
+    original_verify = manager.verify
+    run(fixture, monkeypatch)
+    monkeypatch.setattr(manager, "verify", original_verify)
+    count = len(fixture["processes"].launches)
+    result = manager.verify(plan_file=fixture["path"], processes=fixture["processes"], timeout=0)
+    assert result["operation_status"] == "APPLIED_VERIFY_HOLD"
+    assert len(fixture["processes"].launches) == count
+
+
+def test_late_complete_verifier_response_is_not_accepted(fixture, monkeypatch):
+    launch(fixture)
+    original_verify = manager.verify
+    run(fixture, monkeypatch)
+    monkeypatch.setattr(manager, "verify", original_verify)
+    elapsed = [0]
+    def late(response):
+        elapsed[0] = 2
+        response["result"]["operation_status"] = "COMPLETE"
+        return response
+    fixture["processes"].verifier_transform = late
+    result = manager.verify(plan_file=fixture["path"], processes=fixture["processes"],
+                            timeout=1, monotonic=lambda: elapsed[0])
+    assert result["operation_status"] == "APPLIED_VERIFY_HOLD"
+    assert manager._journal(fixture["plan"])["phase"] == "APPLIED_VERIFY_HOLD"
+
+
+def test_verifier_cleanup_uncertain_blocks_next_verify_and_apply(fixture, monkeypatch):
+    launch(fixture)
+    original_verify = manager.verify
+    run(fixture, monkeypatch)
+    monkeypatch.setattr(manager, "verify", original_verify)
+    fixture["processes"].verifier_timeout = True
+    fixture["processes"].stuck_group = fixture["processes"].lingering_group = True
+    original_gone = fixture["processes"].group_gone
+    fixture["processes"].group_gone = lambda process: True if isinstance(process, dict) and process["role"] != "verifier" else original_gone(process)
+    result = manager.verify(plan_file=fixture["path"], processes=fixture["processes"])
+    assert result["operation_status"] == "APPLIED_VERIFY_HOLD"
+    journal = manager._journal(fixture["plan"])
+    assert journal["verifier_direct_reaped"] and not journal["verifier_group_gone"]
+    before = list(fixture["system"].actions)
+    with pytest.raises(manager.Error, match="verifier"):
+        manager.verify(plan_file=fixture["path"], processes=fixture["processes"])
+    with pytest.raises(manager.Error, match="verifier"):
+        launch(fixture)
+    assert fixture["system"].actions == before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="real Linux /proc and process group semantics")
+def test_linux_reaped_leader_does_not_hide_term_ignoring_descendant(fixture):
+    processes = manager.Processes()
+    child = "import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);print('READY',flush=True);time.sleep(60)"
+    code = ("import json,subprocess,sys,time;"
+            "p=subprocess.Popen([sys.executable,'-c'," + repr(child) + "],stdout=subprocess.PIPE);"
+            "p.stdout.readline();print(json.dumps({'child':p.pid}),flush=True);time.sleep(60)")
+    process = processes.own(subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True))
+    try:
+        child_pid = json.loads(process.stdout.readline())["child"]
+        launch(fixture)
+        plan = dict(fixture["plan"], budgets=dict(fixture["plan"]["budgets"], terminate_grace_seconds=1, kill_reap_seconds=1))
+        journal = manager._journal(fixture["plan"])
+        manager._terminate_reap(plan, process, processes, journal)
+        assert journal["worker_direct_reaped"] and journal["worker_group_gone"] and journal["worker_reaped"]
+        assert process.returncode is not None
+        assert processes.group_gone(process)
+        try:
+            processes.identity(child_pid)
+        except (ProcessLookupError, FileNotFoundError):
+            pass
+        else:
+            pytest.fail("descendant remains running")
+        assert fixture["system"].actions == []
+    finally:
+        processes.terminate(process, force=True)
+        process.wait(timeout=5)
+        process.stdout.close()
+
+
+def test_spawned_verifier_identity_failure_is_cleaned_and_held(fixture, monkeypatch):
+    launch(fixture)
+    original_verify = manager.verify
+    run(fixture, monkeypatch)
+    monkeypatch.setattr(manager, "verify", original_verify)
+    fixture["processes"].own = lambda _: (_ for _ in ()).throw(OSError("identity unavailable"))
+    result = manager.verify(plan_file=fixture["path"], processes=fixture["processes"])
+    assert result["operation_status"] == "APPLIED_VERIFY_HOLD"
+    journal = manager._journal(fixture["plan"])
+    assert journal["verifier_direct_reaped"] and not journal["verifier_group_gone"]
+    assert not journal["verifier_reaped"]
+    assert manager._receipt(fixture["plan"], "verifier")["ownership_unconfirmed"]
+    with pytest.raises(manager.Error, match="ownership"):
+        manager.verify(plan_file=fixture["path"], processes=fixture["processes"])
+
+
+def test_spawned_worker_receipt_failure_never_leaks_or_restores_unknown_group(fixture, monkeypatch):
+    original = manager._record_process
+    def fail(plan, role, pid, processes, start_identity=None):
+        if role == "worker":
+            raise OSError("receipt unavailable")
+        return original(plan, role, pid, processes, start_identity)
+    monkeypatch.setattr(manager, "_record_process", fail)
+    launch(fixture)
+    result = run(fixture, monkeypatch)
+    assert result["phase"] == "COMMITTED_OR_UNKNOWN_HOLD"
+    assert result["worker_direct_reaped"] and not result["worker_group_gone"]
+    assert not any(action == "start" for action, *_ in fixture["system"].actions)
+    assert _audits(fixture["base"]) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="real Linux /proc and process group semantics")
+def test_linux_fast_zombie_identity_is_owned_and_reaped(fixture):
+    import time
+    processes = manager.Processes()
+    process = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    try:
+        deadline = time.monotonic() + 5
+        while manager._process_stat(process.pid)[0] != "Z":
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        processes.own(process)
+        assert process.start_identity
+        launch(fixture)
+        journal = manager._journal(fixture["plan"])
+        manager._terminate_reap(fixture["plan"], process, processes, journal)
+        assert journal["worker_direct_reaped"] and journal["worker_group_gone"]
+        assert process.returncode == 0
+    finally:
+        process.wait(timeout=5)
+
+
+@pytest.mark.parametrize("field,value", [("units", []), ("source_session_id", "other"),
+                                        ("target_session_id", "other"), ("boot_id", "other")])
+def test_verify_keeps_full_scope_gate_before_parent_writes(fixture, monkeypatch, field, value):
+    launch(fixture)
+    journal_path = manager._paths(fixture["plan"])[1]
+    journal_bytes = journal_path.read_bytes()
+    approval = dict(fixture["plan"], **{field: value})
+    manager._save(fixture["path"], approval)
+    monkeypatch.setattr(manager.core, "single_instance_lock", lambda *_a, **_k: pytest.fail("unvalidated lock write"))
+    monkeypatch.setattr(manager, "_save", lambda *_: pytest.fail("unvalidated manager write"))
+    with pytest.raises(manager.Error, match="scope binding"):
+        manager.verify(plan_file=fixture["path"], processes=fixture["processes"])
+    assert journal_path.read_bytes() == journal_bytes
+
+
+def test_verify_keeps_generated_path_gate_before_parent_writes(fixture, monkeypatch):
+    launch(fixture)
+    unapproved = fixture["base"]["root"] / "unapproved-output"
+    unapproved.mkdir()
+    approval = dict(fixture["plan"], artifact_dir=str(unapproved))
+    manager._save(fixture["path"], approval)
+    monkeypatch.setattr(manager.core, "single_instance_lock", lambda *_a, **_k: pytest.fail("unvalidated lock write"))
+    monkeypatch.setattr(manager, "_save", lambda *_: pytest.fail("unvalidated manager write"))
+    with pytest.raises(manager.Error, match="ignored"):
+        manager.verify(plan_file=fixture["path"], processes=fixture["processes"])
+
+
+@pytest.mark.parametrize("mutation", ["missing-status", "wrong-result-sha", "false-complete", "damaged-checksum"])
+def test_malformed_verifier_result_is_applied_hold(fixture, monkeypatch, mutation):
+    launch(fixture)
+    original_verify = manager.verify
+    run(fixture, monkeypatch)
+    monkeypatch.setattr(manager, "verify", original_verify)
+    def corrupt(response):
+        if mutation == "missing-status":
+            response["result"].pop("operation_status")
+        elif mutation == "wrong-result-sha":
+            response["result"]["plan_sha256"] = "wrong-pair"
+        elif mutation == "false-complete":
+            response["result"].update(operation_status="COMPLETE", database_committed=False)
+        else:
+            response["result"]["operation_status"] = "COMPLETE"
+            return response
+        return manager.core.attach_plan_sha256(response, generated_at=manager.core._utc_now())
+    fixture["processes"].verifier_transform = corrupt
+    before = list(fixture["system"].actions)
+    result = manager.verify(plan_file=fixture["path"], processes=fixture["processes"])
+    assert result["operation_status"] == "APPLIED_VERIFY_HOLD"
+    assert fixture["system"].actions == before
+    assert len(_audits(fixture["base"])) == 2
+
+
+def test_cli_verify_installs_interrupt_cleanup_handler(fixture, monkeypatch, capsys):
+    from types import SimpleNamespace
+    calls = []
+    monkeypatch.setattr(cli, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(cli.signal, "signal", lambda number, handler: calls.append((number, handler)))
+    monkeypatch.setattr(manager, "verify", lambda **_: {"operation_status": "APPLIED_VERIFY_HOLD", "database_committed": True})
+    assert cli.main(["verify", "--plan-file", str(fixture["path"])]) == 3
+    assert calls[0][0] == cli.signal.SIGTERM
+    with pytest.raises(manager.Error, match="interrupted"):
+        calls[0][1](cli.signal.SIGTERM, None)
+    capsys.readouterr()
+
+
+def test_internal_verifier_unblocks_inherited_handoff_signals(fixture, monkeypatch, capsys):
+    from types import SimpleNamespace
+    calls = []
+    monkeypatch.setattr(cli, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(cli.signal, "signal", lambda *_: None)
+    monkeypatch.setattr(cli.signal, "SIGHUP", 1, raising=False)
+    monkeypatch.setattr(cli.signal, "SIG_UNBLOCK", 1, raising=False)
+    monkeypatch.setattr(cli.signal, "pthread_sigmask", lambda operation, signals: calls.append((operation, signals)), raising=False)
+    monkeypatch.setattr(manager, "verifier", lambda *_: {"fresh": True})
+    assert cli.main(["--internal-verifier", "--plan-file", str(fixture["path"]), "--verification-token", "fresh"]) == 0
+    assert calls == [(cli.signal.SIG_UNBLOCK, {cli.signal.SIGTERM, cli.signal.SIGINT})]
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("comm", ["온도수집".encode("utf-8"), b"collector\xff)name"])
+def test_owned_group_scan_ignores_unrelated_non_ascii_process_name(monkeypatch, comm):
+    from types import SimpleNamespace
+    state = ["Z"]
+    def stat(pid, name, process_state, group, session, identity):
+        fields = [process_state, "1", str(group), str(session)] + ["0"] * 15 + [identity]
+        return str(pid).encode("ascii") + b" (" + name + b") " + " ".join(fields).encode("ascii")
+    class ProcPath:
+        def __init__(self, path):
+            self.path = str(path)
+        def iterdir(self):
+            assert self.path == "/proc"
+            return iter([SimpleNamespace(name="101"), SimpleNamespace(name="202")])
+        def read_bytes(self):
+            return (stat(101, b"owned", state[0], 101, 101, "123") if self.path == "/proc/101/stat"
+                    else stat(202, comm, "S", 202, 202, "456"))
+        def read_text(self, encoding):
+            return self.read_bytes().decode(encoding)
+    monkeypatch.setattr(manager, "Path", ProcPath)
+    processes = manager.Processes()
+    owned = SimpleNamespace(pid=101)
+    processes.own(owned)
+    assert owned.start_identity == "123"
+    assert processes.group_gone(owned)
+    with pytest.raises(ProcessLookupError):
+        manager._identity(101)
+    state[0] = "S"
+    assert manager._identity(101) == "123"
+    assert not processes.group_gone(owned)
