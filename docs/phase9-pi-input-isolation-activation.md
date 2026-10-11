@@ -1,6 +1,6 @@
 # Pi IPv4 INPUT 격리 운영 활성화 준비
 
-이 문서는 명령 검토용이다. 작성·로컬 검증 중 Pi 설치, host 방화벽 변경, 운영 DB migration, 서비스 정지와 재부팅은 실행하지 않았다. 10/9 임시 namespace 시험과 DB 사본 검증은 [기존 문서의 Historical 기록](phase9-pi-input-isolation.md)을 참고한다.
+이 문서는 Pi 접근 격리 설치 명령 검토용이다. 이번 활성화의 보호 설정 설치·운영 DB migration·host 방화벽 변경·실물 펌웨어 업로드·재부팅은 아직 실행하지 않았다. 코드·API만 적용한 결과는 아래 운영 기준과 구분한다. 10/9 임시 namespace 시험과 DB 사본 검증은 [기존 문서의 Historical 기록](phase9-pi-input-isolation.md)을 참고한다.
 
 2026/10/11 로컬 승인 준비에서 API·repository·worker·recovery·migration·wrapper·snapshot 회귀 **242개**, 프론트 **13개**(광역/legacy/missing 응답의 shared React render 계약 3개 포함)가 통과했다. 19개 업무 테이블 집합 보존을 추가한 기존 migration 시험도 재실행해 통과했다. Vite production build, 새 helper/test 정적 검사와 `git diff --check`가 통과했다. 임시 로컬 DB·가짜 Worker·dry-run 및 로컬 화면 빌드의 결과이며 운영 설치·차단 완료를 인증하지 않는다.
 
@@ -8,8 +8,8 @@
 
 ## 최종 릴리스 조건
 
-- 통합 candidate가 2026/10/11 15:03 KST에 적용한 Pi API 코드 `ffa82c00b31ebdfcd621b83aa13d1597bd02b26c`(복구 `542455f`·조회 경합 수정 `d87bfd4` 포함)와 PR111 구현을 모두 포함해야 한다. 설치 직전 새 Pi HEAD와 서비스 실행 경로를 다시 대조해 이후 변경도 보존한다. PR111 단독 HEAD를 운영 checkout하지 않는다. base develop과 현재 Pi HEAD가 다른 상태를 먼저 해결한다.
-- merge 직전 모든 migration 파일의 번호가 유일·연속인지, 실제 `schema_migrations`의 이름과 번호가 일치하는지 확인한다. 2026/10/11 최신 develop 및 공개 미병합 PR에서 011 중복이 없음을 확인했고 이 PR에 011을 배정했다. 통합 후보의 001..011 유일·연속 검사도 통과했으며 후속 데이터 마이그레이션은 012 이후를 사용한다. 미래의 미공개 작업까지 충돌이 없다고 보장하는 확인은 아니다. 충돌하면 SQL 파일 번호, runner의 `FOREIGN_KEY_REBUILD_MIGRATIONS`, `firewall_repository.has_scope_schema`의 버전 경계, 문서·시험을 함께 조정한 candidate를 다시 검증한다. runner는 적용된 번호를 건너뛰므로 파일 번호 검사만으로 이미 적용된 다른 migration 이름과의 충돌을 탐지했다고 간주하지 않는다.
+- 운영 설치 후보는 2026/10/11 19:14 KST에 코드·API에 적용한 `c2bfc24a1641e65a2f8c4f815bf7cdc9c53da48d`와 이후 검증된 변경을 모두 포함해야 한다. 당시 API 재시작은 약 2.72초였고 다른 수집·처리 서비스는 계속 실행됐다. 23:49 KST 읽기에서도 운영 schema 001..010, 기존 Wrapper, 보호 설정 미설치 상태를 확인했다. 코드 적용을 격리 설치 완료로 표시하지 않는다. 설치 직전 새 Pi HEAD와 실행 경로를 다시 대조해 복구·조회 경합·모델 조회·격리 구현을 함께 보존하며, base develop과 현재 Pi HEAD가 다른 상태를 먼저 해결한다.
+- merge 직전 모든 migration 파일의 번호가 유일·연속인지, 실제 `schema_migrations`의 이름과 번호가 일치하는지 확인한다. 2026/10/11 최신 develop 및 공개 미병합 PR에서 011 중복이 없음을 확인했고 격리 구현에 011을 배정했다. 통합 후보의 001..011 유일·연속 검사도 통과했으며 후속 데이터 마이그레이션은 012 이후를 사용한다. 미래의 미공개 작업까지 충돌이 없다고 보장하는 확인은 아니다. 충돌하면 SQL 파일 번호, runner의 `FOREIGN_KEY_REBUILD_MIGRATIONS`, `firewall_repository.has_scope_schema`의 버전 경계, 문서·시험을 함께 조정한 candidate를 다시 검증한다. runner는 적용된 번호를 건너뛰므로 파일 번호 검사만으로 이미 적용된 다른 migration 이름과의 충돌을 탐지했다고 간주하지 않는다.
 - 설치 전 예상 운영 schema는 001..010, 기존 업무 테이블 집합은 19개다(`schema_migrations`, `sqlite_sequence` 제외). migration은 기존 firewall table을 교체하며 permanent table을 추가하지 않는다. 새 일관된 **사본**에서 기존 컬럼의 모든 행·ID, sqlite_sequence, release FK와 테이블 집합을 비교하고 FK/integrity 및 두 번째 no-op을 확인한다. 실제 운영 적용 완료는 별도 사후 근거로 기록한다.
 - 새 작업의 서비스 중단·손실·복귀 조건을 별도로 승인하고 원래 active 서비스 목록을 기록한다. 완료된 복구의 6회 Subscriber/180초 writer 승인을 재사용하지 않는다. Capture·Subscriber·Broker·reboot는 설치에 자동 포함되지 않는다.
 
