@@ -448,6 +448,7 @@ def complete_bounded_manager(fixture):
     managed_plan = manager.create_plan(pair_plan_file=base["output"], db_path=base["database"],
         artifact_dir=fixture["artifacts"], plan_output=managed_path, system=system)
     processes = Processes(lambda: (_execute(base), _finish_replay(base)))
+    processes.system = system
     managed = {"base":base, "system":system, "path":managed_path, "plan":managed_plan, "processes":processes}
     launch(managed)
     elapsed = [0]

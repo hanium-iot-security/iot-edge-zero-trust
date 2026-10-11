@@ -189,3 +189,7 @@ ESP32 두 대·Pico의 수신은 각각 5초 이내였다. Session111 RUNNING, �
 복구 감사 69개·기존 설정/Packet 모델 바이트·Boot가 보존됐다. DB Migration,
 복구 재적용, 모델 학습·활성화와 방화벽 차단은 하지 않았다. 이 문서의 이후 수정은
 배포한 `ffa82c0` 코드의 검증 기록이며 운영 코드 SHA와 구분한다.
+
+## 복구 명령 의존 코드 통합 — 2026/10/11
+
+최종 관측·소유 프로세스 종료 보완 c0c903c를 API 브랜치에 통합했다. 관리 API는 manager의 계획·기존 v1 Journal과 과거 검증 결과를 읽으며 새 verifier나 서비스 제어를 실행하지 않는다. 새 가짜 verifier에 동일한 가짜 서비스 객체를 전달하도록 완료 조회 시험 fixture 한 줄을 보완했다. 수정 전 fixture 오류 9건은 별도 기록하고, 기존 REPLAY_COMPLETE·현재 runtime UNKNOWN·DB/진행/Journal 불변 assertion을 유지한 최종 API·모델 정보·배포 회귀 **98개가 통과했다(173.45초, skip 없음)**. 이 통합 후보는 Pi에 배포하지 않았다. 현재 운영 ffa82c0와 이전 운영 검증은 그대로이며, 새 manager의 전체 Linux CLI·서비스 통합과 배포 전 검증은 PR108에 남아 있다.
