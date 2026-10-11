@@ -192,4 +192,7 @@ ESP32 두 대·Pico의 수신은 각각 5초 이내였다. Session111 RUNNING, �
 
 ## 복구 명령 의존 코드 통합 — 2026/10/11
 
-최종 관측·소유 프로세스 종료 보완 c0c903c를 API 브랜치에 통합했다. 관리 API는 manager의 계획·기존 v1 Journal과 과거 검증 결과를 읽으며 새 verifier나 서비스 제어를 실행하지 않는다. 새 가짜 verifier에 동일한 가짜 서비스 객체를 전달하도록 완료 조회 시험 fixture 한 줄을 보완했다. 수정 전 fixture 오류 9건은 별도 기록하고, 기존 REPLAY_COMPLETE·현재 runtime UNKNOWN·DB/진행/Journal 불변 assertion을 유지한 최종 API·모델 정보·배포 회귀 **98개가 통과했다(173.45초, skip 없음)**. 이 통합 후보는 Pi에 배포하지 않았다. 현재 운영 ffa82c0와 이전 운영 검증은 그대로이며, 새 manager의 전체 Linux CLI·서비스 통합과 배포 전 검증은 PR108에 남아 있다.
+최종 관측·소유 프로세스 종료 보완 c0c903c를 API 브랜치에 통합했다. 관리 API는 manager의 계획·기존 v1 Journal과 과거 검증 결과를 읽으며 새 verifier나 서비스 제어를 실행하지 않는다. 새 가짜 verifier에 동일한 가짜 서비스 객체를 전달하도록 완료 조회 시험 fixture 한 줄을 보완했다. 수정 전 fixture 오류 9건은 별도 기록하고, 기존 REPLAY_COMPLETE·현재 runtime UNKNOWN·DB/진행/Journal 불변 assertion을 유지한 최종 API·모델 정보·배포 회귀 **98개가 통과했다(173.45초, skip 없음)**. 이 통합 후보는 Pi에 배포하지 않았다. 현재 운영 ffa82c0와 이전 운영 검증은 그대로이며, 새 manager의 공개 부모 CLI 중단·실제 운영 서비스 경계와 배포 전 검증은 PR108에 남아 있다.
+
+
+2026/10/11 후속 확인: PR108의 full-module/internal-verifier CLI는 Pi 임시 사본에서 manager·pair 175개가 통과했다(68.20초, skip·경고 없음). 실제 child CLI·임시 DB 감사/backup/Git 검사를 사용하며 서비스·runtime·clock과 공통 부모 fixture lock은 시험 값이다. 해당 시험·검증 문서 fbdc4ea를 이 API 브랜치에 이어받았다. API 구현·기존 API 시험·production manager/CLI는 9a9efab와 동일하므로 기존98개 검증은 그 범위로 유지하고 재실행 숫자를 더하지 않는다. 운영 Pi는 ffa82c0 그대로이며, 공개 부모 CLI 중단·실제 SSH 단절 서비스 복귀와 새 verifier 운영 배포는 여전히 미검증이다.
