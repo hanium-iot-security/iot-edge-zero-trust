@@ -52,6 +52,8 @@ class PairPlanResponse(BaseModel):
     skips_processable: bool
     boundary: str | None
     children: list[dict[str, Any]]
+    mode: Literal["live-resume", "bounded-replay"] = "live-resume"
+    replay_end: str | None = None
     apply_transport: Literal["ROOT_CLI"] = "ROOT_CLI"
     runtime: PairRuntime = Field(default_factory=PairRuntime)
 
@@ -61,12 +63,15 @@ class PairVerification(BaseModel):
     error_code: str | None = None
     root_progress_verified: bool = False
     root_completion_recorded: bool = False
-    root_progress_status: Literal["NOT_CHECKED", "UNAVAILABLE", "VERIFIED", "INVALID"] = "NOT_CHECKED"
+    root_progress_status: Literal["NOT_CHECKED", "NOT_APPLICABLE", "UNAVAILABLE", "VERIFIED", "INVALID"] = "NOT_CHECKED"
     root_progress_observed_at: str | None = None
     root_progress_age_seconds: float | None = None
     root_progress_fresh: bool = False
     root_progress_max_age_seconds: int = 45
     root_completion_evidence_status: Literal["UNAVAILABLE", "NOT_COMPLETED", "RECORDED"] = "UNAVAILABLE"
+    historical_completion_status: Literal["COMPLETE", "REPLAY_COMPLETE"] | None = None
+    historical_completion_source: Literal["ROOT_PROGRESS", "ROOT_MANAGER"] | None = None
+    historical_completion_recorded_at: str | None = None
 
 
 class PairStatusResponse(BaseModel):
@@ -78,5 +83,7 @@ class PairStatusResponse(BaseModel):
     ]
     database_committed: bool | None
     children: dict[str, dict[str, Any]]
+    mode: Literal["live-resume", "bounded-replay"] = "live-resume"
+    replay_end: str | None = None
     verification: PairVerification
     runtime: PairRuntime = Field(default_factory=PairRuntime)

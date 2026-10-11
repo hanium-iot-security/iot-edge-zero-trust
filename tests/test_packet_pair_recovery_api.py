@@ -13,7 +13,9 @@ from backend.app.main import app
 from backend.app.services import packet_pair_recovery_service as service
 from edge.detection import packet_checkpoint_pair_recovery as pair
 from edge.detection import packet_checkpoint_pair_manager as manager
-from test_packet_checkpoint_pair_recovery import fixture as recovery_fixture, _audits, _execute
+from test_packet_checkpoint_pair_recovery import (
+    fixture as recovery_fixture, _audits, _execute, _advance, _finish_replay, _close_target_with_uncaptured_tail,
+)
 from test_packet_checkpoint_pair_manager import System, Processes, launch, run
 
 PREFIX = "/api/recovery/packet-pair"
@@ -94,7 +96,8 @@ def test_management_routes_require_admin_auth(fixture, headers, method, suffix):
 
 @pytest.mark.parametrize("extra", [{"approved_by": "client-principal"}, {"database_path": "other.db"},
                                     {"plan_output": "tracked.txt"}, {"artifact_dir": "other"},
-                                    {"allow_failed_current_session": True}, {"confirm": "bypass"}])
+                                    {"allow_failed_current_session": True}, {"allow_failed_target_session": True},
+                                    {"mode": "bounded-replay"}, {"confirm": "bypass"}])
 def test_plan_body_rejects_principal_paths_or_apply_options(fixture, extra):
     response = fixture["client"].post(PREFIX + "/plans", json=dict(fixture["payload"], **extra), headers=HEADERS)
     assert response.status_code == 422
@@ -133,6 +136,7 @@ def test_plan_is_server_owned_and_does_not_change_database_or_apply(fixture, mon
     assert body["target_session_id"] == fixture["payload"]["target_session_id"]
     assert body["apply_transport"] == "ROOT_CLI"
     assert body["runtime"]["status"] == "UNKNOWN"
+    assert body["mode"] == "live-resume" and body["replay_end"] is None
     assert body["can_execute"] is True
     assert str(uuid.UUID(body["plan_id"])) == body["plan_id"]
     assert _audits(fixture["base"]) == []
@@ -347,7 +351,194 @@ def test_historical_root_completion_never_becomes_current_api_complete(fixture, 
     assert body["verification"]["root_progress_max_age_seconds"] == 45
     assert body["verification"]["root_progress_status"] == "VERIFIED"
     assert body["verification"]["root_completion_evidence_status"] == "RECORDED"
+    assert body["verification"]["historical_completion_status"] == "COMPLETE"
+    assert body["verification"]["historical_completion_source"] == "ROOT_MANAGER"
     assert body["operation_status"] == "APPLIED_VERIFY_REQUIRED"
     assert body["runtime"]["status"] == "UNKNOWN"
     assert file_bytes(fixture["artifacts"]) == before_artifacts
     assert base["database"].read_bytes() == before_db
+
+
+def record_live_progress(fixture, *, observations=3):
+    create(fixture)
+    base = fixture["base"]
+    _execute(base)
+    result = None
+    for seconds in (10,20,30)[:observations]:
+        _advance(base, seconds)
+        result = pair.status_pair(plan_file=base["output"], db_path=base["database"], artifact_dir=fixture["artifacts"])
+    return result
+
+
+def test_direct_root_progress_proves_past_complete_without_manager_or_current_runtime(fixture, monkeypatch):
+    assert record_live_progress(fixture)["operation_status"] == "COMPLETE"
+    before_db, before_files = fixture["base"]["database"].read_bytes(), file_bytes(fixture["artifacts"])
+    monkeypatch.setattr(pair, "_runtime_observation", lambda: pytest.fail("API attested current runtime"))
+    monkeypatch.setattr(pair, "status_pair", lambda **_: pytest.fail("API wrote Root progress"))
+    monkeypatch.setattr(pair, "execute_pair", lambda **_: pytest.fail("API reapplied completed pair"))
+    response = verify(fixture)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["verification"]["historical_completion_status"] == "COMPLETE"
+    assert body["verification"]["historical_completion_source"] == "ROOT_PROGRESS"
+    assert body["verification"]["root_completion_recorded"] is False
+    assert body["verification"]["root_completion_evidence_status"] == "UNAVAILABLE"
+    assert body["operation_status"] == "APPLIED_VERIFY_REQUIRED"
+    assert body["runtime"]["status"] == "UNKNOWN"
+    assert file_bytes(fixture["artifacts"]) == before_files and fixture["base"]["database"].read_bytes() == before_db
+
+
+def test_one_advance_progress_is_not_historical_completion(fixture):
+    assert record_live_progress(fixture, observations=2)["operation_status"] != "COMPLETE"
+    body = verify(fixture).json()
+    assert body["verification"]["root_progress_verified"] is True
+    assert body["verification"]["historical_completion_status"] is None
+    assert body["verification"]["historical_completion_source"] is None
+
+
+@pytest.mark.parametrize("mutation", ["ineligible", "future", "inactive", "stale-at-observation", "trust-ahead", "binding", "sha"])
+def test_root_progress_cannot_forge_historical_completion(fixture, mutation):
+    record_live_progress(fixture)
+    progress_path = pair._group(fixture["base"]["plan"], fixture["artifacts"]) / "progress.json"
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    if mutation == "ineligible": progress["eligible"] = False
+    elif mutation == "future": progress["observed_at"] = "2099-01-01T00:00:00Z"
+    elif mutation == "inactive": progress["runtime"]["services"][pair.SERVICES[0]] = False
+    elif mutation == "stale-at-observation":
+        progress["observed_at"] = (pair.core._utc_now()+timedelta(seconds=100)).isoformat()
+    elif mutation == "trust-ahead":
+        old = progress["checkpoints"]["packet_rule"]
+        end = pair.core.parse_db_utc(old["last_completed_window_end"])-timedelta(seconds=10)
+        old["last_completed_window_end"] = old["updated_at"] = pair.core.format_db_utc(end)
+    elif mutation == "binding": progress["approval_sha256"] = "0"*64
+    progress = pair.core.attach_plan_sha256(progress, generated_at=pair.core._utc_now())
+    if mutation == "sha": progress["plan_sha256"] = "0"*64
+    progress_path.write_text(json.dumps(progress), encoding="utf-8")
+    body = verify(fixture).json()
+    assert body["verification"]["status"] == "HOLD"
+    assert body["verification"]["historical_completion_status"] is None
+    assert body["verification"]["root_completion_recorded"] is False
+
+
+def publish_bounded_plan(fixture, *, failed_target=False):
+    base = fixture["base"]
+    if failed_target:
+        _close_target_with_uncaptured_tail(base)
+    else:
+        with sqlite3.connect(base["database"]) as db:
+            end = base["plan"]["children"][0]["plan"]["target_session"]["packet_feature_ready_through"]
+            db.execute("UPDATE packet_capture_sessions SET status='COMPLETED',ended_at=? WHERE session_id=?",
+                       (end, base["plan"]["target_session_id"]))
+    temporary = fixture["plans"] / "bounded-pending.json"
+    plan = pair.inspect_pair(db_path=base["database"], repository_root=base["root"],
+        current_session_id=base["plan"]["current_session_id"], target_session_id=base["plan"]["target_session_id"],
+        approved_by="root-fixture", reason="preserved bounded input", plan_output=temporary,
+        mode=pair.core.BOUNDED_REPLAY_MODE, allow_failed_target_session=failed_target)
+    assert plan["can_execute"], plan["blocking_reasons"]
+    destination = fixture["plans"] / (plan["pair_id"] + ".json")
+    temporary.rename(destination)
+    base.update(output=destination, plan=plan, artifacts=fixture["artifacts"])
+    fixture["plan_id"] = plan["pair_id"]
+
+
+def complete_bounded_manager(fixture):
+    base = fixture["base"]
+    system = System(base)
+    managed_path = fixture["managers"] / (fixture["plan_id"] + ".manager.json")
+    managed_plan = manager.create_plan(pair_plan_file=base["output"], db_path=base["database"],
+        artifact_dir=fixture["artifacts"], plan_output=managed_path, system=system)
+    processes = Processes(lambda: (_execute(base), _finish_replay(base)))
+    managed = {"base":base, "system":system, "path":managed_path, "plan":managed_plan, "processes":processes}
+    launch(managed)
+    elapsed = [0]
+    def sleep(seconds): elapsed[0] += seconds
+    result = manager.supervise(managed_path, system=system, processes=processes,
+        monotonic=lambda:elapsed[0], sleep=sleep)
+    assert result["phase"] == "REPLAY_COMPLETE"
+    return managed_plan
+
+
+@pytest.mark.parametrize("failed_target", [False, True])
+def test_bounded_manager_completion_needs_no_live_progress_and_does_not_attest_runtime(fixture, monkeypatch, failed_target):
+    publish_bounded_plan(fixture, failed_target=failed_target)
+    complete_bounded_manager(fixture)
+    group = pair._group(fixture["base"]["plan"], fixture["artifacts"])
+    assert not (group/"progress.json").exists()
+    before_db, before_files = fixture["base"]["database"].read_bytes(), file_bytes(fixture["artifacts"])
+    monkeypatch.setattr(pair, "status_pair", lambda **_: pytest.fail("API wrote bounded progress"))
+    monkeypatch.setattr(pair, "_runtime_observation", lambda: pytest.fail("API attested live runtime"))
+    response = verify(fixture)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["mode"] == "bounded-replay"
+    assert body["replay_end"] == fixture["base"]["plan"]["bounded_replay"]["replay_end"]
+    assert body["verification"]["root_progress_status"] == "NOT_APPLICABLE"
+    assert body["verification"]["historical_completion_status"] == "REPLAY_COMPLETE"
+    assert body["verification"]["historical_completion_source"] == "ROOT_MANAGER"
+    assert body["verification"]["root_completion_recorded"] is True
+    assert body["operation_status"] == "APPLIED_VERIFY_REQUIRED" and body["runtime"]["status"] == "UNKNOWN"
+    assert file_bytes(fixture["artifacts"]) == before_files and fixture["base"]["database"].read_bytes() == before_db
+
+
+def test_bounded_applied_audits_without_root_completion_are_not_missing_live_progress(fixture):
+    publish_bounded_plan(fixture)
+    _execute(fixture["base"])
+    _finish_replay(fixture["base"])
+    response = verify(fixture)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["verification"]["status"] == "VERIFIED_AUDITS"
+    assert body["verification"]["root_progress_status"] == "NOT_APPLICABLE"
+    assert body["verification"]["error_code"] is None
+    assert body["verification"]["historical_completion_status"] is None
+
+
+@pytest.mark.parametrize("mutation", ["live-complete", "end", "tail-live", "trust-cutoff", "restoration", "sha"])
+def test_bounded_manager_scope_and_completion_evidence_cannot_be_relabelled(fixture, mutation):
+    publish_bounded_plan(fixture, failed_target=True)
+    managed_plan = complete_bounded_manager(fixture)
+    journal_path = manager._paths(managed_plan)[1]
+    journal = manager._journal(managed_plan)
+    if mutation == "live-complete": journal["phase"] = journal["verification"]["operation_status"] = "COMPLETE"
+    elif mutation == "end": journal["verification"]["replay_end"] = fixture["base"]["plan"]["boundary"]
+    elif mutation == "tail-live": journal["verification"]["live_recovery_complete"] = True
+    elif mutation == "trust-cutoff": journal["verification"]["checkpoints"]["trust_score_v2"]["last_completed_window_end"] = fixture["base"]["plan"]["boundary"]
+    elif mutation == "restoration": journal["restoration_failures"] = [{"unit":manager.UNITS[0],"error":"failed"}]
+    manager._save(journal_path, journal)
+    if mutation == "sha":
+        raw = json.loads(journal_path.read_text(encoding="utf-8"))
+        raw["plan_sha256"] = "0"*64
+        journal_path.write_text(json.dumps(raw), encoding="utf-8")
+    body = verify(fixture).json()
+    assert body["verification"]["historical_completion_status"] is None
+    assert body["verification"]["root_completion_recorded"] is False
+
+
+def test_completed_record_cannot_bypass_failed_original_audit_validation(fixture):
+    record_live_progress(fixture)
+    with sqlite3.connect(fixture["base"]["database"]) as db:
+        db.execute("UPDATE packet_checkpoint_recoveries SET approved_by='forged'")
+    body = verify(fixture).json()
+    assert body["verification"]["status"] == "HOLD"
+    assert body["verification"]["historical_completion_status"] is None
+
+
+@pytest.mark.parametrize("which", ["intent", "progress", "manager"])
+def test_private_root_evidence_permission_denied_is_sanitized_unknown_without_writes(fixture, monkeypatch, which):
+    if which == "manager":
+        publish_bounded_plan(fixture)
+        complete_bounded_manager(fixture)
+    else:
+        record_live_progress(fixture)
+    before_db, before_files = fixture["base"]["database"].read_bytes(), file_bytes(fixture["artifacts"])
+    original = service._read_json
+    def read(path):
+        if (which == "intent" and path.name == "intent.json" or which == "progress" and path.name == "progress.json"
+                or which == "manager" and path.name.endswith(".manager.json")):
+            raise PermissionError("private root path must not be exposed")
+        return original(path)
+    monkeypatch.setattr(service, "_read_json", read)
+    response = verify(fixture)
+    assert response.status_code == 503
+    assert response.json()["detail"] == {"code":"ROOT_RECOVERY_ARTIFACT_UNAVAILABLE","verification":"UNKNOWN"}
+    assert file_bytes(fixture["artifacts"]) == before_files and fixture["base"]["database"].read_bytes() == before_db

@@ -113,7 +113,14 @@ def _plan_summary(plan: dict) -> dict:
             "approved_by": plan["approved_by"], "reason": plan["reason"],
             "generated_at": plan["generated_at"], "can_execute": plan["can_execute"],
             "blocking_reasons": plan["blocking_reasons"], "skips_processable": plan["skips_processable"],
-            "boundary": plan["boundary"], "children": children}
+            "boundary": plan["boundary"], "children": children, **_completion_scope(plan)}
+
+
+def _completion_scope(plan):
+    mode = plan.get("mode", "live-resume")
+    if mode not in ("live-resume", "bounded-replay"):
+        raise pair.Error("unsupported management recovery mode")
+    return {"mode": mode, "replay_end": plan["bounded_replay"]["replay_end"] if mode == "bounded-replay" else None}
 
 
 def create_plan(*, source_session_id: str, target_session_id: str, reason: str, principal: str) -> dict:
@@ -161,7 +168,7 @@ def _status(plan, children):
     return {"plan_id": plan["pair_id"], "plan_sha256": plan["plan_sha256"],
             "observed_at": _now(), "database_committed": count > 0,
             "operation_status": "COMMITTED_UNVERIFIED" if count == 2 else "PARTIAL_HOLD" if count else "PENDING",
-            "children": children, "verification": {"status": "NOT_REQUESTED"}}
+            "children": children, "verification": {"status": "NOT_REQUESTED"}, **_completion_scope(plan)}
 
 
 def get_plan_status(plan_id: str) -> dict:
@@ -173,7 +180,75 @@ def get_plan_status(plan_id: str) -> dict:
         raise PairAPIError("PACKET_PAIR_DATABASE_INSPECTION_UNAVAILABLE") from error
 
 
+def _recorded_checkpoint(db, name, table, old):
+    current = pair.repository.get_checkpoint(db, name, table)
+    if current is None or old["detector_name"] != name or old["source_table"] != table:
+        raise pair.Error("root recorded checkpoint identity changed")
+    old_end, new_end = parse_db_utc(old["last_completed_window_end"]), parse_db_utc(current["last_completed_window_end"])
+    if new_end < old_end or old["last_processed_id"] is not None and (
+            current["last_processed_id"] is None or current["last_processed_id"] < old["last_processed_id"]) or (
+            new_end == old_end and dict(current) != old):
+        raise pair.Error("root recorded checkpoint regressed")
+    return old_end
+
+
+def _root_manager_completion(paths, path, plan, db):
+    """Read a bound historical journal; never attest the current services."""
+    proof = {"root_completion_recorded": False, "root_completion_evidence_status": "UNAVAILABLE"}
+    manager_path = paths["manager_plans"] / (plan["pair_id"] + ".manager.json")
+    try:
+        _read_json(manager_path)
+    except FileNotFoundError:
+        return proof
+    managed = manager._load_plan(manager_path)
+    if (managed["pair_plan_file"] != str(path) or managed["pair_plan_sha256"] != plan["plan_sha256"]
+            or managed["database_path"] != str(paths["database"])
+            or managed["artifact_dir"] != str(paths["artifacts"])):
+        raise pair.Error("root manager plan binding changed")
+    journal_path = manager._safe_path(paths["artifacts"] / ("manager-" + managed["manager_id"]) / "journal.json")
+    try:
+        _read_json(journal_path)
+    except FileNotFoundError:
+        return proof
+    journal = manager._journal(managed)
+    verified = journal.get("verification", {})
+    expected = "REPLAY_COMPLETE" if _completion_scope(plan)["mode"] == "bounded-replay" else "COMPLETE"
+    if journal["phase"] in ("COMPLETE", "REPLAY_COMPLETE") and journal["phase"] != expected:
+        raise pair.Error("historical manager completion scope changed")
+    recorded = (journal["phase"] == expected and not journal.get("restoration_failures")
+                and verified.get("operation_status") == expected
+                and verified.get("pair_id") == plan["pair_id"]
+                and verified.get("plan_sha256") == plan["plan_sha256"]
+                and verified.get("children") == dict.fromkeys(pair.DETECTORS, "APPLIED"))
+    if not recorded:
+        return dict(proof, root_completion_evidence_status="NOT_COMPLETED")
+    recorded_at = journal["generated_at"]
+    if parse_db_utc(recorded_at) > datetime.now(timezone.utc):
+        raise pair.Error("manager completion timestamp is in the future")
+    if expected == "REPLAY_COMPLETE":
+        replay_end = parse_db_utc(plan["bounded_replay"]["replay_end"])
+        if (verified.get("mode") != "bounded-replay" or verified.get("replay_end") != plan["bounded_replay"]["replay_end"]
+                or verified.get("live_recovery_complete") is not False):
+            raise pair.Error("historical replay completion boundary changed")
+        entries = [(name, pair.SOURCE) for name in pair.DETECTORS] + [("trust_score_v2", "detection_events")]
+        entries += [(name, "feature_logs" if name == "mqtt_feature_rule" else "mqtt_logs")
+                    for name in ("mqtt_feature_rule", "mqtt_message_rule") if name in plan["runtime"]["required"]]
+        for name, table in entries:
+            old = verified["checkpoints"][name]
+            end = _recorded_checkpoint(db, name, table, old)
+            if old["updated_at"] != old["last_completed_window_end"] or (
+                    end != replay_end if name in (*pair.DETECTORS, "trust_score_v2") else end < replay_end):
+                raise pair.Error("historical replay processing incomplete")
+    return dict(proof, root_completion_recorded=True, root_completion_evidence_status="RECORDED",
+                historical_completion_status=expected, historical_completion_source="ROOT_MANAGER",
+                historical_completion_recorded_at=recorded_at)
+
+
 def _root_progress(paths, path, plan, db):
+    if _completion_scope(plan)["mode"] == "bounded-replay":
+        # Bounded status intentionally never creates progress.json. Its fixed
+        # end is distinct from a live target's two continuing advances.
+        return {"root_progress_status": "NOT_APPLICABLE", **_root_manager_completion(paths, path, plan, db)}
     group = manager._safe_path(paths["artifacts"] / plan["pair_id"])
     progress = _read_json(group / "progress.json")
     pair.core.verify_plan_sha256(progress)
@@ -187,45 +262,35 @@ def _root_progress(paths, path, plan, db):
         raise pair.Error("root progress timestamp is in the future")
     if type(progress["advances"]) is not int or not 0 <= progress["advances"] <= 2 or type(progress["eligible"]) is not bool:
         raise pair.Error("root progress counters are invalid")
+    if progress["advances"] and not progress["eligible"]:
+        raise pair.Error("ineligible root progress claims advances")
     for name, table in [(name, pair.SOURCE) for name in pair.DETECTORS] + [("trust_score_v2", "detection_events")]:
         old = progress["checkpoints"][name]
-        current = pair.repository.get_checkpoint(db, name, table)
-        if current is None or old["detector_name"] != name or old["source_table"] != table:
-            raise pair.Error("root progress checkpoint identity changed")
-        old_end, new_end = parse_db_utc(old["last_completed_window_end"]), parse_db_utc(current["last_completed_window_end"])
-        if new_end < old_end or old["last_processed_id"] is not None and (
-                current["last_processed_id"] is None or current["last_processed_id"] < old["last_processed_id"]) or (
-                new_end == old_end and dict(current) != old):
-            raise pair.Error("root progress checkpoint regressed")
-    # Optional fixed convention connects a historical manager completion to
-    # the exact server-owned pair plan. It still does not attest live runtime.
-    manager_path = paths["manager_plans"] / (plan["pair_id"] + ".manager.json")
+        old_end = _recorded_checkpoint(db, name, table, old)
+        if progress["eligible"] and (not parse_db_utc(plan["boundary"]) < old_end <= observed
+                or (observed - old_end).total_seconds() > pair.FRESH_SECONDS
+                or old["updated_at"] != old["last_completed_window_end"]):
+            raise pair.Error("eligible root progress checkpoint was not fresh")
     proof = {"root_progress_verified": True, "root_progress_status": "VERIFIED",
              "root_progress_observed_at": progress["observed_at"], "root_progress_age_seconds": age,
              "root_progress_fresh": age <= pair.FRESH_SECONDS,
              "root_progress_max_age_seconds": pair.FRESH_SECONDS,
              "root_completion_recorded": False, "root_completion_evidence_status": "UNAVAILABLE"}
-    if not manager_path.exists():
-        return proof
-    manager._safe_path(manager_path)
-    _read_json(manager_path)
-    managed = manager._load_plan(manager_path)
-    if (managed["pair_plan_file"] != str(path) or managed["pair_plan_sha256"] != plan["plan_sha256"]
-            or managed["database_path"] != str(paths["database"])
-            or managed["artifact_dir"] != str(paths["artifacts"])):
-        raise pair.Error("root manager plan binding changed")
-    journal_path = manager._safe_path(paths["artifacts"] / ("manager-" + managed["manager_id"]) / "journal.json")
-    _read_json(journal_path)
-    journal = manager._journal(managed)
-    verified = journal.get("verification", {})
-    recorded = (journal["phase"] == "COMPLETE" and not journal.get("restoration_failures")
-                and verified.get("operation_status") == "COMPLETE"
-                and verified.get("pair_id") == plan["pair_id"]
-                and verified.get("plan_sha256") == plan["plan_sha256"]
-                and verified.get("children") == dict.fromkeys(pair.DETECTORS, "APPLIED")
-                and progress["eligible"] is True and progress["advances"] == 2)
-    proof.update(root_completion_recorded=recorded,
-                 root_completion_evidence_status="RECORDED" if recorded else "NOT_COMPLETED")
+    if progress["eligible"] and progress["advances"] == 2:
+        runtime = progress["runtime"]
+        if (runtime.get("clock_synchronized") is not True or any(runtime["services"].get(name) is not True for name in pair.SERVICES)
+                or any(name not in runtime["enabled"] or name not in runtime["required"] for name in pair.DETECTORS)):
+            raise pair.Error("root completion runtime evidence was not eligible")
+        ends = {name: parse_db_utc(progress["checkpoints"][name]["last_completed_window_end"])
+                for name in (*pair.DETECTORS, "trust_score_v2")}
+        if ends["trust_score_v2"] > min(ends[name] for name in pair.DETECTORS):
+            raise pair.Error("root completion Trust passed Packet progress")
+        proof.update(historical_completion_status="COMPLETE", historical_completion_source="ROOT_PROGRESS",
+                     historical_completion_recorded_at=progress["observed_at"])
+    manager_proof = _root_manager_completion(paths, path, plan, db)
+    if manager_proof["root_completion_recorded"] and not (progress["eligible"] and progress["advances"] == 2):
+        raise pair.Error("manager completion lacks complete root progress")
+    proof.update(manager_proof)
     return proof
 
 

@@ -152,8 +152,8 @@ MQTT 학습 필터 또는 정상 허용 범위의 크기 제한과 관계없습�
 
 ## Packet Rule·IF 복구 관리 APIs
 
-기존 단일 복구 엔진과 통합 관리자 CLI의 `COMPLETED` 원본 → 유일한 `RUNNING` 대상
-Session 재개 경로를 조회하는 관리 API입니다. 위 모델 조회와 달리 아래 세 경로는 모두
+기존 live-resume 계획을 생성하고 실제 감사를 조회하는 관리 API입니다. 서버에 등록된
+Root CLI의 bounded-replay 원본 계획도 조회할 수 있습니다. 위 모델 조회와 달리 아래 세 경로는 모두
 `X-Recovery-Admin-Key`가 필요합니다. 키 미설정은 503 `RECOVERY_ADMIN_NOT_CONFIGURED`,
 키 누락·불일치는 401 `RECOVERY_ADMIN_UNAUTHORIZED`입니다. `approved_by`는 서버
 `RECOVERY_ADMIN_PRINCIPAL`에서 정하며 요청자가 지정하지 않습니다.
@@ -161,6 +161,7 @@ Session 재개 경로를 조회하는 관리 API입니다. 위 모델 조회와 
 ### POST /api/recovery/packet-pair/plans
 
 다음 세 문자열만 받는 strict 요청입니다. 추가 필드·다른 자료형은 422입니다.
+HTTP 계획 생성은 live-resume만 지원하며 mode와 FAILED 승인 옵션은 받지 않습니다.
 Session ID는 소문자 표준 UUID이고 서로 달라야 합니다. `reason`은 1~1000자이며
 공백만인 값, ASCII 제어 문자와 DEL은 거부하고 앞뒤 공백을 제거합니다.
 
@@ -174,7 +175,8 @@ Session ID는 소문자 표준 UUID이고 서로 달라야 합니다. `reason`�
 
 201 응답은 `plan_id`(Pair UUID), `plan_sha256`, source/target Session, 승인자·사유·
 생성 시각, `can_execute`, `blocking_reasons`, `skips_processable`, `boundary`,
-`children`, `apply_transport="ROOT_CLI"`, `runtime.status="UNKNOWN"`을 반환합니다.
+`children`, `mode="live-resume"`, `replay_end=null`, `apply_transport="ROOT_CLI"`,
+`runtime.status="UNKNOWN"`을 반환합니다.
 `children`은 Rule/IF의 `detector`, `child_operation_id`, `checkpoint_before`,
 `checkpoint_after`, 건너뛸 Session과 차단 사유를 포함합니다.
 
@@ -191,7 +193,9 @@ Session ID는 소문자 표준 UUID이고 서로 달라야 합니다. `reason`�
 서버에 저장한 표준 UUID 계획을 읽고 한 SQLite 읽기 Transaction에서 실제 Child 감사
 존재와 현재 Checkpoint를 조회합니다. Backup·감사의 전체 계약 검증은 하지 않습니다.
 200 응답 필드는 `plan_id`, `plan_sha256`, `observed_at`, `operation_status`,
-`database_committed`, `children`, `verification`, `runtime`입니다.
+`database_committed`, `children`, `verification`, `mode`, `replay_end`, `runtime`입니다.
+`mode`는 `live-resume` 또는 `bounded-replay`이며 `replay_end`는 bounded 계획의
+보존 데이터 처리 종점입니다. 이후 Session의 실시간 복구나 FAILED 끝 구간의 승인은 아닙니다.
 
 `children`은 `packet_rule`/`packet_if`별 `state`, `audit_present`, `checkpoint`를
 포함합니다. GET의 상태는 감사가 있으면 `COMMITTED_UNVERIFIED`, 없으면
@@ -221,6 +225,7 @@ Child ID, 계획 원문·SHA, 현재 CAS와 Source ID 소비, DB/Backup integrit
 두 Child의 적용 여부는 별도 상태로 확인합니다. Root Intent가 없으면 200 HOLD/UNKNOWN,
 증거가 잘못되면 200 HOLD입니다. 전체 감사가 검증됐지만 진행 파일이 없으면
 `VERIFIED_AUDITS`를 유지하고 `root_progress_status="UNAVAILABLE"`로 구분합니다.
+진행 파일을 만들지 않는 bounded-replay는 `root_progress_status="NOT_APPLICABLE"`입니다.
 비공개 Root Artifact 읽기 권한이 없으면 503/UNKNOWN으로 반환합니다.
 
 `root_progress_verified`는 기존 진행 파일의 SHA·승인·Checkpoint 연결을 확인했다는
@@ -230,6 +235,16 @@ Child ID, 계획 원문·SHA, 현재 CAS와 Source ID 소비, DB/Backup integrit
 `root_completion_recorded=true`도 **과거 완료 기록**입니다. 현재 Boot·서비스 실행·모델
 로딩이나 처리 전진을 인증하지 않습니다. 이 첫 API는 진행 파일이 fresh여도 현재
 `COMPLETE`를 반환하지 않으며 모든 응답의 `runtime.status`는 `UNKNOWN`입니다.
+
+`historical_completion_status`는 원본 감사 검증을 통과한 과거 `COMPLETE` 또는
+`REPLAY_COMPLETE` 기록이며, 근거가 없거나 검증에 실패하면 null입니다.
+`historical_completion_source`는 직접 Root 진행 문서의 `ROOT_PROGRESS` 또는
+연결된 Manager Journal의 `ROOT_MANAGER`, `historical_completion_recorded_at`은
+당시 관측 또는 완료 Journal 보관 시각입니다. Manager 없이도 eligible=true·advances=2의
+검증된 진행 문서로 과거 COMPLETE를 확인할 수 있지만 `root_completion_recorded`는
+false로 유지합니다. 과거 완료와 현재 runtime UNKNOWN을 함께 표시해야 합니다.
+후속 복구 등으로 원본 감사 검증이 HOLD면 과거 완료 문서로 우회하지 않습니다.
+상세한 증명 범위는 [모델 정보·복구 관리 API](phase9-model-management-api.md)를 따릅니다.
 
 ### 서버 경로·권한과 구현 범위
 
