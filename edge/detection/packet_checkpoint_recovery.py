@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import hmac
 import json
@@ -1440,6 +1441,10 @@ def _inventory_entry(repository_root: Path, relative_path: str) -> dict[str, obj
     return {"path": relative.as_posix(), "size": after.st_size, "sha256": digest}
 
 
+class _RepositoryTraversalChanged(Exception):
+    """Only an entry that disappeared during the filesystem traversal."""
+
+
 def _reject_non_regular_repository_entries(root: Path) -> None:
     """Git omits FIFOs/sockets from ls-files; reject them without opening them.
 
@@ -1451,15 +1456,22 @@ def _reject_non_regular_repository_entries(root: Path) -> None:
     while pending:
         directory = pending.pop()
         candidates: dict[str, tuple[Path, bool]] = {}
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                if entry.name == ".git":
-                    continue
-                mode = entry.stat(follow_symlinks=False).st_mode
-                if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
-                    continue
-                path = Path(entry.path)
-                candidates[path.relative_to(root).as_posix()] = (path, stat.S_ISDIR(mode))
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if entry.name == ".git":
+                        continue
+                    mode = entry.stat(follow_symlinks=False).st_mode
+                    if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+                        continue
+                    path = Path(entry.path)
+                    candidates[path.relative_to(root).as_posix()] = (path, stat.S_ISDIR(mode))
+        except FileNotFoundError as exc:
+            if exc.errno != errno.ENOENT:
+                raise
+            # A capture worker may rename an ignored PCAP after enumeration.
+            # Do not skip it: discard this traversal and all earlier Git reads.
+            raise _RepositoryTraversalChanged from exc
         if not candidates:
             continue
         ignored = subprocess.run(
@@ -1483,20 +1495,30 @@ def _reject_non_regular_repository_entries(root: Path) -> None:
 
 def inspect_repository_state(repository_root: str | Path) -> dict[str, object]:
     root = Path(repository_root).expanduser().resolve(strict=True)
-    commit = _git(root, "rev-parse", "HEAD").strip()
-    tracked = _git(root, "diff", "--name-only", "--").splitlines()
-    staged = _git(root, "diff", "--cached", "--name-only", "--").splitlines()
-    untracked = _git(
-        root, "ls-files", "--others", "--exclude-standard", "-z"
-    ).split("\0")
-    _reject_non_regular_repository_entries(root)
-    inventory = [_inventory_entry(root, path) for path in untracked if path]
-    if tracked or staged:
-        raise PacketCheckpointRecoveryError("tracked/staged worktree must be clean")
-    return {
-        "repository_root": str(root),
-        "repository_commit": commit,
-        "tracked_worktree_clean": True,
-        "staged_worktree_clean": True,
-        "untracked_inventory": sorted(inventory, key=lambda row: row["path"]),
-    }
+    for attempt in range(3):
+        commit = _git(root, "rev-parse", "HEAD").strip()
+        tracked = _git(root, "diff", "--name-only", "--").splitlines()
+        staged = _git(root, "diff", "--cached", "--name-only", "--").splitlines()
+        untracked = _git(
+            root, "ls-files", "--others", "--exclude-standard", "-z"
+        ).split("\0")
+        try:
+            _reject_non_regular_repository_entries(root)
+        except _RepositoryTraversalChanged as exc:
+            if attempt == 2:
+                raise PacketCheckpointRecoveryError(
+                    "repository filesystem changed repeatedly during inspection"
+                ) from exc
+            continue
+        # Inventory disappearance/mutation and Git errors remain fail-closed;
+        # they do not share the capture traversal's bounded retry allowance.
+        inventory = [_inventory_entry(root, path) for path in untracked if path]
+        if tracked or staged:
+            raise PacketCheckpointRecoveryError("tracked/staged worktree must be clean")
+        return {
+            "repository_root": str(root),
+            "repository_commit": commit,
+            "tracked_worktree_clean": True,
+            "staged_worktree_clean": True,
+            "untracked_inventory": sorted(inventory, key=lambda row: row["path"]),
+        }
