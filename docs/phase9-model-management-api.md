@@ -167,3 +167,25 @@ LEGACY_CONTRACT_UNAVAILABLE, 두 실행 상태는 UNKNOWN이었다. 키 누락·
 이 loopback 시험은 운영 API 서비스 배포와 구별한다. 당시 운영 Pi는 542455f였고,
 시험 뒤 다섯 처리 경계가 2026-10-11T05:49:20Z로 전진했으며 세 기기의 수신이
 지속됐다. 새 FAILED 구간은 없었다. 운영 DB Migration·모델 활성화·학습은 실행하지 않았다.
+
+## 운영 API 적용 확인 — 2026/10/11
+
+15:03:23~15:03:27 KST에 검증한 코드 `ffa82c00b31ebdfcd621b83aa13d1597bd02b26c`를
+Pi에 적용했다. 기존 복구 Commit `542455f`와 PCAP 이동 경합 수정 `d87bfd4`를
+포함하는 전진 적용이며 API 서비스만 약 2.74초 재시작했다. Capture·Subscriber·
+Broker·Orchestrator·MQTT Builder·Firewall Worker의 PID와 기동 시각은 같았다.
+Writer·Subscriber 대기는 각각 0회이며 기존 복구 대기 승인을 재사용하지 않았다.
+독립 systemd 작업으로 실행했고 실패 시 Git 자식 회수 확인 후 이전 코드·API를
+복원하도록 준비했다. 이번 적용은 성공해 rollback은 실행하지 않았다.
+
+운영 HTTP의 `/api/models`는 200, Packet은 BUNDLE_METADATA_VERIFIED,
+MQTT는 LEGACY_CONTRACT_UNAVAILABLE, 두 runtime은 UNKNOWN이었다. 관리자 키
+누락·불일치는 401, 올바른 키의 존재하지 않는 계획은 404/UNKNOWN이었다.
+기존 root-private 복구 자료의 503/UNKNOWN은 위 별도 loopback 시험 결과이며,
+운영에 복구 계획 별칭을 만들거나 자료 권한을 완화하지 않았다.
+
+15:04:52 KST의 읽기 조회에서 다섯 필수 처리 경계가 모두 15:04:40으로 전진했고
+ESP32 두 대·Pico의 수신은 각각 5초 이내였다. Session111 RUNNING, 신규 FAILED 0,
+복구 감사 69개·기존 설정/Packet 모델 바이트·Boot가 보존됐다. DB Migration,
+복구 재적용, 모델 학습·활성화와 방화벽 차단은 하지 않았다. 이 문서의 이후 수정은
+배포한 `ffa82c0` 코드의 검증 기록이며 운영 코드 SHA와 구분한다.
