@@ -9,6 +9,7 @@ Phase 8 기기 등록·정책 API는 [기기 정책 v1 계약](contracts/device-
 
 ```txt
 GET /api/health
+GET /api/models
 GET /api/dashboard/summary
 GET /api/devices
 GET /api/devices/{device_id}
@@ -31,6 +32,9 @@ POST /api/recovery/preflight
 POST /api/recovery/execute
 GET /api/recovery/history
 GET /api/recovery/history/{operation_id}
+POST /api/recovery/packet-pair/plans
+GET /api/recovery/packet-pair/{plan_id}
+POST /api/recovery/packet-pair/{plan_id}/verify
 ```
 
 ## Device 등록·정책 APIs
@@ -102,6 +106,179 @@ auto_response_eligible, auto_response_exclusion_reason
 공용 Firewall lock 경로·권한을 확인한 뒤 활성화합니다. 관리자 키는 검증된 SSH 포워딩
 loopback 또는 HTTPS 경로에서 전송합니다. 세부 절차는
 [기기 정책 API 운영 확인](device-policy-api-runbook.md)을 따릅니다.
+
+## 모델 정보 API
+
+### GET /api/models
+
+관리자 키를 요구하지 않는 공개 조회입니다. 서버에 설정된 Packet IF Artifact의
+계약과 실제 실행 상태를 구분하며, 모델 활성화·역직렬화·추론은 실행하지 않습니다.
+응답은 `200 {observed_at, models}`이고 `models`에는 `packet_if`, `mqtt_if`가 들어갑니다.
+Artifact를 읽을 수 없거나 계약이 잘못된 경우도 해당 항목의 상태로 반환합니다.
+
+| 항목 필드 | 의미 |
+| --- | --- |
+| `detector` | `packet_if` 또는 `mqtt_if` |
+| `configured_model_version`, `configured_bundle_sha256` | API 서버의 설정값 또는 null. 실행 중 모델의 인증값이 아님 |
+| `artifact_status` | 아래 Artifact 검사 상태 |
+| `artifact` | 검증 성공 시 공개 Metadata 부분집합, 그 외 null |
+| `checks` | Bundle·Metadata·Report 검사 여부와 미검증 항목 |
+| `runtime` | 항상 `{status: "UNKNOWN", reason_code: "RUNTIME_MODEL_EVIDENCE_NOT_AVAILABLE"}` |
+| `error_code` | 확인 불가·잘못된 계약 등의 안전한 오류 코드 또는 null |
+
+| `artifact_status` | 의미 |
+| --- | --- |
+| `BUNDLE_METADATA_VERIFIED` | 외부 설정의 Bundle SHA·모델 Version, 개별 모델/Report SHA, Metadata 계약과 Report UTF-8 JSON 객체 형태 확인 |
+| `UNCONFIGURED` | Packet Artifact 경로·기대 Version·기대 Bundle SHA 중 필수 설정 누락 |
+| `UNAVAILABLE` | 필수 파일 누락 또는 읽기 권한/파일 접근 실패 |
+| `INVALID` | Hash·Version·Metadata 계약 불일치, 잘못된 Report 형태, 크기 상한 초과 또는 안전하지 않은 경로 |
+| `LEGACY_CONTRACT_UNAVAILABLE` | MQTT 기존 단일 Joblib 경로에 같은 외부 pin·Bundle·Metadata 계약이 준비되지 않음 |
+
+공개 Metadata에는 모델·Feature·변환·Dataset·정상 정책 Version, Feature 순서,
+Threshold와 비교 방향·출처, 생성 시각, Bundle/Dataset/Manifest SHA, 분할별 행 수와
+정해진 CapturePolicy 필드만 포함합니다. 선택적인 `normal_policy_version`은 null일 수
+있습니다. 내부 경로·임의 확장 필드·Report 원문과 평가 수치는 노출하지 않습니다.
+MQTT 정책 Version을 모델 Version으로 표시하지 않습니다.
+
+검증 성공 시 `bundle_sha256_verified`, `metadata_contract_verified`,
+`report_sha256_verified`, `report_json_object_verified`는 true입니다.
+`report_semantics_verified`, `model_deserialized`, `inference_verified`는 항상 false입니다.
+Report의 내부 평가 수치 일치·학습 품질·공식 학습 승인·현재 Orchestrator의 라이브러리
+호환성이나 로딩은 확인하지 않습니다. API 설정과 과거 탐지 이벤트도 실제 실행 증거를
+대신하지 않습니다. 기기별 모델을 생성하는 API가 아닙니다.
+
+파일당 **64 MiB**는 API가 읽는 세 Artifact 파일의 검사 상한입니다. 센서 Payload,
+MQTT 학습 필터 또는 정상 허용 범위의 크기 제한과 관계없습니다.
+
+## Packet Rule·IF 복구 관리 APIs
+
+기존 live-resume 계획을 생성하고 실제 감사를 조회하는 관리 API입니다. 서버에 등록된
+Root CLI의 bounded-replay 원본 계획도 조회할 수 있습니다. 위 모델 조회와 달리 아래 세 경로는 모두
+`X-Recovery-Admin-Key`가 필요합니다. 키 미설정은 503 `RECOVERY_ADMIN_NOT_CONFIGURED`,
+키 누락·불일치는 401 `RECOVERY_ADMIN_UNAUTHORIZED`입니다. `approved_by`는 서버
+`RECOVERY_ADMIN_PRINCIPAL`에서 정하며 요청자가 지정하지 않습니다.
+
+### POST /api/recovery/packet-pair/plans
+
+다음 세 문자열만 받는 strict 요청입니다. 추가 필드·다른 자료형은 422입니다.
+HTTP 계획 생성은 live-resume만 지원하며 mode와 FAILED 승인 옵션은 받지 않습니다.
+Session ID는 소문자 표준 UUID이고 서로 달라야 합니다. `reason`은 1~1000자이며
+공백만인 값, ASCII 제어 문자와 DEL은 거부하고 앞뒤 공백을 제거합니다.
+
+```json
+{
+  "source_session_id": "11111111-1111-4111-8111-111111111111",
+  "target_session_id": "22222222-2222-4222-8222-222222222222",
+  "reason": "완료된 수집 Session에서 현재 수집 Session으로 처리를 재개"
+}
+```
+
+201 응답은 `plan_id`(Pair UUID), `plan_sha256`, source/target Session, 승인자·사유·
+생성 시각, `can_execute`, `blocking_reasons`, `skips_processable`, `boundary`,
+`children`, `mode="live-resume"`, `replay_end=null`, `apply_transport="ROOT_CLI"`,
+`runtime.status="UNKNOWN"`을 반환합니다.
+`children`은 Rule/IF의 `detector`, `child_operation_id`, `checkpoint_before`,
+`checkpoint_after`, 건너뛸 Session과 차단 사유를 포함합니다.
+
+201은 새 계획 파일 저장 성공이며 복구 적용·완료가 아닙니다. `can_execute=false`인
+계획도 차단 사유와 함께 저장될 수 있습니다. true여도 실제 실행 시 재검사가 필요합니다.
+처리 가능 Session을 건너뛰면 기존 CLI의 같은 Plan SHA에 연결된 별도 skip 승인이
+필요합니다. 승인자·DB/Artifact/출력 경로·Child ID·실행 옵션·확인 문자열은 Body에서
+받지 않습니다. 원본 계획은 `<plan_id>.json`으로 새로 저장하며 기존 파일을 덮어쓰지
+않습니다. 같은 Body의 반복 POST에 대한 중복 제거는 제공하지 않으며 새 계획을
+만들 수 있으므로, 응답 유실을 기존 복구의 재실행 승인으로 해석하지 않습니다.
+
+### GET /api/recovery/packet-pair/{plan_id}
+
+서버에 저장한 표준 UUID 계획을 읽고 한 SQLite 읽기 Transaction에서 실제 Child 감사
+존재와 현재 Checkpoint를 조회합니다. Backup·감사의 전체 계약 검증은 하지 않습니다.
+200 응답 필드는 `plan_id`, `plan_sha256`, `observed_at`, `operation_status`,
+`database_committed`, `children`, `verification`, `mode`, `replay_end`, `runtime`입니다.
+`mode`는 `live-resume` 또는 `bounded-replay`이며 `replay_end`는 bounded 계획의
+보존 데이터 처리 종점입니다. 이후 Session의 실시간 복구나 FAILED 끝 구간의 승인은 아닙니다.
+
+`children`은 `packet_rule`/`packet_if`별 `state`, `audit_present`, `checkpoint`를
+포함합니다. GET의 상태는 감사가 있으면 `COMMITTED_UNVERIFIED`, 없으면
+`PENDING_UNVERIFIED`입니다. `database_committed`는 이 조회에서 감사가 하나라도
+존재하는지를 표시하며 승인·Backup·실제 처리 전진까지 검증됐다는 뜻은 아닙니다.
+GET의 `verification.status`는 `NOT_REQUESTED`입니다.
+
+### POST /api/recovery/packet-pair/{plan_id}/verify
+
+별도 Body 계약 없이 같은 계획의 Root Intent·실제 DB 감사·Before/After Checkpoint·
+Backup/SHA와 기존 Root 진행 기록을 **읽기 전용**으로 대조합니다. 같은 승인 작업의
+Child ID, 계획 원문·SHA, 현재 CAS와 Source ID 소비, DB/Backup integrity·FK 검증은
+기존 Pair 엔진의 검증을 재사용합니다. 성공한 Child는 `APPLIED`, 미적용 Child는
+`PENDING`으로 표시합니다. stdout이나 결과 파일의 `COMPLETE`만으로 Commit을
+인정하지 않습니다.
+
+| `operation_status` | 의미 |
+| --- | --- |
+| `PENDING` | Child 감사가 없거나 검증된 Child가 모두 미적용 |
+| `COMMITTED_UNVERIFIED` | GET에서 두 Child 감사 존재를 확인했으나 전체 검증 전 |
+| `PARTIAL_HOLD` | 한 Child만 적용/감사 존재. 전체 복구 완료가 아님 |
+| `HOLD` | Root Intent 부재, 변경된 감사/Checkpoint/Backup 또는 잘못된 증거로 보류 |
+| `APPLIED_VERIFY_REQUIRED` | verify에서 두 Child 적용을 검증했으나 현재 Runtime 전진은 미확인 |
+
+`verification.status`는 `NOT_REQUESTED`, `VERIFIED_AUDITS`, `HOLD`, `UNKNOWN`입니다.
+`VERIFIED_AUDITS`는 같은 계획의 감사와 미적용 Checkpoint 검사가 통과했다는 뜻이며
+두 Child의 적용 여부는 별도 상태로 확인합니다. Root Intent가 없으면 200 HOLD/UNKNOWN,
+증거가 잘못되면 200 HOLD입니다. 전체 감사가 검증됐지만 진행 파일이 없으면
+`VERIFIED_AUDITS`를 유지하고 `root_progress_status="UNAVAILABLE"`로 구분합니다.
+진행 파일을 만들지 않는 bounded-replay는 `root_progress_status="NOT_APPLICABLE"`입니다.
+비공개 Root Artifact 읽기 권한이 없으면 503/UNKNOWN으로 반환합니다.
+
+`root_progress_verified`는 기존 진행 파일의 SHA·승인·Checkpoint 연결을 확인했다는
+뜻입니다. `root_progress_observed_at`, `root_progress_age_seconds`,
+`root_progress_max_age_seconds=45`, `root_progress_fresh`로 원래 관측 시각과 최신성을
+구분합니다. 선택적인 `<pair_id>.manager.json`과 연결된 Manager Journal까지 확인한
+`root_completion_recorded=true`도 **과거 완료 기록**입니다. 현재 Boot·서비스 실행·모델
+로딩이나 처리 전진을 인증하지 않습니다. 이 첫 API는 진행 파일이 fresh여도 현재
+`COMPLETE`를 반환하지 않으며 모든 응답의 `runtime.status`는 `UNKNOWN`입니다.
+
+`historical_completion_status`는 원본 감사 검증을 통과한 과거 `COMPLETE` 또는
+`REPLAY_COMPLETE` 기록이며, 근거가 없거나 검증에 실패하면 null입니다.
+`historical_completion_source`는 직접 Root 진행 문서의 `ROOT_PROGRESS` 또는
+연결된 Manager Journal의 `ROOT_MANAGER`, `historical_completion_recorded_at`은
+당시 관측 또는 완료 Journal 보관 시각입니다. Manager 없이도 eligible=true·advances=2의
+검증된 진행 문서로 과거 COMPLETE를 확인할 수 있지만 `root_completion_recorded`는
+false로 유지합니다. 과거 완료와 현재 runtime UNKNOWN을 함께 표시해야 합니다.
+후속 복구 등으로 원본 감사 검증이 HOLD면 과거 완료 문서로 우회하지 않습니다.
+상세한 증명 범위는 [모델 정보·복구 관리 API](phase9-model-management-api.md)를 따릅니다.
+
+### 서버 경로·권한과 구현 범위
+
+| 설정 | 기본값 |
+| --- | --- |
+| `PACKET_PAIR_REPOSITORY_ROOT` | API 패키지가 있는 Repository Root |
+| `DATABASE_URL` | 기존 SQLite DB 설정 |
+| `PACKET_PAIR_PLAN_DIR` | `output/phase9-packet-pair-api/plans` |
+| `PACKET_PAIR_ARTIFACT_DIR` | `data/recovery/packet-pair` |
+| `PACKET_PAIR_MANAGER_PLAN_DIR` | `output/phase9-packet-pair-api/manager-plans` |
+
+상대 경로는 Repository Root 기준이며 client가 경로를 지정할 수 없습니다.
+Symlink/Junction을 거부하고 DB는 기존 파일을 `mode=ro`·`query_only`로 조회합니다.
+계획 생성만 새 파일을 쓰며 세 API 모두 DB 감사·Checkpoint·Trust를 쓰지 않습니다.
+GET/verify는 Lock·Root Progress·Journal·Backup을 갱신하지 않습니다.
+
+적용·Resume·서비스 중단/원상복귀는 같은 Pair UUID·Plan SHA·DB·Artifact Root를 사용하는
+Root 관리자 CLI로 수행합니다. HTTP apply 경로는 없습니다. API에서 sudo·서비스 제어·
+Root 프로세스 시작을 하지 않으며 `iot-edge-api.service`의 `NoNewPrivileges=true`를
+유지합니다. Manager Plan을 서버 설정 디렉토리의 `<pair_id>.manager.json`에 보관하는
+선택 규약은 API의 과거 완료 증거 조회용이며 기존 CLI 파일명 규약을 바꾸지 않습니다.
+
+잘못된 UUID/Body는 422, 계획 부재는 404, 서버 경로·DB·계획 생성/읽기 또는 비공개
+증거 접근 불가는 503입니다. Pair 업무 오류는
+`{detail:{code: "...", verification: "UNKNOWN"}}`이며 내부 경로·상세 OS 오류를
+노출하지 않습니다. 인증 오류는 위 문자열 형식을 사용합니다.
+
+현재 구현은 모델 원본 조회와 복구 계획/감사 검증의 첫 범위입니다. 2026/10/11의
+운영 API 적용·HTTP 확인 기록은 아래 전용 문서를 참조합니다. 이후 manager 통합
+후보의 운영 배포는 별도 검증 대상입니다. Artifact 검사나 정상 HTTP 응답을 실제
+실행 모델 인증으로 표시하지 않습니다. 실제 Runtime
+발행, 기기별 OFF/OBSERVE 저장·적용, 모델 활성화·중단·후보 평가와 Frontend 연결은
+후속이며 P9-06 전체 완료가 아닙니다. 검증 기록과 세부 계약은
+[모델 정보·복구 관리 API](phase9-model-management-api.md)를 참조합니다.
 
 ## Packet Gateway Read APIs
 
@@ -637,10 +814,12 @@ Baseline Recovery는 P0에서 서로 다른 Source로 유지하며 통합 Timeli
 
 ## 현재 구현 상태
 
-현재 backend에 구현된 조회 API는 다음과 같습니다.
+현재 backend의 주요 API는 다음과 같습니다. 신규 API의 운영 배포 여부와
+미구현 후속 범위는 각 계약을 참조합니다.
 
 ```txt
 GET /api/health
+GET /api/models
 GET /api/dashboard/summary
 GET /api/devices
 GET /api/devices/{device_id}
@@ -658,4 +837,7 @@ POST /api/recovery/preflight
 POST /api/recovery/execute
 GET /api/recovery/history
 GET /api/recovery/history/{operation_id}
+POST /api/recovery/packet-pair/plans
+GET /api/recovery/packet-pair/{plan_id}
+POST /api/recovery/packet-pair/{plan_id}/verify
 ```
