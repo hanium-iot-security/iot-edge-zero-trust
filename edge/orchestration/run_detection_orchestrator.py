@@ -336,6 +336,53 @@ def _target_has_live_resume_ready_shape(
     return status == "RUNNING"
 
 
+def _bounded_replay_audit_matches(db: Session, candidate, plan: dict, boundary: datetime, range_start: datetime) -> bool:
+    """Admit a new closed-target operation only with its actual signed input proof."""
+    from edge.detection.packet_checkpoint_recovery import PacketCheckpointRecoveryError, verify_plan_sha256
+    from edge.detection.packet_checkpoint_recovery_repository import bounded_replay_target_evidence
+
+    try:
+        verify_plan_sha256(plan)
+        evidence = plan["bounded_replay"]
+        before, after = plan["checkpoint"]["before"], plan["checkpoint"]["after"]
+        allow_failed_target = plan.get("allow_failed_target_session", False)
+        if type(allow_failed_target) is not bool:
+            return False
+        expected_status = "FAILED" if allow_failed_target else "COMPLETED"
+        if (candidate["status"] != expected_status or plan["target_session_id"] != candidate["target_capture_session_id"]
+                or plan["current_session_id"] != candidate["current_capture_session_id"]
+                or plan["detector_name"] != candidate["detector_name"]
+                or plan["source_table"] != candidate["source_table"]
+                or before["last_processed_id"] != candidate["last_processed_id_before"]
+                or after["last_processed_id"] != candidate["last_processed_id_after"]
+                or before["last_completed_window_end"] != candidate["last_completed_window_end_before"]
+                or parse_db_utc(before["last_completed_window_end"]) != range_start
+                or after["last_completed_window_end"] != format_db_utc(boundary)
+                or evidence["replay_start"] != format_db_utc(boundary)
+                or plan["sessions_between"] or candidate["skipped_session_count"] != 0
+                or candidate["skipped_processable_session_count"] != 0):
+            return False
+        session = db.execute(text("SELECT * FROM packet_capture_sessions WHERE session_id=:id"),
+                             {"id": candidate["target_capture_session_id"]}).mappings().one()
+        segments = list(db.execute(text("SELECT * FROM packet_capture_segments WHERE capture_session_id=:id "
+                                       "ORDER BY window_start,id"), {"id": session["id"]}).mappings())
+        features = list(db.execute(text("SELECT f.* FROM packet_feature_logs f JOIN packet_capture_segments g "
+                                       "ON g.id=f.capture_segment_id WHERE g.capture_session_id=:id ORDER BY f.id"),
+                                   {"id": session["id"]}).mappings())
+        actual = bounded_replay_target_evidence(
+            session, segments, features, allow_failed_target_session=allow_failed_target)
+        if actual is None or any(evidence.get(key) != value for key, value in actual.items()):
+            return False
+        if allow_failed_target:
+            return plan.get("failed_target_tail") == actual["failed_target_tail"]
+        return (session["ended_at"] is not None and actual["replay_end"] is not None
+                and parse_db_utc(session["ended_at"]) >= parse_db_utc(actual["replay_end"])
+                and all(row["status"] in {"PROCESSED", "EMPTY"} and row["error_code"] is None
+                        for row in segments))
+    except (PacketCheckpointRecoveryError, KeyError, TypeError, ValueError):
+        return False
+
+
 def _resolve_packet_stage_live_resume_audit(
     db: Session,
     *,
@@ -343,12 +390,12 @@ def _resolve_packet_stage_live_resume_audit(
     source_table: str,
     last_processed_id: object,
     boundary: datetime,
+    range_start: datetime,
 ) -> PacketLiveResumeTransition | None:
     candidates = db.execute(
         text(
             """
-            SELECT pcr.target_capture_session_id, pcr.plan_sha256,
-                   pcr.plan_json, pcs.status
+            SELECT pcr.*, pcs.status
             FROM packet_checkpoint_recoveries pcr
             JOIN packet_capture_sessions pcs
                 ON pcs.session_id = pcr.target_capture_session_id
@@ -358,7 +405,7 @@ def _resolve_packet_stage_live_resume_audit(
               AND pcr.last_processed_id_before IS :last_processed_id
               AND pcr.last_processed_id_after IS :last_processed_id
               AND pcs.first_window_start = :boundary
-              AND pcs.status IN ('RUNNING', 'COMPLETED')
+              AND pcs.status IN ('RUNNING', 'COMPLETED', 'FAILED')
             ORDER BY pcr.id DESC
             """
         ),
@@ -378,12 +425,14 @@ def _resolve_packet_stage_live_resume_audit(
             continue
         if (
             not isinstance(plan, dict)
-            or plan.get("mode") != "live-resume"
+            or plan.get("mode") not in {"live-resume", "bounded-replay"}
             or plan.get("plan_sha256") != candidate["plan_sha256"]
         ):
             continue
+        if plan["mode"] == "bounded-replay" and not _bounded_replay_audit_matches(db, candidate, plan, boundary, range_start):
+            continue
         target_session_id = str(candidate["target_capture_session_id"])
-        if not _target_has_live_resume_ready_shape(
+        if (plan["mode"] != "bounded-replay" or candidate["status"] != "FAILED") and not _target_has_live_resume_ready_shape(
             db,
             session_id=target_session_id,
             first_window_start=boundary,
@@ -395,6 +444,7 @@ def _resolve_packet_stage_live_resume_audit(
                 boundary=boundary,
                 target_session_id=target_session_id,
                 plan_sha256=str(candidate["plan_sha256"]),
+                mode=plan["mode"],
             )
         )
     return valid[0] if len(valid) == 1 else None
@@ -499,13 +549,14 @@ def resolve_packet_live_resume_transition(
             source_table=configured.stage.source_table,
             last_processed_id=checkpoint["last_processed_id"],
             boundary=boundary,
+            range_start=range_start,
         )
         if audit is None:
             return None
         audits.append(audit)
 
     target_session_id = audits[0].target_session_id
-    if any(audit.target_session_id != target_session_id for audit in audits[1:]):
+    if any(audit.target_session_id != target_session_id or audit.mode != audits[0].mode for audit in audits[1:]):
         return None
 
     packet_rule_index = next(
@@ -560,6 +611,8 @@ def run_orchestration_cycle(
                     (
                         "PACKET_SEGMENT_GAP_CATCHUP"
                         if packet_resume_transition.mode == "segment-gap"
+                        else "PACKET_BOUNDED_REPLAY_CATCHUP"
+                        if packet_resume_transition.mode == "bounded-replay"
                         else "PACKET_LIVE_RESUME_CATCHUP"
                     ),
                     format_db_utc(range_start),
