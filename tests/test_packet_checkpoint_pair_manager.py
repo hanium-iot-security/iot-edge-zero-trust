@@ -822,3 +822,251 @@ def test_owned_group_scan_ignores_unrelated_non_ascii_process_name(monkeypatch, 
     state[0] = "S"
     assert manager._identity(101) == "123"
     assert not processes.group_gone(owned)
+
+
+# Real child imports require an entirely separate staged checkout and explicit opt-in.
+ISOLATED_LINUX = pytest.mark.skipif(
+    sys.platform != "linux" or os.environ.get("PHASE9_MANAGER_LINUX_INTEGRATION") != "1",
+    reason="explicit isolated Linux staging required; never run against deployed paths",
+)
+
+
+@pytest.fixture
+def isolated_linux_verifier(fixture, tmp_path, monkeypatch):
+    import time
+    import uuid
+    stage = Path(os.environ["PHASE9_MANAGER_LINUX_STAGE_ROOT"]).resolve(strict=True)
+    source = Path(manager.__file__).resolve().parents[2]
+    assert source.is_relative_to(stage) and tmp_path.resolve().is_relative_to(stage)
+    assert not (source / ".env").exists() and not (source.parent / ".env").exists()
+    base = fixture["base"]
+    assert all(Path(base[key]).resolve().is_relative_to(stage) for key in ("database", "root", "artifacts", "output"))
+    # Only temporary fixture SQL is applied; no manager/service application runs.
+    assert _execute(base)["database_committed"] is True
+    _advance(base, 10)
+    baseline = manager.pair.status_pair(plan_file=base["output"], db_path=base["database"], artifact_dir=base["artifacts"])
+    assert baseline["operation_status"] == "APPLIED_PENDING_PROGRESS" and baseline["progress_advances"] == 0
+    group, journal_path, _ = manager._paths(fixture["plan"])
+    group.mkdir()
+    original = dict.fromkeys(manager.UNITS, "active")
+    journal = {"manager_id": fixture["plan"]["manager_id"], "approval_sha256": fixture["plan"]["plan_sha256"],
+               "attempt_id": str(uuid.uuid4()), "original": original, "requested": {}, "actual": original.copy(),
+               "transitions": [], "restoration_failures": [], "phase": "APPLIED_VERIFY_HOLD",
+               "worker_reaped": True, "database_committed": True}
+    manager._save(journal_path, journal)
+    state = tmp_path / "child-host.json"
+    trace = tmp_path / "child-trace.jsonl"
+    bootstrap = tmp_path / "child-bootstrap"
+    bootstrap.mkdir()
+    (bootstrap / "sitecustomize.py").write_text(r'''
+import json, os, subprocess, sys, time
+from pathlib import Path
+try:
+    state_path = Path(os.environ["PHASE9_MANAGER_CHILD_STATE"]).resolve(strict=True)
+    def host():
+        return json.loads(state_path.read_text(encoding="utf-8"))
+    configuration = host()
+    stage = Path(configuration["stage"]).resolve(strict=True)
+    source = Path(configuration["source"]).resolve(strict=True)
+    approved_git = Path(configuration["repository"]).resolve(strict=True)
+    assert state_path.is_relative_to(stage) and source.is_relative_to(stage) and approved_git.is_relative_to(stage)
+    assert not (source / ".env").exists() and not (source.parent / ".env").exists()
+    assert os.environ["DATABASE_URL"] == "sqlite:///:memory:"
+    original_popen = subprocess.Popen
+    cpu_queries = []
+    import_phase = True
+    def fixture_git_and_import_cpu_read(args, *positional, **kwargs):
+        if (import_phase and not cpu_queries and (args == "lscpu" or args == ["lscpu"])
+                and not positional and kwargs.get("shell", False) is False
+                and kwargs.get("cwd") is None and kwargs.get("executable") is None
+                and kwargs.get("env") is None):
+            cpu_queries.append("lscpu")  # NumPy 2 ARM/SVE support probe, read once during import.
+            return original_popen(args, **kwargs)
+        if (not isinstance(args, (list, tuple)) or len(args) < 2 or args[0] != "git"
+                or args[1] not in {"rev-parse", "diff", "ls-files", "check-ignore"}
+                or Path(kwargs.get("cwd", "/")).resolve() != approved_git):
+            raise RuntimeError("isolated verifier denied non-fixture command")
+        return original_popen(args, *positional, **kwargs)
+    subprocess.Popen = fixture_git_and_import_cpu_read
+    from edge.detection import packet_checkpoint_pair_manager as manager
+    from edge.detection import run_packet_recovery_pair as cli
+    from backend.app.config import settings
+    import_phase = False
+    for name, module in tuple(sys.modules.items()):
+        if name.split(".")[0] in {"ai", "backend", "db", "edge"} and getattr(module, "__file__", None):
+            assert Path(module.__file__).resolve().is_relative_to(source), name
+    assert settings.database_url == "sqlite:///:memory:"
+    assert Path(manager.__file__).resolve() == source / "edge/detection/packet_checkpoint_pair_manager.py"
+    def record(event, **fields):
+        with Path(host()["trace"]).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(dict(event=event, pid=os.getpid(), **fields)) + "\n")
+    record("full_import_ready", manager_file=manager.__file__, cli_file=cli.__file__, cpu_read_count=len(cpu_queries))
+    manager.pair._runtime_observation = lambda: host()["runtime"]
+    manager.core._utc_now = lambda: manager.core.parse_db_utc(host()["clock"])
+    class HostServices:
+        def state(self, unit):
+            assert unit in manager.UNITS
+            record("service_state", unit=unit)
+            if host()["hang"]:
+                time.sleep(60)
+            return host()["services"][unit]
+        def require_admin(self):
+            raise RuntimeError("isolated verifier must not request root")
+        def start(self, *args, **kwargs):
+            raise RuntimeError("isolated verifier must not start services")
+        def stop(self, *args, **kwargs):
+            raise RuntimeError("isolated verifier must not stop services")
+    manager.Services = HostServices
+except BaseException:
+    # sitecustomize normally prints errors and continues: forbid falling through to host commands.
+    os._exit(91)
+''', encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join((str(bootstrap), str(source))))
+    monkeypatch.setenv("PHASE9_MANAGER_CHILD_STATE", str(state))
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///:memory:")
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
+    monkeypatch.setenv("ORCHESTRATOR_LOCK_PATH", "")
+    monkeypatch.setenv("PACKET_IF_ARTIFACT_DIR", "")
+    monkeypatch.setenv("PACKET_IF_EXPECTED_MODEL_VERSION", "")
+    monkeypatch.setenv("PACKET_IF_EXPECTED_BUNDLE_SHA256", "")
+    children = []
+    class RealProcesses(manager.Processes):
+        def launch_verifier(self, path, token):
+            child = super().launch_verifier(path, token)
+            children.append(child)
+            return child
+    processes = RealProcesses()
+    def update(*, hang=False, inactive=False):
+        configured = dict(stage=str(stage), source=str(source), repository=str(base["root"]), trace=str(trace),
+                          runtime=base["runtime"], clock=manager.core.format_db_utc(base["clock"][0]), hang=hang,
+                          services=dict.fromkeys(manager.UNITS, "active"))
+        if inactive:
+            configured["services"][manager.UNITS[-1]] = "inactive"
+        state.write_text(json.dumps(configured), encoding="utf-8")
+    def observed():
+        return [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    update()
+    try:
+        yield dict(fixture=fixture, processes=processes, children=children, update=update,
+                   trace=observed, plan_bytes=fixture["path"].read_bytes(), monotonic=time.monotonic)
+    finally:
+        # Retain the actual Popen and captured identity; never signal an arbitrary PID.
+        for child in children:
+            if child.poll() is None or not processes.group_gone(child):
+                cleanup_plan = dict(fixture["plan"], budgets=dict(fixture["plan"]["budgets"],
+                                                                 terminate_grace_seconds=1, kill_reap_seconds=5))
+                manager._terminate_reap(cleanup_plan, child, processes, manager._journal(fixture["plan"]), "verifier")
+            child.wait(timeout=5)
+            if child.stdout is not None:
+                child.stdout.close()
+            assert processes.group_gone(child)
+
+
+def _real_fixture_verify(test, *, timeout=20):
+    return manager.verify(plan_file=test["fixture"]["path"], processes=test["processes"], timeout=timeout)
+
+
+def _assert_real_verifier_stopped(test):
+    fixture = test["fixture"]
+    journal = manager._journal(fixture["plan"])
+    receipt = manager._receipt(fixture["plan"], "verifier")
+    child = test["children"][-1]
+    assert child.returncode is not None
+    assert child.args[1:3] == ["-m", "edge.detection.run_packet_recovery_pair"]
+    assert receipt["pid"] == child.pid and receipt["verification_token"] == journal["verification_token"]
+    assert receipt["owner_pid"] == os.getpid() and receipt["attempt_id"] == journal["attempt_id"]
+    assert journal["verifier_direct_reaped"] and journal["verifier_group_gone"] and journal["verifier_reaped"]
+    assert not test["processes"].alive(receipt) and test["processes"].group_gone(child)
+    assert fixture["path"].read_bytes() == test["plan_bytes"]
+    assert len(_audits(fixture["base"])) == 2 and fixture["system"].actions == []
+    assert any(event["event"] == "full_import_ready" and event["pid"] == child.pid for event in test["trace"]())
+    return receipt
+
+
+@ISOLATED_LINUX
+def test_linux_real_verifier_cli_uses_audits_and_fresh_receipts(isolated_linux_verifier):
+    test = isolated_linux_verifier
+    base = test["fixture"]["base"]
+    _advance(base, 20)
+    test["update"]()
+    first = _real_fixture_verify(test)
+    assert first["operation_status"] == "APPLIED_PENDING_PROGRESS" and first["progress_advances"] == 1
+    receipt = _assert_real_verifier_stopped(test)
+    _advance(base, 30)
+    test["update"]()
+    second = _real_fixture_verify(test)
+    assert second["operation_status"] == "COMPLETE" and second["progress_advances"] == 2
+    new_receipt = _assert_real_verifier_stopped(test)
+    assert new_receipt["verification_token"] != receipt["verification_token"]
+    assert new_receipt["start_identity"] != receipt["start_identity"] or new_receipt["pid"] != receipt["pid"]
+
+
+@ISOLATED_LINUX
+def test_linux_real_verifier_host_hang_times_out_and_reaps(isolated_linux_verifier):
+    test = isolated_linux_verifier
+    _advance(test["fixture"]["base"], 20)
+    test["update"](hang=True)
+    started = test["monotonic"]()
+    result = _real_fixture_verify(test, timeout=15)
+    assert result["operation_status"] == "APPLIED_VERIFY_HOLD" and result["error"] == "TimeoutExpired"
+    assert test["monotonic"]() - started < 15 + 10 + 5
+    _assert_real_verifier_stopped(test)
+    assert any(event["event"] == "service_state" for event in test["trace"]())
+    count = len(test["children"])
+    assert count == 1  # No automatic relaunch after timeout in this call.
+    test["update"]()
+    retry = _real_fixture_verify(test)
+    assert retry["operation_status"] == "APPLIED_PENDING_PROGRESS"
+    _assert_real_verifier_stopped(test)
+    assert len(test["children"]) == count + 1
+
+
+@ISOLATED_LINUX
+def test_linux_real_verifier_inactive_service_holds_then_fresh_retry(isolated_linux_verifier):
+    test = isolated_linux_verifier
+    _advance(test["fixture"]["base"], 20)
+    test["update"](inactive=True)
+    rejected = _real_fixture_verify(test)
+    assert rejected["operation_status"] == "APPLIED_VERIFY_HOLD"
+    old_receipt = _assert_real_verifier_stopped(test)
+    test["update"]()
+    retried = _real_fixture_verify(test)
+    assert retried["operation_status"] == "APPLIED_PENDING_PROGRESS" and retried["progress_advances"] == 1
+    new_receipt = _assert_real_verifier_stopped(test)
+    assert old_receipt["verification_token"] != new_receipt["verification_token"]
+
+
+@ISOLATED_LINUX
+def test_linux_real_verifier_resealed_stale_pipe_response_cannot_complete(isolated_linux_verifier, monkeypatch):
+    test = isolated_linux_verifier
+    base = test["fixture"]["base"]
+    _advance(base, 20)
+    test["update"]()
+    assert _real_fixture_verify(test)["operation_status"] == "APPLIED_PENDING_PROGRESS"
+    old = _assert_real_verifier_stopped(test)
+    _advance(base, 30)
+    test["update"]()
+    launch = test["processes"].launch_verifier
+    real_responses = []
+    def damaged_pipe(path, token):
+        child = launch(path, token)  # Genuine production CLI and real Popen.
+        communicate = child.communicate
+        def corrupt(*args, **kwargs):
+            output, error = communicate(*args, **kwargs)
+            response = json.loads(output)
+            manager.core.verify_plan_sha256(response)
+            assert response["result"]["operation_status"] == "COMPLETE"
+            real_responses.append(response)
+            response["verification_token"] = old["verification_token"]
+            sealed = manager.core.attach_plan_sha256(response, generated_at=manager.core._utc_now())
+            manager.core.verify_plan_sha256(sealed)
+            return json.dumps(sealed).encode(), error
+        child.communicate = corrupt
+        return child
+    monkeypatch.setattr(test["processes"], "launch_verifier", damaged_pipe)
+    result = _real_fixture_verify(test)
+    assert real_responses and result["operation_status"] == "APPLIED_VERIFY_HOLD"
+    assert result["error"] == "PacketCheckpointRecoveryError"
+    current = _assert_real_verifier_stopped(test)
+    assert current["verification_token"] != old["verification_token"]
+    assert manager._journal(test["fixture"]["plan"])["phase"] == "APPLIED_VERIFY_HOLD"
