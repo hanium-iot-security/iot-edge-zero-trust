@@ -100,6 +100,8 @@ def test_migration_preserves_ids_values_release_fk_indexes_and_deleted_sequence(
         connection.execute("DELETE FROM firewall_rules WHERE id=900")
         release = connection.execute("INSERT INTO firewall_release_requests(firewall_rule_id,requested_by,reason,requested_at) VALUES (?,'test-admin','cleanup','2026-10-09T11:59:50Z')", (source,)).lastrowid
         before = dict(connection.execute("SELECT * FROM firewall_rules WHERE id=?", (source,)).fetchone())
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('sqlite_sequence','schema_migrations')")}
+        assert len(tables) == 19
         indexes = {value[0] for value in connection.execute("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='firewall_rules'")}
     assert apply_migrations(database, MIGRATIONS_DIR).applied_versions == [11]
     with sqlite3.connect(database) as connection:
@@ -107,6 +109,7 @@ def test_migration_preserves_ids_values_release_fk_indexes_and_deleted_sequence(
         connection.execute("PRAGMA foreign_keys=ON")
         after = dict(connection.execute("SELECT * FROM firewall_rules WHERE id=?", (source,)).fetchone())
         assert {key: after[key] for key in before} == before
+        assert {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('sqlite_sequence','schema_migrations')")} == tables
         assert after["scope"] == MQTT_IPV4_TCP_1883
         assert all(after[key] is None for key in rules.SCOPE_COLUMNS - {"scope"})
         assert connection.execute("SELECT firewall_rule_id FROM firewall_release_requests WHERE id=?", (release,)).fetchone()[0] == source

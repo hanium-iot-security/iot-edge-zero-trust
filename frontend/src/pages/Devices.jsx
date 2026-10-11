@@ -15,6 +15,7 @@ import {
 import DataTable from "../components/DataTable";
 import DetailModal from "../components/DetailModal";
 import EmptyState from "../components/EmptyState";
+import FirewallTrafficFields from "../components/FirewallTrafficFields";
 import ErrorState from "../components/ErrorState";
 import LoadingState from "../components/LoadingState";
 import PageHeader from "../components/PageHeader";
@@ -1288,22 +1289,7 @@ export default function Devices() {
                     </dd>
                   </div>
 
-                  <div>
-                    <dt>Protocol</dt>
-
-                    <dd>
-                      {selectedDevice.firewall_rule
-                        .protocol || "-"}
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Port</dt>
-
-                    <dd>
-                      {selectedDevice.firewall_rule.dest_port ?? "-"}
-                    </dd>
-                  </div>
+                  <FirewallTrafficFields rule={selectedDevice.firewall_rule} />
 
                   <div>
                     <dt>Action</dt>

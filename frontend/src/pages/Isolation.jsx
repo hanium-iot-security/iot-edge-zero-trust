@@ -20,6 +20,7 @@ import {
 import DataTable from "../components/DataTable";
 import DetailModal from "../components/DetailModal";
 import EmptyState from "../components/EmptyState";
+import FirewallTrafficFields from "../components/FirewallTrafficFields";
 import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
 import StatusBadge from "../components/StatusBadge";
@@ -3449,27 +3450,7 @@ export default function Isolation() {
                     </dd>
                   </div>
 
-                  <div>
-                    <dt>
-                      Protocol
-                    </dt>
-
-                    <dd>
-                      {selectedRule.protocol ||
-                        "-"}
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>
-                      Port
-                    </dt>
-
-                    <dd>
-                      {selectedRule.dest_port ??
-                        "-"}
-                    </dd>
-                  </div>
+                  <FirewallTrafficFields rule={selectedRule} />
 
                   <div>
                     <dt>
@@ -4383,27 +4364,7 @@ export default function Isolation() {
                     </dd>
                   </div>
 
-                  <div>
-                    <dt>
-                      Protocol
-                    </dt>
-
-                    <dd>
-                      {selectedHistory.firewall_rule.protocol ||
-                        "-"}
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>
-                      Port
-                    </dt>
-
-                    <dd>
-                      {selectedHistory.firewall_rule.dest_port ??
-                        "-"}
-                    </dd>
-                  </div>
+                  <FirewallTrafficFields rule={selectedHistory.firewall_rule} />
 
                   <div>
                     <dt>

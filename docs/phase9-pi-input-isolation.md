@@ -77,6 +77,14 @@ Wrapper 세 인자 호출은 기존 MQTT scope로 유지한다. 광역 check/ins
 
 기존 단위·회귀 검증은 임시 SQLite DB·가짜 Worker/runtime·Wrapper dry-run을 사용한다. 새/기존 DB, FK·sequence·원자성, UUID 재요청, 승인 이후 IP/정책/해제 변경, FAILED 잔여 정리와 복구 HOLD를 검사한다. 이 결과는 실제 Pi 차단 또는 재부팅 검증을 뜻하지 않는다.
 
+### 2026/10/11 최소 표시 보완과 로컬 회귀
+
+Devices 상세와 Isolation 정확한 해제·이력의 protocol/port를 공통 표시 컴포넌트로 연결했다. `PI_INPUT_IPV4_ALL` 응답의 NULL은 `전체 IPv4` / `모든 포트`로 표시하고 scope 없는 legacy의 TCP 1883 표시는 유지한다. 광역 승인 UI나 전체 상태 번역을 추가한 변경은 아니다.
+
+API·repository·worker·recovery·migration·wrapper·snapshot 회귀 **242개**, 프론트 **13개**가 통과했다. 프론트의 새 3개 계약 시험은 mock API 응답을 공통 컴포넌트에 전달하여 실제 React server renderer(`renderToStaticMarkup`)의 HTML을 확인한다. 이는 Pi의 운영 HTTP 서버·브라우저 화면을 검증한 결과와 구분한다. Vite production build, 새 helper/test의 lint와 `git diff --check`도 통과했으며 기존 500 kB 초과 bundle 경고는 남는다.
+
+정확한 실행 명령·출력 원문·exit code는 개인 보관 `output/phase9-resume-20261011/isolation-followup-validation-20261011.json`에 기록한다. 첫 실행의 전체 원문을 재구성하지 않고 동일 검증을 다시 실행해 기록했다. 임시 로컬 DB·가짜 runtime과 로컬 렌더/빌드의 근거이며 **운영 미배포** 상태다. 이 검증 중 Pi 설치·차단·운영 migration·서비스 정지·재부팅은 실행하지 않았다.
+
 ### 2026/10/9 검증 결과
 
 Windows에서 Worker·Wrapper·Snapshot 관련 184개와 DB·API·정책·복구 관련 494개가 통과했다. 두 묶음의 공통 42개를 제외한 동일 소스의 21개 suite를 Pi 별도 디렉토리에서 함께 실행하여 **636 passed in 101.94s**를 확인했다. Linux 시험 소스는 `6b866961af1200192b8fbe3ae83e8b1939d88f1f`, 전송 TAR SHA256은 `782550c692e0b526872ff6fe3a422434c58d57ef7306b703722f3539b01d97b2`다.
@@ -143,7 +151,9 @@ namespace inode가 host와 다르고 생성 당시 값과 같은지 확인한 �
 
 사용한 Wrapper SHA256은 `19e4d9632ef431df32b7ec799f69c86cf3d46e044854deae95bf5007be08f5fb`, 개인 보관 시험 스크립트 SHA256은 `4e30c331cc0e4130fb20f504c2925c183a80ac83b22b741b84dc85ec381b504a`, 원본 결과 JSON SHA256은 `75f23bb2d92c37e17efa223b4b107f7d4d0e5ed2ee15cfed99cec830030ad4aa`다. 개인 시험 스크립트·로그는 PR에 포함하지 않는다. 운영 Pi의 설치 파일 소유권·sudoers·서비스 권한·Worker/DB 상태 전이·실제 기기 통신·DHCP·재부팅은 이 시험으로 검증되지 않았다.
 
-### Pi 준비 점검과 운영 DB 사본 — 2026/10/9
+### Historical: Pi 준비 점검과 운영 DB 사본 — 2026/10/9
+
+이 절의 Commit·Boot·Session·HOLD와 미실행 복구 상태는 **2026/10/9 당시 기록**이다. 2026/10/11 현재 복구 상태는 다음 절과 구분한다.
 
 Pi 운영 코드와 원격 develop은 `53ec270219692784ce8864976511a52c962cec35`, Boot ID는 `5f5fc610-af8f-4437-9e2c-ccf2af422c91`다. 수집·특징·탐지·방화벽 관련 기존 서비스 6개가 active였고, API의 `NoNewPrivileges=yes`를 확인했다. 관리자 `192.168.0.3`, 공유기 `192.168.0.1`, Pi `192.168.0.20`을 읽기 관측으로 다시 확인했다. 이 값은 이후 설치 직전에 다시 확인한다.
 
@@ -165,9 +175,21 @@ Pi 운영 코드와 원격 develop은 `53ec270219692784ce8864976511a52c962cec35`
 
 이 실패는 DB backup·사본 검증 작업과 같은 시간대에 발생했다. 당시 DB commit과 sidecar 저장 지연도 관측됐지만, 시험 작업이 캡처 지연에 기여했는지는 확인되지 않았다. 손실 구간을 자동 승인하거나 캡처 지연 기준을 완화하지 않았다. 첫 운영 core dry-run은 보호된 `data/recovery/planned` 경로의 권한 오류로 거부됐으며 `database_committed=false`였다. 이후 관리자 권한의 읽기 전용 조회에서 Rule·IF 모두 `can_execute=true`·차단 사유 없음, ID 유지와 경계 `22:42:30 → 22:42:40 KST`를 확인했다. 계획은 손실 승인 전 초안으로 기록했고 실제 복구는 실행하지 않았다. 정확한 손실 구간 승인 이후 복구와 실제 Rule·IF·Trust 전진 확인은 남아 있다.
 
+### 2026/10/11 복구 완료의 읽기 근거
+
+보관한 공식 pair status는 Session 109와 110 정상 prefix의 두 replay에서 `REPLAY_COMPLETE`, 이어서 Session 110 → 111의 live 복구에서 progress `0 → 1 → 2`, `COMPLETE`를 기록한다. live 적용 감사는 68/69이며 원본 실패 tail 49639의 `FAILED/LATE_CAPTURE`, 파일 없음·캡처 시간 없음은 보존됐다. 실패 데이터를 성공 자료로 바꾸거나 공식 QC·학습에 편입했다는 뜻은 아니다.
+
+개인 보관 `final-live-evidence-audit-20261011.json`은 **89 checks / 0 failures**, SHA256 `128643f1bdb46117d541a9859271646c87911547584956b03c4f697d444c22a5`다. 최종 freshness 관측의 실제 UTC는 `2026-10-11T05:21:44.494114Z`이며 파일명의 0522는 라벨이다. 당시 Boot는 `ce3207f0-991b-4252-9da4-d1f90e25f5dd`, Pi Commit은 `542455f397588b97eb21fa075de70bbd470c3893`, Session 111은 RUNNING이다. 다섯 처리 checkpoint는 05:21:30Z, MQTT builder는 05:21:40Z, 세 기기 MQTT는 최신이며 추가 FAILED는 없었다. 수집·Subscriber·Broker는 기존 PID를 유지했다. active/pending 방화벽 규칙은 0개였다.
+
+이것은 보관한 관측 시점의 근거이며 설치 직전의 새 조회를 대신하지 않는다. 원격 DB·PCAP·backup 바이트의 운영 사후 SHA를 인증하지도 않는다. 복구에 사용한 Subscriber 6회와 writer 누적 151.171591초/180초 승인은 완료됐고 **새 배포·서비스 정지·재부팅에 재사용하지 않는다**.
+
+현재 광역 승인 UI는 구현하지 않았다. 기존 Devices와 Isolation의 상세·해제·이력 화면은 `PI_INPUT_IPV4_ALL`의 NULL protocol/port를 `전체 IPv4` / `모든 포트`로 표시하고, scope 없는 legacy 응답의 TCP 1883 표시는 유지한다. 기존 정확한 해제 UI와 서버의 관리자 승인 API를 구분한다. 전체 한글 상태 번역은 별도 후속 범위다.
+
 ## 이후 운영 설치 순서
 
 다음은 검토용 준비 순서이며 지금 운영에 적용하지 않는다.
+
+최종 candidate·읽기 preflight·설치 경로·조건부 명령은 [운영 활성화 준비](phase9-pi-input-isolation-activation.md)에 정리한다. PR111의 현재 HEAD `949b9dd2de7170f303126e14f56be3cf1c52ad28`는 Pi의 PR108 복구 Commit을 포함하지 않는다. 현재 Pi Commit을 ancestor로 포함하는 통합 candidate를 검토한 뒤 배포해야 한다. 2026/10/11 read-only remote 조회의 develop은 여전히 `53ec270219692784ce8864976511a52c962cec35`였으며, 이는 Pi HEAD와 다르다.
 
 1. 원래 서비스별 active 상태와 일시정지 계획을 기록한다. 쓰기 서비스 정지 또는 기존 SQLite 온라인 백업 절차로 일관된 DB 사본과 필요한 WAL·현재 방화벽 규칙을 보관한다. 별도 DB 사본에서 migration 011의 FK/integrity/원래 ID·높은 sequence 보존을 확인한다.
 2. 실제 관리자·라우터·Pi IPv4를 재확인하고 root 소유 보호 디렉토리/파일을 먼저 준비한다. 새 Wrapper에서는 기존 MQTT insert도 이 보호 파일의 영향을 받는다. 이후 root:root 0755 Wrapper와 `NOSETENV` sudoers를 검토·설치하고 `visudo`로 확인한다. 관리 API의 기존 `NoNewPrivileges=true`는 유지한다.
