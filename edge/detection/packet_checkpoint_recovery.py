@@ -35,10 +35,13 @@ from edge.scripts.phase4_cutover_storage import (
 PLAN_SCHEMA_VERSION = "packet-checkpoint-gap-recovery-plan-v1"
 GAP_RECOVERY_MODE = "gap-recovery"
 LIVE_RESUME_MODE = "live-resume"
-RECOVERY_MODES = frozenset({GAP_RECOVERY_MODE, LIVE_RESUME_MODE})
+BOUNDED_REPLAY_MODE = "bounded-replay"
+RECOVERY_MODES = frozenset({GAP_RECOVERY_MODE, LIVE_RESUME_MODE, BOUNDED_REPLAY_MODE})
 EXECUTE_CONFIRMATION = "APPLY-PACKET-CHECKPOINT-GAP-RECOVERY"
 LIVE_RESUME_CONFIRMATION = "APPLY-PACKET-LIVE-RESUME"
 FAILED_TAIL_RESUME_CONFIRMATION = "APPLY-PACKET-FAILED-TAIL-LIVE-RESUME"
+BOUNDED_REPLAY_CONFIRMATION = "APPLY-PACKET-BOUNDED-REPLAY"
+FAILED_TAIL_BOUNDED_REPLAY_CONFIRMATION = "APPLY-PACKET-FAILED-TAIL-BOUNDED-REPLAY"
 PROCESSABLE_SKIP_PREFIX = "SKIP-PROCESSABLE-SESSIONS:"
 _MIGRATION_005_SCHEMA_SHA256 = (
     "a4237ba4405a99a62c533e89fc75d68c76c09bfdc77e73587027022ac326bc0d"
@@ -229,19 +232,25 @@ def classify_skipped_sessions(
     return summaries
 
 
+def recovery_execute_confirmation(plan: Mapping[str, object]) -> str:
+    if plan.get("mode", GAP_RECOVERY_MODE) == BOUNDED_REPLAY_MODE:
+        return (FAILED_TAIL_BOUNDED_REPLAY_CONFIRMATION
+                if plan.get("allow_failed_current_session") is True
+                else BOUNDED_REPLAY_CONFIRMATION)
+    return (FAILED_TAIL_RESUME_CONFIRMATION
+            if plan.get("allow_failed_current_session") is True
+            else LIVE_RESUME_CONFIRMATION
+            if plan.get("mode", GAP_RECOVERY_MODE) == LIVE_RESUME_MODE
+            else EXECUTE_CONFIRMATION)
+
+
 def require_execute_confirmations(
     plan: Mapping[str, object],
     *,
     confirm: str,
     confirm_skip_processable: str | None,
 ) -> None:
-    expected_confirmation = (
-        FAILED_TAIL_RESUME_CONFIRMATION
-        if plan.get("allow_failed_current_session") is True
-        else LIVE_RESUME_CONFIRMATION
-        if plan.get("mode", GAP_RECOVERY_MODE) == LIVE_RESUME_MODE
-        else EXECUTE_CONFIRMATION
-    )
+    expected_confirmation = recovery_execute_confirmation(plan)
     if confirm != expected_confirmation:
         raise PacketCheckpointRecoveryError("execute confirmation mismatch")
     expected = f"{PROCESSABLE_SKIP_PREFIX}{plan['plan_sha256']}"
@@ -308,6 +317,15 @@ def _failed_capture_tail_evidence(
     }
 
 
+def _bounded_replay_evidence(connection: sqlite3.Connection, target_session_id: str) -> dict[str, object] | None:
+    evidence = recovery_repository.get_bounded_replay_target_evidence(connection, target_session_id)
+    if evidence is not None:
+        running = recovery_repository.list_running_capture_sessions(connection)
+        evidence["later_running_session"] = (dict(recovery_repository.get_capture_session(connection, running[0]["session_id"]))
+                                             if len(running) == 1 else None)
+    return evidence
+
+
 def build_recovery_plan(
     connection: sqlite3.Connection,
     *,
@@ -351,7 +369,7 @@ def build_recovery_plan(
         blocking_reasons.append("CHECKPOINT_NOT_FOUND")
     failed_tail_evidence = None
     if allow_failed_current_session:
-        if mode != LIVE_RESUME_MODE or current_session is None or current_session["status"] != "FAILED":
+        if mode not in (LIVE_RESUME_MODE, BOUNDED_REPLAY_MODE) or current_session is None or current_session["status"] != "FAILED":
             blocking_reasons.append("FAILED_TAIL_RESUME_REQUIRES_FAILED_SOURCE_AND_LIVE_MODE")
         else:
             failed_tail_evidence = _failed_capture_tail_evidence(connection, current_session, checkpoint)
@@ -363,7 +381,7 @@ def build_recovery_plan(
         blocking_reasons.append("CURRENT_SESSION_NOT_COMPLETED")
     if target_session is None:
         blocking_reasons.append("TARGET_SESSION_NOT_FOUND")
-    elif mode == GAP_RECOVERY_MODE and target_session["status"] != "COMPLETED":
+    elif mode in (GAP_RECOVERY_MODE, BOUNDED_REPLAY_MODE) and target_session["status"] != "COMPLETED":
         blocking_reasons.append("TARGET_SESSION_NOT_COMPLETED")
     elif mode == LIVE_RESUME_MODE and target_session["status"] != "RUNNING":
         blocking_reasons.append("TARGET_SESSION_NOT_RUNNING")
@@ -398,7 +416,7 @@ def build_recovery_plan(
             blocking_reasons.append("TARGET_SESSION_READINESS_MISSING")
     else:
         target_first = target_readiness.first_window_start
-        if mode == GAP_RECOVERY_MODE and not target_readiness.full_ready:
+        if mode in (GAP_RECOVERY_MODE, BOUNDED_REPLAY_MODE) and not target_readiness.full_ready:
             blocking_reasons.append("TARGET_SESSION_NOT_FULL_READY")
         elif mode == LIVE_RESUME_MODE:
             if (
@@ -425,6 +443,67 @@ def build_recovery_plan(
         or running_sessions[0]["session_id"] != target_session_id
     ):
         blocking_reasons.append("LIVE_RESUME_RUNNING_SESSION_MISMATCH")
+
+    bounded_replay = None
+    if mode == BOUNDED_REPLAY_MODE:
+        bounded_replay = _bounded_replay_evidence(connection, target_session_id)
+        if bounded_replay is not None:
+            replay_end = bounded_replay["replay_end"]
+            if checkpoint is not None:
+                target_minimum_id = connection.execute(
+                    "SELECT MIN(f.id) FROM packet_feature_logs f JOIN packet_capture_segments g ON g.id=f.capture_segment_id "
+                    "WHERE g.capture_session_id=? AND (?='packet_if' OR f.direction='INBOUND')",
+                    (target_session["id"], detector_name)).fetchone()[0]
+                if (target_minimum_id is not None and checkpoint["last_processed_id"] is not None
+                        and checkpoint["last_processed_id"] >= target_minimum_id):
+                    blocking_reasons.append("BOUNDED_REPLAY_TARGET_FEATURE_IDS_ALREADY_PASSED")
+                if current_session is not None and checkpoint["last_completed_window_end"] is not None:
+                    source_maximum_id = connection.execute(
+                        "SELECT MAX(f.id) FROM packet_feature_logs f JOIN packet_capture_segments g ON g.id=f.capture_segment_id "
+                        "WHERE g.capture_session_id=? AND unixepoch(f.window_end)<=unixepoch(?) "
+                        "AND (?='packet_if' OR f.direction='INBOUND')",
+                        (current_session["id"], checkpoint["last_completed_window_end"], detector_name)).fetchone()[0]
+                    if (source_maximum_id is not None and (checkpoint["last_processed_id"] is None
+                            or checkpoint["last_processed_id"] < source_maximum_id)):
+                        blocking_reasons.append("BOUNDED_REPLAY_SOURCE_FEATURES_NOT_CONSUMED")
+            if (current_session is not None and current_session["status"] == "COMPLETED"
+                    and (current_session["ended_at"] is None or current_readiness is None
+                         or not current_readiness.full_ready
+                         or parse_db_utc(current_session["ended_at"]) < current_readiness.packet_feature_ready_through)):
+                blocking_reasons.append("BOUNDED_REPLAY_SOURCE_NOT_CLOSED_FULL_READY")
+            if (target_session["ended_at"] is None or replay_end is None
+                    or parse_db_utc(target_session["ended_at"]) < parse_db_utc(replay_end)
+                    or connection.execute(
+                        "SELECT 1 FROM packet_capture_segments WHERE capture_session_id=? "
+                        "AND (status NOT IN ('PROCESSED','EMPTY') OR error_code IS NOT NULL) LIMIT 1",
+                        (target_session["id"],)).fetchone() is not None):
+                blocking_reasons.append("BOUNDED_REPLAY_TARGET_NOT_NORMAL_FULL_READY")
+            if current_session is not None and current_session["first_window_start"] is not None:
+                successors = connection.execute(
+                    "SELECT session_id,first_window_start FROM packet_capture_sessions "
+                    "WHERE unixepoch(first_window_start)>unixepoch(?) "
+                    "ORDER BY unixepoch(first_window_start),id LIMIT 2",
+                    (current_session["first_window_start"],)).fetchall()
+                if (not successors or successors[0]["session_id"] != target_session_id
+                        or len(successors) > 1 and parse_db_utc(successors[0]["first_window_start"]) == parse_db_utc(successors[1]["first_window_start"])):
+                    blocking_reasons.append("BOUNDED_REPLAY_TARGET_NOT_NEXT_SESSION")
+            if (failed_tail_evidence is not None and
+                    parse_db_utc(target_session["first_window_start"]) != parse_db_utc(failed_tail_evidence["window_end"])):
+                blocking_reasons.append("BOUNDED_REPLAY_FAILED_TAIL_BOUNDARY_MISMATCH")
+            if target_first is not None and replay_end is not None and connection.execute(
+                    "SELECT 1 FROM packet_capture_segments WHERE capture_session_id<>? "
+                    "AND unixepoch(window_start)<unixepoch(?) AND unixepoch(window_end)>unixepoch(?) LIMIT 1",
+                    (target_session["id"], replay_end, target_session["first_window_start"])).fetchone():
+                blocking_reasons.append("BOUNDED_REPLAY_OVERLAPPING_SESSION")
+            if len(running_rows) > 1:
+                blocking_reasons.append("BOUNDED_REPLAY_RUNNING_SESSION_MISMATCH")
+            elif running_rows:
+                later = recovery_repository.get_capture_session(connection, running_rows[0]["session_id"])
+                bounded_replay["later_running_session"] = dict(later)
+                if (later["session_id"] == target_session_id or later["ended_at"] is not None
+                        or later["first_window_start"] is None or replay_end is None
+                        or parse_db_utc(later["first_window_start"]) < parse_db_utc(replay_end)):
+                    blocking_reasons.append("BOUNDED_REPLAY_RUNNING_SESSION_MISMATCH")
 
     existing_recovery = recovery_repository.get_existing_recovery(
         connection,
@@ -463,6 +542,8 @@ def build_recovery_plan(
             checkpoint_window_end=format_db_utc(checkpoint_window),
             target_first_window_start=format_db_utc(target_first),
         )
+    if mode == BOUNDED_REPLAY_MODE and sessions_between:
+        blocking_reasons.append("BOUNDED_REPLAY_INTERMEDIATE_SESSION")
     skips_processable_sessions = any(
         row["classification"] == "SKIPPED_FULL_READY_COMPLETED"
         for row in sessions_between
@@ -478,6 +559,7 @@ def build_recovery_plan(
         "mode": mode,
         "allow_failed_current_session": allow_failed_current_session,
         "failed_current_tail": failed_tail_evidence,
+        **({"bounded_replay": bounded_replay} if mode == BOUNDED_REPLAY_MODE else {}),
         "repository_root": repository_state.get("repository_root"),
         "repository_commit": repository_state.get("repository_commit"),
         "repository_state": dict(repository_state),
@@ -608,13 +690,7 @@ def _execute_command(
         "--artifact-dir",
         "<ARTIFACT_DIR>",
         "--confirm",
-        (
-            FAILED_TAIL_RESUME_CONFIRMATION
-            if plan.get("allow_failed_current_session") is True
-            else LIVE_RESUME_CONFIRMATION
-            if plan.get("mode", GAP_RECOVERY_MODE) == LIVE_RESUME_MODE
-            else EXECUTE_CONFIRMATION
-        ),
+        recovery_execute_confirmation(plan),
     ]
     if plan["summary"]["skips_processable_sessions"]:
         command.extend(

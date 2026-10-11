@@ -2220,3 +2220,92 @@ def test_producer_and_orchestrator_checkpoints_stay_consistent(SessionLocal, reg
                 == outcome.cutoff
             )
         assert _completed(db, TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE) == outcome.cutoff
+
+
+
+def _sign_bounded_orchestrator_audit(SessionLocal, state):
+    from edge.detection.packet_checkpoint_recovery import attach_plan_sha256
+    from edge.detection.packet_checkpoint_recovery_repository import bounded_replay_target_evidence
+
+    with SessionLocal() as db:
+        target = db.execute(text("SELECT * FROM packet_capture_sessions WHERE session_id=:id"),
+                            {"id": LIVE_RESUME_TARGET_SESSION_ID}).mappings().one()
+        segments = list(db.execute(text("SELECT * FROM packet_capture_segments WHERE capture_session_id=:id ORDER BY window_start,id"),
+                                   {"id": target["id"]}).mappings())
+        features = list(db.execute(text("SELECT f.* FROM packet_feature_logs f JOIN packet_capture_segments g ON g.id=f.capture_segment_id "
+                                       "WHERE g.capture_session_id=:id ORDER BY f.id"), {"id": target["id"]}).mappings())
+        bound = bounded_replay_target_evidence(target, segments, features)
+        bound["later_running_session"] = None
+        plan = attach_plan_sha256({"mode": "bounded-replay", "bounded_replay": bound,
+            "detector_name": PACKET_RULE, "source_table": "packet_feature_logs",
+            "current_session_id": PACKET_SESSION_ID, "target_session_id": LIVE_RESUME_TARGET_SESSION_ID,
+            "sessions_between": [], "checkpoint": {
+                "before": {"last_processed_id": state["previous_feature_id"], "last_completed_window_end": format_db_utc(state["boundary_before"])},
+                "after": {"last_processed_id": state["previous_feature_id"], "last_completed_window_end": format_db_utc(state["resume_boundary"])}}}, generated_at=BASE)
+        db.execute(text("UPDATE packet_checkpoint_recoveries SET plan_json=:plan,plan_sha256=:sha WHERE detector_name='packet_rule'"),
+                   {"plan": json.dumps(plan, sort_keys=True), "sha": plan["plan_sha256"]})
+        db.commit()
+    return plan
+
+
+def test_bounded_replay_audit_catches_up_then_consumes_closed_target_and_stops_before_later_session(SessionLocal):
+    state = _seed_live_resume_orchestrator_state(SessionLocal, target_status="COMPLETED")
+    _sign_bounded_orchestrator_audit(SessionLocal, state)
+    with SessionLocal() as db:
+        _insert_processed_packet_window(db, session_id="99999999-9999-4999-8999-999999999999",
+                                       window_start=state["producer_cutoff"] + timedelta(days=1), session_status="RUNNING",
+                                       packet_count=500, total_bytes=5000)
+        db.commit()
+    catchup = run_orchestration_cycle(session_factory=SessionLocal, registry=state["registry"])
+    assert catchup.status == CYCLE_COMPLETED and catchup.cutoff == state["resume_boundary"]
+    assert all(row.detector_name != PACKET_RULE for row in catchup.stage_results)
+    replay = run_orchestration_cycle(session_factory=SessionLocal, registry=state["registry"])
+    assert replay.status == CYCLE_COMPLETED and replay.cutoff == state["producer_cutoff"]
+    packet = next(row for row in replay.stage_results if row.detector_name == PACKET_RULE)
+    assert packet.capture_session_id == LIVE_RESUME_TARGET_SESSION_ID and packet.selected_count == 1
+    with SessionLocal() as db:
+        row = checkpoints.get_detector_checkpoint(db, detector_name=PACKET_RULE, source_table="packet_feature_logs")
+        assert row["last_processed_id"] == state["target_feature_id"]
+        assert _completed(db, TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE) == state["producer_cutoff"]
+    stopped = run_orchestration_cycle(session_factory=SessionLocal, registry=state["registry"])
+    assert stopped.status == CYCLE_SKIPPED_NO_NEW_WINDOW
+
+
+@pytest.mark.parametrize("mutation", ["unsigned", "wrong_end", "target_value", "missing_bound", "skipped_count"])
+def test_bounded_replay_catchup_rejects_unsigned_changed_or_incomplete_closed_target_audit(SessionLocal, mutation):
+    from edge.detection.packet_checkpoint_recovery import attach_plan_sha256
+    state = _seed_live_resume_orchestrator_state(SessionLocal, target_status="COMPLETED")
+    plan = _sign_bounded_orchestrator_audit(SessionLocal, state)
+    with SessionLocal() as db:
+        if mutation == "target_value":
+            db.execute(text("UPDATE packet_feature_logs SET total_bytes=999 WHERE id=:id"), {"id": state["target_feature_id"]})
+        elif mutation == "skipped_count":
+            db.execute(text("UPDATE packet_checkpoint_recoveries SET skipped_session_count=1"))
+        else:
+            if mutation == "missing_bound":
+                plan.pop("bounded_replay")
+            else:
+                plan["bounded_replay"]["replay_end"] = format_db_utc(state["producer_cutoff"] + timedelta(seconds=10))
+            if mutation != "unsigned":
+                plan = attach_plan_sha256(plan, generated_at=BASE)
+            db.execute(text("UPDATE packet_checkpoint_recoveries SET plan_json=:plan,plan_sha256=:sha"),
+                       {"plan": json.dumps(plan, sort_keys=True), "sha": plan["plan_sha256"]})
+        db.commit()
+    result = run_orchestration_cycle(session_factory=SessionLocal, registry=state["registry"])
+    assert result.status == CYCLE_SKIPPED_NO_NEW_WINDOW
+    with SessionLocal() as db:
+        assert _completed(db, TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE) == state["boundary_before"]
+
+
+
+def test_bounded_replay_catchup_does_not_adopt_an_older_unapproved_range(SessionLocal):
+    state = _seed_live_resume_orchestrator_state(SessionLocal, target_status="COMPLETED")
+    _sign_bounded_orchestrator_audit(SessionLocal, state)
+    with SessionLocal() as db:
+        db.execute(text("UPDATE detector_checkpoints SET last_processed_id=NULL,last_completed_window_end=:start,updated_at=:start "
+                        "WHERE detector_name=:detector AND source_table=:source"),
+                   {"start": format_db_utc(BASE), "detector": TRUST_DETECTOR_NAME, "source": TRUST_SOURCE_TABLE})
+        db.commit()
+        transition = resolve_packet_live_resume_transition(db, registry=state["registry"], range_start=BASE,
+                                                           cutoff=state["producer_cutoff"])
+    assert transition is None

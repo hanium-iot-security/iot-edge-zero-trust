@@ -85,7 +85,7 @@ def _kwargs(fixture):
 
 
 def _execute(fixture, **kwargs):
-    return pair.execute_pair(**_kwargs(fixture), confirm=pair.CONFIRM + fixture["plan"]["plan_sha256"], **kwargs)
+    return pair.execute_pair(**_kwargs(fixture), confirm=pair.confirmation_prefix(fixture["plan"]) + fixture["plan"]["plan_sha256"], **kwargs)
 
 
 def _audits(fixture):
@@ -769,3 +769,124 @@ def test_failed_tail_manager_preserves_source_and_completes_only_after_real_targ
     with sqlite3.connect(fixture["database"]) as db:
         assert db.execute("SELECT * FROM packet_capture_sessions WHERE session_id=?", (CURRENT_SESSION,)).fetchone() == source
         assert db.execute("SELECT * FROM packet_capture_segments WHERE id=?", (fixture["tail_id"],)).fetchone() == tail
+
+
+@pytest.fixture
+def replay_fixture(fixture):
+    with sqlite3.connect(fixture["database"]) as db:
+        db.execute("UPDATE packet_capture_sessions SET status='COMPLETED',ended_at=? WHERE session_id=?",
+                   (_db_utc(TARGET_FIRST + timedelta(seconds=20)), TARGET_SESSION))
+    output = fixture["output"].with_name("bounded-replay-plan.json")
+    plan = pair.inspect_pair(db_path=fixture["database"], repository_root=fixture["root"],
+                             current_session_id=CURRENT_SESSION, target_session_id=TARGET_SESSION,
+                             approved_by="admin-fixture", reason="approved preserved replay",
+                             plan_output=output, mode=core.BOUNDED_REPLAY_MODE)
+    assert plan["can_execute"], plan["blocking_reasons"]
+    fixture.update(output=output, plan=plan)
+    fixture["clock"][0] = TARGET_FIRST + timedelta(days=2)
+    return fixture
+
+
+def _finish_replay(fixture, *, trust_pending=False):
+    end = fixture["plan"]["bounded_replay"]["replay_end"]
+    with sqlite3.connect(fixture["database"]) as db:
+        for name in pair.DETECTORS:
+            maximum = db.execute(
+                "SELECT MAX(f.id) FROM packet_feature_logs f JOIN packet_capture_segments g ON g.id=f.capture_segment_id "
+                "JOIN packet_capture_sessions s ON s.id=g.capture_session_id WHERE s.session_id=? "
+                "AND (?='packet_if' OR f.direction='INBOUND')", (TARGET_SESSION, name)).fetchone()[0]
+            db.execute("UPDATE detector_checkpoints SET last_processed_id=?,last_completed_window_end=?,updated_at=? "
+                       "WHERE detector_name=?", (maximum, end, end, name))
+        for name, source in (("trust_score_v2", "detection_events"), ("mqtt_feature_builder", "mqtt_logs")):
+            boundary = fixture["plan"]["boundary"] if name == "trust_score_v2" and trust_pending else end
+            db.execute("INSERT INTO detector_checkpoints(detector_name,source_table,last_processed_id,last_completed_window_end,updated_at) "
+                       "VALUES(?,?,NULL,?,?) ON CONFLICT(detector_name,source_table) DO UPDATE SET "
+                       "last_completed_window_end=excluded.last_completed_window_end,updated_at=excluded.updated_at",
+                       (name, source, boundary, boundary))
+
+
+def test_bounded_replay_requires_actual_end_and_trust_without_live_freshness(replay_fixture):
+    f = replay_fixture
+    assert _execute(f)["operation_status"] == "APPLIED_PENDING_PROGRESS"
+    assert pair.status_pair(**_kwargs(f))["operation_status"] != "REPLAY_COMPLETE"
+    _finish_replay(f, trust_pending=True)
+    assert pair.status_pair(**_kwargs(f))["operation_status"] == "APPLIED_PENDING_PROGRESS"
+    _finish_replay(f)
+    result = pair.status_pair(**_kwargs(f))
+    assert result["operation_status"] == "REPLAY_COMPLETE"
+    assert result["live_recovery_complete"] is False
+    assert result["progress_advances"] == 0
+    assert result["replay_end"] == _db_utc(TARGET_FIRST + timedelta(seconds=20))
+    assert len(_audits(f)) == 2
+    assert _execute(f, resume=True)["operation_status"] == "REPLAY_COMPLETE"
+    assert len(_audits(f)) == 2
+
+
+def test_bounded_replay_does_not_accept_live_confirmation(replay_fixture):
+    f = replay_fixture
+    with pytest.raises(core.PacketCheckpointRecoveryError, match="approval mismatch"):
+        pair.execute_pair(**_kwargs(f), confirm=pair.CONFIRM + f["plan"]["plan_sha256"])
+    assert _audits(f) == []
+
+
+def test_bounded_replay_partial_resume_only_applies_pending_if(replay_fixture, monkeypatch):
+    f = replay_fixture
+    original = core._execute_locked_recovery
+    calls = []
+    def fail_if(**prepared):
+        calls.append(prepared["plan"]["detector_name"])
+        if calls[-1] == "packet_if":
+            raise core.PacketCheckpointRecoveryError("fixture IF failure")
+        return original(**prepared)
+    monkeypatch.setattr(core, "_execute_locked_recovery", fail_if)
+    assert _execute(f)["operation_status"] == "PARTIAL_HOLD"
+    assert len(_audits(f)) == 1
+    monkeypatch.setattr(core, "_execute_locked_recovery", original)
+    assert _execute(f, resume=True)["operation_status"] == "APPLIED_PENDING_PROGRESS"
+    assert len(_audits(f)) == 2
+    _finish_replay(f)
+    assert pair.status_pair(**_kwargs(f))["operation_status"] == "REPLAY_COMPLETE"
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE packet_feature_logs SET total_bytes=61 WHERE id=2",
+    "UPDATE packet_capture_segments SET captured_duration_seconds=9.8 WHERE id=3",
+    "UPDATE packet_capture_sessions SET ended_at='2026-08-06T10:01:30Z' WHERE status='COMPLETED' AND capture_interface='eth-target'",
+])
+def test_bounded_replay_rejects_closed_input_mutation_after_audit(replay_fixture, sql):
+    f = replay_fixture
+    _execute(f)
+    _finish_replay(f)
+    with sqlite3.connect(f["database"]) as db:
+        db.execute(sql)
+    with pytest.raises(core.PacketCheckpointRecoveryError, match="bounded replay target or fixed input changed"):
+        pair.status_pair(**_kwargs(f))
+
+
+def test_bounded_replay_terminal_requires_required_mqtt_cutoffs(replay_fixture):
+    f = replay_fixture
+    f["runtime"]["enabled"].extend(["mqtt_feature_rule", "mqtt_message_rule"])
+    f["runtime"]["required"].extend(["mqtt_feature_rule", "mqtt_message_rule"])
+    output = f["output"].with_name("bounded-replay-mqtt.json")
+    plan = pair.inspect_pair(db_path=f["database"], repository_root=f["root"],
+                             current_session_id=CURRENT_SESSION, target_session_id=TARGET_SESSION,
+                             approved_by="admin-fixture", reason="approved preserved replay",
+                             plan_output=output, mode=core.BOUNDED_REPLAY_MODE)
+    f.update(output=output, plan=plan)
+    _execute(f)
+    _finish_replay(f)
+    assert pair.status_pair(**_kwargs(f))["operation_status"] != "REPLAY_COMPLETE"
+    with sqlite3.connect(f["database"]) as db:
+        for name, source in (("mqtt_feature_rule", "feature_logs"), ("mqtt_message_rule", "mqtt_logs")):
+            db.execute("INSERT INTO detector_checkpoints VALUES(?,?,NULL,?,?)",
+                       (name, source, plan["bounded_replay"]["replay_end"], plan["bounded_replay"]["replay_end"]))
+    assert pair.status_pair(**_kwargs(f))["operation_status"] == "REPLAY_COMPLETE"
+
+
+def test_cli_bounded_replay_terminal_is_success(replay_fixture, capsys):
+    f = replay_fixture
+    _execute(f)
+    _finish_replay(f)
+    assert cli.main(["status", "--plan-file", str(f["output"]), "--db-path", str(f["database"]),
+                     "--artifact-dir", str(f["artifacts"])]) == 0
+    assert json.loads(capsys.readouterr().out)["operation_status"] == "REPLAY_COMPLETE"

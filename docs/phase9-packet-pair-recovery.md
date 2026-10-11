@@ -9,6 +9,37 @@ Rule → IF 순서로 호출한다. 합집합 runtime 잠금을 한 번 획득�
 각각 별도 backup/transaction/audit를 만든다. Rule commit 후 IF 실패는 부분 완료이며
 자동 rollback이나 전체 backup 복원을 하지 않는다.
 
+## 종료된 정상 구간 재처리
+
+`dry-run --mode bounded-replay`는 바로 다음 **COMPLETED** Session에 보존된 정상 입력을
+먼저 처리하기 위한 명시적 모드다. 기본값인 `live-resume`의 동작은 유지한다.
+원본은 처리를 끝낸 COMPLETED Session이거나, 위의 `--allow-failed-current-session`을
+함께 승인한 미수집 FAILED 마지막 구간이어야 한다. FAILED 경로에서는 마지막 10초
+구간의 끝과 대상의 첫 경계가 정확히 같아야 한다.
+
+대상은 모든 구간이 PROCESSED/EMPTY로 연속 준비돼 있고 종료 시각이 준비 경계를
+덮어야 한다. 중간 Session과 겹치는 다른 수집 구간을 건너뛰지 않는다. 더 뒤에 새
+RUNNING Session이 있더라도 그것의 첫 경계가 보존 대상의 끝보다 빠르면 차단한다.
+두 child 계획은 대상의 전체 Session·Segment·Feature 입력 해시, 시작·끝·행 수 및
+나중 RUNNING Session의 식별자를 같은 `bounded_replay`에 고정한다.
+
+이 모드의 pair 승인은 `APPLY-PACKET-PAIR-BOUNDED-REPLAY:<PAIR_SHA256>`이다.
+각 child는 일반 원본에 `APPLY-PACKET-BOUNDED-REPLAY`, FAILED 예외 원본에
+`APPLY-PACKET-FAILED-TAIL-BOUNDED-REPLAY`를 사용한다. live-resume의 승인 문자열로는
+실행할 수 없다. manager는 해당 pair 계획을 그대로 바인딩하며 모드를 바꾸지 않는다.
+
+감사 적용은 기존 ID를 보존하고 대상 첫 경계만 이동한다. 이후 Orchestrator가 실제
+정상 입력을 처리해야 한다. 두 Packet 탐지기가 대상의 마지막 특징 ID와 고정 끝 경계에
+도달하고, 필수 MQTT 처리와 Trust도 끝까지 진행하며 처리되지 않은 대상 이벤트가
+없을 때 `REPLAY_COMPLETE`로 표시한다. 오래된 보존 자료를 처리하므로 현시각 기준
+45초 신선도와 두 번의 실시간 전진은 이 상태에 적용하지 않는다.
+
+`REPLAY_COMPLETE`는 보존 대상의 재처리 완료다. 현재 RUNNING Session의 실시간 복구
+완료를 뜻하지 않는다. 전원을 꺼 둔 구간을 넘어 현재 수집으로 이어가려면, 재처리를
+끝낸 Session에서 현재 Session으로 **새 live-resume 계획과 승인**을 만든다. 기존
+10초 손실 승인을 전원 종료 구간 전체에 자동으로 확대하지 않는다. `status`/`resume`는
+원래 감사·백업·입력 해시를 재검사하고 이미 적용된 child를 반복하지 않는다.
+
 ## 지원 경로와 승인
 
 지원 경로는 COMPLETED 원본 Session의 처리를 끝낸 두 Packet checkpoint에서,
@@ -20,7 +51,7 @@ Rule → IF 순서로 호출한다. 합집합 runtime 잠금을 한 번 획득�
 없고 두 탐지기가 정상 준비 구간을 모두 소비했는지 단일 엔진이 각각 검사한다.
 기록된 PCAP 파일 이름이 있으나 파일이 사라진 경우나 처리 가능한 Feature가 있는 경우는
 이 예외가 아니며 차단한다. FAILED 기록과 입력 데이터는 그대로 보존한다.
-일반 FAILED 복구, 일반 gap recovery, 새로운 Migration은 이 CLI 범위에 없다.
+일반 FAILED 복구, 기존 모드의 임의 gap recovery, 새로운 Migration은 이 CLI 범위에 없다.
 원래 checkpoint ID를 보존하고 target 첫 경계만 바꾼다. 백업 이후 재검사,
 조건부 UPDATE, 보호 테이블 검사, DB integrity/FK 검사 등 단일 엔진의 안전 조건은 유지한다.
 
@@ -192,3 +223,22 @@ Windows Python 3.10.11에서 pair·manager **113 passed, 2 skipped**(Linux 전�
 전송 TAR SHA256은 `9c8b3e8e808b3ba3ffb75253c28aeb2df9cf1fcae10de8f1b5565daf2429ea4c`다.
 임시 SQLite·가상 서비스·소유한 시험 자식과 잠금을 사용했으며 실제 운영 복구 결과가 아니다.
 HTTP 계획 생성은 기본 false를 유지하고 FAILED opt-in 요청을 허용하지 않는다.
+
+
+## 2026/10/11 종료된 정상 자료 재처리 검증
+
+`bounded-replay`를 포함한 단일 엔진·Orchestrator·pair·manager 회귀는 Pi Python
+3.10.11의 별도 소스 사본에서 **375 passed in 38.11s, skip 없음**이었다. 합성
+SQLite·가상 서비스와 소유한 시험 프로세스만 사용했다. 같은 후보 소스의 보존 DB
+복사본 통합 시험은 **2 passed in 58.69s**였다. 후보 TAR SHA256은
+`79ed98c10bf1a66de28112f2de542f4ccf351203f8f63e19548b2d5a244fde40`이다.
+
+실자료 시험은 종료된 정상 Session의 738개 구간·5,218개 특징 행을 유지한 복사본에서
+기존 Rule139713/IF139714의 ID를 보존해 첫 경계로 이동한 뒤, 실제 탐지 Stage와
+Orchestrator·Trust를 실행했다. Rule144931/IF144932와 필수 MQTT·Trust가 원래 끝
+경계에 도달했고 `REPLAY_COMPLETE`, 재실행 불변, 입력값 변조 거부를 확인했다.
+
+수치 IF 예측·Boot·서비스 관측과 뒤의 RUNNING Session만 시험용으로 주입했다.
+실제 모델의 정확도, 운영 서비스 정지·복귀, 운영 DB 복구나 현재 수집의 실시간 완료를
+검증한 것은 아니다. 원본 DB·PCAP 압축본의 크기·전체 SHA256은 시험 후에도 같았다.
+운영 배포와 새로운 전원 종료 구간의 재개 승인은 별도로 남아 있다.

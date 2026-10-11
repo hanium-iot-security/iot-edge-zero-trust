@@ -1,6 +1,7 @@
 """Real pair audits with deterministic fake service/process lifecycle."""
 import json
 import os
+import sqlite3
 from pathlib import Path
 import subprocess
 import sys
@@ -375,7 +376,26 @@ def test_internal_worker_requires_approved_phase_and_current_receipt(fixture, mo
         manager.worker(fixture["path"], "arbitrary-token")
 
 
-def test_authorized_internal_worker_executes_original_pair_with_real_audits(fixture, monkeypatch):
+@pytest.mark.parametrize("mode", ["live-resume", "bounded-replay"])
+def test_authorized_internal_worker_executes_original_pair_with_real_audits(fixture, monkeypatch, mode):
+    if mode == "bounded-replay":
+        base = fixture["base"]
+        with sqlite3.connect(base["database"]) as db:
+            db.execute("UPDATE packet_capture_sessions SET status='COMPLETED',ended_at=? WHERE session_id=?",
+                       (base["plan"]["children"][0]["plan"]["target_session"]["packet_feature_ready_through"],
+                        base["plan"]["target_session_id"]))
+        output = base["output"].with_name("worker-bounded-pair.json")
+        signed = manager.pair.inspect_pair(db_path=base["database"], repository_root=base["root"],
+                                           current_session_id=base["plan"]["current_session_id"],
+                                           target_session_id=base["plan"]["target_session_id"],
+                                           approved_by="admin-fixture", reason="bounded worker test",
+                                           plan_output=output, mode=mode)
+        assert signed["can_execute"], signed["blocking_reasons"]
+        base.update(output=output, plan=signed)
+        path = output.with_name("worker-bounded-manager.json")
+        plan = manager.create_plan(pair_plan_file=output, db_path=base["database"],
+                                   artifact_dir=base["artifacts"], plan_output=path, system=fixture["system"])
+        fixture.update(path=path, plan=plan)
     launch(fixture)
     journal = manager._journal(fixture["plan"])
     journal.update(phase="WORKER_RUNNING", worker_token="approved-fixture-token")

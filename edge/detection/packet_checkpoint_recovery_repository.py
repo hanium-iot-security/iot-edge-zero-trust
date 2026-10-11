@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import hashlib
+import json
 import sqlite3
 from typing import Mapping, Sequence
 
@@ -438,3 +440,37 @@ def calculate_packet_feature_readiness(
         tuple(blocking_reasons),
         live_resume_reasons,
     )
+
+
+
+def bounded_replay_target_evidence(
+    session: Mapping[str, object],
+    segments: Sequence[Mapping[str, object]],
+    features: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """Bind a closed target's identity and exact immutable input rows."""
+    manifest = {"segments": [dict(row) for row in segments],
+                "features": [dict(row) for row in features]}
+    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return {"target_identity": dict(session),
+            "replay_start": session["first_window_start"],
+            "replay_end": segments[-1]["window_end"] if segments else None,
+            "segment_count": len(segments), "feature_row_count": len(features),
+            "input_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest()}
+
+
+def get_bounded_replay_target_evidence(
+    connection: sqlite3.Connection, session_id: str,
+) -> dict[str, object] | None:
+    session = get_capture_session(connection, session_id)
+    if session is None:
+        return None
+    segments = connection.execute(
+        "SELECT * FROM packet_capture_segments WHERE capture_session_id=? ORDER BY window_start,id",
+        (session["id"],),
+    ).fetchall()
+    features = connection.execute(
+        "SELECT f.* FROM packet_feature_logs f JOIN packet_capture_segments g ON g.id=f.capture_segment_id "
+        "WHERE g.capture_session_id=? ORDER BY f.id", (session["id"],),
+    ).fetchall()
+    return bounded_replay_target_evidence(dict(session), segments, features)

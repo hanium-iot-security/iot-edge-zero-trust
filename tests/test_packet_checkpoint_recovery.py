@@ -4123,3 +4123,197 @@ def test_gap_recovery_docs_preserve_orchestrator_gap_block_and_holdout_e2e_scope
     assert "packet_checkpoint_recoveries" in schema
     assert "run_until_for_capture_session" in core
     assert "Holdout" in core
+
+
+
+def _bounded_fixture(tmp_path, *, detector="packet_rule", failed=False):
+    fixture = _live_execute_fixture(tmp_path, detector_name=detector)
+    with sqlite3.connect(fixture["database"]) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("UPDATE packet_capture_sessions SET status='COMPLETED',ended_at=? WHERE session_id=?",
+                   (_db_utc(TARGET_READY_THROUGH), TARGET_SESSION))
+        if failed:
+            _add_uncaptured_failed_tail(db)
+            # The loss approval covers exactly one ten-second tail, no later gap.
+            shift = TARGET_FIRST - (CURRENT_READY_THROUGH + timedelta(seconds=10))
+            db.execute("UPDATE packet_capture_sessions SET first_window_start=?,ended_at=? WHERE session_id=?",
+                       (_db_utc(TARGET_FIRST - shift), _db_utc(TARGET_READY_THROUGH - shift), TARGET_SESSION))
+            for row in db.execute("SELECT id,window_start,window_end FROM packet_capture_segments WHERE capture_session_id="
+                                  "(SELECT id FROM packet_capture_sessions WHERE session_id=?)", (TARGET_SESSION,)).fetchall():
+                start = datetime.fromisoformat(row["window_start"].replace("Z", "+00:00")) - shift
+                end = datetime.fromisoformat(row["window_end"].replace("Z", "+00:00")) - shift
+                db.execute("UPDATE packet_capture_segments SET window_start=?,window_end=? WHERE id=?",
+                           (_db_utc(start), _db_utc(end), row["id"]))
+                db.execute("UPDATE packet_feature_logs SET window_start=?,window_end=? WHERE capture_segment_id=?",
+                           (_db_utc(start), _db_utc(end), row["id"]))
+        _insert_capture_session(db, session_id=RUNNING_SESSION_A, capture_interface="eth-later",
+                                first_window_start=TARGET_READY_THROUGH + timedelta(days=1), status="RUNNING")
+        maximum = db.execute(
+            "SELECT MAX(f.id) FROM packet_feature_logs f JOIN packet_capture_segments g ON g.id=f.capture_segment_id "
+            "JOIN packet_capture_sessions s ON s.id=g.capture_session_id WHERE s.session_id=? "
+            "AND (?='packet_if' OR f.direction='INBOUND')", (CURRENT_SESSION, detector)).fetchone()[0]
+        db.execute("UPDATE detector_checkpoints SET last_processed_id=? WHERE detector_name=?", (maximum, detector))
+        db.commit()
+    fixture["plan_output"] = tmp_path / "bounded-plan.json"
+    fixture["plan"] = packet_checkpoint_recovery.inspect_packet_checkpoint_recovery(
+        **_dry_run_arguments(tmp_path, database=fixture["database"], repository_root=fixture["repository_root"],
+                             plan_output=fixture["plan_output"], detector_name=detector, mode="bounded-replay"),
+        allow_failed_current_session=failed)
+    return fixture
+
+
+@pytest.mark.parametrize("detector", ["packet_rule", "packet_if"])
+@pytest.mark.parametrize("failed", [False, True])
+def test_bounded_replay_executes_only_audited_boundary_and_preserves_all_input(tmp_path, monkeypatch, detector, failed):
+    fixture = _bounded_fixture(tmp_path, detector=detector, failed=failed)
+    plan = fixture["plan"]
+    assert plan["can_execute"], plan["blocking_reasons"]
+    bound = plan["bounded_replay"]
+    assert bound["target_identity"]["status"] == "COMPLETED"
+    assert bound["feature_row_count"] == 2 and bound["segment_count"] == 2
+    assert bound["later_running_session"]["session_id"] == RUNNING_SESSION_A
+    assert len(bound["input_sha256"]) == 64
+    with sqlite3.connect(fixture["database"]) as db:
+        db.row_factory = sqlite3.Row
+        before = snapshot_protected_rows(db, requested_checkpoint_key=(detector, "packet_feature_logs"))
+    _allow_execute_on_test_platform(monkeypatch)
+    wrong = packet_checkpoint_recovery.FAILED_TAIL_RESUME_CONFIRMATION if failed else packet_checkpoint_recovery.LIVE_RESUME_CONFIRMATION
+    with pytest.raises(PacketCheckpointRecoveryError, match="confirmation mismatch"):
+        execute_packet_checkpoint_recovery(plan_file=fixture["plan_output"], db_path=fixture["database"],
+                                           artifact_dir=fixture["artifact_dir"], confirm=wrong)
+    result = execute_packet_checkpoint_recovery(plan_file=fixture["plan_output"], db_path=fixture["database"],
+                                               artifact_dir=fixture["artifact_dir"],
+                                               confirm=packet_checkpoint_recovery.recovery_execute_confirmation(plan))
+    assert result["transaction_total_changes_delta"] == 2
+    with sqlite3.connect(fixture["database"]) as db:
+        db.row_factory = sqlite3.Row
+        assert snapshot_protected_rows(db, requested_checkpoint_key=(detector, "packet_feature_logs")) == before
+        audit = db.execute("SELECT * FROM packet_checkpoint_recoveries").fetchone()
+        assert audit["last_processed_id_before"] == audit["last_processed_id_after"]
+        assert audit["last_completed_window_end_after"] == bound["replay_start"]
+        assert json.loads(audit["plan_json"])["bounded_replay"] == bound
+
+
+@pytest.mark.parametrize("change,reason", [
+    ("UPDATE packet_capture_sessions SET status='RUNNING',ended_at=NULL WHERE session_id='22222222-2222-4222-8222-222222222222'", "TARGET_SESSION_NOT_COMPLETED"),
+    ("UPDATE packet_capture_segments SET status='READY' WHERE capture_session_id=(SELECT id FROM packet_capture_sessions WHERE session_id='22222222-2222-4222-8222-222222222222') AND status='EMPTY'", "TARGET_SESSION_NOT_FULL_READY"),
+    ("UPDATE packet_capture_sessions SET first_window_start='2026-08-06T10:01:00Z' WHERE session_id='33333333-3333-4333-8333-333333333333'", "BOUNDED_REPLAY_RUNNING_SESSION_MISMATCH"),
+    ("UPDATE packet_capture_sessions SET ended_at=NULL WHERE session_id='11111111-1111-4111-8111-111111111111'", "BOUNDED_REPLAY_SOURCE_NOT_CLOSED_FULL_READY"),
+])
+def test_bounded_replay_rejects_unsealed_or_unready_target_and_earlier_running(tmp_path, change, reason):
+    fixture = _bounded_fixture(tmp_path)
+    with sqlite3.connect(fixture["database"]) as db:
+        db.row_factory = sqlite3.Row
+        db.execute(change)
+        db.commit()
+        plan = _build_plan(db, tmp_path=tmp_path, mode="bounded-replay")
+    assert not plan["can_execute"] and reason in plan["blocking_reasons"]
+
+
+def test_bounded_replay_never_skips_processable_intermediate_session(tmp_path):
+    fixture = _bounded_fixture(tmp_path)
+    with sqlite3.connect(fixture["database"]) as db:
+        db.row_factory = sqlite3.Row
+        first = CURRENT_READY_THROUGH + timedelta(seconds=10)
+        skipped = _insert_capture_session(db, session_id=PROCESSABLE_SKIP_SESSION, capture_interface="eth-mid", first_window_start=first)
+        _insert_capture_segment(db, session_pk=skipped, capture_interface="eth-mid", window_start=first, status="PROCESSED", feature_count=1)
+        db.commit()
+        plan = _build_plan(db, tmp_path=tmp_path, mode="bounded-replay")
+    assert not plan["can_execute"]
+    assert "BOUNDED_REPLAY_TARGET_NOT_NEXT_SESSION" in plan["blocking_reasons"]
+    assert "BOUNDED_REPLAY_INTERMEDIATE_SESSION" in plan["blocking_reasons"]
+
+
+def test_bounded_failed_tail_requires_original_opt_in_and_exact_next_window(tmp_path):
+    fixture = _bounded_fixture(tmp_path, failed=True)
+    with sqlite3.connect(fixture["database"]) as db:
+        db.row_factory = sqlite3.Row
+        plan = _build_plan(db, tmp_path=tmp_path, mode="bounded-replay")
+        assert not plan["can_execute"] and "CURRENT_SESSION_NOT_COMPLETED" in plan["blocking_reasons"]
+        db.execute("UPDATE packet_capture_sessions SET first_window_start=? WHERE session_id=?", (_db_utc(TARGET_FIRST), TARGET_SESSION))
+        db.commit()
+        plan = _build_plan(db, tmp_path=tmp_path, mode="bounded-replay", allow_failed_current_session=True)
+        assert not plan["can_execute"] and "BOUNDED_REPLAY_FAILED_TAIL_BOUNDARY_MISMATCH" in plan["blocking_reasons"]
+
+
+def test_bounded_replay_rejects_multiple_later_running_sessions(tmp_path):
+    fixture = _bounded_fixture(tmp_path)
+    with sqlite3.connect(fixture["database"]) as db:
+        db.row_factory = sqlite3.Row
+        _insert_capture_session(db, session_id=RUNNING_SESSION_B, capture_interface="eth-another",
+                                first_window_start=TARGET_READY_THROUGH + timedelta(days=2), status="RUNNING")
+        db.commit()
+        plan = _build_plan(db, tmp_path=tmp_path, mode="bounded-replay")
+    assert not plan["can_execute"] and "BOUNDED_REPLAY_RUNNING_SESSION_MISMATCH" in plan["blocking_reasons"]
+
+
+@pytest.mark.parametrize("change", [
+    "UPDATE packet_feature_logs SET total_bytes=61 WHERE id=(SELECT MIN(f.id) FROM packet_feature_logs f JOIN packet_capture_segments g ON g.id=f.capture_segment_id WHERE g.capture_session_id=(SELECT id FROM packet_capture_sessions WHERE session_id='22222222-2222-4222-8222-222222222222'))",
+    "UPDATE packet_capture_segments SET packet_count=3 WHERE capture_session_id=(SELECT id FROM packet_capture_sessions WHERE session_id='22222222-2222-4222-8222-222222222222')",
+    "UPDATE packet_capture_sessions SET capture_gap_start='2026-08-06T10:00:20Z' WHERE session_id='33333333-3333-4333-8333-333333333333'",
+    "UPDATE detector_checkpoints SET last_processed_id=43 WHERE detector_name='packet_rule'",
+])
+def test_bounded_replay_exact_input_and_successor_binding_rejects_stale_plan(tmp_path, monkeypatch, change):
+    fixture = _bounded_fixture(tmp_path)
+    with sqlite3.connect(fixture["database"]) as db:
+        db.execute(change)
+        db.commit()
+    _allow_execute_on_test_platform(monkeypatch)
+    with pytest.raises(PacketCheckpointRecoveryError, match="canonical plan changed"):
+        execute_packet_checkpoint_recovery(plan_file=fixture["plan_output"], db_path=fixture["database"],
+                                           artifact_dir=fixture["artifact_dir"], confirm=packet_checkpoint_recovery.BOUNDED_REPLAY_CONFIRMATION)
+    with sqlite3.connect(fixture["database"]) as db:
+        assert db.execute("SELECT COUNT(*) FROM packet_checkpoint_recoveries").fetchone()[0] == 0
+
+
+def test_bounded_replay_single_cli_exposes_only_dry_run_mode(tmp_path):
+    cli = importlib.import_module("edge.detection.run_packet_checkpoint_recovery")
+    parser = cli.build_parser()
+    args = parser.parse_args(["dry-run", "--mode", "bounded-replay", "--allow-failed-current-session",
+                              "--db-path", "db", "--repository-root", "root", "--detector", "packet_rule",
+                              "--current-session-id", CURRENT_SESSION, "--target-session-id", TARGET_SESSION,
+                              "--approved-by", "admin", "--reason", "replay", "--plan-output", "plan"])
+    assert args.mode == "bounded-replay" and args.allow_failed_current_session
+    with pytest.raises(SystemExit):
+        parser.parse_args(["execute", "--mode", "bounded-replay", "--plan-file", "plan", "--db-path", "db",
+                           "--artifact-dir", "artifacts", "--confirm", "confirmation"])
+
+
+
+def test_bounded_replay_rejects_ambiguous_next_session_even_without_overlapping_data(tmp_path):
+    fixture = _bounded_fixture(tmp_path)
+    with sqlite3.connect(fixture["database"]) as db:
+        db.row_factory = sqlite3.Row
+        _insert_capture_session(db, session_id=PROCESSABLE_SKIP_SESSION, capture_interface="eth-tied",
+                                first_window_start=TARGET_FIRST)
+        db.commit()
+        plan = _build_plan(db, tmp_path=tmp_path, mode="bounded-replay")
+    assert not plan["can_execute"] and "BOUNDED_REPLAY_TARGET_NOT_NEXT_SESSION" in plan["blocking_reasons"]
+
+
+def test_bounded_replay_completed_source_must_have_ended_after_its_final_input(tmp_path):
+    fixture = _bounded_fixture(tmp_path)
+    with sqlite3.connect(fixture["database"]) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("UPDATE packet_capture_sessions SET ended_at=? WHERE session_id=?",
+                   (_db_utc(CURRENT_FIRST), CURRENT_SESSION))
+        db.commit()
+        plan = _build_plan(db, tmp_path=tmp_path, mode="bounded-replay")
+    assert not plan["can_execute"] and "BOUNDED_REPLAY_SOURCE_NOT_CLOSED_FULL_READY" in plan["blocking_reasons"]
+
+
+
+@pytest.mark.parametrize("detector", ["packet_rule", "packet_if"])
+@pytest.mark.parametrize("before_id,reason", [
+    (None, "BOUNDED_REPLAY_SOURCE_FEATURES_NOT_CONSUMED"),
+    (0, "BOUNDED_REPLAY_SOURCE_FEATURES_NOT_CONSUMED"),
+    (2, "BOUNDED_REPLAY_TARGET_FEATURE_IDS_ALREADY_PASSED"),
+])
+def test_bounded_replay_requires_consumed_source_and_all_target_selected_ids_after_before(tmp_path, detector, before_id, reason):
+    fixture = _bounded_fixture(tmp_path, detector=detector)
+    with sqlite3.connect(fixture["database"]) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("UPDATE detector_checkpoints SET last_processed_id=? WHERE detector_name=?", (before_id, detector))
+        db.commit()
+        plan = _build_plan(db, tmp_path=tmp_path, detector_name=detector, mode="bounded-replay")
+    assert not plan["can_execute"] and reason in plan["blocking_reasons"]
