@@ -493,7 +493,7 @@ def verify(*, plan_file, system=None, processes=None, timeout=None, monotonic=No
             previous_mask = None
             try:
                 if os.name == "posix":
-                    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
+                    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT, signal.SIGHUP})
                 process = processes.launch_verifier(plan_file, token)
                 _record_launch(plan, "verifier", process, processes, journal)
                 journal["verification_launch_pending"] = False

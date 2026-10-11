@@ -29,14 +29,16 @@ def main(argv=None):
     if os.name == "posix" and (args.internal_supervisor or args.command == "verify"):
         def interrupted(signum, frame):
             raise manager.Error("manager interrupted")
-        signal.signal(signal.SIGTERM, interrupted)
+        signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP) if args.command == "verify" else (signal.SIGTERM, signal.SIGINT)
+        for number in signals:
+            signal.signal(number, interrupted)
     try:
         if args.internal_supervisor or args.internal_worker or args.internal_verifier:
             if os.name != "posix":
                 raise manager.Error("internal manager requires Linux")
             signal.signal(signal.SIGHUP, signal.SIG_IGN)
             if args.internal_verifier:
-                signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT})
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT, signal.SIGHUP})
                 result = manager.verifier(args.plan_file, args.verification_token)
                 print(json.dumps(result, ensure_ascii=False, sort_keys=True))
                 return 0

@@ -771,11 +771,13 @@ def test_cli_verify_installs_interrupt_cleanup_handler(fixture, monkeypatch, cap
     calls = []
     monkeypatch.setattr(cli, "os", SimpleNamespace(name="posix"))
     monkeypatch.setattr(cli.signal, "signal", lambda number, handler: calls.append((number, handler)))
+    monkeypatch.setattr(cli.signal, "SIGHUP", 1, raising=False)
     monkeypatch.setattr(manager, "verify", lambda **_: {"operation_status": "APPLIED_VERIFY_HOLD", "database_committed": True})
     assert cli.main(["verify", "--plan-file", str(fixture["path"])]) == 3
-    assert calls[0][0] == cli.signal.SIGTERM
-    with pytest.raises(manager.Error, match="interrupted"):
-        calls[0][1](cli.signal.SIGTERM, None)
+    assert {number for number, _ in calls} == {cli.signal.SIGTERM, cli.signal.SIGINT, cli.signal.SIGHUP}
+    for number, handler in calls:
+        with pytest.raises(manager.Error, match="interrupted"):
+            handler(number, None)
     capsys.readouterr()
 
 
@@ -789,7 +791,7 @@ def test_internal_verifier_unblocks_inherited_handoff_signals(fixture, monkeypat
     monkeypatch.setattr(cli.signal, "pthread_sigmask", lambda operation, signals: calls.append((operation, signals)), raising=False)
     monkeypatch.setattr(manager, "verifier", lambda *_: {"fresh": True})
     assert cli.main(["--internal-verifier", "--plan-file", str(fixture["path"]), "--verification-token", "fresh"]) == 0
-    assert calls == [(cli.signal.SIG_UNBLOCK, {cli.signal.SIGTERM, cli.signal.SIGINT})]
+    assert calls == [(cli.signal.SIG_UNBLOCK, {cli.signal.SIGTERM, cli.signal.SIGINT, cli.signal.SIGHUP})]
     capsys.readouterr()
 
 
@@ -869,6 +871,8 @@ try:
     stage = Path(configuration["stage"]).resolve(strict=True)
     source = Path(configuration["source"]).resolve(strict=True)
     approved_git = Path(configuration["repository"]).resolve(strict=True)
+    approved_plan = Path(configuration["manager_plan"]).resolve(strict=True)
+    assert approved_plan.is_relative_to(stage)
     assert state_path.is_relative_to(stage) and source.is_relative_to(stage) and approved_git.is_relative_to(stage)
     assert not (source / ".env").exists() and not (source.parent / ".env").exists()
     assert os.environ["DATABASE_URL"] == "sqlite:///:memory:"
@@ -882,6 +886,14 @@ try:
                 and kwargs.get("env") is None):
             cpu_queries.append("lscpu")  # NumPy 2 ARM/SVE support probe, read once during import.
             return original_popen(args, **kwargs)
+        if (not import_phase and isinstance(args, (list, tuple)) and len(args) == 8
+                and args[:5] == [sys.executable, "-m", "edge.detection.run_packet_recovery_pair", "--internal-verifier", "--plan-file"]
+                and Path(args[5]).resolve() == approved_plan and args[6] == "--verification-token"
+                and len(args[7]) == 32 and all(c in "0123456789abcdef" for c in args[7])
+                and not positional and kwargs.get("shell", False) is False
+                and kwargs.get("executable") is None and kwargs.get("env") is None
+                and Path(kwargs.get("cwd", "/")).resolve() == source):
+            return original_popen(args, **kwargs)  # The actual public CLI may launch only its bound verifier.
         if (not isinstance(args, (list, tuple)) or len(args) < 2 or args[0] != "git"
                 or args[1] not in {"rev-parse", "diff", "ls-files", "check-ignore"}
                 or Path(kwargs.get("cwd", "/")).resolve() != approved_git):
@@ -938,6 +950,7 @@ except BaseException:
     processes = RealProcesses()
     def update(*, hang=False, inactive=False):
         configured = dict(stage=str(stage), source=str(source), repository=str(base["root"]), trace=str(trace),
+                          manager_plan=str(fixture["path"]),
                           runtime=base["runtime"], clock=manager.core.format_db_utc(base["clock"][0]), hang=hang,
                           services=dict.fromkeys(manager.UNITS, "active"))
         if inactive:
@@ -1070,3 +1083,74 @@ def test_linux_real_verifier_resealed_stale_pipe_response_cannot_complete(isolat
     current = _assert_real_verifier_stopped(test)
     assert current["verification_token"] != old["verification_token"]
     assert manager._journal(test["fixture"]["plan"])["phase"] == "APPLIED_VERIFY_HOLD"
+
+
+
+@ISOLATED_LINUX
+@pytest.mark.parametrize("signal_name", ["SIGHUP", "SIGINT", "SIGTERM"])
+def test_linux_public_verify_interrupt_reaps_detached_verifier(isolated_linux_verifier, signal_name):
+    import signal
+    from types import SimpleNamespace
+    import time
+    test = isolated_linux_verifier
+    fixture = test["fixture"]
+    _advance(fixture["base"], 20)
+    test["update"](hang=True)
+    audits_before = _audits(fixture["base"])
+    processes = manager.Processes()
+    parent = subprocess.Popen([sys.executable, "-m", "edge.detection.run_packet_recovery_pair",
+                               "verify", "--plan-file", str(fixture["path"])],
+                              cwd=Path(manager.__file__).resolve().parents[2], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    processes.own(parent)
+    receipt = None
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            assert parent.poll() is None, "public verifier exited before the controlled observation"
+            assert time.monotonic() < deadline, "verifier did not reach the controlled observation"
+            try:
+                events = test["trace"]()
+                receipt = manager._receipt(fixture["plan"], "verifier")
+            except FileNotFoundError:
+                events, receipt = [], None
+            if (receipt and receipt.get("owner_pid") == parent.pid
+                    and receipt.get("owner_start_identity") == parent.start_identity
+                    and any(e["event"] == "service_state" and e["pid"] == receipt["pid"] for e in events)):
+                break
+            time.sleep(0.02)
+        assert processes.alive(receipt)
+        fd = os.pidfd_open(parent.pid)
+        try:
+            assert processes.identity(parent.pid) == parent.start_identity
+            signal.pidfd_send_signal(fd, getattr(signal, signal_name))
+        finally:
+            os.close(fd)
+        output, error = parent.communicate(timeout=15)
+        result = json.loads(output)
+        assert parent.returncode == 3, error.decode("utf-8", errors="replace")
+        assert result["operation_status"] == "APPLIED_VERIFY_HOLD" and result["error"] == "PacketCheckpointRecoveryError"
+        journal = manager._journal(fixture["plan"])
+        assert journal["verifier_direct_reaped"] and journal["verifier_group_gone"] and journal["verifier_reaped"]
+        assert not processes.alive(receipt) and processes.group_gone(receipt)
+        assert _audits(fixture["base"]) == audits_before and fixture["system"].actions == []
+        assert fixture["path"].read_bytes() == test["plan_bytes"]
+        test["update"]()
+        retry = _real_fixture_verify(test)
+        assert retry["operation_status"] == "APPLIED_PENDING_PROGRESS"
+        fresh = _assert_real_verifier_stopped(test)
+        assert fresh["verification_token"] != receipt["verification_token"]
+    finally:
+        if parent.poll() is None:
+            processes.terminate(parent, force=True)
+            parent.wait(timeout=5)
+        # Only the bound child of our captured public process can be cleaned here.
+        if (receipt and receipt.get("owner_pid") == parent.pid
+                and receipt.get("owner_start_identity") == parent.start_identity
+                and not processes.group_gone(receipt)):
+            child = SimpleNamespace(pid=receipt["pid"], start_identity=receipt["start_identity"])
+            processes.terminate(child, force=True)
+            assert processes.wait_group(child, 5)
+        for stream in (parent.stdout, parent.stderr):
+            if stream:
+                stream.close()
