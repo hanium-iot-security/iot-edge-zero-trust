@@ -183,7 +183,7 @@ Pi 운영 코드와 원격 develop은 `53ec270219692784ce8864976511a52c962cec35`
 
 이것은 보관한 관측 시점의 근거이며 설치 직전의 새 조회를 대신하지 않는다. 원격 DB·PCAP·backup 바이트의 운영 사후 SHA를 인증하지도 않는다. 복구에 사용한 Subscriber 6회와 writer 누적 151.171591초/180초 승인은 완료됐고 **새 배포·서비스 정지·재부팅에 재사용하지 않는다**.
 
-현재 광역 승인 UI는 구현하지 않았다. 기존 Devices와 Isolation의 상세·해제·이력 화면은 `PI_INPUT_IPV4_ALL`의 NULL protocol/port를 `전체 IPv4` / `모든 포트`로 표시하고, scope 없는 legacy 응답의 TCP 1883 표시는 유지한다. 기존 정확한 해제 UI와 서버의 관리자 승인 API를 구분한다. 전체 한글 상태 번역은 별도 후속 범위다.
+현재 광역 승인 UI는 구현하지 않았다. 기존 Devices와 Isolation의 상세·해제·이력 화면은 `PI_INPUT_IPV4_ALL`의 NULL protocol/port를 `전체 IPv4` / `모든 포트`로 표시하고, scope 없는 legacy 응답의 TCP 1883 표시는 유지한다. Devices·Isolation과 같은 trigger event의 이력은 REMOVED보다 미해제 규칙을 우선 선택한다. 한쪽 scope만 해제하면 남은 규칙의 ID가 다음 해제 대상이며, APPLIED/FAILED에 대해서만 해당 ID의 확인 문구로 요청할 수 있다. 기존 정확한 해제 UI와 서버의 관리자 승인 API를 구분한다. 전체 한글 상태 번역은 별도 후속 범위다.
 
 ## 이후 운영 설치 순서
 

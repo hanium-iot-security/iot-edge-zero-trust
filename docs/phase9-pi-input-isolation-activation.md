@@ -4,6 +4,8 @@
 
 2026/10/11 로컬 승인 준비에서 API·repository·worker·recovery·migration·wrapper·snapshot 회귀 **242개**, 프론트 **13개**(광역/legacy/missing 응답의 shared React render 계약 3개 포함)가 통과했다. 19개 업무 테이블 집합 보존을 추가한 기존 migration 시험도 재실행해 통과했다. Vite production build, 새 helper/test 정적 검사와 `git diff --check`가 통과했다. 임시 로컬 DB·가짜 Worker·dry-run 및 로컬 화면 빌드의 결과이며 운영 설치·차단 완료를 인증하지 않는다.
 
+2026/10/11 최종 병합 검토에서는 현재 PR111의 백엔드 회귀 **420개**, 프론트 **19개**와 production build가 통과했다. 두 scope가 함께 있을 때 최신 REMOVED 규칙이 남은 차단을 가리는 화면 결함을 수정했다. Devices·Isolation·정확한 trigger event 이력은 미해제 규칙을 우선 표시하며, APPLIED/FAILED의 정확한 ID로 해제 요청을 보낸다. 로컬의 실제 페이지 handler·API 함수를 가짜 HTTP에 연결한 8개 시나리오에서도 양쪽 해제 순서의 남은 Rule ID와 확인 문구가 일치하고 이전 ID의 문구는 요청 전에 거부됐다. 이는 로컬 모의 검증이며 실제 브라우저·새 API의 운영 배포 검증을 대신하지 않는다. 변경 페이지 정적 검사에는 기존 unused `status` 경고 1개, 빌드에는 기존 500 kB chunk 경고가 남는다.
+
 ## 최종 릴리스 조건
 
 - 통합 candidate가 2026/10/11 15:03 KST에 적용한 Pi API 코드 `ffa82c00b31ebdfcd621b83aa13d1597bd02b26c`(복구 `542455f`·조회 경합 수정 `d87bfd4` 포함)와 PR111 구현을 모두 포함해야 한다. 설치 직전 새 Pi HEAD와 서비스 실행 경로를 다시 대조해 이후 변경도 보존한다. PR111 단독 HEAD를 운영 checkout하지 않는다. base develop과 현재 Pi HEAD가 다른 상태를 먼저 해결한다.
@@ -71,7 +73,7 @@ sudo systemd-analyze verify /etc/systemd/system/firewall-worker.service /etc/sys
 
 API가 201/PENDING을 반환한 것만으로 차단 완료로 표시하지 않는다. Worker의 exact match 후 APPLIED와 runtime snapshot v2를 함께 확인한다. wide는 Pi의 INPUT IPv4 전체이며 IPv6·FORWARD·다른 서버 통신을 인증하지 않는다. 넓은 규칙 해제는 해당 wide Rule ID의 `release-requests`와 감사·runtime 부재 확인을 사용한다. 기존 MQTT 규칙은 별개이며 자동 해제되지 않는다.
 
-광역 승인 입력 UI, 관리자 정책 revision 선택/confirmation 화면은 아직 없다. 기존 정확한 해제/이력 화면과 NULL 필드 표시만 호환된다. 실제 차단·정확한 해제·DHCP 이동·서비스 재시작·재부팅 복원은 각각 별도 승인·증거가 필요하다.
+광역 승인 입력 UI, 관리자 정책 revision 선택/confirmation 화면은 아직 없다. 기존 정확한 해제/이력 화면은 남은 scope의 규칙을 우선 표시하고 APPLIED/FAILED 해제를 지원하며 NULL 필드를 범위에 맞게 표시한다. 실제 차단·정확한 해제·DHCP 이동·서비스 재시작·재부팅 복원은 각각 별도 승인·증거가 필요하다.
 
 ## 실물 시험을 시작하기 전에 남은 준비
 

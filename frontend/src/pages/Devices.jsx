@@ -22,6 +22,7 @@ import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
 import StatusBadge from "../components/StatusBadge";
 import SummaryCard from "../components/SummaryCard";
+import { getCurrentFirewallRuleMap } from "../utils/firewallRuleSelection";
 import {
   LEGACY_KST_OPTIONS,
   elapsedSecondsFromMqttTimestamp,
@@ -436,58 +437,10 @@ export default function Devices() {
     };
   }, [loadData]);
 
-  const firewallRuleMap =
-    useMemo(() => {
-      const result = new Map();
-
-      firewallRules.forEach(
-        (rule) => {
-          if (!rule.device_id) {
-            return;
-          }
-
-          const existingRule =
-            result.get(
-              rule.device_id
-            );
-
-          if (!existingRule) {
-            result.set(
-              rule.device_id,
-              rule
-            );
-
-            return;
-          }
-
-          const currentTime =
-            new Date(
-              rule.updated_at ||
-              rule.created_at ||
-              0
-            ).getTime();
-
-          const existingTime =
-            new Date(
-              existingRule.updated_at ||
-              existingRule.created_at ||
-              0
-            ).getTime();
-
-          if (
-            currentTime >
-            existingTime
-          ) {
-            result.set(
-              rule.device_id,
-              rule
-            );
-          }
-        }
-      );
-
-      return result;
-    }, [firewallRules]);
+  const firewallRuleMap = useMemo(
+    () => getCurrentFirewallRuleMap(firewallRules),
+    [firewallRules],
+  );
 
   const devicesWithFirewall =
     useMemo(
