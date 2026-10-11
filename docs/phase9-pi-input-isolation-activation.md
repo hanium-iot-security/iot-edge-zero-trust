@@ -9,7 +9,7 @@
 ## 최종 릴리스 조건
 
 - 통합 candidate가 2026/10/11 15:03 KST에 적용한 Pi API 코드 `ffa82c00b31ebdfcd621b83aa13d1597bd02b26c`(복구 `542455f`·조회 경합 수정 `d87bfd4` 포함)와 PR111 구현을 모두 포함해야 한다. 설치 직전 새 Pi HEAD와 서비스 실행 경로를 다시 대조해 이후 변경도 보존한다. PR111 단독 HEAD를 운영 checkout하지 않는다. base develop과 현재 Pi HEAD가 다른 상태를 먼저 해결한다.
-- merge 직전 모든 migration 파일의 번호가 유일·연속인지, 실제 `schema_migrations`의 이름과 번호가 일치하는지 확인한다. 현재 PR111만 011을 추가하며 조회한 sibling API/model·normal-pilot 작업 트리에는 001..010만 있었다. 다른 PR의 미래 011 예약을 확정하지는 못한다. 충돌하면 SQL 파일 번호, runner의 `FOREIGN_KEY_REBUILD_MIGRATIONS`, `firewall_repository.has_scope_schema`의 버전 경계, 문서·시험을 함께 조정한 candidate를 다시 검증한다. runner는 적용된 번호를 건너뛰므로 파일 번호 검사만으로 이미 적용된 다른 migration 이름과의 충돌을 탐지했다고 간주하지 않는다.
+- merge 직전 모든 migration 파일의 번호가 유일·연속인지, 실제 `schema_migrations`의 이름과 번호가 일치하는지 확인한다. 2026/10/11 최신 develop 및 공개 미병합 PR에서 011 중복이 없음을 확인했고 이 PR에 011을 배정했다. 통합 후보의 001..011 유일·연속 검사도 통과했으며 후속 데이터 마이그레이션은 012 이후를 사용한다. 미래의 미공개 작업까지 충돌이 없다고 보장하는 확인은 아니다. 충돌하면 SQL 파일 번호, runner의 `FOREIGN_KEY_REBUILD_MIGRATIONS`, `firewall_repository.has_scope_schema`의 버전 경계, 문서·시험을 함께 조정한 candidate를 다시 검증한다. runner는 적용된 번호를 건너뛰므로 파일 번호 검사만으로 이미 적용된 다른 migration 이름과의 충돌을 탐지했다고 간주하지 않는다.
 - 설치 전 예상 운영 schema는 001..010, 기존 업무 테이블 집합은 19개다(`schema_migrations`, `sqlite_sequence` 제외). migration은 기존 firewall table을 교체하며 permanent table을 추가하지 않는다. 새 일관된 **사본**에서 기존 컬럼의 모든 행·ID, sqlite_sequence, release FK와 테이블 집합을 비교하고 FK/integrity 및 두 번째 no-op을 확인한다. 실제 운영 적용 완료는 별도 사후 근거로 기록한다.
 - 새 작업의 서비스 중단·손실·복귀 조건을 별도로 승인하고 원래 active 서비스 목록을 기록한다. 완료된 복구의 6회 Subscriber/180초 writer 승인을 재사용하지 않는다. Capture·Subscriber·Broker·reboot는 설치에 자동 포함되지 않는다.
 

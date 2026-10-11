@@ -15,7 +15,7 @@
 
 ## 마이그레이션 011
 
-`011_pi_input_isolation.sql`은 잠정 예약한 번호다. 공식 정상 자료 편입/QC 마이그레이션과 별개이며 번호가 실제 통합 전에 충돌하면 조정해야 한다.
+`011_pi_input_isolation.sql`은 이 PR에 배정한 번호다. 2026/10/11 최신 develop과 공개 미병합 PR의 변경 파일에서 중복이 없음을 확인했고, 통합 후보의 001..011 유일·연속 검사도 통과했다. 공식 정상 자료 편입/QC의 후속 마이그레이션은 012 이후 번호를 사용한다.
 
 기존 `firewall_rules` ID와 모든 기존 열의 값을 유지하고, 기존 행에 MQTT scope 및 NULL 승인 메타데이터를 붙인다. 삭제된 높은 ID도 `sqlite_sequence`에 보존하여 과거 ID를 재사용하지 않는다. Release의 기존 FK와 광역 source FK는 같은 `firewall_rules` ID를 참조한다. 상태/IP 인덱스를 재생성하며 활성 유일성은 `(source_ip, scope)`로 바뀐다. 따라서 서로 다른 scope의 두 규칙은 공존할 수 있고, 같은 IP·scope의 PENDING/APPLIED 중복은 차단된다.
 
@@ -169,7 +169,7 @@ Pi 운영 코드와 원격 develop은 `53ec270219692784ce8864976511a52c962cec35`
 
 22:42 KST에 운영 DB를 읽기 전용 연결의 SQLite 온라인 backup으로 별도 파일에 보관하고, 그 사본을 다시 복제해 Migration 011을 시험했다. 원본 backup 140,869,632바이트의 SHA256은 `b8e480f570f886a9aee6b56f7396053c3d1c7bf0eada5003cf17bc98abcf689a`다. 사본에서 기존 19개 테이블의 원래 컬럼·모든 행 digest, 방화벽 20행·해제 16행·sequence 20·기존 Migration 기록이 보존됐다. 기존 모든 방화벽 범위는 MQTT로 유지됐다. integrity/FK 검사와 두 번째 Migration no-op·사본 파일 SHA 불변도 통과했다. 보관 원본 SHA는 그대로였고 운영 DB 스키마는 10을 유지했다. 운영 DB 원본·사본과 개인 로그는 PR에 첨부하지 않는다.
 
-이 사본 검증은 운영 Migration 적용·서비스 릴리스·rollback 실행 검증이 아니다. Migration 번호 조율과 실제 배포 직전의 새 일관된 백업·현재 상태 확인은 남아 있다.
+이 사본 검증은 운영 Migration 적용·서비스 릴리스·rollback 실행 검증이 아니다. 당시 Migration 번호 조율은 남아 있었으며 위 2026/10/11 병합 전 대조에서 011 배정을 확인했다. 실제 배포 직전의 새 일관된 백업·현재 상태 확인은 남아 있다.
 
 후속 조회에서는 **22:42:30~22:42:40 KST의 10초 구간**이 `FAILED/LATE_CAPTURE`로 확인됐다. 캡처 시작이 1.30814초 지연되어 Session 108이 FAILED로 마감됐고, Session 109에서 수집을 이어가고 있다. 해당 실패 segment에는 캡처 파일·특징 데이터가 없다. MQTT 수신과 이후 Packet 수집·특징 처리는 계속되지만 Packet Rule·IF·Trust의 처리 경계는 22:42:30에서 HOLD 중이다. 서비스가 active라는 사실만으로 탐지 전진을 정상으로 표시하지 않는다.
 
