@@ -117,11 +117,12 @@ class TestApply:
                         45, -20, -20, -20, 25, '[1]', 'trust-v2')
                 """
             )
+            original_rule_columns = ", ".join(row["name"] for row in connection.execute("PRAGMA table_info(firewall_rules)"))
             queries = {
                 "devices": f"SELECT {original_columns} FROM devices ORDER BY device_id",
                 "events": "SELECT * FROM detection_events ORDER BY id",
                 "isolation": "SELECT * FROM isolation_history ORDER BY id",
-                "rules": "SELECT * FROM firewall_rules ORDER BY id",
+                "rules": f"SELECT {original_rule_columns} FROM firewall_rules ORDER BY id",
                 "history": "SELECT * FROM trust_score_history ORDER BY id",
             }
             before = {
@@ -131,7 +132,7 @@ class TestApply:
 
         result = apply_migrations(path, MIGRATIONS_DIR)
 
-        assert result.applied_versions == [7, 8, 9, 10]
+        assert result.applied_versions == [7, 8, 9, 10, 11]
         with connect_database(path) as connection:
             after = {
                 name: [tuple(row) for row in connection.execute(sql)]

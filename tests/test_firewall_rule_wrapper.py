@@ -24,20 +24,24 @@ from edge.trust.firewall_worker import (
     FirewallRuleSpec,
     build_rule_args,
 )
+from edge.trust.firewall_scope import MQTT_IPV4_TCP_1883, PI_INPUT_IPV4_ALL
 
 
 WRAPPER = Path("infra/scripts/hanium-firewall-rule")
 DEVICE_IP = "192.168.0.5"
 RULE_ID = 12
-BASH = shutil.which("bash")
+_GIT_BASH = Path("C:/Program Files/Git/bin/bash.exe")
+BASH = str(_GIT_BASH) if os.name == "nt" and _GIT_BASH.is_file() else shutil.which("bash")
 
 pytestmark = pytest.mark.skipif(
     BASH is None, reason="bash가 없는 환경에서는 Wrapper를 검증할 수 없습니다"
 )
 
 
-def _run_wrapper(*args: str) -> subprocess.CompletedProcess[str]:
+def _run_wrapper(*args: str, env_overrides=None) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ, HANIUM_FW_DRY_RUN="1")
+    env.update(HANIUM_FW_TEST_PROTECTED_FILE="", HANIUM_FW_TEST_LOCAL_IPV4="")
+    env.update(env_overrides or {})
     return subprocess.run(
         # Use the executable we checked; Windows may otherwise resolve the WSL
         # launcher from System32 before the Bash selected through PATH.
@@ -92,7 +96,7 @@ def test_wrapper_rejects_non_private_or_malformed_ip(source_ip):
     assert "iptables" not in result.stdout
 
 
-@pytest.mark.parametrize("rule_id", ["abc", "-1", "1;2", ""])
+@pytest.mark.parametrize("rule_id", ["abc", "-1", "1;2", "", "0", "01", "9223372036854775808"])
 def test_wrapper_rejects_invalid_rule_id(rule_id):
     result = _run_wrapper("insert", DEVICE_IP, rule_id)
     assert result.returncode == 65
@@ -131,3 +135,42 @@ def test_wrapper_accepts_all_private_ipv4_ranges(source_ip):
 
 def test_wrapper_is_executable():
     assert os.access(WRAPPER, os.X_OK), "Wrapper에 실행 권한이 필요합니다"
+
+
+@pytest.mark.parametrize("operation,python_operation", [("check", CHECK), ("insert", INSERT), ("delete", DELETE)])
+def test_wide_scope_exact_match_has_no_protocol_or_port(operation, python_operation):
+    spec = FirewallRuleSpec(RULE_ID, DEVICE_IP, PI_INPUT_IPV4_ALL)
+    assert _wrapper_args(operation, DEVICE_IP, str(RULE_ID), PI_INPUT_IPV4_ALL) == build_rule_args(spec, operation=python_operation)
+    assert "--dport" not in build_rule_args(spec, operation=python_operation)
+    assert "-p" not in build_rule_args(spec, operation=python_operation)
+
+
+@pytest.mark.parametrize("scope", ["", "ALL", "PI_INPUT_IPV6_ALL", "tcp", "pi_input_ipv4_all"])
+def test_unknown_explicit_scope_is_not_legacy_fallback(scope):
+    assert _run_wrapper("insert", DEVICE_IP, str(RULE_ID), scope).returncode == 64
+
+
+@pytest.mark.parametrize("scope", [MQTT_IPV4_TCP_1883, PI_INPUT_IPV4_ALL])
+def test_configured_protection_blocks_insert_but_allows_exact_cleanup(tmp_path, scope):
+    config = tmp_path / "protected.txt"
+    config.write_text(DEVICE_IP + "\n", encoding="utf-8")
+    env = {"HANIUM_FW_TEST_PROTECTED_FILE": config.as_posix()}
+    assert _run_wrapper("insert", DEVICE_IP, str(RULE_ID), scope, env_overrides=env).returncode == 65
+    for operation in ("check", "delete"):
+        assert _run_wrapper(operation, DEVICE_IP, str(RULE_ID), scope, env_overrides=env).returncode == 0
+
+
+def test_actual_pi_address_guard_is_exercised_with_dry_run_fixture():
+    env = {"HANIUM_FW_TEST_LOCAL_IPV4": DEVICE_IP + ",192.168.0.20"}
+    assert _run_wrapper("insert", DEVICE_IP, str(RULE_ID), PI_INPUT_IPV4_ALL, env_overrides=env).returncode == 65
+    assert _run_wrapper("delete", DEVICE_IP, str(RULE_ID), PI_INPUT_IPV4_ALL, env_overrides=env).returncode == 0
+
+
+def test_production_iptables_binary_and_protect_file_are_fixed():
+    source = WRAPPER.read_text(encoding="utf-8")
+    assert "IPTABLES=/usr/sbin/iptables\n" in source
+    assert "PROTECTED_FILE=/etc/hanium/firewall-protected-ipv4.conf\n" in source
+    assert "HANIUM_FW_IPTABLES" not in source
+    assert "NOSETENV:" in Path("infra/sudoers/hanium-firewall-worker").read_text(encoding="utf-8")
+    assert "check_owned_path /etc/hanium" in source
+    assert "local IPv4 observation failed" in source

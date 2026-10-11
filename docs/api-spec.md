@@ -26,6 +26,7 @@ GET /api/trust-score/{device_id}/history
 GET /api/trust-score/compensations
 GET /api/isolation/history
 GET /api/firewall-rules
+POST /api/firewall-rules/{source_rule_id}/scope-extension-requests
 POST /api/firewall-rules/{rule_id}/release-requests
 GET /api/firewall-release-requests/{request_id}
 POST /api/recovery/preflight
@@ -540,6 +541,13 @@ Isolation History는 Trust 정책상 격리 결정을 표현합니다. 실제 �
 
 ## Firewall Rules
 
+Migration 011의 두 scope는 `MQTT_IPV4_TCP_1883`(Pi INPUT의 TCP 1883)와
+`PI_INPUT_IPV4_ALL`(같은 source IPv4의 Pi INPUT 전체 프로토콜·포트)입니다.
+자동 격리는 기존 MQTT 1883을 유지하며 기존 ID의 범위를 확대하지 않습니다.
+관리자 확장은 이미 `isolated`인 기기의 `APPLIED` MQTT 규칙에서 새 광역 행을 만드는
+첫 경로만 구현했습니다. 운영 Pi migration/배포는 미적용 상태이며 실제 차단·DHCP/재부팅은
+미검증입니다. 자동 신규 광역 격리 정책·광역 확장 승인 Frontend는 후속 미완료 범위입니다.
+
 ### GET /api/firewall-rules
 
 Query parameters:
@@ -567,6 +575,7 @@ Each item includes:
 id
 device_id
 source_ip
+scope
 protocol
 dest_port
 action
@@ -581,16 +590,112 @@ applied_at
 released_at
 created_at
 updated_at
+source_rule_id
+approved_policy_revision
+requested_by
+request_id
 ```
+
+MQTT scope의 `protocol`/`dest_port`는 `tcp`/`1883`이고 광역 scope에서는 둘 다
+`null`입니다. 새 승인 메타데이터 네 필드는 nullable이며 Migration 011 이전 행에는
+`null`입니다. 완전한 pre-011 DB도 조회 시 MQTT scope와 null 메타데이터를 반환합니다.
+scope 필터는 제공하지 않으며 `status`, `device_id`, `source_ip`로 조회합니다.
 
 The backend only reads DB state. It does not run Firewall Worker logic or iptables.
 
+### POST /api/firewall-rules/{source_rule_id}/scope-extension-requests
+
+`X-Recovery-Admin-Key` 인증으로 기존 MQTT 규칙을 광역 scope로 확장 승인합니다.
+`requested_by`는 서버 인증 principal에서 파생하며 요청 Body에는 허용하지 않습니다.
+Backend는 Worker와 같은 파일 lock을 얻은 뒤 `BEGIN IMMEDIATE`에서 새 ID의 `PENDING`
+행을 저장합니다. 기존 source 행을 수정·제거하거나 sudo/iptables를 실행하지 않습니다.
+API의 `NoNewPrivileges=true`도 유지합니다.
+
+Request (`source_rule_id=12` 예시):
+
+```json
+{
+  "device_id": "pico_01",
+  "source_ip": "192.168.0.31",
+  "approved_policy_revision": 1,
+  "scope": "PI_INPUT_IPV4_ALL",
+  "reason": "operator approved Pi input isolation",
+  "request_id": "6af7a972-a852-4e21-86f3-4632c68ea331",
+  "confirm": "EXTEND-PI-INPUT-12-192.168.0.31-REV-1"
+}
+```
+
+모든 필드가 필수이며 미지원 필드와 자료형 변환은 거부합니다. source ID는 양의
+64비트 정수, 승인 revision은 `1..2147483647` 정수, `source_ip`는 정규 RFC1918 IPv4,
+`request_id`는 소문자 정규 UUID4여야 합니다. `device_id`는 영숫자로 시작하는 1~64자
+ASCII 영숫자·`_`·`-`이고, `reason`은 공백 제거 후 1~500자이며 제어 문자를 허용하지
+않습니다. 확인 문자열은 `EXTEND-PI-INPUT-{source_rule_id}-{source_ip}-REV-{approved_policy_revision}`입니다.
+
+첫 승인 시 source가 `APPLIED` MQTT 규칙이고 device/IP/사양이 요청과 일치해야 합니다.
+기기의 현재 상태는 `isolated`, 소유 IPv4는 요청 값, 현재 적용 정책은 `ACTIVE`이며
+승인 revision과 같아야 합니다. 적용 예정 DISABLED 정책, source의 해제 대기, 같은
+device/IP의 미해결 광역 규칙이 있으면 거부합니다. 과거 광역 `REMOVED`도 정확한 성공
+해제 감사가 해당 제거 시각을 포함해야 다음 새 승인을 허용합니다.
+
+Response `201`의 `item`은 GET의 전체 FirewallRuleItem입니다. 예시에서는 주요 필드만
+표시합니다.
+
+```json
+{
+  "item": {
+    "id": 13,
+    "device_id": "pico_01",
+    "source_ip": "192.168.0.31",
+    "scope": "PI_INPUT_IPV4_ALL",
+    "protocol": null,
+    "dest_port": null,
+    "action": "DROP",
+    "status": "PENDING",
+    "reason": "operator approved Pi input isolation",
+    "source_rule_id": 12,
+    "approved_policy_revision": 1,
+    "requested_by": "recovery-admin",
+    "request_id": "6af7a972-a852-4e21-86f3-4632c68ea331"
+  },
+  "created": true,
+  "replayed": false,
+  "runtime_verified": false
+}
+```
+
+동일 UUID와 principal/source/device/IP/revision/scope/reason으로 재요청하면 상태가
+`FAILED` 또는 `REMOVED`여도 같은 행을 반환합니다. 재요청도 `201`이며 `created=false`,
+`replayed=true`입니다. 다른 바인딩은 `409 REQUEST_ID_BINDING_MISMATCH`입니다. 응답이
+유실되면 같은 UUID와 같은 요청을 재사용합니다. 새 UUID로 이전 광역 FAILED/PENDING/APPLIED
+또는 미감사 REMOVED를 우회할 수 없습니다. `runtime_verified`는 항상 false이며 현재
+실제 적용을 인증하지 않습니다.
+
+Worker는 적용·복원 직전에 source/device/IP/ACTIVE 정책 revision/해제 대기를 다시
+확인합니다. 최초 PENDING 광역에는 source APPLIED가 필요합니다. 이미 APPLIED인 광역은
+원본 MQTT를 별도로 감사 해제한 경우에도 복원할 수 있으나 정확한 source ID의 성공
+해제, non-null `released_at`, `requested_at <= released_at <= processed_at`을 요구합니다.
+원본 MQTT는 광역 확인 전후 모두 자동 제거하지 않습니다. 세부 범위·운영 순서는
+[Pi 입력 격리](phase9-pi-input-isolation.md)를 따릅니다.
+
+| 상태 | 의미 |
+| --- | --- |
+| 401 | 관리자 인증 실패 |
+| 404 | source 규칙 없음 (`SOURCE_RULE_NOT_FOUND`) |
+| 409 | 확인 불일치, source/IP/상태/정책 변경, 해제 대기, 이전 광역 미해결, UUID 바인딩 충돌, Worker/DB busy |
+| 422 | 잘못된 필드·자료형·scope·IPv4·UUID·reason |
+| 503 | 관리자 키·잠금·DB·정책 불가, 011 미적용 (`MIGRATION_011_REQUIRED`) 또는 schema 불일치 |
+
+업무 오류는 `{detail:{result:"DENIED",failure_code,failure_reason}}`이며 두 failure
+필드는 고정 코드입니다. 422는 입력 원문을 제외한 필드 오류 배열 또는 고정 오류
+문자열입니다. 완전한 pre-011 DB에서는 기존 조회·해제를 유지하고 광역 승인만 거부합니다.
+
 ### POST /api/firewall-rules/{rule_id}/release-requests
 
-관리자가 `APPLIED` Firewall Rule의 공식 Release를 요청하는 Command API입니다.
+관리자가 `APPLIED` 또는 `FAILED` Firewall Rule의 공식 Release를 요청하는 Command API입니다.
 Backend는 `firewall_release_requests`에 `PENDING` 요청만 저장하며, sudo/iptables
 또는 `release_rule()`을 직접 실행하지 않습니다. 실제 Release는 Firewall Worker가
-공유 lock 아래에서 처리합니다.
+공유 lock 아래에서 처리합니다. 요청 저장도 같은 파일 lock 뒤 `BEGIN IMMEDIATE`를
+사용합니다. 두 scope 모두 정확한 Rule ID로 따로 해제하며 같은 IP의 다른 scope는 보존합니다.
 
 관리자 헤더:
 
@@ -609,6 +714,11 @@ Request:
 
 `confirm`은 Rule ID에 묶인 `RELEASE-FIREWALL-RULE-{rule_id}` 값이어야 합니다.
 `requested_by`는 요청 Body가 아니라 인증된 관리자 principal에서 파생합니다.
+FAILED의 런타임 잔여 DROP 정리는 정확한 ID의 PENDING 감사 요청이 있어야 Worker가
+허용합니다. 정확한 scope/IP/ID 규칙의 삭제 후 부재를 확인해야 Rule을 REMOVED로 기록하고
+요청을 SUCCEEDED로 완료합니다. 삭제·확인 실패는 성공으로 반환하지 않습니다. IP·정책·
+보호 주소가 바뀌어도 과거 정확한 규칙의 확인·삭제는 허용합니다. REMOVED만 먼저 기록된
+중단 상황은 다음 Worker cycle에서 부재 확인 후 요청을 수렴시킬 수 있습니다.
 
 Response `201`:
 
@@ -633,12 +743,19 @@ Error:
 
 - `401`: 관리자 인증 실패
 - `404`: 대상 Firewall Rule 없음
-- `409`: 확인 문구 불일치, 대상 Rule이 `APPLIED`가 아님, 같은 Rule의 `PENDING` 요청 중복
+- `409`: 확인 문구 불일치, 대상 Rule이 `APPLIED`/`FAILED`가 아님, 같은 Rule의 `PENDING` 요청 중복, Worker/DB busy
+- `422`: 필수 필드 누락·잘못된 자료형·빈 reason
+- `503`: 관리자 키 또는 잠금/DB 불가
+
+해제할 수 없는 상태의 기존 오류 코드는 호환을 위해 `FIREWALL_RULE_NOT_APPLIED`를
+유지합니다. 해제 요청의 201은 실제 해제 성공과 별개입니다. Runtime DROP이 남아 있는
+FAILED 규칙은 Baseline 복구를 통과하지 못하며 마지막 해제 시도 이후의 새 관측이 필요합니다.
 
 ### GET /api/firewall-release-requests/{request_id}
 
 Firewall Release Request 처리 상태를 조회합니다. `PENDING`, `SUCCEEDED`, `FAILED`
 중 하나를 반환합니다. `FAILED`인 경우 `last_error`에 Worker 실패 사유가 저장됩니다.
+POST와 같은 관리자 헤더가 필요하며 정상 조회는 `200 {item: ...}`입니다.
 
 ## Recovery Command APIs
 
@@ -833,6 +950,9 @@ GET /api/trust-score/{device_id}/history
 GET /api/trust-score/compensations
 GET /api/isolation/history
 GET /api/firewall-rules
+POST /api/firewall-rules/{source_rule_id}/scope-extension-requests
+POST /api/firewall-rules/{rule_id}/release-requests
+GET /api/firewall-release-requests/{request_id}
 POST /api/recovery/preflight
 POST /api/recovery/execute
 GET /api/recovery/history

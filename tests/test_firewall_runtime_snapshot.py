@@ -7,10 +7,12 @@ from pathlib import Path
 import pytest
 
 from edge.trust.firewall_runtime_snapshot import (
+    LEGACY_SNAPSHOT_SCHEMA_VERSION,
     SNAPSHOT_SCHEMA_VERSION,
     capture_firewall_runtime_snapshot,
     verify_firewall_runtime_snapshot,
 )
+from edge.trust.firewall_scope import MQTT_IPV4_TCP_1883, PI_INPUT_IPV4_ALL
 from edge.trust.firewall_worker import (
     CommandResult,
     FirewallRuleSpec,
@@ -61,6 +63,9 @@ def _managed_rule(rule_id: int, source_ip: str) -> str:
 
 def _write_snapshot(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Existing fixtures represent pre-scope observer files (v1).
+    if payload.get("managed_rules") and all("scope" not in row for row in payload["managed_rules"]):
+        payload = dict(payload, schema_version=LEGACY_SNAPSHOT_SCHEMA_VERSION)
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
@@ -96,11 +101,59 @@ def test_capture_writes_only_managed_hanium_rules_atomically(tmp_path: Path) -> 
     assert payload["available"] is True
     assert payload["observed_at"] == "2026-08-14T07:30:00Z"
     assert payload["managed_rules"] == [
-        {"rule_id": 12, "source_ip": DEVICE_IP},
-        {"rule_id": 13, "source_ip": "192.168.0.6"},
+        {"rule_id": 12, "source_ip": DEVICE_IP, "scope": MQTT_IPV4_TCP_1883},
+        {"rule_id": 13, "source_ip": "192.168.0.6", "scope": MQTT_IPV4_TCP_1883},
     ]
     assert json.loads(snapshot.read_text(encoding="utf-8")) == payload
     assert not list(tmp_path.glob("*.tmp-*"))
+
+
+def test_v2_capture_identifies_both_exact_scopes_and_recovery_detects_wide(tmp_path):
+    wide = f'-A INPUT -s {DEVICE_IP}/32 -m comment --comment "hanium-firewall:14" -j DROP'
+    path = tmp_path / "runtime.json"
+    payload = capture_firewall_runtime_snapshot(ListingRunner(stdout=_managed_rule(12, "192.168.0.6") + "\n" + wide),
+                                               snapshot_path=path, observed_at=NOW)
+    assert payload["available"] is True
+    assert [row["scope"] for row in payload["managed_rules"]] == [MQTT_IPV4_TCP_1883, PI_INPUT_IPV4_ALL]
+    result = verify_firewall_runtime_snapshot(_device(), snapshot_path=path, max_age_seconds=15, now=NOW)
+    assert result["status"] == "ACTIVE" and result["rule_count"] == 1
+
+
+@pytest.mark.parametrize("match", ["-p udp", "-p tcp --dport 22", "-i eth0", "-d 192.168.0.20", "-m conntrack --ctstate NEW"])
+def test_unknown_managed_scope_fails_entire_snapshot_closed(tmp_path, match):
+    line = f'-A INPUT -s {DEVICE_IP}/32 {match} -m comment --comment "hanium-firewall:14" -j DROP'
+    result = capture_firewall_runtime_snapshot(ListingRunner(stdout=line), snapshot_path=tmp_path / "runtime.json", observed_at=NOW)
+    assert result["available"] is False
+    assert result["managed_rules"] == []
+
+
+def test_duplicate_managed_rule_identity_is_unavailable(tmp_path):
+    line = _managed_rule(12, DEVICE_IP)
+    result = capture_firewall_runtime_snapshot(ListingRunner(stdout=line + "\n" + line), snapshot_path=tmp_path / "runtime.json", observed_at=NOW)
+    assert result["available"] is False
+    assert "Duplicate" in result["error"]
+
+
+@pytest.mark.parametrize("scope", [None, "UNKNOWN", "MISSING"])
+def test_v2_scope_is_required_and_never_implicitly_legacy(tmp_path, scope):
+    row = {"rule_id": 12, "source_ip": DEVICE_IP}
+    if scope != "MISSING":
+        row["scope"] = scope
+    path = tmp_path / "runtime.json"
+    path.write_text(json.dumps({"schema_version": SNAPSHOT_SCHEMA_VERSION, "observed_at": NOW.isoformat(),
+                               "available": True, "managed_rules": [row], "error": None}), encoding="utf-8")
+    assert verify_firewall_runtime_snapshot(_device(), snapshot_path=path, max_age_seconds=15, now=NOW)["status"] == "UNAVAILABLE"
+
+
+def test_v1_read_compatibility_is_legacy_only(tmp_path):
+    path = tmp_path / "runtime.json"
+    payload = {"schema_version": LEGACY_SNAPSHOT_SCHEMA_VERSION, "observed_at": NOW.isoformat(),
+               "available": True, "managed_rules": [{"rule_id": 12, "source_ip": DEVICE_IP}], "error": None}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert verify_firewall_runtime_snapshot(_device(), snapshot_path=path, max_age_seconds=15, now=NOW)["status"] == "ACTIVE"
+    payload["managed_rules"][0]["scope"] = PI_INPUT_IPV4_ALL
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert verify_firewall_runtime_snapshot(_device(), snapshot_path=path, max_age_seconds=15, now=NOW)["status"] == "UNAVAILABLE"
 
 
 def test_capture_marks_snapshot_unavailable_when_runtime_list_fails(tmp_path: Path) -> None:

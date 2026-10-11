@@ -20,10 +20,16 @@ import {
 import DataTable from "../components/DataTable";
 import DetailModal from "../components/DetailModal";
 import EmptyState from "../components/EmptyState";
+import FirewallTrafficFields from "../components/FirewallTrafficFields";
 import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
 import StatusBadge from "../components/StatusBadge";
 import SummaryCard from "../components/SummaryCard";
+import {
+  canReleaseFirewallRule,
+  findCurrentFirewallRuleByTriggerEvent,
+  getCurrentFirewallRuleMap,
+} from "../utils/firewallRuleSelection";
 
 import "../styles/pages/Isolation.scss"
 
@@ -199,117 +205,6 @@ function getFirewallReleaseConfirmation(
   }
 
   return `RELEASE-FIREWALL-RULE-${ruleId}`;
-}
-
-/*
- * 현재 격리 Device에는
- * 해당 Device의 최신 Firewall Rule을 연결합니다.
- */
-function getLatestRuleMap(
-  rules
-) {
-  const ruleMap =
-    new Map();
-
-  rules.forEach(
-    (rule) => {
-      if (
-        !rule.device_id
-      ) {
-        return;
-      }
-
-      const existingRule =
-        ruleMap.get(
-          rule.device_id
-        );
-
-      if (
-        !existingRule
-      ) {
-        ruleMap.set(
-          rule.device_id,
-          rule
-        );
-
-        return;
-      }
-
-      const currentTime =
-        new Date(
-          rule.updated_at ||
-          rule.created_at ||
-          0
-        ).getTime();
-
-      const existingTime =
-        new Date(
-          existingRule.updated_at ||
-          existingRule.created_at ||
-          0
-        ).getTime();
-
-      if (
-        currentTime >
-        existingTime
-      ) {
-        ruleMap.set(
-          rule.device_id,
-          rule
-        );
-      }
-    }
-  );
-
-  return ruleMap;
-}
-
-/*
- * 과거 Isolation History는
- * Device ID만으로 최신 Firewall Rule을 연결하지 않습니다.
- *
- * trigger_event_id가 정확히 같은 Rule만 연결합니다.
- */
-function findFirewallRuleByTriggerEvent(
-  rules,
-  triggerEventId
-) {
-  if (
-    triggerEventId === null ||
-    triggerEventId === undefined ||
-    triggerEventId === ""
-  ) {
-    return null;
-  }
-
-  const normalizedTriggerEventId =
-    String(
-      triggerEventId
-    );
-
-  return (
-    rules.find(
-      (rule) => {
-        if (
-          rule.trigger_event_id ===
-          null ||
-          rule.trigger_event_id ===
-          undefined ||
-          rule.trigger_event_id ===
-          ""
-        ) {
-          return false;
-        }
-
-        return (
-          String(
-            rule.trigger_event_id
-          ) ===
-          normalizedTriggerEventId
-        );
-      }
-    ) || null
-  );
 }
 
 /* =========================================================
@@ -766,7 +661,7 @@ function getRecoveryUiStatus(
         "Firewall 상태 확인 필요",
 
       description:
-        "Firewall Rule 상태가 FAILED입니다. Recovery를 진행할 수 없습니다.",
+        "Firewall Rule 상태가 FAILED입니다. 남은 차단을 정확한 Rule ID의 해제 요청으로 정리한 뒤 Recovery를 진행해 주세요.",
     };
   }
 
@@ -1240,7 +1135,7 @@ export default function Isolation() {
   const firewallRuleMap =
     useMemo(
       () =>
-        getLatestRuleMap(
+        getCurrentFirewallRuleMap(
           firewallRules
         ),
       [firewallRules]
@@ -1465,7 +1360,7 @@ export default function Isolation() {
         history.map(
           (item) => {
             const firewallRule =
-              findFirewallRuleByTriggerEvent(
+              findCurrentFirewallRuleByTriggerEvent(
                 firewallRules,
                 item.trigger_event_id
               );
@@ -1885,14 +1780,9 @@ export default function Isolation() {
       return;
     }
 
-    if (
-      String(
-        rule.status || ""
-      ).toUpperCase() !==
-      "APPLIED"
-    ) {
+    if (!canReleaseFirewallRule(rule)) {
       setReleaseError(
-        "APPLIED 상태의 Firewall Rule만 해제 요청할 수 있습니다."
+        "APPLIED 또는 FAILED 상태의 Firewall Rule만 해제 요청할 수 있습니다."
       );
 
       return;
@@ -2648,15 +2538,7 @@ export default function Isolation() {
     ).toUpperCase();
 
   const canRequestRelease =
-    Boolean(
-      selectedRule?.id
-    ) &&
-    String(
-      selectedRule
-        ?.status ||
-      ""
-    ).toUpperCase() ===
-    "APPLIED" &&
+    canReleaseFirewallRule(selectedRule) &&
     releaseRequestStatus !==
     "PENDING" &&
     !releaseSubmitting;
@@ -3449,27 +3331,7 @@ export default function Isolation() {
                     </dd>
                   </div>
 
-                  <div>
-                    <dt>
-                      Protocol
-                    </dt>
-
-                    <dd>
-                      {selectedRule.protocol ||
-                        "-"}
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>
-                      Port
-                    </dt>
-
-                    <dd>
-                      {selectedRule.dest_port ??
-                        "-"}
-                    </dd>
-                  </div>
+                  <FirewallTrafficFields rule={selectedRule} />
 
                   <div>
                     <dt>
@@ -3534,7 +3396,7 @@ export default function Isolation() {
               </h3>
 
               <p className="text-muted">
-                APPLIED Firewall Rule에 대한 관리자 승인형 Release Request를 생성합니다. 실제 차단 해제는 Firewall Worker가 수행합니다.
+                APPLIED 또는 FAILED Firewall Rule의 정확한 ID로 해제를 요청합니다. 실제 차단 해제는 Firewall Worker가 수행합니다. 다른 범위의 규칙이 남아 있으면 이어서 해당 규칙의 해제가 필요합니다.
               </p>
 
               <div className="recovery-form">
@@ -4383,27 +4245,7 @@ export default function Isolation() {
                     </dd>
                   </div>
 
-                  <div>
-                    <dt>
-                      Protocol
-                    </dt>
-
-                    <dd>
-                      {selectedHistory.firewall_rule.protocol ||
-                        "-"}
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>
-                      Port
-                    </dt>
-
-                    <dd>
-                      {selectedHistory.firewall_rule.dest_port ??
-                        "-"}
-                    </dd>
-                  </div>
+                  <FirewallTrafficFields rule={selectedHistory.firewall_rule} />
 
                   <div>
                     <dt>

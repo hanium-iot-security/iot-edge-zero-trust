@@ -444,7 +444,7 @@ def test_release_rule_deletes_with_same_specification(SessionLocal, policy):
 
         assert removed is True
         assert runner.installed == []
-        assert runner.operations()[-2:] == [CHECK, DELETE]
+        assert runner.operations()[-3:] == [CHECK, DELETE, CHECK]
         row = _rule_row(db, rule_id)
         assert row["status"] == "REMOVED"
         assert row["released_at"] == "2026-07-25T12:05:00Z"
