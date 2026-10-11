@@ -189,7 +189,7 @@ Pi 운영 코드와 원격 develop은 `53ec270219692784ce8864976511a52c962cec35`
 
 다음은 검토용 준비 순서이며 지금 운영에 적용하지 않는다.
 
-최종 candidate·읽기 preflight·설치 경로·조건부 명령은 [운영 활성화 준비](phase9-pi-input-isolation-activation.md)에 정리한다. PR111의 현재 HEAD `949b9dd2de7170f303126e14f56be3cf1c52ad28`는 Pi의 PR108 복구 Commit을 포함하지 않는다. 현재 Pi Commit을 ancestor로 포함하는 통합 candidate를 검토한 뒤 배포해야 한다. 2026/10/11 read-only remote 조회의 develop은 여전히 `53ec270219692784ce8864976511a52c962cec35`였으며, 이는 Pi HEAD와 다르다.
+최종 candidate·읽기 preflight·설치 경로·조건부 명령은 [운영 활성화 준비](phase9-pi-input-isolation-activation.md)에 정리한다. PR111은 develop에서 분리된 격리 브랜치다. 2026/10/11 15:03 KST에 적용한 Pi API 코드 `ffa82c00b31ebdfcd621b83aa13d1597bd02b26c`와 PR111 구현을 모두 포함하는 통합 candidate를 검토한 뒤 배포해야 한다. 설치 직전의 새 HEAD와 실행 경로도 확인한다. 2026/10/11 read-only remote 조회의 develop은 여전히 `53ec270219692784ce8864976511a52c962cec35`였으며, 이는 Pi HEAD와 다르다.
 
 1. 원래 서비스별 active 상태와 일시정지 계획을 기록한다. 쓰기 서비스 정지 또는 기존 SQLite 온라인 백업 절차로 일관된 DB 사본과 필요한 WAL·현재 방화벽 규칙을 보관한다. 별도 DB 사본에서 migration 011의 FK/integrity/원래 ID·높은 sequence 보존을 확인한다.
 2. 실제 관리자·라우터·Pi IPv4를 재확인하고 root 소유 보호 디렉토리/파일을 먼저 준비한다. 새 Wrapper에서는 기존 MQTT insert도 이 보호 파일의 영향을 받는다. 이후 root:root 0755 Wrapper와 `NOSETENV` sudoers를 검토·설치하고 `visudo`로 확인한다. 관리 API의 기존 `NoNewPrivileges=true`는 유지한다.

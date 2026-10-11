@@ -6,7 +6,7 @@
 
 ## 최종 릴리스 조건
 
-- 통합 candidate가 현재 Pi HEAD `542455f397588b97eb21fa075de70bbd470c3893`와 PR111 구현을 모두 포함해야 한다. PR111 단독 HEAD를 운영 checkout하지 않는다. base develop과 현재 Pi HEAD가 다른 상태를 먼저 해결한다.
+- 통합 candidate가 2026/10/11 15:03 KST에 적용한 Pi API 코드 `ffa82c00b31ebdfcd621b83aa13d1597bd02b26c`(복구 `542455f`·조회 경합 수정 `d87bfd4` 포함)와 PR111 구현을 모두 포함해야 한다. 설치 직전 새 Pi HEAD와 서비스 실행 경로를 다시 대조해 이후 변경도 보존한다. PR111 단독 HEAD를 운영 checkout하지 않는다. base develop과 현재 Pi HEAD가 다른 상태를 먼저 해결한다.
 - merge 직전 모든 migration 파일의 번호가 유일·연속인지, 실제 `schema_migrations`의 이름과 번호가 일치하는지 확인한다. 현재 PR111만 011을 추가하며 조회한 sibling API/model·normal-pilot 작업 트리에는 001..010만 있었다. 다른 PR의 미래 011 예약을 확정하지는 못한다. 충돌하면 SQL 파일 번호, runner의 `FOREIGN_KEY_REBUILD_MIGRATIONS`, `firewall_repository.has_scope_schema`의 버전 경계, 문서·시험을 함께 조정한 candidate를 다시 검증한다. runner는 적용된 번호를 건너뛰므로 파일 번호 검사만으로 이미 적용된 다른 migration 이름과의 충돌을 탐지했다고 간주하지 않는다.
 - 설치 전 예상 운영 schema는 001..010, 기존 업무 테이블 집합은 19개다(`schema_migrations`, `sqlite_sequence` 제외). migration은 기존 firewall table을 교체하며 permanent table을 추가하지 않는다. 새 일관된 **사본**에서 기존 컬럼의 모든 행·ID, sqlite_sequence, release FK와 테이블 집합을 비교하고 FK/integrity 및 두 번째 no-op을 확인한다. 실제 운영 적용 완료는 별도 사후 근거로 기록한다.
 - 새 작업의 서비스 중단·손실·복귀 조건을 별도로 승인하고 원래 active 서비스 목록을 기록한다. 완료된 복구의 6회 Subscriber/180초 writer 승인을 재사용하지 않는다. Capture·Subscriber·Broker·reboot는 설치에 자동 포함되지 않는다.
@@ -62,7 +62,7 @@ sudo systemd-analyze verify /etc/systemd/system/firewall-worker.service /etc/sys
 
 ## 광역 확장과 정확한 해제의 조건
 
-2026/10/11 보관 관측에서 active/pending 규칙은 0개였다. 지금 확장할 원본 규칙이 있다는 뜻이 아니다. 별도로 승인된 실제 MQTT 격리에서 다음 값을 읽어 고정해야 한다.
+2026/10/11 15:04 KST 관측에서 세 기기는 정상 수신 중이고 active/pending 규칙은 0개였다. 지금 확장할 원본 규칙이 있다는 뜻이 아니다. 정상 기기의 최초 격리 관리자 API/CLI는 현재 없다. 실제 탐지 대표 이벤트와 v2 Trust 판단으로 격리된 뒤 Worker가 원래 MQTT 규칙을 적용하는 경로를 사용한다. 실장비 시험은 대상·펌웨어·전송/공격 범위·시각·정상 대조 기기를 별도로 확인한 뒤 진행한다. 시험 전에 같은 대상의 MQTT와 확인할 TCP/UDP/ICMP 통신 성공을 확보한다. 임의 DB 상태·Trust 점수·정책 변경으로 확장 조건을 만들지 않는다. 별도로 승인된 실제 MQTT 격리에서 다음 값을 읽어 고정해야 한다.
 
 1. 원본 Rule은 동일 device/IP의 `MQTT_IPV4_TCP_1883`, `DROP`, `APPLIED`이며 정확한 runtime match가 있다.
 2. 기기는 현재 `isolated`, IP ownership 일치, 정책 ACTIVE 및 revision 일치, PENDING DISABLED/해제 없음이다.
