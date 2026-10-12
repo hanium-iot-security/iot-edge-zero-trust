@@ -1,6 +1,29 @@
 # 정상 후보의 범위 편입 계약
 
-2026/10/9. 종민의 공식 편입·품질 검사 작업에 연결할 **새 계약 제안이며 아직 구현하지 않았다.** 원본의 학습·전체 Session 승인 false, 미배정 Split과 출처 상태를 보존한다. 별도 사전 결재를 기다리는 절차를 추가하지 않는다.
+2026/10/9 제안, 2026/10/12 심사 도구(`ai/normal_admission.py`) 구현. 원본의 학습·전체 Session 승인 false, 미배정 Split과 출처 상태를 보존한다. 별도 사전 결재를 기다리는 절차를 추가하지 않는다.
+
+## 구현된 심사 도구
+
+```
+python -m ai.normal_admission --packages-dir <압축 해제 폴더> --request request.json --output-dir <새 폴더>
+```
+
+각 Run의 후보 QC(`ai.export_normal_collection`)를 새 폴더에 재실행하고, 아래 표의 계약 중 후보 QC가 판단하지 않는 항목을
+검사해 `admission-report.json`을 쓴다. **이 도구는 어떤 승인도 발급하지 않는다.** `training_approved`와
+`whole_capture_session_approved`는 항상 false다. 입력 폴더는 읽기 전용이고 출력 폴더는 새 폴더여야 한다.
+종료 코드는 `BOUNDED_ELIGIBLE` 0, `HOLD`·입력 오류 2다.
+
+요청(`normal-admission-request-v1`, 알 수 없는 필드는 거부): `runs`(`run_dir`, `manifest_sha256`),
+`final_snapshot`(`path`, `sha256`, 입력 폴더 안의 COMPLETED 사본), `device_specs`(기기별 `firmware_id`,
+`payload_schema`(`esp32-telemetry-v1`/`pico-bme280-v1`), `profile`, `effective_from`, 증거 `kind`·`sha256`·`observed_at`),
+`slots`(`collection_slot_id`, `run_id`, `split`).
+
+검사: 후보 QC 재현과 원본 불변, 단일 원본 그룹·Run 비중복, 그룹의 Split 교차 금지와 slot↔Run 일대일 대응, 기기 규격 집합의
+Run 일치와 실제 payload 키 대조, 규격 효력·증거 시각이 Run 시작 이전일 것(후속 증거의 소급 거부), 최종 Snapshot의 SHA·
+COMPLETED·그룹 일치, Run 구간 안 실패는 HOLD, 구간 밖 실패는 `whole_session_eligible=false`로 공개하고 구간 편입은 유지,
+후보와 최종 Snapshot의 선택 구간 행 동일성. 증거 해시는 형식만 검사하며 증거 파일의 내용은 승인 단계에서 확인한다. 150분 자료처럼 설치 증거가 없으면 `HOLD`가 정상 결과다.
+
+범위 밖: Profile별 QC 정책과 100B 필터 교체, Packet 외부 평가 경로, 승인 기록 발급.
 
 ## 먼저 구분할 범위
 
@@ -32,8 +55,8 @@ P0/P1/P2 예비 수집은 각각 180초이며 모두 Session 108의 한 개발 �
 
 INBOUND Packet 후보는 실제 Capture 시간으로 정규화한 6특징 변환을 통과했다. 네 150분 Run은 180×6·180×6·180×6·1080×6, 예비 세 Run은 각각 54×6이다. 숫자 변환 성공은 공식 Dataset 검증이나 모델 학습 승인을 뜻하지 않는다.
 
-## 필요한 반례 시험 — 미실행
+## 반례 시험
 
-범위의 시작 포함·종료 제외, 부분 Window 거부, ID/Topic 불일치, 내부 순번 손실·중복·uptime 역전, SHA/바이트/길이 변조, 잘못된 JSON/숫자, 같은 그룹의 Split 교차, 종료 증거와 구간 밖 실패, 후속 설치 증거의 소급 사용을 격리된 사본에서 검증한다.
+범위의 시작 포함·종료 제외, 부분 Window 거부, ID/Topic 불일치, 내부 순번 손실·중복·uptime 역전, SHA/바이트/길이 변조, 잘못된 JSON/숫자는 기존 후보 QC 시험(`tests/test_normal_collection_export.py`)이 다룬다. 같은 그룹의 Split 교차, 종료 증거와 구간 밖 실패, 후속 설치 증거의 소급 사용, 기기 규격 바꿔치기는 `tests/test_normal_admission.py`가 합성 3기기 사본으로 검증한다. 실제 압축본·COMPLETED 최종 사본에 대한 확인은 수령 후 별도로 기록한다.
 
 이 검토에서 일곱 Run의 원본 42파일 전후 SHA는 모두 동일했다. 상세 파일 목록·건수·해시 근거와 원본 압축본은 우민의 보관 자료 및 종민 인수인계 페이지에서 연결한다. 원본·정책·공식 승인·Dataset·모델을 변경하지 않았다.
