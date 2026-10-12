@@ -13,6 +13,7 @@ export default function DetailModal({
   onClose,
   size = "medium",
   footer,
+  closeDisabled = false,
 }) {
   const titleId = useId();
   const descriptionId = useId();
@@ -23,7 +24,10 @@ export default function DetailModal({
     }
 
     function handleKeyDown(event) {
-      if (event.key === "Escape") {
+      if (
+        event.key === "Escape" &&
+        !closeDisabled
+      ) {
         onClose?.();
       }
     }
@@ -48,16 +52,28 @@ export default function DetailModal({
         handleKeyDown
       );
     };
-  }, [open, onClose]);
+  }, [
+    open,
+    onClose,
+    closeDisabled,
+  ]);
 
   if (!open) {
     return null;
   }
 
+  function requestClose() {
+    if (closeDisabled) {
+      return;
+    }
+
+    onClose?.();
+  }
+
   return (
     <div
       className="modal-backdrop"
-      onMouseDown={onClose}
+      onMouseDown={requestClose}
     >
       <section
         className={[
@@ -70,6 +86,11 @@ export default function DetailModal({
         aria-describedby={
           description
             ? descriptionId
+            : undefined
+        }
+        aria-busy={
+          closeDisabled
+            ? "true"
             : undefined
         }
         onMouseDown={(event) =>
@@ -98,8 +119,13 @@ export default function DetailModal({
           <button
             type="button"
             className="modal-close"
-            onClick={onClose}
-            aria-label="상세 창 닫기"
+            onClick={requestClose}
+            disabled={closeDisabled}
+            aria-label={
+              closeDisabled
+                ? "작업 진행 중에는 창을 닫을 수 없습니다."
+                : "상세 창 닫기"
+            }
           >
             ×
           </button>

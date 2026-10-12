@@ -1,6 +1,6 @@
 # Pi IPv4 INPUT 격리 운영 활성화 준비
 
-이 문서는 명령 검토용이다. 작성·로컬 검증 중 Pi 설치, host 방화벽 변경, 운영 DB migration, 서비스 정지와 재부팅은 실행하지 않았다. 10/9 임시 namespace 시험과 DB 사본 검증은 [기존 문서의 Historical 기록](phase9-pi-input-isolation.md)을 참고한다.
+이 문서는 Pi 접근 격리 설치 명령 검토용이다. 이번 활성화의 보호 설정 설치·운영 DB migration·host 방화벽 변경·실물 펌웨어 업로드·재부팅은 아직 실행하지 않았다. 코드·API만 적용한 결과는 아래 운영 기준과 구분한다. 10/9 임시 namespace 시험과 DB 사본 검증은 [기존 문서의 Historical 기록](phase9-pi-input-isolation.md)을 참고한다.
 
 2026/10/11 로컬 승인 준비에서 API·repository·worker·recovery·migration·wrapper·snapshot 회귀 **242개**, 프론트 **13개**(광역/legacy/missing 응답의 shared React render 계약 3개 포함)가 통과했다. 19개 업무 테이블 집합 보존을 추가한 기존 migration 시험도 재실행해 통과했다. Vite production build, 새 helper/test 정적 검사와 `git diff --check`가 통과했다. 임시 로컬 DB·가짜 Worker·dry-run 및 로컬 화면 빌드의 결과이며 운영 설치·차단 완료를 인증하지 않는다.
 
@@ -8,8 +8,8 @@
 
 ## 최종 릴리스 조건
 
-- 통합 candidate가 2026/10/11 15:03 KST에 적용한 Pi API 코드 `ffa82c00b31ebdfcd621b83aa13d1597bd02b26c`(복구 `542455f`·조회 경합 수정 `d87bfd4` 포함)와 PR111 구현을 모두 포함해야 한다. 설치 직전 새 Pi HEAD와 서비스 실행 경로를 다시 대조해 이후 변경도 보존한다. PR111 단독 HEAD를 운영 checkout하지 않는다. base develop과 현재 Pi HEAD가 다른 상태를 먼저 해결한다.
-- merge 직전 모든 migration 파일의 번호가 유일·연속인지, 실제 `schema_migrations`의 이름과 번호가 일치하는지 확인한다. 2026/10/11 최신 develop 및 공개 미병합 PR에서 011 중복이 없음을 확인했고 이 PR에 011을 배정했다. 통합 후보의 001..011 유일·연속 검사도 통과했으며 후속 데이터 마이그레이션은 012 이후를 사용한다. 미래의 미공개 작업까지 충돌이 없다고 보장하는 확인은 아니다. 충돌하면 SQL 파일 번호, runner의 `FOREIGN_KEY_REBUILD_MIGRATIONS`, `firewall_repository.has_scope_schema`의 버전 경계, 문서·시험을 함께 조정한 candidate를 다시 검증한다. runner는 적용된 번호를 건너뛰므로 파일 번호 검사만으로 이미 적용된 다른 migration 이름과의 충돌을 탐지했다고 간주하지 않는다.
+- 운영 설치 후보는 2026/10/11 19:14 KST에 코드·API에 적용한 `c2bfc24a1641e65a2f8c4f815bf7cdc9c53da48d`와 이후 검증된 변경을 모두 포함해야 한다. 당시 API 재시작은 약 2.72초였고 다른 수집·처리 서비스는 계속 실행됐다. 23:49 KST 읽기에서도 운영 schema 001..010, 기존 Wrapper, 보호 설정 미설치 상태를 확인했다. 코드 적용을 격리 설치 완료로 표시하지 않는다. 설치 직전 새 Pi HEAD와 실행 경로를 다시 대조해 복구·조회 경합·모델 조회·격리 구현을 함께 보존하며, base develop과 현재 Pi HEAD가 다른 상태를 먼저 해결한다.
+- merge 직전 모든 migration 파일의 번호가 유일·연속인지, 실제 `schema_migrations`의 이름과 번호가 일치하는지 확인한다. 2026/10/11 최신 develop 및 공개 미병합 PR에서 011 중복이 없음을 확인했고 격리 구현에 011을 배정했다. 통합 후보의 001..011 유일·연속 검사도 통과했으며 후속 데이터 마이그레이션은 012 이후를 사용한다. 미래의 미공개 작업까지 충돌이 없다고 보장하는 확인은 아니다. 충돌하면 SQL 파일 번호, runner의 `FOREIGN_KEY_REBUILD_MIGRATIONS`, `firewall_repository.has_scope_schema`의 버전 경계, 문서·시험을 함께 조정한 candidate를 다시 검증한다. runner는 적용된 번호를 건너뛰므로 파일 번호 검사만으로 이미 적용된 다른 migration 이름과의 충돌을 탐지했다고 간주하지 않는다.
 - 설치 전 예상 운영 schema는 001..010, 기존 업무 테이블 집합은 19개다(`schema_migrations`, `sqlite_sequence` 제외). migration은 기존 firewall table을 교체하며 permanent table을 추가하지 않는다. 새 일관된 **사본**에서 기존 컬럼의 모든 행·ID, sqlite_sequence, release FK와 테이블 집합을 비교하고 FK/integrity 및 두 번째 no-op을 확인한다. 실제 운영 적용 완료는 별도 사후 근거로 기록한다.
 - 새 작업의 서비스 중단·손실·복귀 조건을 별도로 승인하고 원래 active 서비스 목록을 기록한다. 완료된 복구의 6회 Subscriber/180초 writer 승인을 재사용하지 않는다. Capture·Subscriber·Broker·reboot는 설치에 자동 포함되지 않는다.
 
@@ -77,9 +77,9 @@ API가 201/PENDING을 반환한 것만으로 차단 완료로 표시하지 않�
 
 ## 실물 시험을 시작하기 전에 남은 준비
 
-ESP32 #2 한 대의 실제 MQTT 발행만 늘려 최초 격리를 확인하고, ESP32 #1과 Pico는 정상 대조 기기로 유지하는 범위를 우선 검토한다. 기존 `RUN_DEMO`의 식별자 위조·잘못된 JSON·UDP 공격을 함께 실행할 필요는 없다. `RUN MQTT_FLOOD`는 본인 principal/topic으로 정상 JSON 40건을 50ms 간격으로 발행한다. 개별 명령은 10초 분석 윈도우를 자동 정렬하지 않으므로, 매 실행의 실제 수신·대표 Rule 이벤트·Trust 처리를 확인하고 다음 실행 여부를 결정한다. 응답이 불명확한 명령을 재전송하거나 예상 감점만으로 격리 성공을 판정하지 않는다. 현재 관측된 Trust 80에서 격리에 이르는 횟수는 실제 적용 정책과 대표 이벤트를 보고 정하며 시작 점수를 임의로 변경하지 않는다.
+ESP32 #2 한 대의 실제 MQTT 발행만 늘려 최초 격리를 확인하고, ESP32 #1과 Pico는 정상 대조 기기로 유지하는 범위를 우선 검토한다. 새 [실물 시험 앱](../firmware/esp32/pi_input_isolation_probe/README.md)은 별도 준비 명령 `ARM MQTT_FLOOD <nonce>` 후 15초 안에 `RUN MQTT_FLOOD`를 입력할 때만 본인 principal/topic으로 정상 JSON 최대 40건을 50ms 간격으로 발행한다. 준비는 실행 전에 소비되며 새 실행은 새 nonce로 다시 준비해야 한다. 기존 `RUN_DEMO`의 식별자 위조·잘못된 JSON·UDP 공격을 함께 실행하지 않는다. 개별 명령은 10초 분석 윈도우를 자동 정렬하지 않으므로, 매 실행의 실제 수신·대표 Rule 이벤트·Trust 처리를 확인하고 다음 실행 여부를 결정한다. 응답이 불명확한 명령을 재전송하거나 예상 감점만으로 격리 성공을 판정하지 않는다. 현재 관측된 Trust 80에서 격리에 이르는 횟수는 실제 적용 정책과 대표 이벤트를 보고 정하며 시작 점수를 임의로 변경하지 않는다.
 
-같은 물리 ESP32에서 MQTT·TCP·UDP·ICMP의 전후 응답을 확인할 시험 앱은 아직 준비되지 않았다. 기존 UDP send 성공값만으로 Pi에 도착하거나 응답했다고 판단하지 않는다. 준비할 probe는 Pi 고정 주소에 한정하며 TCP 응답, UDP nonce와 응답 발신주소, ICMP echo 응답을 기록한다. 대상 IP·현재 기기 IP·기기 식별자와 자체 MQTT principal/topic을 먼저 확인한다. PC에서 ESP32의 device_id만 사용해 대신 발행한 결과는 해당 ESP32 source IP의 격리 시험이 아니다. 필요한 임시 UDP 응답 서비스·probe 횟수·포트·종료 및 회수도 시험 범위에 포함해 확정한다.
+같은 물리 ESP32에서 MQTT·TCP·UDP·ICMP의 전후 응답을 확인할 시험 앱과 제한적 UDP 응답 도구의 소스·공개 example compile은 준비됐다. 실제 업로드·운영 LAN 응답 도구 실행·통신·차단·복원은 아직 검증하지 않았다. 네 probe는 독립 명령이며 MQTT 실패가 다른 세 probe를 막지 않는다. MQTT CONNACK·로컬 publish와 Pi nonce 실제 저장을 구분하고, 기존 API의 완전한 TCP/HTTP 응답, 정확한 UDP nonce·발신주소, ICMP echo의 id/sequence·nonce·checksum을 기록한다. 기존 UDP send 성공값만으로 Pi에 도착하거나 응답했다고 판단하지 않는다. 대상 IP·현재 기기 IP·기기 식별자와 자체 MQTT principal/topic을 먼저 확인한다. PC에서 ESP32의 device_id만 사용해 대신 발행한 결과는 해당 ESP32 source IP의 격리 시험이 아니다. UDP helper는 일반 사용자 foreground로 Pi `.20:9002`에만 bind하고 `.5:42100`에만 응답하며 전체 300초·idle 120초·수신 30건으로 제한한다. 필요한 운영 시작·종료 범위도 실물 시험 전에 확정한다.
 
 | 단계 | 같은 시험 기기에서 확인할 결과 |
 |---|---|
@@ -94,4 +94,4 @@ ESP32 #2 한 대의 실제 MQTT 발행만 늘려 최초 격리를 확인하고, 
 
 10/9에 보존한 P0 원본은 1,048,576바이트이며 SHA256은 `0432c96be74ebccb75bfa274ac35bd578c9e8edf88229d54ab7a5d40de6b84e4`다. 복원한 앱은 offset `0x10000`, 937,984바이트, SHA256 `03714a517d1c5acdd5a59ca95e03155f14eb17a04d41bb1a9668febfba957c22`였고 당시 앱 digest·P0 부팅·정상 MQTT를 확인했다. 이는 당시 앱 구간의 복원 근거이며 현재 설치 펌웨어나 전체 flash/NVS/partition의 복원 증명은 아니다. 새 시험 전에 현재 물리 기기·serial mapping·칩/partition/app 범위와 새 백업을 확인한다. 보존 앱 바이트로 복귀하고 재컴파일본을 원본이라고 부르지 않는다. 과거 COM5 고정 업로드 도구나 RTS reset이 있는 관측 스크립트를 그대로 실행하지 않는다. 개인 백업 바이너리와 기기별 비밀 설정은 저장소에 올리지 않는다.
 
-이 절차는 준비 상태다. 시험 앱 구현·컴파일, 현재 기기 확인, 새 설치 대기 예산, 실제 host 설치·물리 통신·복구는 아직 실행하지 않았다. DHCP 이동과 서비스 재시작·재부팅 복원도 위 기본 통신 시험의 통과와 구분해 후속으로 검증한다.
+이 절차는 준비 상태다. 시험 앱의 최종 두 구성 compile과 미설정 구성 거부, UDP 도구의 Windows·Pi 임시 loopback 회귀 18개가 통과했다. ICMP native frame fixture의 23개 사례도 Pi에서 통과했고 최종 pytest는 19개 모두 통과했다(skip·warning 없음). 현재 물리 기기·원본 앱 새 백업 확인, 새 설치 대기 예산, 실제 host 설치·물리 통신·복구는 아직 실행하지 않았다. DHCP 이동과 서비스 재시작·재부팅 복원도 위 기본 통신 시험의 통과와 구분해 후속으로 검증한다.

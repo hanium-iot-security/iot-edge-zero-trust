@@ -980,6 +980,48 @@ def test_repository_state_prunes_git_and_ignored_directories(tmp_path: Path, mon
     assert state["untracked_inventory"] == []
 
 
+@pytest.mark.parametrize("denied_relative", ["data/recovery/planned", "data/fixtures"])
+def test_production_ignore_prunes_private_plans_but_keeps_data_fixtures(
+    tmp_path: Path, monkeypatch, denied_relative: str,
+) -> None:
+    repository_root = _repository(tmp_path)
+    production_ignore = Path(__file__).resolve().parents[1] / ".gitignore"
+    (repository_root / ".gitignore").write_bytes(production_ignore.read_bytes())
+    _git(repository_root, "add", ".gitignore")
+    _git(repository_root, "commit", "-m", "use production ignore rules")
+    private_plans = repository_root / "data/recovery/planned"
+    private_plans.mkdir(parents=True)
+    (private_plans / "receipt.json").write_text("{}", encoding="utf-8")
+    fixtures = repository_root / "data/fixtures"
+    fixtures.mkdir()
+    (fixtures / ".gitkeep").write_text("", encoding="utf-8")
+    for relative in ("data/fixtures", "data/fixtures/.gitkeep"):
+        assert subprocess.run(
+            ["git", "check-ignore", "--", relative], cwd=repository_root,
+            capture_output=True, check=False,
+        ).returncode == 1
+    scan = os.scandir
+    denied = repository_root / denied_relative
+    scanned = []
+
+    def guarded_scan(path):
+        scanned.append(Path(path))
+        if Path(path) == denied:
+            raise PermissionError(errno.EACCES, "directory access denied", str(path))
+        return scan(path)
+
+    monkeypatch.setattr(packet_checkpoint_recovery.os, "scandir", guarded_scan)
+    if denied == private_plans:
+        state = packet_checkpoint_recovery.inspect_repository_state(repository_root)
+        assert private_plans not in scanned
+        assert fixtures in scanned
+        assert [item["path"] for item in state["untracked_inventory"]] == ["data/fixtures/.gitkeep"]
+    else:
+        with pytest.raises(PermissionError):
+            packet_checkpoint_recovery.inspect_repository_state(repository_root)
+        assert fixtures in scanned
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX FIFO support")
 def test_repository_state_excludes_ignored_special_entry(tmp_path: Path) -> None:
     repository_root = _repository(tmp_path)
