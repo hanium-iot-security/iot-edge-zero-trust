@@ -6,6 +6,13 @@
 - PR #107(정상 운용 v1), #108(복구), #109(수집 전 점검), #110(모델 정보 API), #111(Pi IPv4 격리)은 2026-10-10 조회 시 open이다. #110은 MQTT를 `LEGACY_CONTRACT_UNAVAILABLE`로 표시하며 새 MQTT Bundle과 실행 근거를 제외 범위에 둔다. AI 정책·경고·Stage 활성화 Migration과 Broker 전용 Feature Migration은 develop 및 공개 PR에서 확인되지 않았다.
 - 이 문서의 로컬 PASS는 임시 SQLite/합성 입력이다. 운영 Pi, 운영 DB 사본, 실제 방화벽·공격 결과가 아니다.
 
+## 2026-10-12 원격 develop 재확인
+
+- 원격 `develop`은 `5a0325f`로 전진했다. PR #107~#114 중 #107, #108, #109, #110, #111, #112(MQTT IF offline Bundle), #113, #114(기기별 AI 정책 저장)가 merge commit으로 포함됐다. 위 2026-10-10 상태는 당시 조회 기록이다. 이 작업 브랜치에는 develop을 병합하거나 재배치하지 않았다.
+- PR #112의 `ai/mqtt_if_artifact.py`와 `docs/phase9-mqtt-if-offline-bundle.md`는 **offline** Bundle 검사 계약을 제공한다. 현재 이 브랜치의 MQTT Stage는 여전히 legacy loader를 사용한다. 모델 해시·Feature 순서·점수 방향·Threshold·비교 연산을 운영 Runtime까지 연결하고 새 develop 위에서 다시 검증해야 한다.
+- PR #114의 Migration 012와 `edge/policy/device_ai_policy_resolver.py`는 `device_ai_policy_revisions` 저장·조회 계약을 제공한다. 이 브랜치의 `ai_window_selector`는 아직 해당 resolver 또는 운영 Stage Registry에 연결되지 않았다. 활성화 감사·경고·완료 기록의 영속 저장 계약도 이 merge 결과에서 확인되지 않았다. 따라서 아래의 관련 HOLD는 "저장 revision 부재"가 아니라 "확정된 저장 revision과 실행 경로의 미연결"로 읽어야 한다.
+- Broker 목적지 전용 Feature/Migration은 이 `develop`에서 확인되지 않았다. 기존 로컬 시험은 이전 기준 `53ec270` 위에서 실행했다. 최신 develop과의 통합 diff·회귀 및 Pi 결과는 미검증이며 병합 전에 별도로 확인해야 한다.
+
 ## 정상 운용 기준 v1 검토 — P9-08/V06·V07
 
 근거는 PR #107의 `d591e04`에 담긴 `docs/phase9-normal-operating-range.md`, `docs/phase9-message-contract.md`와 계획 11절이다. 아래 Run은 모두 Session 108의 한 개발 그룹이다. 학습·Session·정상 패턴 승인은 false이며 P1·P2 개발 허용을 Train 승인으로 해석하지 않는다.
