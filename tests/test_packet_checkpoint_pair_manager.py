@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 import pytest
 
@@ -167,6 +168,67 @@ def test_plan_is_read_only_and_binds_whole_worker_budget(fixture):
     assert fixture["plan"]["pair_plan_sha256"] == fixture["base"]["plan"]["plan_sha256"]
     assert fixture["plan"]["budgets"]["verify_observation_start_seconds"] == 120
     assert "verify_seconds" not in fixture["plan"]["budgets"]
+
+
+def test_plan_and_launch_journal_save_with_microsecond_clock(recovery_fixture, monkeypatch):
+    base = recovery_fixture
+    now = datetime.now(timezone.utc)
+    if now.microsecond == 0:
+        now = now.replace(microsecond=123456)
+    monkeypatch.setattr(manager.core, "_utc_now", lambda: now)
+    assert manager.core._utc_now().microsecond != 0
+    before = base["database"].read_bytes()
+    system = System(base)
+    path = base["output"].with_name("manager-microsecond-plan.json")
+    plan = manager.create_plan(pair_plan_file=base["output"], db_path=base["database"],
+                               artifact_dir=base["artifacts"], plan_output=path, system=system)
+    saved_plan = json.loads(path.read_text(encoding="utf-8"))
+    manager.core.verify_plan_sha256(saved_plan)
+    assert saved_plan == plan
+    assert plan["generated_at"] == manager.core.format_db_utc(now.replace(microsecond=0))
+
+    processes = Processes(lambda: pytest.fail("launch must not execute the worker"))
+    manager.apply(plan_file=path, confirm="APPLY-PACKET-PAIR-MANAGER:" + plan["plan_sha256"],
+                  system=system, processes=processes)
+    journal = manager._journal(plan)
+    manager.core.verify_plan_sha256(journal)
+    assert journal["generated_at"] == plan["generated_at"]
+    assert journal["phase"] == "LAUNCH_REQUESTED"
+    assert journal["original"] == dict.fromkeys(manager.UNITS, "active")
+    assert journal["approval_sha256"] == plan["plan_sha256"]
+    assert [role for role, _ in processes.launches] == ["supervisor"]
+    assert system.actions == []
+    assert base["database"].read_bytes() == before
+
+
+def test_verifier_response_with_microsecond_clock(fixture, monkeypatch):
+    launch(fixture)
+    _execute(fixture["base"])
+    now = datetime.now(timezone.utc)
+    if now.microsecond == 0:
+        now = now.replace(microsecond=123456)
+    monkeypatch.setattr(manager.core, "_utc_now", lambda: now)
+    assert manager.core._utc_now().microsecond != 0
+    before = fixture["base"]["database"].read_bytes()
+    responses = []
+    fixture["processes"].verifier_transform = lambda response: responses.append(response) or response
+
+    result = manager.verify(plan_file=fixture["path"], system=fixture["system"], processes=fixture["processes"])
+
+    assert result["operation_status"] == "HOLD"
+    assert result["error"] == "required processing checkpoint missing"
+    assert result["database_committed"] is True
+    assert len(responses) == 1
+    response = responses[0]
+    manager.core.verify_plan_sha256(response)
+    assert response["generated_at"] == manager.core.format_db_utc(now.replace(microsecond=0))
+    assert response["result"] == result
+    assert response["pair_plan_sha256"] == fixture["base"]["plan"]["plan_sha256"]
+    journal = manager._journal(fixture["plan"])
+    manager.core.verify_plan_sha256(journal)
+    assert journal["verification"] == result
+    assert journal["verifier_reaped"] is True
+    assert fixture["base"]["database"].read_bytes() == before
 
 
 def test_detached_launch_journal_survives_parent_and_duplicate_is_not_started(fixture):
