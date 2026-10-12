@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations, connect_database
+from edge.policy.device_ai_policy_resolver import AI_RESOLUTION_OK, resolve_ai_mode
 from tests.device_policy_support import count, insert_legacy_device
 
 
@@ -95,6 +96,42 @@ class TestConstraints:
         with pytest.raises(sqlite3.IntegrityError):
             _insert(db, **overrides)
         assert count(db, "device_ai_policy_revisions") == 0
+
+    @pytest.mark.parametrize("field,value", [
+        ("effective_from", "2026-02-30T00:00:10Z"),
+        ("effective_from", "2026-02-29T00:00:10Z"),
+        ("effective_from", "1900-02-29T00:00:10Z"),
+        ("effective_from", "2026-04-31T00:00:10Z"),
+        ("effective_from", "2026-10-12T24:00:10Z"),
+        ("effective_from", "0000-10-12T00:00:10Z"),
+        ("created_at", "2026-02-30T00:00:03Z"),
+        ("created_at", "2026-02-30T00:00:03.123Z"),
+        ("created_at", "2026-02-29T00:00:03Z"),
+        ("created_at", "1900-02-29T00:00:03Z"),
+        ("created_at", "2026-04-31T00:00:03Z"),
+        ("created_at", "2026-10-12T24:00:03Z"),
+        ("created_at", "2026-10-12T24:00:03.123Z"),
+        ("created_at", "0000-10-12T00:00:03Z"),
+        ("created_at", "0000-10-12T00:00:03.123Z"),
+    ])
+    def test_noncanonical_calendar_timestamp_is_rejected(self, db, field, value) -> None:
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert(db, **{field: value})
+        assert count(db, "device_ai_policy_revisions") == 0
+
+    @pytest.mark.parametrize("effective_from,created_at", [
+        ("2028-02-29T00:00:10Z", "2028-02-29T00:00:03Z"),
+        ("2028-02-29T00:00:10Z", "2028-02-29T00:00:03.123Z"),
+        ("2000-02-29T23:59:50Z", "2000-02-29T23:59:49.999Z"),
+        ("0001-01-01T00:00:10Z", "0001-01-01T00:00:03.000Z"),
+        ("9999-12-31T23:59:50Z", "9999-12-31T23:59:49.999Z"),
+    ])
+    def test_valid_calendar_timestamp_is_preserved_and_resolves(self, db, effective_from, created_at) -> None:
+        _insert(db, effective_from=effective_from, created_at=created_at)
+        stored = db.execute("SELECT effective_from,created_at FROM device_ai_policy_revisions").fetchone()
+        assert tuple(stored) == (effective_from, created_at)
+        resolved = resolve_ai_mode(db, "dev_a", effective_from)
+        assert (resolved.resolution, resolved.ai_policy_revision, resolved.mode) == (AI_RESOLUTION_OK, 1, "OFF")
 
     def test_revision_must_follow_the_previous_one(self, db) -> None:
         _insert(db)

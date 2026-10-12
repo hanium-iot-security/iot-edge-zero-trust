@@ -15,13 +15,17 @@ CREATE TABLE device_ai_policy_revisions (
     mode TEXT NOT NULL CHECK (mode IN ('OFF', 'OBSERVE')),
     effective_from TEXT NOT NULL
         CHECK (
-            strftime('%Y-%m-%dT%H:%M:%SZ', effective_from) IS effective_from
+            substr(effective_from, 1, 4) >= '0001'
+            AND strftime('%Y-%m-%dT%H:%M:%SZ', effective_from, '+0 seconds') IS effective_from
             AND effective_from GLOB '*:[0-5]0Z'
         ),
     created_at TEXT NOT NULL
         CHECK (
-            strftime('%Y-%m-%dT%H:%M:%SZ', created_at) IS created_at
-            OR strftime('%Y-%m-%dT%H:%M:%fZ', created_at) IS created_at
+            substr(created_at, 1, 4) >= '0001'
+            AND (
+                strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+0 seconds') IS created_at
+                OR strftime('%Y-%m-%dT%H:%M:%fZ', created_at, '+0 seconds') IS created_at
+            )
         ),
     created_by TEXT NOT NULL CHECK (length(trim(created_by)) BETWEEN 1 AND 128),
     reason TEXT NOT NULL CHECK (length(trim(reason)) BETWEEN 1 AND 500),
