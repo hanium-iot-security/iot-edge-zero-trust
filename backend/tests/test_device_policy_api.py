@@ -37,11 +37,12 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request):
 
     db_path = tmp_path / "device-policy-api.db"
     migrations = MIGRATIONS_DIR
-    if getattr(request, "param", None) == "legacy":
-        migrations = tmp_path / "legacy-migrations"
+    migration_limit = {"legacy": 6, "pre012": 11}.get(getattr(request, "param", None))
+    if migration_limit is not None:
+        migrations = tmp_path / "partial-migrations"
         migrations.mkdir()
         for source in MIGRATIONS_DIR.glob("*.sql"):
-            if int(source.name.split("_", 1)[0]) <= 6:
+            if int(source.name.split("_", 1)[0]) <= migration_limit:
                 shutil.copyfile(source, migrations / source.name)
     apply_migrations(db_path, migrations)
 
@@ -538,6 +539,26 @@ def test_list_pagination_and_trust_filter_do_not_duplicate_revision_rows(api_cli
     assert filtered["total"] == 1
     assert [item["device_id"] for item in filtered["items"]] == ["pico_01"]
     assert client.get("/api/devices", params={"status": "PENDING"}).status_code == 422
+
+
+@pytest.mark.parametrize("api_client", ["pre012"], indirect=True)
+def test_pre012_registration_returns_unavailable_and_rolls_back(api_client):
+    client, db_path, _ = api_client
+    assert rows(db_path, "SELECT max(version) FROM schema_migrations") == [(11,)]
+    response = client.post("/api/devices", json=registration(), headers=ADMIN_HEADERS)
+    assert_business_error(response, 503, "AI_POLICY_UNAVAILABLE")
+    assert rows(db_path, "SELECT device_id FROM devices") == []
+    assert rows(db_path, "SELECT revision FROM device_policy_revisions") == []
+
+
+def test_partial_ai_schema_registration_returns_unavailable_and_rolls_back(api_client):
+    client, db_path, _ = api_client
+    write(db_path, "ALTER TABLE device_ai_policy_revisions RENAME COLUMN reason TO missing_reason")
+    response = client.post("/api/devices", json=registration(), headers=ADMIN_HEADERS)
+    assert_business_error(response, 503, "AI_POLICY_UNAVAILABLE")
+    assert rows(db_path, "SELECT device_id FROM devices") == []
+    assert rows(db_path, "SELECT revision FROM device_policy_revisions") == []
+    assert rows(db_path, "SELECT revision FROM device_ai_policy_revisions") == []
 
 
 def test_revision_insert_failure_rolls_back_the_whole_registration(api_client):
