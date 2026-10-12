@@ -32,6 +32,8 @@ backend/data/*
 data/**/*
 !data/**/
 !data/**/.gitkeep
+# Private root-owned recovery plans are runtime evidence, not repository input.
+/data/recovery/planned/
 data/**/*.csv
 data/**/*.jsonl
 *.log
