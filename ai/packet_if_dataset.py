@@ -174,9 +174,15 @@ class PacketIFDataset:
 def load_packet_if_dataset(
     dataset_path: Path,
     manifest_path: Path,
+    *,
+    external_holdout: bool = False,
 ) -> PacketIFDataset:
-    """변경되지 않는 CSV와 Session 단위 Split Manifest를 읽습니다."""
-    manifest = load_packet_if_manifest(manifest_path)
+    """변경되지 않는 CSV와 Session 단위 Split Manifest를 읽습니다.
+
+    `external_holdout=True`는 학습과 분리해 따로 수집한 평가 전용 Dataset(모든 Session이 test)만
+    허용한다. 다른 검증은 그대로이며 기본값(세 Split 필수)은 변하지 않는다.
+    """
+    manifest = load_packet_if_manifest(manifest_path, external_holdout=external_holdout)
     actual_sha256 = file_sha256(dataset_path)
     if actual_sha256 != manifest.dataset_sha256:
         raise ValueError(
@@ -209,6 +215,14 @@ def load_packet_if_dataset(
         kind="stable",
     ).reset_index(drop=True)
 
+    if external_holdout:
+        no_rows = enriched.iloc[0:0]
+        return PacketIFDataset(
+            train=no_rows,
+            validation=no_rows,
+            test=_split_frame(enriched, TEST_SPLIT),
+            manifest=manifest,
+        )
     return PacketIFDataset(
         train=_split_frame(enriched, TRAIN_SPLIT),
         validation=_split_frame(enriched, VALIDATION_SPLIT),
@@ -219,6 +233,8 @@ def load_packet_if_dataset(
 
 def load_packet_if_manifest(
     path: Path,
+    *,
+    external_holdout: bool = False,
 ) -> PacketIFDatasetManifest:
     if not path.exists():
         raise FileNotFoundError(f"packet dataset manifest not found: {path}")
@@ -259,7 +275,11 @@ def load_packet_if_manifest(
         _parse_session_spec(item, dataset_version=dataset_version)
         for item in raw_sessions
     )
-    _validate_manifest_sessions(sessions, dataset_version=dataset_version)
+    _validate_manifest_sessions(
+        sessions,
+        dataset_version=dataset_version,
+        external_holdout=external_holdout,
+    )
     manifest = PacketIFDatasetManifest(
         dataset_version=dataset_version,
         capture_policy=capture_policy,
@@ -560,6 +580,7 @@ def _validate_manifest_sessions(
     sessions: tuple[PacketIFSessionSpec, ...],
     *,
     dataset_version: str,
+    external_holdout: bool = False,
 ) -> None:
     session_ids = [spec.session_id for spec in sessions]
     if len(set(session_ids)) != len(session_ids):
@@ -569,7 +590,9 @@ def _validate_manifest_sessions(
         _validate_phase5_manifest_sessions(sessions)
 
     split_values = {spec.split for spec in sessions}
-    missing_splits = VALID_SPLITS - split_values
+    if external_holdout and split_values != {TEST_SPLIT}:
+        raise ValueError("external holdout manifest must contain only test sessions")
+    missing_splits = (frozenset({TEST_SPLIT}) if external_holdout else VALID_SPLITS) - split_values
     if missing_splits:
         raise ValueError(
             f"packet dataset manifest is missing splits: {sorted(missing_splits)}"
@@ -592,7 +615,10 @@ def _validate_manifest_sessions(
         for spec in sessions
         if spec.split == TEST_SPLIT
     }
-    missing_test_labels = VALID_TRAFFIC_LABELS - test_labels
+    # A normal-only or attack-only external holdout is a valid evaluation set.
+    missing_test_labels = (
+        frozenset() if external_holdout else VALID_TRAFFIC_LABELS - test_labels
+    )
     if missing_test_labels:
         raise ValueError(
             "test split must contain separate normal and attack sessions: "
