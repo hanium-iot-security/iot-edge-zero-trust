@@ -185,14 +185,104 @@ def test_a_review_that_changes_the_source_package_holds(case, package, monkeypat
     case.request()
     real = admission.export_normal_collection
 
-    def touching(path, *, output_dir):
-        report = real(path, output_dir=output_dir)
+    def touching(path, *, output_dir, qc_profiles=None):
+        report = real(path, output_dir=output_dir, qc_profiles=qc_profiles)
         (path / "pcap" / "stray.txt").write_text("changed", encoding="utf-8")
         return report
 
     monkeypatch.setattr(admission, "export_normal_collection", touching)
 
     assert "run:1:source_package_changed" in case.review()["blockers"]
+
+
+def _p1_messages(package, *, extra_payload_key=False):
+    """Real four-second P1 rows with matching features in the synthetic candidate DB."""
+    device = "esp32_02"
+    messages = []
+    with closing(sqlite3.connect(package / "after.db")) as db:
+        db.execute("DELETE FROM mqtt_logs WHERE device_id=?", (device,))
+        for index, offset in enumerate((1, 5, 9, 13, 17)):
+            value = {"device_id": device, "sequence": 100 + index, "uptime_s": 100 + offset}
+            if extra_payload_key:
+                value["temperature_c"] = 24.0  # P2-like schema diversity is not authorized by P1 cadence.
+            payload = json.dumps(value)
+            size = len(payload.encode())
+            base.insert(db, "mqtt_logs", device_id=device, topic=f"iot/{device}/sensor", payload=payload,
+                        payload_size=size, payload_raw=payload.encode(), payload_decode_status="OK",
+                        received_at=utc(START + timedelta(seconds=offset)), is_json_valid=1, is_topic_valid=1)
+            messages.append((offset, size))
+        for second in (0, 10):
+            sizes = [size for offset, size in messages if second <= offset < second + 10]
+            db.execute("UPDATE feature_logs SET publish_count=?, avg_payload_size=?, max_payload_size=?, "
+                       "avg_message_interval=4, min_message_interval=4 WHERE device_id=? AND window_start=?",
+                       (len(sizes), sum(sizes) / len(sizes), max(sizes), device, utc(START + timedelta(seconds=second))))
+        db.commit()
+    save_manifest(package, json.loads((package / "manifest.json").read_text()))
+
+
+@pytest.mark.parametrize("profile,expected", [("P0", "HOLD"), ("P1", "PASS")])
+def test_admission_uses_the_declared_profile_for_real_p1_cadence(case, package, profile, expected):
+    _p1_messages(package)
+    case.final()
+    request = case.request()
+    request["device_specs"][1]["profile"] = profile
+    case.request(device_specs=request["device_specs"])
+    before = tree_hashes(package)
+
+    report = case.review()
+    qc = json.loads((case.out / "review" / "qc" / "run-01" / "qc-report.json").read_text())
+
+    assert report["status"] == expected and qc["status"] == expected
+    assert qc["qc_policy"]["esp32_02"]["profile"] == profile
+    assert report["runs"][0]["qc_profiles"] == {"esp32_01": "P0", "esp32_02": profile, "pico_01": "P0"}
+    assert tree_hashes(package) == before
+    assert report["training_approved"] is False and report["whole_capture_session_approved"] is False
+    if profile == "P0":
+        assert "mqtt:esp32_02:sender_cadence" in qc["hold_reasons"]
+
+
+def test_p1_cadence_permission_does_not_admit_a_different_payload_schema(case, package):
+    _p1_messages(package, extra_payload_key=True)
+    case.final()
+    request = case.request()
+    request["device_specs"][1]["profile"] = "P1"
+    case.request(device_specs=request["device_specs"])
+
+    report = case.review()
+
+    assert report["runs"][0]["candidate_qc"] == "PASS"
+    assert report["official_admission"] == "HOLD"
+    assert "device_specs:payload_schema_mismatch(esp32_02)" in report["blockers"]
+    assert report["training_approved"] is False
+
+
+@pytest.mark.parametrize("index,profile,code", [
+    (1, "P7", "unknown_qc_profile"),
+    (2, "P1", "profile_not_supported_for_device"),
+])
+def test_unsupported_declared_profile_is_refused_by_admission_qc(case, index, profile, code):
+    request = case.request()
+    request["device_specs"][index]["profile"] = profile
+    case.request(device_specs=request["device_specs"])
+
+    report = case.review()
+
+    assert report["status"] == "HOLD" and report["runs"][0]["candidate_qc"] == "HOLD"
+    assert f"mqtt:{code}" in report["runs"][0]["hold_reasons"]
+
+
+def test_admission_requires_the_profile_aware_qc_api(case, monkeypatch):
+    case.request()
+
+    def old_qc_api(package, *, output_dir):
+        pytest.fail("Legacy QC must not silently run with its default P0 policy")
+
+    monkeypatch.setattr(admission, "export_normal_collection", old_qc_api)
+
+    report = case.review()
+
+    assert report["status"] == "HOLD" and report["blockers"] == ["preflight:qc_profile_api_unavailable"]
+    assert not (case.out / "review").exists()
 
 
 @pytest.mark.parametrize("slots,expected", [
@@ -225,6 +315,72 @@ def test_final_snapshot_must_be_completed_and_match_the_declared_hash(case):
     request["final_snapshot"]["sha256"] = "0" * 64
     case.request(final_snapshot=request["final_snapshot"])
     assert "final_snapshot:final_snapshot_checksum" in case.review("bad-hash")["blockers"]
+
+
+@pytest.mark.parametrize("phase", ["before_read", "before_publish"])
+def test_final_snapshot_change_during_review_holds_the_published_report(case, monkeypatch, phase):
+    request = case.request()
+    final = case.packages / "final.db"
+    changed = False
+
+    def change_final():
+        nonlocal changed
+        if not changed:
+            # Change an unselected Session field, preserving all row-consistency checks.
+            with closing(sqlite3.connect(final)) as db:
+                db.execute("UPDATE packet_capture_sessions SET ended_at=?",
+                           (utc(START + timedelta(seconds=31)),))
+                db.commit()
+            changed = True
+
+    if phase == "before_read":
+        original = admission._open_readonly
+
+        def open_after_change(path):
+            if path == final:
+                change_final()
+            return original(path)
+
+        monkeypatch.setattr(admission, "_open_readonly", open_after_change)
+    else:
+        original = admission._check
+
+        def check_then_change(report, label, function):
+            original(report, label, function)
+            if label == "device_specs":
+                change_final()
+
+        monkeypatch.setattr(admission, "_check", check_then_change)
+
+    report = case.review()
+    published = json.loads((case.out / "review" / "admission-report.json").read_text())
+
+    assert changed and digest(final) != request["final_snapshot"]["sha256"]
+    assert report == published
+    assert report["status"] == "HOLD" and report["official_admission"] == "HOLD"
+    expected_stage = "final_snapshot" if phase == "before_read" else "final_snapshot_unchanged"
+    assert f"{expected_stage}:final_snapshot_checksum" in report["blockers"]
+    assert report["training_approved"] is False and report["whole_capture_session_approved"] is False
+
+
+def test_new_final_snapshot_wal_before_publish_holds_even_when_db_hash_matches(case, monkeypatch):
+    request = case.request()
+    final = case.packages / "final.db"
+    original = admission._check
+
+    def check_then_add_wal(report, label, function):
+        original(report, label, function)
+        if label == "device_specs":
+            final.with_name(final.name + "-wal").write_bytes(b"uncheckpointed writer")
+
+    monkeypatch.setattr(admission, "_check", check_then_add_wal)
+
+    report = case.review()
+    published = json.loads((case.out / "review" / "admission-report.json").read_text())
+
+    assert digest(final) == request["final_snapshot"]["sha256"]
+    assert report == published and report["status"] == "HOLD"
+    assert "final_snapshot_unchanged:snapshot_not_standalone" in report["blockers"]
 
 
 def test_failure_inside_the_selected_range_holds(case):

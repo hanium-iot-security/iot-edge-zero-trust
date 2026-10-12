@@ -12,6 +12,7 @@ import argparse
 from contextlib import closing
 from datetime import datetime, timezone
 import hashlib
+import inspect
 import json
 from pathlib import Path
 import re
@@ -176,6 +177,8 @@ def review_admission(packages_dir: Path, request_path: Path, output_dir: Path) -
     root = Path(packages_dir).resolve()
     try:
         request = load_request(request_path)
+        _require("qc_profiles" in inspect.signature(export_normal_collection).parameters,
+                 "qc_profile_api_unavailable")
         destination = _new_output_dir(root, output_dir)
     except SAFE_ERRORS as exc:
         report["blockers"].append(f"preflight:{exc if isinstance(exc, CandidateQCError) else type(exc).__name__}")
@@ -190,12 +193,15 @@ def review_admission(packages_dir: Path, request_path: Path, output_dir: Path) -
         manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
         _uuid(manifest["run_id"])
         before = _tree(package)
-        qc = export_normal_collection(package, output_dir=destination / "qc" / f"run-{index:02d}")
+        qc_profiles = {spec["device_id"]: spec["profile"] for spec in request["device_specs"]
+                       if spec["device_id"] in manifest["included_device_ids"]}
+        qc = export_normal_collection(package, output_dir=destination / "qc" / f"run-{index:02d}",
+                                      qc_profiles=qc_profiles)
         _require(_tree(package) == before, "source_package_changed")
         manifests[manifest["run_id"]] = (package, manifest)
         report["runs"].append({"run_id": manifest["run_id"], "run_dir": entry["run_dir"],
                                "candidate_qc": qc["status"], "hold_reasons": qc["hold_reasons"],
-                               "counts": qc["counts"]})
+                               "counts": qc["counts"], "qc_profiles": qc_profiles})
         _require(qc["status"] == "PASS", f"candidate_qc_hold({manifest['run_id']})")
 
     for index, entry in enumerate(request["runs"], 1):
@@ -222,9 +228,15 @@ def review_admission(packages_dir: Path, request_path: Path, output_dir: Path) -
 
     final_rows = {}
 
-    def final_snapshot():
+    def final_snapshot_unchanged():
         final = _path(root, request["final_snapshot"]["path"])
         _require(final.is_file() and _hash(final) == request["final_snapshot"]["sha256"], "final_snapshot_checksum")
+        _require(not any(Path(str(final) + suffix).exists() for suffix in ("-wal", "-shm")),
+                 "snapshot_not_standalone")
+
+    def final_snapshot():
+        final = _path(root, request["final_snapshot"]["path"])
+        final_snapshot_unchanged()
         report["final_snapshot_sha256"] = request["final_snapshot"]["sha256"]
         first = runs[0]
         with closing(_open_readonly(final)) as db:
@@ -250,6 +262,7 @@ def review_admission(packages_dir: Path, request_path: Path, output_dir: Path) -
             for run in runs:
                 final_rows[run["run_id"]] = _range_rows(db, run)
             _require(not inside, "session_failure_inside_selected_range")
+        final_snapshot_unchanged()
 
     if runs:
         _check(report, "final_snapshot", final_snapshot)
@@ -294,6 +307,7 @@ def review_admission(packages_dir: Path, request_path: Path, output_dir: Path) -
 
     if runs:
         _check(report, "device_specs", device_specs)
+        _check(report, "final_snapshot_unchanged", final_snapshot_unchanged)
 
     if not report["blockers"]:
         report["official_admission"] = "BOUNDED_ELIGIBLE"

@@ -32,6 +32,9 @@ COMPLETED·그룹 일치, Run 구간 안 실패는 HOLD, 구간 밖 실패는 `w
 후속 개발 사본에서 Session 90은 COMPLETED지만 전체 범위에는 실패 Segment ID 35478이 있다. 실패 Window는 같은 날 UTC `[15:13:20,15:13:30)`, 사유는 `PARTIAL_CAPTURE`이며 선택한 150분 밖에 있다. 최종 종료 사본을 연결해도 실패가 사라지는 것은 아니다. 현 공식 Importer/Packet Exporter의 전체 Session 검사는 이런 실패를 거부한다.
 
 따라서 선택 구간의 후보 QC와 전체 Session 적격성을 별도로 기록해야 한다. 실패 행을 삭제하거나 Session 상태를 바꾸어 전체 정상으로 편입하지 않는다.
+최종 사본의 SHA256과 WAL/SHM 없는 독립 사본 상태는 읽기 전·읽은 후·심사 보고서 작성 직전에 확인한다. 검사 도중 사본이 바뀌면 HOLD를 기록한다.
+이 심사 도구는 PR 119의 Profile별 QC API(`qc_profiles`)가 먼저 있어야 한다. 각 Run에 포함된 기기의 선언 Profile을 그대로 재검사에 전달하며,
+지원하지 않는 Profile은 HOLD로 처리한다. P1 주기 허용이 다른 payload 규격의 허용이나 학습 승인을 뜻하지 않는다.
 
 ## 첫 구현에 필요한 입력과 검사
 
