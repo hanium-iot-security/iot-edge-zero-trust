@@ -20,7 +20,11 @@ from ai.packet_if_dataset import (
     PacketIFSessionSpec,
     file_sha256,
 )
-from ai.packet_if_phase5_manifest import PACKET_IF_DATASET_VERSION_V1, PacketIFRunManifestReference
+from ai.packet_if_phase5_manifest import (
+    PACKET_IF_DATASET_VERSION_V1,
+    PACKET_IF_DATASET_VERSION_V2,
+    PacketIFRunManifestReference,
+)
 from ai.predict_packet_isolation_forest import PacketIFArtifact, PacketIFPrediction
 from edge.packet.capture_policy import CapturePolicy
 from edge.phase5.contracts import RUN_MANIFEST_SCHEMA_VERSION
@@ -47,7 +51,7 @@ def spec(name, split, *, label="normal", started=COLLECTED, group=None, slot=Non
 
 
 def manifest(sessions, policy=None, sha="d" * 64):
-    return PacketIFDatasetManifest(PACKET_IF_DATASET_VERSION_V1, policy or CapturePolicy(), sha, tuple(sessions))
+    return PacketIFDatasetManifest(PACKET_IF_DATASET_VERSION_V2, policy or CapturePolicy(), sha, tuple(sessions))
 
 
 def row(feature_id, session, label, offset):
@@ -337,17 +341,26 @@ def test_cli_exit_codes(case, capsys):
 # ── Real loaders and a really trained artifact (nothing but git provenance is patched) ──────────────
 
 
-def _real_case(tmp_path, monkeypatch, *, rename):
+def _real_case(tmp_path, monkeypatch, *, rename, dataset_version=PACKET_IF_DATASET_VERSION_V2,
+               rename_only=False):
     """Train a real artifact, then derive an external Holdout bundle from its Test sessions."""
     from uuid import uuid4
 
     from ai.packet_if_dataset import session_data_sha256s
     from ai.train_packet_isolation_forest import train_from_files
     from tests.test_train_packet_isolation_forest import GIT_COMMIT_SHA, _write_training_bundle
+    from tests.test_packet_if_dataset import _write_dataset_bundle
 
     training_dir = tmp_path / "training"
     training_dir.mkdir()
     dataset_path, manifest_path = _write_training_bundle(training_dir)
+    if dataset_version == PACKET_IF_DATASET_VERSION_V2:
+        original = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for session in original["sessions"]:
+            session.pop("data_sha256")  # Recompute after the CSV is serialized by the v2 fixture.
+        dataset_path, manifest_path = _write_dataset_bundle(
+            training_dir, rows=pd.read_csv(dataset_path).to_dict(orient="records"), sessions=original["sessions"],
+            manifest_overrides={"dataset_version": PACKET_IF_DATASET_VERSION_V2})
     artifacts = train_from_files(dataset_path=dataset_path, manifest_path=manifest_path,
                                  artifact_dir=training_dir / "packet-if-v1", git_commit_sha=GIT_COMMIT_SHA)
 
@@ -357,9 +370,12 @@ def _real_case(tmp_path, monkeypatch, *, rename):
     mapping = {old: (str(uuid4()) if rename else old) for old in test_ids}
     rows = frame[frame["session_id"].isin(test_ids)].copy()
     rows["session_id"] = rows["session_id"].map(mapping)
-    if rename:
+    if rename and not rename_only:
         rows["packet_feature_log_id"] = rows["packet_feature_log_id"] + 100_000
-        rows["total_bytes"] = rows["total_bytes"] + 1  # different data, so the session hash differs
+        rows["total_bytes"] = rows["total_bytes"] + 1
+        for column in ("window_start", "window_end", "segment_window_start", "segment_window_end"):
+            rows[column] = (pd.to_datetime(rows[column], utc=True) + pd.Timedelta(days=7)).dt.strftime(
+                "%Y-%m-%dT%H:%M:%SZ")
     holdout_dir = tmp_path / "holdout"
     holdout_dir.mkdir()
     csv_path = holdout_dir / "holdout.csv"
@@ -369,14 +385,30 @@ def _real_case(tmp_path, monkeypatch, *, rename):
     for item in manifest_json["sessions"]:
         if item["split"] != "test":
             continue
-        sessions.append({**item, "session_id": mapping[item["session_id"]], "data_sha256": hashes[mapping[item["session_id"]]]})
+        session = {**item, "session_id": mapping[item["session_id"]],
+                   "data_sha256": hashes[mapping[item["session_id"]]]}
+        if dataset_version == PACKET_IF_DATASET_VERSION_V2:
+            session.pop("data_sha256")
+            session.pop("run_manifest_ref")  # Write an actual matching Run and sidecar for this Session.
+            if rename and not rename_only:
+                session["source_capture_group_id"] = mapping[item["session_id"]]
+                session["collection_slot_id"] = f"slot-{session['session_id']}"
+                for column in ("started_at", "first_window_start", "ended_at"):
+                    session[column] = (pd.Timestamp(session[column]) + pd.Timedelta(days=7)).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ")
+        sessions.append(session)
     manifest_out = holdout_dir / "holdout-manifest.json"
-    manifest_out.write_text(json.dumps({**manifest_json, "dataset_sha256": file_sha256(csv_path), "sessions": sessions}),
-                            encoding="utf-8")
+    if dataset_version == PACKET_IF_DATASET_VERSION_V2:
+        csv_path, manifest_out = _write_dataset_bundle(
+            holdout_dir, rows=rows.to_dict(orient="records"), sessions=sessions,
+            manifest_overrides={"dataset_version": PACKET_IF_DATASET_VERSION_V2})
+    else:
+        manifest_out.write_text(json.dumps({**manifest_json, "dataset_sha256": file_sha256(csv_path), "sessions": sessions}),
+                                encoding="utf-8")
     request = {"schema_version": "packet-external-eval-request-v1", "purpose": "DEVELOPMENT",
-               "artifact": {"dir": str(training_dir / "packet-if-v1"), "expected_bundle_sha256": artifacts.bundle_sha256},
-               "dataset": {"csv": "holdout/holdout.csv", "csv_sha256": file_sha256(csv_path),
-                           "manifest": "holdout/holdout-manifest.json", "manifest_sha256": file_sha256(manifest_out)},
+               "artifact": {"dir": (training_dir / "packet-if-v1").as_posix(), "expected_bundle_sha256": artifacts.bundle_sha256},
+               "dataset": {"csv": csv_path.relative_to(tmp_path).as_posix(), "csv_sha256": file_sha256(csv_path),
+                           "manifest": manifest_out.relative_to(tmp_path).as_posix(), "manifest_sha256": file_sha256(manifest_out)},
                "training_manifest": {"path": "training/" + manifest_path.name, "sha256": file_sha256(manifest_path)}}
     (tmp_path / "request.json").write_text(json.dumps(request), encoding="utf-8")
     monkeypatch.setattr(holdout, "_resolve_evaluation_git_provenance",
@@ -384,7 +416,7 @@ def _real_case(tmp_path, monkeypatch, *, rename):
     return tmp_path / "request.json", artifacts
 
 
-def test_real_artifact_scores_a_renamed_holdout_with_its_own_threshold(tmp_path, monkeypatch):
+def test_real_artifact_scores_an_independent_v2_holdout_with_its_own_threshold(tmp_path, monkeypatch):
     request, artifacts = _real_case(tmp_path, monkeypatch, rename=True)
 
     report = evaluate_external_holdout(request, tmp_path / "evaluation")
@@ -403,6 +435,44 @@ def test_real_artifact_refuses_its_own_test_sessions_as_a_holdout(tmp_path, monk
 
     assert report["status"] == "HOLD" and "non_overlap:overlap_session_id" in report["blockers"]
     assert not (tmp_path / "evaluation" / "packet-if-evaluation.json").exists()
+
+
+@pytest.mark.parametrize("version,expected", [
+    (PACKET_IF_DATASET_VERSION_V1, "contract:external_dataset_requires_v2"),
+    (PACKET_IF_DATASET_VERSION_V2, "non_overlap:overlap_source_capture_group_id"),
+])
+def test_real_renamed_copy_cannot_pass_as_an_independent_holdout(tmp_path, monkeypatch, version, expected):
+    request_path, _ = _real_case(tmp_path, monkeypatch, rename=True, dataset_version=version, rename_only=True)
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    training_path = next((tmp_path / "training").glob("packet_if*.csv"))
+    if version == PACKET_IF_DATASET_VERSION_V2:
+        training_path = tmp_path / "training" / "packet_if.csv"
+    training = pd.read_csv(training_path)
+    original_manifest = json.loads((tmp_path / request["training_manifest"]["path"]).read_text(encoding="utf-8"))
+    test_ids = [session["session_id"] for session in original_manifest["sessions"] if session["split"] == "test"]
+    original = training[training["session_id"].isin(test_ids)].drop(columns="session_id").reset_index(drop=True)
+    copied = pd.read_csv(tmp_path / request["dataset"]["csv"]).drop(columns="session_id")
+    pd.testing.assert_frame_equal(original, copied, check_dtype=False)
+
+    report = evaluate_external_holdout(request_path, tmp_path / "evaluation")
+
+    assert report["status"] == "HOLD" and expected in report["blockers"]
+    assert not (tmp_path / "evaluation" / "packet-if-evaluation.json").exists()
+
+
+@pytest.mark.parametrize("kind,expected", [
+    ("external", "contract:external_dataset_requires_v2"),
+    ("training", "training_evidence:training_manifest_requires_v2"),
+    ("prior", "non_overlap:prior_manifest_requires_v2"),
+])
+def test_every_comparison_manifest_requires_v2_provenance(case, kind, expected):
+    case.request()
+    setattr(case, kind, replace(getattr(case, kind), dataset_version=PACKET_IF_DATASET_VERSION_V1))
+
+    report = case.run()
+
+    assert report["status"] == "HOLD" and expected in report["blockers"]
+    assert not (case.out / "result" / "packet-if-evaluation.json").exists()
 
 
 # ── Opt-in loader mode: the default three-split contract must not change ────────────────────────────

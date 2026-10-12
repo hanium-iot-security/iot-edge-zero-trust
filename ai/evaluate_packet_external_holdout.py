@@ -46,6 +46,7 @@ from ai.packet_if_dataset import (
     load_packet_if_dataset,
     load_packet_if_manifest,
 )
+from ai.packet_if_phase5_manifest import PACKET_IF_DATASET_VERSION_V2
 from ai.predict_packet_isolation_forest import load_packet_if_artifact, predict_packet_feature_rows
 
 REQUEST_SCHEMA = "packet-external-eval-request-v1"
@@ -196,6 +197,8 @@ def evaluate_external_holdout(request_path: Path, output_dir: Path, *, evaluated
     artifact, dataset = state["artifact"], state["dataset"]
 
     def contract():
+        _require(dataset.manifest.dataset_version == PACKET_IF_DATASET_VERSION_V2,
+                 "external_dataset_requires_v2")
         _require(dataset.manifest.capture_policy == artifact.capture_policy, "capture_policy_mismatch")
         _require(dataset.manifest.normal_policy_version == artifact.metadata.get("normal_policy_version"),
                  "normal_policy_mismatch")
@@ -205,6 +208,8 @@ def evaluate_external_holdout(request_path: Path, output_dir: Path, *, evaluated
         _require(request["training_manifest"]["sha256"] == artifact.metadata.get("manifest_sha256"),
                  "training_manifest_not_the_artifact_manifest")
         training = load_packet_if_manifest(state["training_path"])
+        _require(training.dataset_version == PACKET_IF_DATASET_VERSION_V2,
+                 "training_manifest_requires_v2")
         state["training"] = training
         listed = artifact.metadata["sessions"]
         for split in ("train", "validation", "test"):
@@ -216,7 +221,9 @@ def evaluate_external_holdout(request_path: Path, output_dir: Path, *, evaluated
         _require(training is not None, "training_evidence_unavailable")
         used = [("training", _identity(training))]
         for path, item in state["prior_paths"]:
-            used.append((item["role"], _identity(_load_any_manifest(path))))
+            prior = _load_any_manifest(path)
+            _require(prior.dataset_version == PACKET_IF_DATASET_VERSION_V2, "prior_manifest_requires_v2")
+            used.append((item["role"], _identity(prior)))
         external = _identity(dataset.manifest)
         summary = []
         for role, identity in used:

@@ -10,7 +10,8 @@ python -m ai.evaluate_packet_external_holdout --request request.json --output-di
 
 ## 외부 Holdout 자료
 
-모든 Session이 `split=test`인 기존 Dataset 번들(CSV + Manifest)이다. `load_packet_if_dataset(..., external_holdout=True)`로 읽으며
+모든 Session이 `split=test`인 Dataset v2 번들(CSV + Manifest)이다. 대조하는 학습·이력 Manifest도 v2여야 한다. v1은 원본 그룹·Run·slot 증거가 없어
+이 외부 평가 경로에서는 HOLD로 처리한다. 기존 학습·평가기와 기본 loader의 v1 지원은 유지한다. `load_packet_if_dataset(..., external_holdout=True)`로 읽으며
 컬럼·행·Session·해시·Run Manifest 참조·그룹 검증은 기존과 같다. 이 옵션은 세 Split 필수와 "test에 정상·공격 Session이 모두 있어야 한다"는
 조건만 바꾼다(정상만 또는 공격만 있는 평가 자료 허용). 기본 동작은 변하지 않는다.
 
@@ -27,7 +28,8 @@ python -m ai.evaluate_packet_external_holdout --request request.json --output-di
 2. Capture Policy와 정상 정책 버전이 Artifact와 같을 것(비호환이면 HOLD, 과거 정책을 재명명하지 않음)
 3. 학습 Manifest의 해시가 Artifact 메타의 `manifest_sha256`과 같고, 그 Session 목록이 Artifact 메타의 `sessions`와 일치
 4. 외부 Session의 `session_id`, `source_capture_group_id`, Run ID, `collection_slot_id`, Session `data_sha256`이 학습 Manifest와 모든 이력 Manifest와
-   겹치지 않을 것(이름만 바꾼 중복도 `data_sha256`으로 잡는다)
+   겹치지 않을 것. Session 이름만 바꿔도 원본 그룹·Run·slot은 유지해야 하며, 이 증거의 중복으로 거부한다.
+   `data_sha256`에는 Session ID가 포함되므로 이 해시만으로 이름을 바꾼 복제본의 독립성을 판단하지 않는다.
 5. FINAL은 `freeze`가 필수이고 모든 Session의 `started_at`이 `frozen_at` 이후일 것. DEVELOPMENT는 `freeze`를 받지 않으며 결과에 최종 평가가 아님을 기록
 6. 평가 중과 게시 직전에 입력 파일이 바뀌지 않았을 것
 
