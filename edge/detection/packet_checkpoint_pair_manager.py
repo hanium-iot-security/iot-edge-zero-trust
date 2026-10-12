@@ -28,7 +28,7 @@ def _safe_path(value):
 
 
 def _save(path, value):
-    core._write_json_atomically(path, core.attach_plan_sha256(value, generated_at=core._utc_now()))
+    core._write_json_atomically(path, core.attach_plan_sha256(value, generated_at=core._utc_now().replace(microsecond=0)))
     if os.name == "posix":
         descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
@@ -425,7 +425,7 @@ def verifier(plan_file, token, *, system=None, processes=None):
     response = {key: receipt[key] for key in ("manager_id", "approval_sha256", "attempt_id",
                                          "verification_token", "pid", "start_identity")} | {
         "pair_plan_sha256": plan["pair_plan_sha256"], "result": result}
-    return core.attach_plan_sha256(response, generated_at=core._utc_now())
+    return core.attach_plan_sha256(response, generated_at=core._utc_now().replace(microsecond=0))
 
 
 def _terminate_reap(plan, worker, processes, journal, role="worker"):
