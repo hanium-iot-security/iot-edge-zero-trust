@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from edge.policy.device_policy import DevicePolicyError, DevicePolicyValidationError
+from edge.policy.device_policy import DevicePolicyValidationError, PolicyUnavailableError
 
 
 AI_MODE_OFF = "OFF"
@@ -19,7 +19,7 @@ AI_MODES = (AI_MODE_OFF, AI_MODE_OBSERVE)
 INITIAL_AI_REASON = "default AI mode at device registration"
 
 
-class AiPolicyUnavailableError(DevicePolicyError):
+class AiPolicyUnavailableError(PolicyUnavailableError):
     """기기의 AI 설정이 없거나 손상됐다(API 503). OFF로 간주하지 않는다."""
 
     code = "AI_POLICY_UNAVAILABLE"

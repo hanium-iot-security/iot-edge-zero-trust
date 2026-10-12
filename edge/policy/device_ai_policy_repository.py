@@ -206,6 +206,9 @@ def insert_ai_revision(
     created_by = validate_actor(created_by)
     effective_text = format_utc_seconds(effective_from)
     created_text = format_utc_millis(created_at)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(device_ai_policy_revisions)")}
+    if not set(_COLUMNS.split(", ")) <= columns:
+        raise AiPolicyUnavailableError("Device AI policy migration must be completed")
     connection.execute(
         """
         INSERT INTO device_ai_policy_revisions (

@@ -261,9 +261,28 @@ def test_legacy_and_wide_coexist_but_each_scope_active_ip_is_unique(environment)
         assert isinstance(error.value.orig, sqlite3.IntegrityError)
 
 
-def test_partial_scope_schema_and_inconsistent_migration_metadata_fail_closed(environment):
+@pytest.mark.parametrize("metadata_change", [
+    "DELETE FROM schema_migrations WHERE version=11",
+    "DELETE FROM schema_migrations WHERE version>=11",
+    "UPDATE schema_migrations SET name='wrong_pi_input_isolation' WHERE version=11",
+], ids=["011-missing-with-012", "all-post010-missing", "011-name-mismatch-with-012"])
+def test_partial_scope_schema_and_inconsistent_migration_metadata_fail_closed(environment, metadata_change):
     database, sessions, source = environment
-    execute(database, "DELETE FROM schema_migrations WHERE version>=11")
+    execute(database, metadata_change)
+    if "version>=11" not in metadata_change:
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("SELECT name FROM schema_migrations WHERE version=12").fetchone() == ("device_ai_policy_revisions",)
+    with pytest.raises(service.FirewallScopeExtensionError) as error:
+        approve(sessions, source)
+    assert error.value.status_code == 503 and error.value.detail["failure_code"] == "FIREWALL_SCOPE_SCHEMA_UNAVAILABLE"
+    with sessions() as db, pytest.raises(rules.AutomaticResponseBlockedError, match="FIREWALL_SCOPE_SCHEMA_UNAVAILABLE"):
+        rules.authorized_automatic_rule(db, rule_id=source, required_status="APPLIED", now=NOW)
+
+
+@pytest.mark.parametrize("column", sorted(rules.SCOPE_COLUMNS))
+def test_missing_required_scope_column_fails_closed_with_012(environment, column):
+    database, sessions, source = environment
+    execute(database, f"ALTER TABLE firewall_rules RENAME COLUMN {column} TO missing_scope_column")
     with pytest.raises(service.FirewallScopeExtensionError) as error:
         approve(sessions, source)
     assert error.value.status_code == 503 and error.value.detail["failure_code"] == "FIREWALL_SCOPE_SCHEMA_UNAVAILABLE"
