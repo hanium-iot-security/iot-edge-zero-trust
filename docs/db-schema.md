@@ -47,7 +47,9 @@ Migration 012 (`device_ai_policy_revisions`)는 기기별 AI 모드(OFF/OBSERVE)
 추가한다. 기존 기기의 모드는 만들지 않으며, 운영자 승인 목록으로
 `python -m db.backfill_device_ai_policies --db <복사본> --manifest <목록.json>`(기본 dry-run)을
 실행하기 전까지 기존 기기는 AI 설정 누락 상태다. 배포 순서는 012 적용 → 승인 목록 이관 →
-이 설정을 읽는 API·탐지기 배포다. 012만 적용해서는 기존 동작이 바뀌지 않는다.
+이 설정을 읽는 API·탐지기 배포다. 신규 등록과 AI 초기 기록을 연동하는 코드도 012 적용 후
+배포하며, AI 초기 기록이 실패하면 기기·등록 정책을 포함한 전체 등록이 rollback된다.
+012만 적용해서는 기존 동작이 바뀌지 않는다.
 
 적용과 복구: 007은 컬럼 추가를 포함하며 되돌리는(down) Migration이 없다. 운영 DB에는 먼저
 일관된 백업(SQLite backup API 등, 쓰기 중 파일 하나만 복사하지 않는다)을 만든 뒤 **복사본에서**
