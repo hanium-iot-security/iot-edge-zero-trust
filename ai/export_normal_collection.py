@@ -34,6 +34,9 @@ from firmware.pico_wh_bme280.verify_pico_telemetry import verify as verify_pico
 SCHEMA_VERSION = "phase8-normal-candidate-v1"
 TARGETS = {"esp32_01", "esp32_02", "pico_01"}
 SAFE_ERRORS = (OSError, ValueError, TypeError, KeyError, IndexError, sqlite3.Error, OverflowError, DevicePolicyError)
+# Reception cadence per Profile as the (min, max) scheduled interval in seconds. P0 is the
+# 5-second default; P1 allows a 4-6 second schedule on one ESP32. Thresholds derive from these bounds.
+MQTT_QC_PROFILES = {"P0": (5.0, 5.0), "P1": (4.0, 6.0)}
 MQTT_COLUMNS = ("id", "device_id", "window_start", "window_end", "publish_count",
                 "avg_payload_size", "max_payload_size", "avg_message_interval", "min_message_interval",
                 "topic_count", "abnormal_topic_count", "malformed_payload_count")
@@ -173,9 +176,31 @@ def _policies(db, manifest, start, end):
                          for row in revisions), "policy_changed_within_range")
 
 
-def _mqtt_qc(raw, features, ids, start, end, report):
+def mqtt_qc_policy(profile):
+    """Thresholds derived from a Profile's scheduled interval bounds (P0 equals the original constants)."""
+    _require(profile in MQTT_QC_PROFILES, "unknown_qc_profile")
+    low, high = MQTT_QC_PROFILES[profile]
+    return {"profile": profile, "interval_seconds": [low, high],
+            "sender_gap_seconds": [low - 1, high + 3], "sender_median_seconds": [low - 0.5, high + 1.5],
+            "reception_gap_seconds": [low * 3 / 5, 2 * high], "edge_gap_seconds": 2 * high,
+            "interval_max_seconds": high}
+
+
+def _qc_profiles(profiles, ids):
+    profiles = dict(profiles or {})
+    for device_id, profile in profiles.items():
+        _require(device_id in ids, "qc_profile_device_not_in_run")
+        mqtt_qc_policy(profile)
+        _require(device_id != "pico_01" or profile == "P0", "profile_not_supported_for_device")
+    return {device_id: mqtt_qc_policy(profiles.get(device_id, "P0")) for device_id in ids}
+
+
+def _mqtt_qc(raw, features, ids, start, end, report, profiles=None):
+    policies = _qc_profiles(profiles, ids)
+    report["qc_policy"] = policies
     grouped = defaultdict(list)
     for device_id in ids:
+        policy = policies[device_id]
         rows = [row for row in raw if row["device_id"] == device_id]
         rows.sort(key=lambda row: (_time(row["received_at"]), row["id"]))
 
@@ -199,21 +224,24 @@ def _mqtt_qc(raw, features, ids, start, end, report):
                 sequences.append(sequence)
                 uptimes.append(uptime / (1000 if device_id == "pico_01" else 1))
             _require(len(rows) >= 2, "too_few_messages")
+            gap_low, gap_high = policy["sender_gap_seconds"]
             for left, right, old, new in zip(sequences, sequences[1:], uptimes, uptimes[1:]):
-                _require(right == left + 1 and 4 <= new - old <= 8, "sequence_or_sender_gap")
-            _require(4.5 <= statistics.median(b-a for a, b in zip(uptimes, uptimes[1:])) <= 6.5,
+                _require(right == left + 1 and gap_low <= new - old <= gap_high, "sequence_or_sender_gap")
+            median_low, median_high = policy["sender_median_seconds"]
+            _require(median_low <= statistics.median(b-a for a, b in zip(uptimes, uptimes[1:])) <= median_high,
                      "sender_cadence")
             times = [_time(row["received_at"]) for row in rows]
-            _require(all(3 <= (b-a).total_seconds() <= 10 for a, b in zip(times, times[1:])),
-                     "reception_gap_or_burst")
+            reception_low, reception_high = policy["reception_gap_seconds"]
+            _require(all(reception_low <= (b-a).total_seconds() <= reception_high
+                         for a, b in zip(times, times[1:])), "reception_gap_or_burst")
             cursor = start
             while cursor < end:
                 stop = min(cursor + timedelta(minutes=5), end)
-                minimum = math.ceil((stop-cursor).total_seconds() / 5 * 58 / 60)
+                minimum = math.ceil((stop-cursor).total_seconds() / policy["interval_max_seconds"] * 58 / 60)
                 _require(sum(cursor <= value < stop for value in times) >= minimum, "message_count_shortfall")
                 cursor = stop
-            _require((times[0]-start).total_seconds() <= 10
-                     and (end-times[-1]).total_seconds() <= 10, "edge_reception_gap")
+            _require((times[0]-start).total_seconds() <= policy["edge_gap_seconds"]
+                     and (end-times[-1]).total_seconds() <= policy["edge_gap_seconds"], "edge_reception_gap")
             if device_id == "pico_01":
                 verify_pico(rows, mode="gateway", payload_max=5120, min_samples=2)
             report["mqtt_devices"][device_id] = {"samples": len(rows), "first_seq": sequences[0],
@@ -345,7 +373,7 @@ def _new_output_dir(root: Path, output_dir: Path) -> Path:
     return path
 
 
-def export_normal_collection(package_dir: Path, *, output_dir: Path | None = None) -> dict:
+def export_normal_collection(package_dir: Path, *, output_dir: Path | None = None, qc_profiles=None) -> dict:
     root = Path(package_dir).resolve()
     report = {"schema_version": SCHEMA_VERSION, "status": "HOLD", "training_approved": False,
               "whole_capture_session_approved": False, "provenance_status": "UNCONFIRMED",
@@ -414,7 +442,7 @@ def export_normal_collection(package_dir: Path, *, output_dir: Path | None = Non
                 "approved_maintenance_interval_overlap",
             ))
             _stage(report, "policies", lambda: _policies(db, manifest, start, end))
-            _stage(report, "mqtt", lambda: _mqtt_qc(raw, features, ids, start, end, report))
+            _stage(report, "mqtt", lambda: _mqtt_qc(raw, features, ids, start, end, report, qc_profiles))
             _stage(report, "capture", lambda: _capture_qc(root, manifest, session, segments, packets, start, end, report))
         _require(_hash(snapshot) == manifest["snapshot"]["sha256"], "snapshot_changed_during_export")
         provenance = manifest["firmware_provenance"]
@@ -451,8 +479,13 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, help="New directory outside the source package for read-only re-QC")
+    parser.add_argument("--qc-profile", action="append", default=[], metavar="DEVICE_ID=PROFILE",
+                        help="MQTT QC Profile for one device (P0 default, P1 for a 4-6 s ESP32 schedule)")
     args = parser.parse_args(argv)
-    report = export_normal_collection(args.package_dir, output_dir=args.output_dir)
+    profiles = dict(item.split("=", 1) for item in args.qc_profile if "=" in item)
+    if len(profiles) != len(args.qc_profile):
+        parser.error("--qc-profile must look like DEVICE_ID=PROFILE")
+    report = export_normal_collection(args.package_dir, output_dir=args.output_dir, qc_profiles=profiles)
     print(f"Candidate content QC: {report['status']}; training_approved=false; whole_session_approved=false")
     if report["hold_reasons"]:
         print("Hold reasons: " + "; ".join(report["hold_reasons"]))
