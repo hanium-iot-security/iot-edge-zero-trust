@@ -3032,9 +3032,10 @@ def test_execute_creates_verified_backup_before_begin_immediate(
     real_verify = packet_checkpoint_recovery.verify_database
     real_update = recovery_repository.update_checkpoint_conditionally
 
-    def record_backup(source: Path, backup: Path):
+    def record_backup(source: Path, backup: Path, **kwargs):
+        assert kwargs == {"verify": False}
         events.append("backup")
-        return real_backup(source, backup)
+        return real_backup(source, backup, **kwargs)
 
     def record_verify(database: Path):
         if Path(database).name == "database.backup.db":
