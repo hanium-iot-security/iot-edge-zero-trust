@@ -449,6 +449,21 @@ def create_device_locked(
             created_by=created_by,
             reason=reason,
         )
+        # 기기 AI 설정은 등록과 같은 트랜잭션·같은 효력 경계에서 OFF로 시작한다(P9-03).
+        # device_ai_policy_repository가 이 모듈을 import하므로 순환을 피해 함수 안에서 가져온다.
+        from edge.policy.device_ai_policy import AI_MODE_OFF, INITIAL_AI_REASON
+        from edge.policy.device_ai_policy_repository import insert_ai_revision
+
+        insert_ai_revision(
+            connection,
+            device_id=device_id,
+            revision=1,
+            mode=AI_MODE_OFF,
+            effective_from=effective_from,
+            created_at=now,
+            created_by=created_by,
+            reason=INITIAL_AI_REASON,
+        )
     except sqlite3.IntegrityError as exc:
         message = str(exc)
         if "devices.ip_address" in message:

@@ -62,6 +62,10 @@ Payload는 원본 바이트, Packet/Byte Rate는 유효 캡처 초당 수치입�
 10초 경계**입니다. 두 POST의 `server_time`과 current/pending은 이 접수 시각을 기준으로
 반환합니다. 응답 도착 전에 경계를 지났더라도 pending으로 표시될 수 있으므로,
 저장 후와 효력 경계 이후에는 GET으로 재조회합니다. GET은 조회 시각을 기준으로 반환합니다.
+신규 등록에는 Migration 012가 필요하며, 초기 AI 모드 `OFF` revision을 기기·등록 정책과
+같은 트랜잭션에 기록합니다. AI 정책 테이블이 없거나 필수 컬럼이 누락되면 503
+`AI_POLICY_UNAVAILABLE`을 반환하고, AI 초기 기록 실패 시 기기·등록 정책을 포함한
+전체 등록이 rollback됩니다.
 
 상태는 PENDING→ACTIVE, PENDING/ACTIVE→DISABLED만 전환할 수 있습니다.
 DISABLED 재활성화·편집, 기기 삭제, ID/IP/type/principal 변경, 부분 PATCH는 지원하지
@@ -93,7 +97,7 @@ auto_response_eligible, auto_response_exclusion_reason
 | 404 | 미등록 기기 |
 | 409 | 중복 ID/IP, revision 충돌, pending 존재, 변경 없음, 금지 상태 전환, Worker/DB busy |
 | 422 | 잘못된 자료형·범위·필드·기기 IP |
-| 503 | 관리자 키/허용 LAN 설정 미비, Migration 또는 정책 누락·손상 |
+| 503 | 관리자 키/허용 LAN 설정 미비, Migration 또는 정책 누락·손상, 신규 등록의 AI 정책 스키마 불가 (`AI_POLICY_UNAVAILABLE`) |
 
 `REVISION_CONFLICT`, `PENDING_REVISION_EXISTS`는 `current_revision`, `pending_revision`,
 `latest_revision`을 함께 제공합니다. 충돌이나 결과가 불명확한 네트워크 오류는 초안을

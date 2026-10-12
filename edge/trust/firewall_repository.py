@@ -41,13 +41,14 @@ def has_scope_schema(db: Session) -> bool:
     columns = {row[1] for row in connection.execute("PRAGMA table_info(firewall_rules)")}
     try:
         version = connection.execute("SELECT max(version) FROM schema_migrations").fetchone()[0]
+        migration = connection.execute("SELECT name FROM schema_migrations WHERE version=11").fetchone()
     except sqlite3.Error:
         raise AutomaticResponseBlockedError("POLICY_UNAVAILABLE") from None
     if type(version) is not int:
         raise AutomaticResponseBlockedError("POLICY_UNAVAILABLE")
-    if SCOPE_COLUMNS <= columns and type(version) is int and version >= 11:
+    if SCOPE_COLUMNS <= columns and migration is not None and migration[0] == "pi_input_isolation":
         return True
-    if not (columns & SCOPE_COLUMNS) and type(version) is int and version < 11:
+    if not (columns & SCOPE_COLUMNS) and version < 11:
         return False
     raise AutomaticResponseBlockedError("FIREWALL_SCOPE_SCHEMA_UNAVAILABLE")
 

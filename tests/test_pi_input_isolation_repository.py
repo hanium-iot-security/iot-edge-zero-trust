@@ -103,13 +103,13 @@ def test_migration_preserves_ids_values_release_fk_indexes_and_deleted_sequence(
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('sqlite_sequence','schema_migrations')")}
         assert len(tables) == 19
         indexes = {value[0] for value in connection.execute("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='firewall_rules'")}
-    assert apply_migrations(database, MIGRATIONS_DIR).applied_versions == [11]
+    assert apply_migrations(database, MIGRATIONS_DIR).applied_versions == [11, 12]
     with sqlite3.connect(database) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         after = dict(connection.execute("SELECT * FROM firewall_rules WHERE id=?", (source,)).fetchone())
         assert {key: after[key] for key in before} == before
-        assert {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('sqlite_sequence','schema_migrations')")} == tables
+        assert {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('sqlite_sequence','schema_migrations')")} == tables | {"device_ai_policy_revisions"}  # Migration 012
         assert after["scope"] == MQTT_IPV4_TCP_1883
         assert all(after[key] is None for key in rules.SCOPE_COLUMNS - {"scope"})
         assert connection.execute("SELECT firewall_rule_id FROM firewall_release_requests WHERE id=?", (release,)).fetchone()[0] == source
@@ -261,9 +261,28 @@ def test_legacy_and_wide_coexist_but_each_scope_active_ip_is_unique(environment)
         assert isinstance(error.value.orig, sqlite3.IntegrityError)
 
 
-def test_partial_scope_schema_and_inconsistent_migration_metadata_fail_closed(environment):
+@pytest.mark.parametrize("metadata_change", [
+    "DELETE FROM schema_migrations WHERE version=11",
+    "DELETE FROM schema_migrations WHERE version>=11",
+    "UPDATE schema_migrations SET name='wrong_pi_input_isolation' WHERE version=11",
+], ids=["011-missing-with-012", "all-post010-missing", "011-name-mismatch-with-012"])
+def test_partial_scope_schema_and_inconsistent_migration_metadata_fail_closed(environment, metadata_change):
     database, sessions, source = environment
-    execute(database, "DELETE FROM schema_migrations WHERE version=11")
+    execute(database, metadata_change)
+    if "version>=11" not in metadata_change:
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("SELECT name FROM schema_migrations WHERE version=12").fetchone() == ("device_ai_policy_revisions",)
+    with pytest.raises(service.FirewallScopeExtensionError) as error:
+        approve(sessions, source)
+    assert error.value.status_code == 503 and error.value.detail["failure_code"] == "FIREWALL_SCOPE_SCHEMA_UNAVAILABLE"
+    with sessions() as db, pytest.raises(rules.AutomaticResponseBlockedError, match="FIREWALL_SCOPE_SCHEMA_UNAVAILABLE"):
+        rules.authorized_automatic_rule(db, rule_id=source, required_status="APPLIED", now=NOW)
+
+
+@pytest.mark.parametrize("column", sorted(rules.SCOPE_COLUMNS))
+def test_missing_required_scope_column_fails_closed_with_012(environment, column):
+    database, sessions, source = environment
+    execute(database, f"ALTER TABLE firewall_rules RENAME COLUMN {column} TO missing_scope_column")
     with pytest.raises(service.FirewallScopeExtensionError) as error:
         approve(sessions, source)
     assert error.value.status_code == 503 and error.value.detail["failure_code"] == "FIREWALL_SCOPE_SCHEMA_UNAVAILABLE"
