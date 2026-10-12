@@ -9,6 +9,8 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from edge.packet.pcap_naming import format_utc_iso
+from edge.trust.firewall_repository import has_scope_schema
+from edge.trust.firewall_scope import MQTT_IPV4_TCP_1883
 
 
 VALID_FIREWALL_STATUSES = {"PENDING", "APPLIED", "FAILED", "REMOVED"}
@@ -51,6 +53,9 @@ def list_firewall_rules(
         ),
         params,
     ).scalar_one()
+    scope_projection = ("scope, source_rule_id, approved_policy_revision, requested_by, request_id" if has_scope_schema(db) else
+                        "'" + MQTT_IPV4_TCP_1883 + "' AS scope, NULL AS source_rule_id, "
+                        "NULL AS approved_policy_revision, NULL AS requested_by, NULL AS request_id")
     rows = db.execute(
         text(
             f"""
@@ -71,7 +76,8 @@ def list_firewall_rules(
                 applied_at,
                 released_at,
                 created_at,
-                updated_at
+                updated_at,
+                {scope_projection}
             FROM firewall_rules
             {where_sql}
             ORDER BY created_at DESC, id DESC

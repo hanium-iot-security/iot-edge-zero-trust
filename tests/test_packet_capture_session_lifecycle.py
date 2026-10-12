@@ -5,6 +5,7 @@
 """
 
 from datetime import datetime, timedelta, timezone
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from backend.app.config import settings
 from backend.app.database import SessionLocal
 from db.migration_runner import apply_migrations
 from edge.packet import capture_session_repository as repo
+from edge.packet import run_packet_capture
 from edge.packet.capture_runtime import CaptureOutcome, CaptureRuntimeConfig
 from edge.packet.pcap_naming import build_pcap_filename, format_utc_iso, parse_utc_iso
 from edge.packet.run_packet_capture import (
@@ -455,6 +457,70 @@ class TestStartNewSession:
         assert row["capture_gap_end"] == format_utc_iso(first_window_start)
 
 
+    def test_insert_delay_chooses_fresh_first_boundary_and_gap(self, db_session, tmp_path, monkeypatch) -> None:
+        config = _make_config(tmp_path)
+        previous = repo.create_session(db_session, session_id=SESSION_ID_A, capture_interface="eth0",
+                                       started_at=_utc(2026, 7, 15, 9, 59, 50))
+        repo.insert_ready_segment(db_session, capture_session_pk=previous, file_name="previous.pcap",
+                                  capture_interface="eth0", window_start=_utc(2026, 7, 15, 9, 59, 50),
+                                  window_end=_utc(2026, 7, 15, 10, 0, 0))
+        repo.close_session(db_session, previous, _utc(2026, 7, 15, 10, 0, 0), "COMPLETED")
+        db_session.commit()
+        clock = _MutableClock(_utc(2026, 7, 15, 10, 0, 9))
+        create_session = repo.create_session
+
+        def delayed_create(*args, **kwargs):
+            result = create_session(*args, **kwargs)
+            clock.advance(2.254)
+            return result
+
+        monkeypatch.setattr(repo, "create_session", delayed_create)
+        session_pk, _, first = start_new_session(db_session, config, clock.now(), clock=clock.now)
+        row = db_session.execute(text("SELECT first_window_start,capture_gap_start,capture_gap_end "
+                                      "FROM packet_capture_sessions WHERE id=:id"), {"id": session_pk}).mappings().one()
+        assert first == _utc(2026, 7, 15, 10, 0, 20)
+        assert dict(row) == {"first_window_start": "2026-07-15T10:00:20Z",
+                             "capture_gap_start": "2026-07-15T10:00:00Z",
+                             "capture_gap_end": "2026-07-15T10:00:20Z"}
+        assert db_session.execute(text("SELECT COUNT(*) FROM packet_capture_segments WHERE error_code='LATE_CAPTURE'")).scalar() == 0
+
+    def test_main_refreshes_time_after_stale_session_reconciliation(self, db_session, tmp_path, monkeypatch) -> None:
+        config = _make_config(tmp_path)
+        clock = _MutableClock(_utc(2026, 7, 15, 10, 0, 9))
+        reconcile = run_packet_capture.reconcile_stale_running_sessions
+        observed = {}
+
+        class ClockedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock.now()
+
+        def delayed_reconcile(db, config, now):
+            observed["reconciled_at"] = now
+            result = reconcile(db, config, now)
+            clock.advance(2.254)
+            return result
+
+        def capture(db, process, config, **kwargs):
+            observed.update(kwargs)
+            return 0
+
+        monkeypatch.setattr(run_packet_capture, "datetime", ClockedDatetime)
+        monkeypatch.setattr(run_packet_capture, "SessionLocal", lambda: nullcontext(db_session))
+        monkeypatch.setattr(CaptureRuntimeConfig, "from_env", lambda: config)
+        monkeypatch.setattr(GracefulShutdown, "install", lambda _self: None)
+        monkeypatch.setattr(run_packet_capture, "reconcile_stale_running_sessions", delayed_reconcile)
+        monkeypatch.setattr(run_packet_capture, "run_capture_loop", capture)
+        monkeypatch.setattr("sys.argv", ["run_packet_capture", "--windows", "1"])
+        run_packet_capture.main()
+        row = db_session.execute(text("SELECT started_at,first_window_start FROM packet_capture_sessions")).mappings().one()
+        assert observed["reconciled_at"] == _utc(2026, 7, 15, 10, 0, 9)
+        assert row["started_at"] == "2026-07-15T10:00:11Z"
+        assert row["first_window_start"] == "2026-07-15T10:00:20Z"
+        assert observed["first_window_start"] == _utc(2026, 7, 15, 10, 0, 20)
+        assert observed["clock"]() == clock.now()
+
+
 class TestRunCaptureLoop:
     def test_captures_two_successful_windows(self, db_session, tmp_path) -> None:
         config = _make_config(tmp_path)
@@ -890,6 +956,71 @@ class TestRunCaptureLoopLateCaptureWithinWindow:
         assert len(segments) == 2
         assert segments[0] == ("2026-07-15T10:00:10Z", "FAILED", "LATE_CAPTURE")
         assert segments[1][1] == "READY"
+
+
+    def test_commit_delay_after_arming_boundary_still_records_late_capture(self, db_session, tmp_path, monkeypatch) -> None:
+        config = _make_config(tmp_path)
+        clock = _MutableClock(_utc(2026, 7, 15, 10, 0, 19))
+        commit = db_session.commit
+        first_commit = True
+
+        def delayed_first_commit():
+            nonlocal first_commit
+            commit()
+            if first_commit:
+                first_commit = False
+                clock.advance(2.254)
+
+        monkeypatch.setattr(db_session, "commit", delayed_first_commit)
+        source_pk, source_id, first = start_new_session(db_session, config, clock.now(), clock=clock.now)
+        process = _OverheadCaptureProcess(clock=clock, overhead_seconds=0)
+        assert run_capture_loop(db_session, process, config, session_pk=source_pk, session_id=source_id,
+                                first_window_start=first, shutdown=GracefulShutdown(), max_windows=1,
+                                clock=clock.now, sleep=clock.advance) == 1
+        source = db_session.execute(text("SELECT first_window_start,status FROM packet_capture_sessions WHERE id=:id"),
+                                    {"id": source_pk}).mappings().one()
+        late = db_session.execute(text("SELECT window_start,status,error_code,file_name,start_delay_seconds "
+                                        "FROM packet_capture_segments WHERE capture_session_id=:id"),
+                                  {"id": source_pk}).mappings().one()
+        assert dict(source) == {"first_window_start": "2026-07-15T10:00:20Z", "status": "FAILED"}
+        assert late["window_start"] == "2026-07-15T10:00:20Z"
+        assert late["status"] == "FAILED" and late["error_code"] == "LATE_CAPTURE" and late["file_name"] is None
+        assert late["start_delay_seconds"] == pytest.approx(1.254)
+        assert len(process.calls) == 1
+
+    def test_late_transition_refreshes_clock_after_close_and_insert_delay(self, db_session, tmp_path, monkeypatch) -> None:
+        config = _make_config(tmp_path)
+        clock = _MutableClock(_utc(2026, 7, 15, 10, 0, 3))
+        source_pk, source_id, first = start_new_session(db_session, config, clock.now(), clock=clock.now)
+        clock.advance(9)
+        close_session, create_session = repo.close_session, repo.create_session
+
+        def delayed_close(*args, **kwargs):
+            close_session(*args, **kwargs)
+            if args[3] == "FAILED":
+                clock.advance(7)
+
+        def delayed_create(*args, **kwargs):
+            result = create_session(*args, **kwargs)
+            clock.advance(2.254)
+            return result
+
+        monkeypatch.setattr(repo, "close_session", delayed_close)
+        monkeypatch.setattr(repo, "create_session", delayed_create)
+        process = _OverheadCaptureProcess(clock=clock, overhead_seconds=0)
+        assert run_capture_loop(db_session, process, config, session_pk=source_pk, session_id=source_id,
+                                first_window_start=first, shutdown=GracefulShutdown(), max_windows=1,
+                                clock=clock.now, sleep=clock.advance) == 1
+        rows = db_session.execute(text("SELECT started_at,first_window_start,capture_gap_start,capture_gap_end,status "
+                                       "FROM packet_capture_sessions ORDER BY id")).mappings().all()
+        assert rows[0]["first_window_start"] == "2026-07-15T10:00:10Z" and rows[0]["status"] == "FAILED"
+        assert dict(rows[1]) == {"started_at": "2026-07-15T10:00:19Z", "first_window_start": "2026-07-15T10:00:30Z",
+                                "capture_gap_start": "2026-07-15T10:00:20Z", "capture_gap_end": "2026-07-15T10:00:30Z",
+                                "status": "COMPLETED"}
+        segments = db_session.execute(text("SELECT window_start,status,error_code FROM packet_capture_segments "
+                                           "ORDER BY window_start")).fetchall()
+        assert segments == [("2026-07-15T10:00:10Z", "FAILED", "LATE_CAPTURE"), ("2026-07-15T10:00:30Z", "READY", None)]
+        assert len(process.calls) == 1
 
 
 class TestCumulativeDriftDoesNotAccumulate:

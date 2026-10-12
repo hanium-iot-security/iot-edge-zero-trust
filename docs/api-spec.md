@@ -9,6 +9,7 @@ Phase 8 기기 등록·정책 API는 [기기 정책 v1 계약](contracts/device-
 
 ```txt
 GET /api/health
+GET /api/models
 GET /api/dashboard/summary
 GET /api/devices
 GET /api/devices/{device_id}
@@ -25,12 +26,16 @@ GET /api/trust-score/{device_id}/history
 GET /api/trust-score/compensations
 GET /api/isolation/history
 GET /api/firewall-rules
+POST /api/firewall-rules/{source_rule_id}/scope-extension-requests
 POST /api/firewall-rules/{rule_id}/release-requests
 GET /api/firewall-release-requests/{request_id}
 POST /api/recovery/preflight
 POST /api/recovery/execute
 GET /api/recovery/history
 GET /api/recovery/history/{operation_id}
+POST /api/recovery/packet-pair/plans
+GET /api/recovery/packet-pair/{plan_id}
+POST /api/recovery/packet-pair/{plan_id}/verify
 ```
 
 ## Device 등록·정책 APIs
@@ -102,6 +107,179 @@ auto_response_eligible, auto_response_exclusion_reason
 공용 Firewall lock 경로·권한을 확인한 뒤 활성화합니다. 관리자 키는 검증된 SSH 포워딩
 loopback 또는 HTTPS 경로에서 전송합니다. 세부 절차는
 [기기 정책 API 운영 확인](device-policy-api-runbook.md)을 따릅니다.
+
+## 모델 정보 API
+
+### GET /api/models
+
+관리자 키를 요구하지 않는 공개 조회입니다. 서버에 설정된 Packet IF Artifact의
+계약과 실제 실행 상태를 구분하며, 모델 활성화·역직렬화·추론은 실행하지 않습니다.
+응답은 `200 {observed_at, models}`이고 `models`에는 `packet_if`, `mqtt_if`가 들어갑니다.
+Artifact를 읽을 수 없거나 계약이 잘못된 경우도 해당 항목의 상태로 반환합니다.
+
+| 항목 필드 | 의미 |
+| --- | --- |
+| `detector` | `packet_if` 또는 `mqtt_if` |
+| `configured_model_version`, `configured_bundle_sha256` | API 서버의 설정값 또는 null. 실행 중 모델의 인증값이 아님 |
+| `artifact_status` | 아래 Artifact 검사 상태 |
+| `artifact` | 검증 성공 시 공개 Metadata 부분집합, 그 외 null |
+| `checks` | Bundle·Metadata·Report 검사 여부와 미검증 항목 |
+| `runtime` | 항상 `{status: "UNKNOWN", reason_code: "RUNTIME_MODEL_EVIDENCE_NOT_AVAILABLE"}` |
+| `error_code` | 확인 불가·잘못된 계약 등의 안전한 오류 코드 또는 null |
+
+| `artifact_status` | 의미 |
+| --- | --- |
+| `BUNDLE_METADATA_VERIFIED` | 외부 설정의 Bundle SHA·모델 Version, 개별 모델/Report SHA, Metadata 계약과 Report UTF-8 JSON 객체 형태 확인 |
+| `UNCONFIGURED` | Packet Artifact 경로·기대 Version·기대 Bundle SHA 중 필수 설정 누락 |
+| `UNAVAILABLE` | 필수 파일 누락 또는 읽기 권한/파일 접근 실패 |
+| `INVALID` | Hash·Version·Metadata 계약 불일치, 잘못된 Report 형태, 크기 상한 초과 또는 안전하지 않은 경로 |
+| `LEGACY_CONTRACT_UNAVAILABLE` | MQTT 기존 단일 Joblib 경로에 같은 외부 pin·Bundle·Metadata 계약이 준비되지 않음 |
+
+공개 Metadata에는 모델·Feature·변환·Dataset·정상 정책 Version, Feature 순서,
+Threshold와 비교 방향·출처, 생성 시각, Bundle/Dataset/Manifest SHA, 분할별 행 수와
+정해진 CapturePolicy 필드만 포함합니다. 선택적인 `normal_policy_version`은 null일 수
+있습니다. 내부 경로·임의 확장 필드·Report 원문과 평가 수치는 노출하지 않습니다.
+MQTT 정책 Version을 모델 Version으로 표시하지 않습니다.
+
+검증 성공 시 `bundle_sha256_verified`, `metadata_contract_verified`,
+`report_sha256_verified`, `report_json_object_verified`는 true입니다.
+`report_semantics_verified`, `model_deserialized`, `inference_verified`는 항상 false입니다.
+Report의 내부 평가 수치 일치·학습 품질·공식 학습 승인·현재 Orchestrator의 라이브러리
+호환성이나 로딩은 확인하지 않습니다. API 설정과 과거 탐지 이벤트도 실제 실행 증거를
+대신하지 않습니다. 기기별 모델을 생성하는 API가 아닙니다.
+
+파일당 **64 MiB**는 API가 읽는 세 Artifact 파일의 검사 상한입니다. 센서 Payload,
+MQTT 학습 필터 또는 정상 허용 범위의 크기 제한과 관계없습니다.
+
+## Packet Rule·IF 복구 관리 APIs
+
+기존 live-resume 계획을 생성하고 실제 감사를 조회하는 관리 API입니다. 서버에 등록된
+Root CLI의 bounded-replay 원본 계획도 조회할 수 있습니다. 위 모델 조회와 달리 아래 세 경로는 모두
+`X-Recovery-Admin-Key`가 필요합니다. 키 미설정은 503 `RECOVERY_ADMIN_NOT_CONFIGURED`,
+키 누락·불일치는 401 `RECOVERY_ADMIN_UNAUTHORIZED`입니다. `approved_by`는 서버
+`RECOVERY_ADMIN_PRINCIPAL`에서 정하며 요청자가 지정하지 않습니다.
+
+### POST /api/recovery/packet-pair/plans
+
+다음 세 문자열만 받는 strict 요청입니다. 추가 필드·다른 자료형은 422입니다.
+HTTP 계획 생성은 live-resume만 지원하며 mode와 FAILED 승인 옵션은 받지 않습니다.
+Session ID는 소문자 표준 UUID이고 서로 달라야 합니다. `reason`은 1~1000자이며
+공백만인 값, ASCII 제어 문자와 DEL은 거부하고 앞뒤 공백을 제거합니다.
+
+```json
+{
+  "source_session_id": "11111111-1111-4111-8111-111111111111",
+  "target_session_id": "22222222-2222-4222-8222-222222222222",
+  "reason": "완료된 수집 Session에서 현재 수집 Session으로 처리를 재개"
+}
+```
+
+201 응답은 `plan_id`(Pair UUID), `plan_sha256`, source/target Session, 승인자·사유·
+생성 시각, `can_execute`, `blocking_reasons`, `skips_processable`, `boundary`,
+`children`, `mode="live-resume"`, `replay_end=null`, `apply_transport="ROOT_CLI"`,
+`runtime.status="UNKNOWN"`을 반환합니다.
+`children`은 Rule/IF의 `detector`, `child_operation_id`, `checkpoint_before`,
+`checkpoint_after`, 건너뛸 Session과 차단 사유를 포함합니다.
+
+201은 새 계획 파일 저장 성공이며 복구 적용·완료가 아닙니다. `can_execute=false`인
+계획도 차단 사유와 함께 저장될 수 있습니다. true여도 실제 실행 시 재검사가 필요합니다.
+처리 가능 Session을 건너뛰면 기존 CLI의 같은 Plan SHA에 연결된 별도 skip 승인이
+필요합니다. 승인자·DB/Artifact/출력 경로·Child ID·실행 옵션·확인 문자열은 Body에서
+받지 않습니다. 원본 계획은 `<plan_id>.json`으로 새로 저장하며 기존 파일을 덮어쓰지
+않습니다. 같은 Body의 반복 POST에 대한 중복 제거는 제공하지 않으며 새 계획을
+만들 수 있으므로, 응답 유실을 기존 복구의 재실행 승인으로 해석하지 않습니다.
+
+### GET /api/recovery/packet-pair/{plan_id}
+
+서버에 저장한 표준 UUID 계획을 읽고 한 SQLite 읽기 Transaction에서 실제 Child 감사
+존재와 현재 Checkpoint를 조회합니다. Backup·감사의 전체 계약 검증은 하지 않습니다.
+200 응답 필드는 `plan_id`, `plan_sha256`, `observed_at`, `operation_status`,
+`database_committed`, `children`, `verification`, `mode`, `replay_end`, `runtime`입니다.
+`mode`는 `live-resume` 또는 `bounded-replay`이며 `replay_end`는 bounded 계획의
+보존 데이터 처리 종점입니다. 이후 Session의 실시간 복구나 FAILED 끝 구간의 승인은 아닙니다.
+
+`children`은 `packet_rule`/`packet_if`별 `state`, `audit_present`, `checkpoint`를
+포함합니다. GET의 상태는 감사가 있으면 `COMMITTED_UNVERIFIED`, 없으면
+`PENDING_UNVERIFIED`입니다. `database_committed`는 이 조회에서 감사가 하나라도
+존재하는지를 표시하며 승인·Backup·실제 처리 전진까지 검증됐다는 뜻은 아닙니다.
+GET의 `verification.status`는 `NOT_REQUESTED`입니다.
+
+### POST /api/recovery/packet-pair/{plan_id}/verify
+
+별도 Body 계약 없이 같은 계획의 Root Intent·실제 DB 감사·Before/After Checkpoint·
+Backup/SHA와 기존 Root 진행 기록을 **읽기 전용**으로 대조합니다. 같은 승인 작업의
+Child ID, 계획 원문·SHA, 현재 CAS와 Source ID 소비, DB/Backup integrity·FK 검증은
+기존 Pair 엔진의 검증을 재사용합니다. 성공한 Child는 `APPLIED`, 미적용 Child는
+`PENDING`으로 표시합니다. stdout이나 결과 파일의 `COMPLETE`만으로 Commit을
+인정하지 않습니다.
+
+| `operation_status` | 의미 |
+| --- | --- |
+| `PENDING` | Child 감사가 없거나 검증된 Child가 모두 미적용 |
+| `COMMITTED_UNVERIFIED` | GET에서 두 Child 감사 존재를 확인했으나 전체 검증 전 |
+| `PARTIAL_HOLD` | 한 Child만 적용/감사 존재. 전체 복구 완료가 아님 |
+| `HOLD` | Root Intent 부재, 변경된 감사/Checkpoint/Backup 또는 잘못된 증거로 보류 |
+| `APPLIED_VERIFY_REQUIRED` | verify에서 두 Child 적용을 검증했으나 현재 Runtime 전진은 미확인 |
+
+`verification.status`는 `NOT_REQUESTED`, `VERIFIED_AUDITS`, `HOLD`, `UNKNOWN`입니다.
+`VERIFIED_AUDITS`는 같은 계획의 감사와 미적용 Checkpoint 검사가 통과했다는 뜻이며
+두 Child의 적용 여부는 별도 상태로 확인합니다. Root Intent가 없으면 200 HOLD/UNKNOWN,
+증거가 잘못되면 200 HOLD입니다. 전체 감사가 검증됐지만 진행 파일이 없으면
+`VERIFIED_AUDITS`를 유지하고 `root_progress_status="UNAVAILABLE"`로 구분합니다.
+진행 파일을 만들지 않는 bounded-replay는 `root_progress_status="NOT_APPLICABLE"`입니다.
+비공개 Root Artifact 읽기 권한이 없으면 503/UNKNOWN으로 반환합니다.
+
+`root_progress_verified`는 기존 진행 파일의 SHA·승인·Checkpoint 연결을 확인했다는
+뜻입니다. `root_progress_observed_at`, `root_progress_age_seconds`,
+`root_progress_max_age_seconds=45`, `root_progress_fresh`로 원래 관측 시각과 최신성을
+구분합니다. 선택적인 `<pair_id>.manager.json`과 연결된 Manager Journal까지 확인한
+`root_completion_recorded=true`도 **과거 완료 기록**입니다. 현재 Boot·서비스 실행·모델
+로딩이나 처리 전진을 인증하지 않습니다. 이 첫 API는 진행 파일이 fresh여도 현재
+`COMPLETE`를 반환하지 않으며 모든 응답의 `runtime.status`는 `UNKNOWN`입니다.
+
+`historical_completion_status`는 원본 감사 검증을 통과한 과거 `COMPLETE` 또는
+`REPLAY_COMPLETE` 기록이며, 근거가 없거나 검증에 실패하면 null입니다.
+`historical_completion_source`는 직접 Root 진행 문서의 `ROOT_PROGRESS` 또는
+연결된 Manager Journal의 `ROOT_MANAGER`, `historical_completion_recorded_at`은
+당시 관측 또는 완료 Journal 보관 시각입니다. Manager 없이도 eligible=true·advances=2의
+검증된 진행 문서로 과거 COMPLETE를 확인할 수 있지만 `root_completion_recorded`는
+false로 유지합니다. 과거 완료와 현재 runtime UNKNOWN을 함께 표시해야 합니다.
+후속 복구 등으로 원본 감사 검증이 HOLD면 과거 완료 문서로 우회하지 않습니다.
+상세한 증명 범위는 [모델 정보·복구 관리 API](phase9-model-management-api.md)를 따릅니다.
+
+### 서버 경로·권한과 구현 범위
+
+| 설정 | 기본값 |
+| --- | --- |
+| `PACKET_PAIR_REPOSITORY_ROOT` | API 패키지가 있는 Repository Root |
+| `DATABASE_URL` | 기존 SQLite DB 설정 |
+| `PACKET_PAIR_PLAN_DIR` | `output/phase9-packet-pair-api/plans` |
+| `PACKET_PAIR_ARTIFACT_DIR` | `data/recovery/packet-pair` |
+| `PACKET_PAIR_MANAGER_PLAN_DIR` | `output/phase9-packet-pair-api/manager-plans` |
+
+상대 경로는 Repository Root 기준이며 client가 경로를 지정할 수 없습니다.
+Symlink/Junction을 거부하고 DB는 기존 파일을 `mode=ro`·`query_only`로 조회합니다.
+계획 생성만 새 파일을 쓰며 세 API 모두 DB 감사·Checkpoint·Trust를 쓰지 않습니다.
+GET/verify는 Lock·Root Progress·Journal·Backup을 갱신하지 않습니다.
+
+적용·Resume·서비스 중단/원상복귀는 같은 Pair UUID·Plan SHA·DB·Artifact Root를 사용하는
+Root 관리자 CLI로 수행합니다. HTTP apply 경로는 없습니다. API에서 sudo·서비스 제어·
+Root 프로세스 시작을 하지 않으며 `iot-edge-api.service`의 `NoNewPrivileges=true`를
+유지합니다. Manager Plan을 서버 설정 디렉토리의 `<pair_id>.manager.json`에 보관하는
+선택 규약은 API의 과거 완료 증거 조회용이며 기존 CLI 파일명 규약을 바꾸지 않습니다.
+
+잘못된 UUID/Body는 422, 계획 부재는 404, 서버 경로·DB·계획 생성/읽기 또는 비공개
+증거 접근 불가는 503입니다. Pair 업무 오류는
+`{detail:{code: "...", verification: "UNKNOWN"}}`이며 내부 경로·상세 OS 오류를
+노출하지 않습니다. 인증 오류는 위 문자열 형식을 사용합니다.
+
+현재 구현은 모델 원본 조회와 복구 계획/감사 검증의 첫 범위입니다. 2026/10/11의
+운영 API 적용·HTTP 확인 기록은 아래 전용 문서를 참조합니다. 이후 manager 통합
+후보의 운영 배포는 별도 검증 대상입니다. Artifact 검사나 정상 HTTP 응답을 실제
+실행 모델 인증으로 표시하지 않습니다. 실제 Runtime
+발행, 기기별 OFF/OBSERVE 저장·적용, 모델 활성화·중단·후보 평가와 Frontend 연결은
+후속이며 P9-06 전체 완료가 아닙니다. 검증 기록과 세부 계약은
+[모델 정보·복구 관리 API](phase9-model-management-api.md)를 참조합니다.
 
 ## Packet Gateway Read APIs
 
@@ -363,6 +541,13 @@ Isolation History는 Trust 정책상 격리 결정을 표현합니다. 실제 �
 
 ## Firewall Rules
 
+Migration 011의 두 scope는 `MQTT_IPV4_TCP_1883`(Pi INPUT의 TCP 1883)와
+`PI_INPUT_IPV4_ALL`(같은 source IPv4의 Pi INPUT 전체 프로토콜·포트)입니다.
+자동 격리는 기존 MQTT 1883을 유지하며 기존 ID의 범위를 확대하지 않습니다.
+관리자 확장은 이미 `isolated`인 기기의 `APPLIED` MQTT 규칙에서 새 광역 행을 만드는
+첫 경로만 구현했습니다. 운영 Pi migration/배포는 미적용 상태이며 실제 차단·DHCP/재부팅은
+미검증입니다. 자동 신규 광역 격리 정책·광역 확장 승인 Frontend는 후속 미완료 범위입니다.
+
 ### GET /api/firewall-rules
 
 Query parameters:
@@ -390,6 +575,7 @@ Each item includes:
 id
 device_id
 source_ip
+scope
 protocol
 dest_port
 action
@@ -404,16 +590,112 @@ applied_at
 released_at
 created_at
 updated_at
+source_rule_id
+approved_policy_revision
+requested_by
+request_id
 ```
+
+MQTT scope의 `protocol`/`dest_port`는 `tcp`/`1883`이고 광역 scope에서는 둘 다
+`null`입니다. 새 승인 메타데이터 네 필드는 nullable이며 Migration 011 이전 행에는
+`null`입니다. 완전한 pre-011 DB도 조회 시 MQTT scope와 null 메타데이터를 반환합니다.
+scope 필터는 제공하지 않으며 `status`, `device_id`, `source_ip`로 조회합니다.
 
 The backend only reads DB state. It does not run Firewall Worker logic or iptables.
 
+### POST /api/firewall-rules/{source_rule_id}/scope-extension-requests
+
+`X-Recovery-Admin-Key` 인증으로 기존 MQTT 규칙을 광역 scope로 확장 승인합니다.
+`requested_by`는 서버 인증 principal에서 파생하며 요청 Body에는 허용하지 않습니다.
+Backend는 Worker와 같은 파일 lock을 얻은 뒤 `BEGIN IMMEDIATE`에서 새 ID의 `PENDING`
+행을 저장합니다. 기존 source 행을 수정·제거하거나 sudo/iptables를 실행하지 않습니다.
+API의 `NoNewPrivileges=true`도 유지합니다.
+
+Request (`source_rule_id=12` 예시):
+
+```json
+{
+  "device_id": "pico_01",
+  "source_ip": "192.168.0.31",
+  "approved_policy_revision": 1,
+  "scope": "PI_INPUT_IPV4_ALL",
+  "reason": "operator approved Pi input isolation",
+  "request_id": "6af7a972-a852-4e21-86f3-4632c68ea331",
+  "confirm": "EXTEND-PI-INPUT-12-192.168.0.31-REV-1"
+}
+```
+
+모든 필드가 필수이며 미지원 필드와 자료형 변환은 거부합니다. source ID는 양의
+64비트 정수, 승인 revision은 `1..2147483647` 정수, `source_ip`는 정규 RFC1918 IPv4,
+`request_id`는 소문자 정규 UUID4여야 합니다. `device_id`는 영숫자로 시작하는 1~64자
+ASCII 영숫자·`_`·`-`이고, `reason`은 공백 제거 후 1~500자이며 제어 문자를 허용하지
+않습니다. 확인 문자열은 `EXTEND-PI-INPUT-{source_rule_id}-{source_ip}-REV-{approved_policy_revision}`입니다.
+
+첫 승인 시 source가 `APPLIED` MQTT 규칙이고 device/IP/사양이 요청과 일치해야 합니다.
+기기의 현재 상태는 `isolated`, 소유 IPv4는 요청 값, 현재 적용 정책은 `ACTIVE`이며
+승인 revision과 같아야 합니다. 적용 예정 DISABLED 정책, source의 해제 대기, 같은
+device/IP의 미해결 광역 규칙이 있으면 거부합니다. 과거 광역 `REMOVED`도 정확한 성공
+해제 감사가 해당 제거 시각을 포함해야 다음 새 승인을 허용합니다.
+
+Response `201`의 `item`은 GET의 전체 FirewallRuleItem입니다. 예시에서는 주요 필드만
+표시합니다.
+
+```json
+{
+  "item": {
+    "id": 13,
+    "device_id": "pico_01",
+    "source_ip": "192.168.0.31",
+    "scope": "PI_INPUT_IPV4_ALL",
+    "protocol": null,
+    "dest_port": null,
+    "action": "DROP",
+    "status": "PENDING",
+    "reason": "operator approved Pi input isolation",
+    "source_rule_id": 12,
+    "approved_policy_revision": 1,
+    "requested_by": "recovery-admin",
+    "request_id": "6af7a972-a852-4e21-86f3-4632c68ea331"
+  },
+  "created": true,
+  "replayed": false,
+  "runtime_verified": false
+}
+```
+
+동일 UUID와 principal/source/device/IP/revision/scope/reason으로 재요청하면 상태가
+`FAILED` 또는 `REMOVED`여도 같은 행을 반환합니다. 재요청도 `201`이며 `created=false`,
+`replayed=true`입니다. 다른 바인딩은 `409 REQUEST_ID_BINDING_MISMATCH`입니다. 응답이
+유실되면 같은 UUID와 같은 요청을 재사용합니다. 새 UUID로 이전 광역 FAILED/PENDING/APPLIED
+또는 미감사 REMOVED를 우회할 수 없습니다. `runtime_verified`는 항상 false이며 현재
+실제 적용을 인증하지 않습니다.
+
+Worker는 적용·복원 직전에 source/device/IP/ACTIVE 정책 revision/해제 대기를 다시
+확인합니다. 최초 PENDING 광역에는 source APPLIED가 필요합니다. 이미 APPLIED인 광역은
+원본 MQTT를 별도로 감사 해제한 경우에도 복원할 수 있으나 정확한 source ID의 성공
+해제, non-null `released_at`, `requested_at <= released_at <= processed_at`을 요구합니다.
+원본 MQTT는 광역 확인 전후 모두 자동 제거하지 않습니다. 세부 범위·운영 순서는
+[Pi 입력 격리](phase9-pi-input-isolation.md)를 따릅니다.
+
+| 상태 | 의미 |
+| --- | --- |
+| 401 | 관리자 인증 실패 |
+| 404 | source 규칙 없음 (`SOURCE_RULE_NOT_FOUND`) |
+| 409 | 확인 불일치, source/IP/상태/정책 변경, 해제 대기, 이전 광역 미해결, UUID 바인딩 충돌, Worker/DB busy |
+| 422 | 잘못된 필드·자료형·scope·IPv4·UUID·reason |
+| 503 | 관리자 키·잠금·DB·정책 불가, 011 미적용 (`MIGRATION_011_REQUIRED`) 또는 schema 불일치 |
+
+업무 오류는 `{detail:{result:"DENIED",failure_code,failure_reason}}`이며 두 failure
+필드는 고정 코드입니다. 422는 입력 원문을 제외한 필드 오류 배열 또는 고정 오류
+문자열입니다. 완전한 pre-011 DB에서는 기존 조회·해제를 유지하고 광역 승인만 거부합니다.
+
 ### POST /api/firewall-rules/{rule_id}/release-requests
 
-관리자가 `APPLIED` Firewall Rule의 공식 Release를 요청하는 Command API입니다.
+관리자가 `APPLIED` 또는 `FAILED` Firewall Rule의 공식 Release를 요청하는 Command API입니다.
 Backend는 `firewall_release_requests`에 `PENDING` 요청만 저장하며, sudo/iptables
 또는 `release_rule()`을 직접 실행하지 않습니다. 실제 Release는 Firewall Worker가
-공유 lock 아래에서 처리합니다.
+공유 lock 아래에서 처리합니다. 요청 저장도 같은 파일 lock 뒤 `BEGIN IMMEDIATE`를
+사용합니다. 두 scope 모두 정확한 Rule ID로 따로 해제하며 같은 IP의 다른 scope는 보존합니다.
 
 관리자 헤더:
 
@@ -432,6 +714,11 @@ Request:
 
 `confirm`은 Rule ID에 묶인 `RELEASE-FIREWALL-RULE-{rule_id}` 값이어야 합니다.
 `requested_by`는 요청 Body가 아니라 인증된 관리자 principal에서 파생합니다.
+FAILED의 런타임 잔여 DROP 정리는 정확한 ID의 PENDING 감사 요청이 있어야 Worker가
+허용합니다. 정확한 scope/IP/ID 규칙의 삭제 후 부재를 확인해야 Rule을 REMOVED로 기록하고
+요청을 SUCCEEDED로 완료합니다. 삭제·확인 실패는 성공으로 반환하지 않습니다. IP·정책·
+보호 주소가 바뀌어도 과거 정확한 규칙의 확인·삭제는 허용합니다. REMOVED만 먼저 기록된
+중단 상황은 다음 Worker cycle에서 부재 확인 후 요청을 수렴시킬 수 있습니다.
 
 Response `201`:
 
@@ -456,12 +743,19 @@ Error:
 
 - `401`: 관리자 인증 실패
 - `404`: 대상 Firewall Rule 없음
-- `409`: 확인 문구 불일치, 대상 Rule이 `APPLIED`가 아님, 같은 Rule의 `PENDING` 요청 중복
+- `409`: 확인 문구 불일치, 대상 Rule이 `APPLIED`/`FAILED`가 아님, 같은 Rule의 `PENDING` 요청 중복, Worker/DB busy
+- `422`: 필수 필드 누락·잘못된 자료형·빈 reason
+- `503`: 관리자 키 또는 잠금/DB 불가
+
+해제할 수 없는 상태의 기존 오류 코드는 호환을 위해 `FIREWALL_RULE_NOT_APPLIED`를
+유지합니다. 해제 요청의 201은 실제 해제 성공과 별개입니다. Runtime DROP이 남아 있는
+FAILED 규칙은 Baseline 복구를 통과하지 못하며 마지막 해제 시도 이후의 새 관측이 필요합니다.
 
 ### GET /api/firewall-release-requests/{request_id}
 
 Firewall Release Request 처리 상태를 조회합니다. `PENDING`, `SUCCEEDED`, `FAILED`
 중 하나를 반환합니다. `FAILED`인 경우 `last_error`에 Worker 실패 사유가 저장됩니다.
+POST와 같은 관리자 헤더가 필요하며 정상 조회는 `200 {item: ...}`입니다.
 
 ## Recovery Command APIs
 
@@ -637,10 +931,12 @@ Baseline Recovery는 P0에서 서로 다른 Source로 유지하며 통합 Timeli
 
 ## 현재 구현 상태
 
-현재 backend에 구현된 조회 API는 다음과 같습니다.
+현재 backend의 주요 API는 다음과 같습니다. 신규 API의 운영 배포 여부와
+미구현 후속 범위는 각 계약을 참조합니다.
 
 ```txt
 GET /api/health
+GET /api/models
 GET /api/dashboard/summary
 GET /api/devices
 GET /api/devices/{device_id}
@@ -654,8 +950,14 @@ GET /api/trust-score/{device_id}/history
 GET /api/trust-score/compensations
 GET /api/isolation/history
 GET /api/firewall-rules
+POST /api/firewall-rules/{source_rule_id}/scope-extension-requests
+POST /api/firewall-rules/{rule_id}/release-requests
+GET /api/firewall-release-requests/{request_id}
 POST /api/recovery/preflight
 POST /api/recovery/execute
 GET /api/recovery/history
 GET /api/recovery/history/{operation_id}
+POST /api/recovery/packet-pair/plans
+GET /api/recovery/packet-pair/{plan_id}
+POST /api/recovery/packet-pair/{plan_id}/verify
 ```

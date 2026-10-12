@@ -20,6 +20,7 @@ from edge.detection.phase4_time import (
     require_utc_window_boundary,
 )
 from edge.policy.repository import load_policy_resolver
+from edge.maintenance.processing import require_processing_cutoff
 from edge.policy.resolver import POLICY_AVAILABLE
 from edge.trust import firewall_repository
 from edge.trust.trust_policy import (
@@ -109,6 +110,7 @@ def apply_trust_score_v2_until(
     mode = resolve_ai_mode(ai_mode)
     range_start = require_utc_window_boundary(cycle_range_start, "cycle_range_start")
     cutoff = require_utc_window_boundary(cycle_cutoff, "cycle_cutoff")
+    require_processing_cutoff(db, cutoff)
     if range_start >= cutoff:
         raise ValueError("cycle_range_start must be before cycle_cutoff")
     _ensure_sqlite_immediate_transaction(db)

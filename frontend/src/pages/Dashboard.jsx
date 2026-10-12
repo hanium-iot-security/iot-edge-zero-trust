@@ -447,9 +447,17 @@ export default function Dashboard() {
   const hasSuccessfulDataRef = useRef(false);
 
   const loadData = useCallback(async (isManualRefresh = false) => {
+    if (
+      requestControllerRef.current &&
+      !requestControllerRef.current.signal.aborted
+    ) {
+      if (isManualRefresh) {
+        setRefreshing(true);
+      }
+      return;
+    }
     const requestId = requestIdRef.current + 1;
     requestIdRef.current = requestId;
-    requestControllerRef.current?.abort();
     const controller = new AbortController();
     requestControllerRef.current = controller;
 
@@ -612,6 +620,9 @@ export default function Dashboard() {
       if (requestId === requestIdRef.current) {
         setLoading(false);
         setRefreshing(false);
+        if (requestControllerRef.current === controller) {
+          requestControllerRef.current = null;
+        }
       }
     }
   }, []);
@@ -624,6 +635,7 @@ export default function Dashboard() {
     return () => {
       window.clearInterval(timer);
       requestControllerRef.current?.abort();
+      requestControllerRef.current = null;
     };
   }, [loadData]);
 

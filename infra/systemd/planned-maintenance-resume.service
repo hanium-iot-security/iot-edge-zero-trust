@@ -1,0 +1,27 @@
+[Unit]
+Description=Resume a drained and explicitly approved IoT Edge planned shutdown
+After=network-online.target systemd-time-wait-sync.service packet-capture.service mqtt-subscriber.service mqtt-feature-builder.service detection-orchestrator.service packet-feature-extractor.timer firewall-worker.service
+Wants=network-online.target systemd-time-wait-sync.service packet-capture.service mqtt-subscriber.service mqtt-feature-builder.service detection-orchestrator.service packet-feature-extractor.timer firewall-worker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/home/pi/iot-edge-zero-trust
+EnvironmentFile=/home/pi/iot-edge-zero-trust/.env
+# systemd root lacks sudo's original-owner context; trust only this repository.
+Environment=GIT_CONFIG_COUNT=1
+Environment=GIT_CONFIG_KEY_0=safe.directory
+Environment=GIT_CONFIG_VALUE_0=/home/pi/iot-edge-zero-trust
+UMask=0077
+ExecStart=/home/pi/iot-edge-zero-trust/venv/bin/python -m edge.maintenance.run_planned_maintenance resume --timeout 120 --verify-timeout 120 --artifact-dir output/planned-maintenance
+TimeoutStartSec=480
+# Failure/WAIT is logged and requires inspection; never loop automatic approvals.
+Restart=no
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=planned-maintenance-resume
+
+[Install]
+WantedBy=multi-user.target

@@ -51,6 +51,7 @@ from edge.packet.capture_policy import (
 )
 from edge.phase5.import_verified_collection import assert_standalone_snapshot
 from edge.phase5.verified_collection_contract import DatasetSessionIdentity
+from edge.maintenance.processing import dataset_maintenance_windows, overlaps_maintenance
 
 
 @dataclass(frozen=True)
@@ -155,9 +156,17 @@ def export_packet_if_dataset(
     )
     exported_rows: list[dict[str, Any]] = []
     exclusion_reasons: Counter[str] = Counter()
+    maintenance = dataset_maintenance_windows(db)
 
     for row in rows:
         _validate_source_window(row)
+        if overlaps_maintenance(
+            maintenance,
+            parse_db_utc(row["window_start"], "window_start"),
+            parse_db_utc(row["window_end"], "window_end"),
+        ):
+            exclusion_reasons["PLANNED_MAINTENANCE"] += 1
+            continue
         reason = _exclusion_reason(
             row,
             capture_policy,

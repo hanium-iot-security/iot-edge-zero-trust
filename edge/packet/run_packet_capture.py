@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta, timezone
 import logging
+import json
 from pathlib import Path
 import signal
 import sys
@@ -202,12 +203,17 @@ def start_new_session(
     now: datetime,
     *,
     fallback_gap_start: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> tuple[int, str, datetime]:
     """새 Session을 생성하고 first_window_start·Capture Gap을 기록합니다.
 
     fallback_gap_start: 이 interface에 대해 DB에 기록된 Segment가 전혀 없을 때
     Gap 시작점으로 사용할 값입니다. 만료된 Window로 인해 Session이 전환되는 경우,
     놓친 window_start를 여기로 넘기면 "이전 Segment가 하나도 없어 Gap을 계산 못 하는" 상황에서도 공백이 누락되지 않습니다.
+
+    Runtime은 clock을 전달하여 Session INSERT의 대기가 끝난 시각으로 첫 경계를
+    계산한다. 이미 저장한 경계는 이후 commit이 지연돼도 변경하지 않는다.
+    clock이 없는 직접 호출은 명시한 now를 사용하는 기존 동작을 유지한다.
 
     Returns:
         (session_pk, session_id, first_window_start)
@@ -220,7 +226,8 @@ def start_new_session(
         started_at=now,
     )
 
-    first_window_start = next_utc_boundary(now, config.window_seconds)
+    boundary_now = clock() if clock is not None else now
+    first_window_start = next_utc_boundary(boundary_now, config.window_seconds)
     repo.set_first_window_start(db, session_pk, first_window_start)
 
     previous_window_end = repo.find_last_segment_window_end(db, config.capture_interface)
@@ -253,6 +260,7 @@ def run_capture_loop(
     max_windows: int | None = None,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> int:
     """first_window_start부터 연속으로 10초 Window를 캡처합니다.
 
@@ -272,6 +280,7 @@ def run_capture_loop(
     """
     window_start = first_window_start
     windows_captured = 0
+    previous_window_timing = None
 
     def _close_current_session(now: datetime, status: str) -> None:
         repo.close_session(db, session_pk, now, status)
@@ -299,16 +308,16 @@ def run_capture_loop(
         db.commit()
         logger.warning(
             "LATE_CAPTURE segment 생성: window=%s~%s start_delay_seconds=%s; "
-            "Session을 FAILED로 마감하고 다음 경계에서 새 Session으로 전환",
+            "Session을 FAILED로 마감하고 다음 경계에서 새 Session으로 전환; previous_window_timing=%s",
             format_utc_iso(missed_window_start), format_utc_iso(missed_window_end),
-            start_delay_seconds,
+            start_delay_seconds, json.dumps(previous_window_timing, sort_keys=True, separators=(",", ":")),
         )
         # 허용 지연을 초과한 Window는 ... 부모 packet_capture_sessions.status=FAILED로
         # 마감한다. (COMPLETED가 아니라 FAILED로 마감해야 Phase 4 Cutover/모니터링에서
         # 지연으로 인한 전환과 정상 종료를 구분할 수 있다.)
         _close_current_session(now, "FAILED")
         session_pk, session_id, window_start = start_new_session(
-            db, config, now, fallback_gap_start=missed_window_end
+            db, config, clock(), fallback_gap_start=missed_window_end, clock=clock
         )
 
     try:
@@ -344,6 +353,7 @@ def run_capture_loop(
                 capture_started_at=capture_started_at,
                 policy=config.capture_policy,
                 clock=clock,
+                monotonic=monotonic,
             )
 
             if result.error_code == LATE_CAPTURE:
@@ -355,6 +365,7 @@ def run_capture_loop(
                 )
                 continue
 
+            insert_started = monotonic()
             if result.success:
                 repo.insert_ready_segment(
                     db,
@@ -369,7 +380,6 @@ def run_capture_loop(
                     start_delay_seconds=result.start_delay_seconds,
                     captured_duration_seconds=result.captured_duration_seconds,
                 )
-                logger.info("READY segment 생성: %s", result.file_name)
             else:
                 repo.insert_failed_segment(
                     db,
@@ -386,9 +396,24 @@ def run_capture_loop(
                     start_delay_seconds=result.start_delay_seconds,
                     captured_duration_seconds=result.captured_duration_seconds,
                 )
-                logger.warning("FAILED segment 생성: %s (%s)", result.file_name, result.error_code)
 
+            insert_finished = monotonic()
             db.commit()
+            commit_finished = monotonic()
+            phase_timings = {**result.phase_timings_seconds,
+                             "db_insert_seconds": insert_finished - insert_started,
+                             "db_commit_seconds": commit_finished - insert_finished}
+            previous_window_timing = {
+                "session_id": session_id, "window_start": format_utc_iso(window_start),
+                "window_end": format_utc_iso(window_end), "timing_seconds": phase_timings,
+                "process_wait_completed_at": (
+                    result.process_wait_completed_at.isoformat() if result.process_wait_completed_at is not None else None),
+            }
+            timing = json.dumps(previous_window_timing, sort_keys=True, separators=(",", ":"))
+            if result.success:
+                logger.info("READY segment 생성: %s timing=%s", result.file_name, timing)
+            else:
+                logger.warning("FAILED segment 생성: %s (%s) timing=%s", result.file_name, result.error_code, timing)
             window_start = window_end
             windows_captured += 1
 
@@ -456,9 +481,9 @@ def main() -> None:
             reconcile_orphan_ready_files(db, config)
             reconcile_orphan_failed_files(db, config)
 
-            now = datetime.now(timezone.utc)
-            reconcile_stale_running_sessions(db, config, now)
-            session_pk, session_id, first_window_start = start_new_session(db, config, now)
+            clock = lambda: datetime.now(timezone.utc)
+            reconcile_stale_running_sessions(db, config, clock())
+            session_pk, session_id, first_window_start = start_new_session(db, config, clock(), clock=clock)
 
             windows_captured = run_capture_loop(
                 db,
@@ -469,6 +494,7 @@ def main() -> None:
                 first_window_start=first_window_start,
                 shutdown=shutdown,
                 max_windows=args.windows,
+                clock=clock,
             )
             logger.info("Capture Runtime 종료: windows_captured=%d", windows_captured)
 

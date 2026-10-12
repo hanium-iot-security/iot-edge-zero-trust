@@ -22,6 +22,7 @@ TimeoutStopSec=15
 # 대신 sudoers를 필요한 iptables 명령만 허용하도록 제한한다.
 # (infra/sudoers/hanium-firewall-worker 참고)
 NoNewPrivileges=false
+ReadOnlyPaths=/etc/hanium
 
 StandardOutput=journal
 StandardError=journal

@@ -34,6 +34,15 @@ Migration 009 (`mqtt_raw_payload`)는 `mqtt_logs`에 수신 원본 바이트(`pa
 저장이 실패하고(오류 로그만 남고 해당 메시지는 저장되지 않는다) 수신 증적이 유실된다. 009는 컬럼 추가와
 Trigger만 포함하고 기존 컬럼의 값은 바꾸지 않는다.
 
+Migration 011 (`pi_input_isolation`)은 `firewall_rules`에 scope와 관리자 확장 승인
+메타데이터를 추가한다. 기존 행은 MQTT TCP 1883과 기존 ID·열 값을 유지하고 새 광역
+행만 별도 ID로 생성한다. Runner는 FK를 잠시 끄는 재구성 경로에서 011 전체를 원자적으로
+적용하고 `foreign_key_check`/`integrity_check` 후 commit한다. 오류면 테이블·행·인덱스·
+`sqlite_sequence`·011 완료 기록이 rollback되며 원래 FK 설정도 복구한다. 삭제된 높은 ID의
+sequence와 기존 Release FK를 보존한다. 완료 뒤 되돌리는 down Migration은 제공하지
+않으므로 운영 적용 전 일관된 백업과 사본 검증이 필요하다. 운영 DB의 011 적용/배포는 아직
+미실행 상태이며 로컬 검증을 운영 적용으로 표시하지 않는다.
+
 적용과 복구: 007은 컬럼 추가를 포함하며 되돌리는(down) Migration이 없다. 운영 DB에는 먼저
 일관된 백업(SQLite backup API 등, 쓰기 중 파일 하나만 복사하지 않는다)을 만든 뒤 **복사본에서**
 Migration과 backfill dry-run을 확인하고 적용한다. 적용 중 오류가 나면 Migration 전체가 rollback되어
@@ -418,19 +427,25 @@ Event와 Source Trust History를 수정하지 않고, 어떤 감점을 어떤 Ba
 
 ## firewall_rules
 
-Phase 4용 firewall 요청/상태 테이블입니다. 격리 진입 시 Trust Score v2 transaction에서 `PENDING` row를 만들 수 있고, Firewall Worker가 실제 iptables 적용·해제와 reconciliation을 담당합니다. Repository는 `PENDING -> APPLIED`, `PENDING -> PENDING/FAILED`, `APPLIED -> REMOVED`, 관리자 재시도용 `FAILED -> PENDING`만 허용합니다.
+Firewall 요청/상태 테이블입니다. 격리 진입 시 Trust Score v2 transaction은 기존 MQTT
+scope의 `PENDING` 행을 만들고, Migration 011 관리 API는 기존 isolated/APPLIED MQTT
+규칙에 연결된 새 광역 PENDING 행을 만듭니다. Worker가 실제 iptables 적용·해제와
+reconciliation을 담당합니다. Repository는 `PENDING -> APPLIED`, `PENDING -> PENDING/FAILED`,
+`APPLIED/FAILED -> REMOVED`, 관리자 재시도용 `FAILED -> PENDING`을 지원합니다.
+FAILED 정리는 정확한 PENDING 해제 감사 요청과 실제 규칙 부재 확인이 필요합니다.
 
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |
 | id | INTEGER | primary key autoincrement |
-| device_id | TEXT | 대상 기기 |
-| source_ip | TEXT | 차단 대상 IP |
-| protocol | TEXT | protocol, 기본 `tcp`, 1차 계약은 `tcp`만 허용 |
-| dest_port | INTEGER | destination port, 1차 계약은 `1883`만 허용 |
-| action | TEXT | firewall action, 1차 계약은 `DROP`만 허용 |
+| device_id | TEXT | 대상 `devices.device_id` FK, NULL 허용, `ON DELETE SET NULL` |
+| source_ip | TEXT | 차단 대상 IPv4, NOT NULL |
+| scope | TEXT | 011. NOT NULL, 기본 `MQTT_IPV4_TCP_1883`, 또는 `PI_INPUT_IPV4_ALL` |
+| protocol | TEXT | 기본 `tcp`; MQTT scope는 `tcp`, 광역 scope는 NULL |
+| dest_port | INTEGER | 기본 `1883`; MQTT scope는 `1883`, 광역 scope는 NULL |
+| action | TEXT | NOT NULL, 기본 `DROP`, `DROP`만 허용 |
 | status | TEXT | `PENDING`, `APPLIED`, `FAILED`, `REMOVED` |
 | reason | TEXT | 요청 사유 |
-| trigger_event_id | INTEGER | 관련 detection event |
+| trigger_event_id | INTEGER | `detection_events.id` FK, NULL 허용, `ON DELETE SET NULL` |
 | applied_at | DATETIME | 적용 시각 |
 | released_at | DATETIME | 해제 시각 |
 | last_error | TEXT | 마지막 오류 메시지 |
@@ -439,18 +454,48 @@ Phase 4용 firewall 요청/상태 테이블입니다. 격리 진입 시 Trust Sc
 | next_retry_at | DATETIME | 다음 재시도 가능 시각 |
 | created_at | DATETIME | 요청 생성 시각 |
 | updated_at | DATETIME | 수정 시각 |
+| source_rule_id | INTEGER | 011. 원본 `firewall_rules.id` FK, `ON DELETE RESTRICT`; 광역은 양수 필수, MQTT는 NULL |
+| approved_policy_revision | INTEGER | 011. 승인한 현재 ACTIVE policy revision; 광역은 양수 필수, MQTT는 NULL |
+| requested_by | TEXT | 011. 광역은 서버 인증 principal, 공백 제외 비어 있지 않아야 함; 기존 행은 NULL |
+| request_id | TEXT | 011. UNIQUE nullable; 광역은 소문자 정규 UUID4 필수, MQTT는 NULL |
 
-`PENDING`, `APPLIED` 상태에서는 `(source_ip, protocol, dest_port)` 조합이 중복될 수 없습니다.
+011 CHECK는 scope별 protocol/port/승인 메타데이터 조합을 강제합니다. MQTT는 `tcp`/`1883`,
+NULL source/revision/request ID이고 광역은 NULL protocol/port, 양의 source/revision, 정규 UUID4,
+비어 있지 않은 actor/reason이어야 합니다. `approved_policy_revision`은 별도 FK가 아니라
+승인값이며 현재 적용 정책과의 동일성은 API/Worker에서 다시 검사합니다.
+
+011부터 `PENDING`/`APPLIED`는 `(source_ip, scope)`가 유일합니다. 같은 IP의 MQTT와 광역
+규칙은 공존할 수 있으나 같은 scope의 활성 중복은 거부합니다. 기존 status/IP 인덱스는
+재생성됩니다. 자동 신규 규칙은 MQTT scope 기본값을 사용하며 기존 ID를 광역으로 바꾸지
+않습니다. 최초 광역에는 source APPLIED·현재 isolated 기기·동일 소유 IPv4·현재 ACTIVE
+revision·해제 대기 없음이 필요합니다. source ID/사양/device/IP 연결과 승인 revision은
+실제 적용·재시도·복원 직전 다시 검사합니다.
+
+동일 `request_id`의 동일 principal/source/device/IP/revision/scope/reason 재요청은 FAILED/
+REMOVED에서도 같은 행을 반환합니다. 다른 바인딩은 거부하며 새 UUID도 미해결 이전 광역을
+우회하지 못합니다. 기존 광역 REMOVED의 새 승인과 이미 APPLIED인 광역의 source REMOVED
+복원에는 정확한 ID의 SUCCEEDED 해제 감사, non-null `released_at`,
+`requested_at <= released_at <= processed_at`을 요구합니다. 최초 PENDING 광역은 source
+REMOVED에서 적용할 수 없고, 원본 MQTT는 자동 제거하지 않습니다.
+
+완전한 pre-011 DB는 기존 열과 `(source_ip, protocol, dest_port)` 활성 유일성을 유지합니다.
+조회와 Release JOIN은 MQTT scope/NULL 승인 메타데이터로 읽기 호환하며 기존 자동·해제
+경로를 유지합니다. 광역 승인에는 011이 필요하고 부분 열/완료 버전 불일치는 거부합니다.
 
 ## firewall_release_requests
 
 Phase 6-B용 관리자 승인 Firewall Release 요청 queue입니다. Backend API는 이 테이블에
 `PENDING` 요청을 생성할 뿐 sudo/iptables를 실행하지 않습니다. Firewall Worker가 공유
 lock 아래에서 `release_rule()`을 호출하고 요청을 `SUCCEEDED` 또는 `FAILED`로 종료합니다.
+API는 APPLIED 또는 FAILED 규칙에 대해 요청을 저장합니다. Worker의 FAILED 잔여 정리는
+정확한 rule ID의 PENDING 요청으로만 허용하고 scope/IP/ID를 모두 맞춰 삭제·부재 확인합니다.
+다른 scope는 제거하지 않으며 IP·정책·보호 목록 변경 후에도 정확한 과거 규칙 정리는 허용합니다.
 Recovery Preflight는 대상 Device/IP에 연결된 `PENDING` release request가 있으면
 Baseline Recovery를 거부합니다. `FAILED` release request는 감사 이력으로 보존하며,
-실제 Recovery 가능 여부는 Firewall Rule의 `REMOVED` 상태와 runtime
-`VERIFIED_RELEASED` 기준으로 판단합니다.
+실제 Recovery에는 대상 Device/같은 IP에 연결된 모든 scope의 활성 PENDING/APPLIED 규칙과
+PENDING 해제 요청이 없어야 하고 마지막 Firewall 시도/해제 처리 이후 fresh runtime
+`VERIFIED_RELEASED` 관측이 필요합니다.
+REMOVED 상태만으로 성공을 증명하지 않으며 FAILED 규칙의 runtime DROP이 남아 있어도 HOLD합니다.
 
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |
@@ -468,6 +513,66 @@ Baseline Recovery를 거부합니다. `FAILED` release request는 감사 이력�
 동일 `firewall_rule_id`에는 `status = 'PENDING'` 요청이 하나만 존재할 수 있습니다.
 `SUCCEEDED` 또는 `FAILED`로 종료된 뒤에는 새 요청을 만들 수 있습니다. `PENDING`은
 `processed_at`과 `last_error`가 없어야 하며, `SUCCEEDED`는 `last_error`가 없어야 합니다.
+요청 생성에는 대상 Rule이 APPLIED/FAILED여야 합니다. Rule REMOVED commit 뒤 Request 완료
+전에 중단되면 Worker는 다음 cycle에서 정확한 규칙 부재를 재확인하고 SUCCEEDED로 수렴시킵니다.
+`processed_at`은 실제 요청 완료 시각을 유지하므로 Rule의 `released_at`보다 늦을 수 있습니다.
+
+## planned_maintenance_operations / planned_maintenance_resumes
+
+010 migration은 계획 종료 승인과 원자적 Packet 재개의 감사 기록을 추가합니다.
+실제 장애·손실 구간의 기존 Recovery 승인 조건은 변경하지 않습니다.
+
+`planned_maintenance_operations`의 상태는 `REQUESTED → READY → RESUMED`이며,
+종료 준비 실패 시 `REQUESTED` 또는 `READY`에서 `CANCELLED`로 종료합니다.
+활성 `REQUESTED`/`READY` 승인은 전체 DB에 하나만 존재할 수 있습니다.
+
+| 주요 컬럼 | 설명 |
+| --- | --- |
+| operation_id | 계획 종료·다음 재개를 연결하는 고유 UUID |
+| approved_by / reason / requested_at | 관리자 식별 정보·사유·승인 시각; 생성 후 불변 |
+| source_session_id / source_boot_id | 승인 당시 RUNNING Capture Session과 OS boot UUID |
+| required_checkpoints_json | 필수 처리 6개; MQTT IF가 필수로 활성화된 구성은 7개 |
+| source_final_boundary | 정상 종료 Session의 마지막 10초 Window 종료 경계 |
+| source_snapshot_json | 완료 Session·Segment/Feature 개수와 SHA256·Capture Policy |
+| checkpoint_snapshot_json | READY 시점의 참여 Checkpoint 전체 Snapshot |
+| ready_at / expires_at | 처리가 완료된 준비 시각과 7일 재개 승인 만료 시각 |
+| target_session_id / target_boot_id | 승인 한 번으로 연결된 새 Session·새 boot UUID |
+| maintenance_start / maintenance_end | 원본을 보존하는 MQTT·Packet 제외 범위 `[시작, 끝)` |
+| resumed_at | 원자적 재개가 적용된 시각 |
+| cancelled_at / cancellation_reason | 실패한 종료 준비를 재사용하지 않도록 취소한 감사 정보 |
+
+READY는 source가 실제 `COMPLETED`이고, 전체 Segment가 연속·정상으로 처리됐으며,
+필수 Producer·Detector·Trust Checkpoint와 종료 전 미처리 Event가 모두 처리된 경우에만
+기록합니다. 참여 Checkpoint의 완료 경계는 모두 source의 마지막 경계와 같아야 합니다.
+단순 Session 종료나 `SIGTERM`은 다음 부팅의 재개 승인이 아닙니다.
+
+재개는 source의 불변 증적과 Packet pair Snapshot을 다시 확인하고, 다른 boot의
+유일한 새 RUNNING Session의 첫 정상 Packet Feature까지 확인합니다. 승인되지 않은
+중간 Session·FAILED 구간·기존 미처리 데이터를 건너뛰지 않습니다. 정상 MQTT 추가나
+새 Session의 정상 Capture tail 추가는 전체 DB 변경으로 취급하지 않습니다.
+종료 전 시각에 뒤늦게 추가된 미처리 Source Row나 유지보수 구간과 겹치는 기존
+Detection Event가 있으면 자동 재개를 보류합니다. 이미 반영된 감점도 삭제·보상하지
+않으며 기존 장애 Recovery에서 별도로 판단합니다.
+
+`planned_maintenance_resumes`는 operation당 하나의 불변 Audit이며 target Session도
+중복 사용할 수 없습니다. Plan SHA256·JSON, 검증된 Backup 경로·SHA256, 재개 시각을
+보존합니다. 두 Packet Checkpoint의 Window 경계 변경, 승인 소비, 이 Audit 생성은
+같은 Transaction에서 이뤄지며 기존 처리 ID·MQTT/Trust Checkpoint·기기 점수·격리를
+수정하지 않습니다. 동일 실행을 재시도하면 기존 Audit을 확인하고 추가 이동하지
+않습니다. 승인 및 Audit의 삭제·재작성은 Trigger로 금지합니다.
+
+READY를 기록하는 Transaction부터 source Session·Segment·Packet Feature의
+추가·변경·삭제를 Seal Trigger가 차단합니다. 이미 READY였던 승인을 취소해도 이
+원본 봉인은 유지합니다. 새 Session의 Capture/Feature 추가 및 MQTT 수신은 허용하며,
+봉인 전에 실패했던 Session의 기존 장애 Recovery 경로에는 적용하지 않습니다.
+재개 처리는 Migration 010의 Table·Index·Trigger 선언을 검사하며, 봉인 Trigger가
+없거나 다른 선언으로 대체된 경우 보류합니다.
+
+승인이 소비된 유지보수 제외 범위는 이후 target Session의 종료·장애나 Checkpoint
+전진 이후에도 보존합니다. Runtime은 불변 Approval/Plan과 Session·첫 Window 연결을
+검사합니다. 전체 완료 Session의 증적 Hash는 Capture가 멈춘 종료 준비 및 Read-only
+재개 검사에서 확인하고, 실제 재개 Write Transaction은 검증된 봉인과 대상 경계를
+재검증하여 기존 Session 전체를 다시 Hash하지 않습니다.
 
 ## 주요 Index
 
@@ -489,6 +594,6 @@ Baseline Recovery를 거부합니다. `FAILED` release request는 감사 이력�
 | `idx_trust_score_history_window` | window 기반 Trust Score history 조회 |
 | `idx_firewall_rules_status` | firewall status 조회 |
 | `idx_firewall_rules_source_ip` | source IP별 firewall rule 조회 |
-| `idx_firewall_rules_active_unique` | 활성 firewall rule 중복 방지 |
+| `idx_firewall_rules_active_unique` | PENDING/APPLIED `(source_ip, scope)` 유일성(011); pre-011은 `(source_ip, protocol, dest_port)` |
 | `uq_firewall_release_requests_pending_rule` | Rule별 PENDING release request 중복 방지 |
 | `idx_firewall_release_requests_status_requested` | Worker의 PENDING release request 조회 |

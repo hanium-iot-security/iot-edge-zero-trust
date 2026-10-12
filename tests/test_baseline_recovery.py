@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import importlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
 import sqlite3
+import threading
 
 import pytest
 
@@ -950,6 +952,156 @@ def test_backup_failure_keeps_database_unchanged(
         )
 
     assert _device_rows(db_path) == before
+
+
+@pytest.mark.parametrize("slow_stage", ["backup", "sha256", "backup_integrity"])
+def test_capture_and_mqtt_writers_commit_during_backup_validation(
+    db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slow_stage: str,
+) -> None:
+    """A slow recovery stage must not hold the single SQLite writer slot."""
+    core = _load_core()
+    with sqlite3.connect(db_path) as connection:
+        session_id = connection.execute(
+            "INSERT INTO packet_capture_sessions "
+            "(session_id,capture_interface,started_at,first_window_start,status) "
+            "VALUES ('22222222-2222-4222-8222-222222222222','eth0',"
+            "'2026-08-03T00:00:00Z','2026-08-03T00:00:00Z','RUNNING')"
+        ).lastrowid
+
+    stage_entered = threading.Event()
+    writer_finished = threading.Event()
+
+    def commit_capture_and_message():
+        assert stage_entered.wait(2)
+        with sqlite3.connect(db_path, timeout=0) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(
+                "INSERT INTO packet_capture_segments "
+                "(capture_session_id,file_name,capture_interface,window_start,window_end,"
+                "status,actual_capture_started_at,captured_duration_seconds) "
+                "VALUES (?,'during-recovery.pcap','eth0','2026-08-03T00:00:00Z',"
+                "'2026-08-03T00:00:10Z','READY','2026-08-03T00:00:00Z',10)",
+                (session_id,),
+            )
+            connection.execute(
+                "INSERT INTO mqtt_logs "
+                "(device_id,topic,payload,payload_size,is_json_valid,is_topic_valid) "
+                "VALUES ('esp32_01','devices/esp32_01/data','{\"seq\":1}',9,1,1)"
+            )
+            connection.commit()
+        writer_finished.set()
+
+    hook_name = {
+        "backup": "_create_backup",
+        "sha256": "_file_sha256",
+        "backup_integrity": "_verify_database_path",
+    }[slow_stage]
+    original = getattr(core, hook_name)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(commit_capture_and_message)
+
+        def slow_stage_with_concurrent_writer(*args):
+            # The operation deliberately cannot finish until the independent
+            # Capture/Subscriber writer commits. No timing/sleep race is needed.
+            if not stage_entered.is_set():
+                stage_entered.set()
+                future.result(timeout=2)
+                assert writer_finished.is_set()
+            return original(*args)
+
+        monkeypatch.setattr(core, hook_name, slow_stage_with_concurrent_writer)
+        result = core.execute_baseline_recovery(
+            db_path=db_path, device_ids=["esp32_01"],
+            expected_trust_scores={"esp32_01": 20},
+            artifact_dir=tmp_path / "artifacts", confirm=core.CONFIRMATION,
+        )
+
+    assert result["result"] == "SUCCESS"
+    assert _rows(db_path, "SELECT status FROM packet_capture_segments") == [("READY",)]
+    assert _rows(db_path, "SELECT payload FROM mqtt_logs") == [('{"seq":1}',)]
+    assert _rows(Path(result["backup_path"]),
+                 "SELECT status,trust_score FROM devices WHERE device_id='esp32_01'") == [
+        ("isolated", 20),
+    ]
+
+
+@pytest.mark.parametrize("change", ["ip", "score", "status", "event", "rule", "release"])
+def test_changes_during_backup_are_revalidated_before_reset(
+    db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    core = _load_core()
+    original = core._create_backup
+
+    def change_after_backup(database, backup):
+        original(database, backup)
+        if change == "event":
+            _insert_detection_event(database)
+        elif change == "release":
+            _insert_release_request(database, status="PENDING")
+        else:
+            with sqlite3.connect(database) as connection:
+                if change == "rule":
+                    connection.execute(
+                        "INSERT INTO firewall_rules(device_id,source_ip,status) "
+                        "VALUES ('esp32_01','192.168.0.4','PENDING')"
+                    )
+                elif change == "ip":
+                    connection.execute("UPDATE devices SET ip_address='192.168.0.9' "
+                                       "WHERE device_id='esp32_01'")
+                elif change == "score":
+                    connection.execute("UPDATE devices SET trust_score=19 WHERE device_id='esp32_01'")
+                else:
+                    connection.execute("UPDATE devices SET status='warning' WHERE device_id='esp32_01'")
+
+    monkeypatch.setattr(core, "_create_backup", change_after_backup)
+    with pytest.raises(core.BaselineRecoveryError):
+        core.execute_baseline_recovery(
+            db_path=db_path, device_ids=["esp32_01"],
+            expected_trust_scores={"esp32_01": 20},
+            artifact_dir=tmp_path / "artifacts", confirm=core.CONFIRMATION,
+        )
+    assert _rows(db_path, "SELECT trust_score FROM devices WHERE device_id='esp32_01'")[0][0] < 100
+    backup = next((tmp_path / "artifacts").glob("*.db"))
+    assert _rows(backup, "SELECT status,trust_score FROM devices WHERE device_id='esp32_01'") == [
+        ("isolated", 20),
+    ]
+    report = json.loads(next((tmp_path / "artifacts").glob("*.json")).read_text(encoding="utf-8"))
+    assert report["result"] == "FAILED"
+    assert report["backup_sha256"] == _sha256(backup)
+
+
+def test_backup_with_pending_event_cannot_be_used_even_if_live_event_is_processed(
+    db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core = _load_core()
+    original = core._create_backup
+
+    def backup_with_intervening_event(database, backup):
+        event_id = _insert_detection_event(database)
+        original(database, backup)
+        with sqlite3.connect(database) as connection:
+            connection.execute("UPDATE detection_events SET processed_at='2026-08-03T00:00:12Z' "
+                               "WHERE id=?", (event_id,))
+
+    monkeypatch.setattr(core, "_create_backup", backup_with_intervening_event)
+    with pytest.raises(core.BaselineRecoveryError, match="미처리 Detection Event"):
+        core.execute_baseline_recovery(
+            db_path=db_path, device_ids=["esp32_01"],
+            expected_trust_scores={"esp32_01": 20},
+            artifact_dir=tmp_path / "artifacts", confirm=core.CONFIRMATION,
+        )
+    assert _rows(db_path, "SELECT status,trust_score FROM devices WHERE device_id='esp32_01'") == [
+        ("isolated", 20),
+    ]
 
 
 def test_one_device_update_failure_rolls_back_all_devices(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib.metadata import version as package_version
 import io
@@ -74,17 +74,41 @@ class PacketIFPrediction:
     feature_values: tuple[float, ...]
 
 
-def load_packet_if_artifact(
+@dataclass(frozen=True)
+class PacketIFArtifactInspection:
+    """Pinned bytes/JSON contracts, without model loading or inference.
+
+    The report has a verified SHA and JSON-object shape. Its evaluation
+    statistics are not semantically validated by this existing contract.
+    """
+
+    model_version: str
+    threshold: float
+    bundle_sha256: str
+    capture_policy: CapturePolicy
+    metadata: dict[str, Any]
+    training_report: dict[str, Any]
+    model_bytes: bytes = field(repr=False)
+
+
+def inspect_packet_if_artifact(
     artifact_dir: Path,
     *,
     expected_bundle_sha256: str,
     expected_model_version: str | None = None,
-) -> PacketIFArtifact:
-    """Verify an externally pinned Bundle before deserializing its model."""
+    maximum_file_bytes: int | None = None,
+) -> PacketIFArtifactInspection:
+    """Verify pinned bytes and JSON contracts without deserializing a model.
+
+    Runtime library compatibility, fitted model properties, inference and
+    report statistics are deliberately outside this inspection result.
+    """
     expected_bundle_sha256 = _validate_external_sha256(
         expected_bundle_sha256,
         "expected_bundle_sha256",
     )
+    if maximum_file_bytes is not None and (type(maximum_file_bytes) is not int or maximum_file_bytes <= 0):
+        raise ValueError("maximum_file_bytes must be a positive integer")
     metadata_path = artifact_dir / PACKET_IF_METADATA_FILENAME
     model_path = artifact_dir / PACKET_IF_MODEL_FILENAME
     training_report_path = artifact_dir / PACKET_IF_TRAINING_REPORT_FILENAME
@@ -92,14 +116,17 @@ def load_packet_if_artifact(
         PACKET_IF_METADATA_FILENAME: _read_artifact_file(
             metadata_path,
             "metadata",
+            maximum_file_bytes=maximum_file_bytes,
         ),
         PACKET_IF_MODEL_FILENAME: _read_artifact_file(
             model_path,
             "model",
+            maximum_file_bytes=maximum_file_bytes,
         ),
         PACKET_IF_TRAINING_REPORT_FILENAME: _read_artifact_file(
             training_report_path,
             "training report",
+            maximum_file_bytes=maximum_file_bytes,
         ),
     }
     actual_bundle_sha256 = packet_if_bundle_sha256_bytes(bundle_files)
@@ -139,15 +166,40 @@ def load_packet_if_artifact(
             "Packet IF training report SHA256 mismatch: "
             f"expected={expected_report_sha256}, actual={actual_report_sha256}"
         )
-    _load_training_report_bytes(
+    training_report = _load_training_report_bytes(
         bundle_files[PACKET_IF_TRAINING_REPORT_FILENAME],
         training_report_path,
     )
+    return PacketIFArtifactInspection(
+        model_version=model_version,
+        threshold=threshold,
+        bundle_sha256=actual_bundle_sha256,
+        capture_policy=capture_policy,
+        metadata=metadata,
+        training_report=training_report,
+        model_bytes=bundle_files[PACKET_IF_MODEL_FILENAME],
+    )
+
+
+def load_packet_if_artifact(
+    artifact_dir: Path,
+    *,
+    expected_bundle_sha256: str,
+    expected_model_version: str | None = None,
+) -> PacketIFArtifact:
+    """Verify an externally pinned Bundle before deserializing its model."""
+    inspected = inspect_packet_if_artifact(
+        artifact_dir,
+        expected_bundle_sha256=expected_bundle_sha256,
+        expected_model_version=expected_model_version,
+    )
+    metadata = inspected.metadata
     _validate_runtime_library_versions(metadata["library_versions"])
+    model_path = artifact_dir / PACKET_IF_MODEL_FILENAME
 
     try:
         model = joblib.load(
-            io.BytesIO(bundle_files[PACKET_IF_MODEL_FILENAME])
+            io.BytesIO(inspected.model_bytes)
         )
     except Exception as exc:
         raise ValueError(f"unable to load Packet IF model: {model_path}") from exc
@@ -168,12 +220,12 @@ def load_packet_if_artifact(
     return PacketIFArtifact(
         model=model,
         model_path=model_path,
-        metadata_path=metadata_path,
-        training_report_path=training_report_path,
-        model_version=model_version,
-        threshold=threshold,
-        bundle_sha256=actual_bundle_sha256,
-        capture_policy=capture_policy,
+        metadata_path=artifact_dir / PACKET_IF_METADATA_FILENAME,
+        training_report_path=artifact_dir / PACKET_IF_TRAINING_REPORT_FILENAME,
+        model_version=inspected.model_version,
+        threshold=inspected.threshold,
+        bundle_sha256=inspected.bundle_sha256,
+        capture_policy=inspected.capture_policy,
         metadata=metadata,
     )
 
@@ -272,7 +324,7 @@ def predict_packet_feature_csv(
     }
 
 
-def _read_artifact_file(path: Path, label: str) -> bytes:
+def _read_artifact_file(path: Path, label: str, *, maximum_file_bytes: int | None = None) -> bytes:
     if not path.exists():
         raise FileNotFoundError(f"Packet IF {label} not found: {path}")
     if path.is_symlink():
@@ -280,7 +332,13 @@ def _read_artifact_file(path: Path, label: str) -> bytes:
     if not path.is_file():
         raise ValueError(f"Packet IF {label} must be a regular file: {path}")
     try:
-        return path.read_bytes()
+        if maximum_file_bytes is None:
+            return path.read_bytes()
+        with path.open("rb") as stream:
+            content = stream.read(maximum_file_bytes + 1)
+        if len(content) > maximum_file_bytes:
+            raise ValueError("Packet IF artifact exceeds inspection size limit")
+        return content
     except OSError as exc:
         raise ValueError(f"unable to read Packet IF {label}: {path}") from exc
 

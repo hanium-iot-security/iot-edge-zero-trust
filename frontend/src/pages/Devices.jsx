@@ -12,11 +12,13 @@ import DataTable from "../components/DataTable";
 import DetailModal from "../components/DetailModal";
 import EmptyState from "../components/EmptyState";
 import ErrorState from "../components/ErrorState";
+import FirewallTrafficFields from "../components/FirewallTrafficFields";
 import LoadingState from "../components/LoadingState";
 import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
 import StatusBadge from "../components/StatusBadge";
 import SummaryCard from "../components/SummaryCard";
+import { getCurrentFirewallRuleMap } from "../utils/firewallRuleSelection";
 import {
   LEGACY_KST_OPTIONS,
   elapsedSecondsFromMqttTimestamp,
@@ -241,22 +243,8 @@ function formatElapsedTime(dateString) {
 }
 
 function pickLatestFirewallRule(items, deviceId) {
-  const candidates = Array.isArray(items)
-    ? items.filter((item) => item?.device_id === deviceId)
-    : [];
-  if (candidates.length === 0) {
-    return null;
-  }
-  return candidates.reduce((latest, item) => {
-    if (!latest) {
-      return item;
-    }
-    const itemTime = new Date(item.updated_at || item.created_at || 0).getTime();
-    const latestTime = new Date(
-      latest.updated_at || latest.created_at || 0
-    ).getTime();
-    return itemTime > latestTime ? item : latest;
-  }, null);
+  const rules = Array.isArray(items) ? items : [];
+  return getCurrentFirewallRuleMap(rules).get(deviceId) || null;
 }
 
 function normalizePolicyResponse(data) {
@@ -560,6 +548,7 @@ export default function Devices() {
   const detailRequestIdRef = useRef(0);
   const detailAbortRef = useRef(null);
   const policyDraftInitializedRef = useRef(false);
+  const policyDraftBaselineRef = useRef(null);
 
   const loadData = useCallback(
     async (isManualRefresh = false) => {
@@ -695,29 +684,10 @@ export default function Devices() {
     };
   }, []);
 
-  const firewallRuleMap = useMemo(() => {
-    const result = new Map();
-    firewallRules.forEach((rule) => {
-      if (!rule.device_id) {
-        return;
-      }
-      const existingRule = result.get(rule.device_id);
-      if (!existingRule) {
-        result.set(rule.device_id, rule);
-        return;
-      }
-      const currentTime = new Date(
-        rule.updated_at || rule.created_at || 0
-      ).getTime();
-      const existingTime = new Date(
-        existingRule.updated_at || existingRule.created_at || 0
-      ).getTime();
-      if (currentTime > existingTime) {
-        result.set(rule.device_id, rule);
-      }
-    });
-    return result;
-  }, [firewallRules]);
+  const firewallRuleMap = useMemo(
+    () => getCurrentFirewallRuleMap(firewallRules),
+    [firewallRules]
+  );
 
   const devicesWithFirewall = useMemo(
     () =>
@@ -805,10 +775,23 @@ export default function Devices() {
       const normalized = normalizePolicyResponse(rawPolicy);
       setPolicyInfo(normalized);
       setPolicyError("");
-      if (!preserveDraft && !policyDraftInitializedRef.current) {
-        setPolicyDraft(draftFromPolicy(normalized.current, device));
+      const nextDraft = draftFromPolicy(normalized.current, device);
+      const previousBaseline = policyDraftBaselineRef.current;
+      if (!preserveDraft || !policyDraftInitializedRef.current) {
+        setPolicyDraft(nextDraft);
         policyDraftInitializedRef.current = true;
+      } else {
+        setPolicyDraft((current) => {
+          const next = { ...current };
+          Object.keys(nextDraft).forEach((key) => {
+            if (current[key] === previousBaseline?.[key]) {
+              next[key] = nextDraft[key];
+            }
+          });
+          return next;
+        });
       }
+      policyDraftBaselineRef.current = nextDraft;
       return normalized;
     },
     []
@@ -819,7 +802,8 @@ export default function Devices() {
       if (!deviceId) {
         return false;
       }
-      const requestId = detailRequestIdRef.current;
+      const requestId = ++detailRequestIdRef.current;
+      setPolicyLoading(true);
       try {
         const [detailResult, policyResult] = await Promise.allSettled([
           getDeviceDetail(deviceId),
@@ -845,10 +829,27 @@ export default function Devices() {
             latestDevice,
             preserveDraft
           );
+        } else {
+          setPolicyError(
+            policyResult.reason instanceof Error
+              ? policyResult.reason.message
+              : "기기 정책을 다시 불러오지 못했습니다. 재시도해 주세요."
+          );
         }
         return policyResult.status === "fulfilled";
-      } catch {
+      } catch (err) {
+        if (requestId === detailRequestIdRef.current) {
+          setPolicyError(
+            err instanceof Error
+              ? err.message
+              : "기기 정책을 다시 불러오지 못했습니다. 재시도해 주세요."
+          );
+        }
         return false;
+      } finally {
+        if (requestId === detailRequestIdRef.current) {
+          setPolicyLoading(false);
+        }
       }
     },
     [applyPolicyResponse]
@@ -1400,7 +1401,7 @@ export default function Devices() {
 
       <section className="device-admin-bar">
         <div>
-          <strong>Phase 8 Device Administration</strong>
+          <strong>Device Administration</strong>
           <p>
             신규 기기는 PENDING으로 등록되며 Broker 준비·수신 확인 전에는 자동 감점·차단이 적용되지 않습니다.
           </p>
@@ -2061,6 +2062,18 @@ export default function Devices() {
                     적용 완료 여부는 브라우저 시계가 아니라 서버의 정책 API 재조회 결과로 판단합니다.
                   </p>
                 </div>
+                <button
+                  type="button"
+                  className="button button-ghost"
+                  onClick={() =>
+                    refreshDetailAndPolicy(selectedDevice.device_id, {
+                      preserveDraft: true,
+                    })
+                  }
+                  disabled={policyLoading || policySubmitting}
+                >
+                  정책 새로고침
+                </button>
               </div>
               {policyLoading ? (
                 <LoadingState title="기기 정책을 불러오는 중입니다." compact />
@@ -2096,12 +2109,6 @@ export default function Devices() {
                           <dt>Policy Profile</dt>
                           <dd>
                             {getPolicyPayload(currentPolicy)?.policy_profile || "-"}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt>Policy Profile</dt>
-                          <dd>
-                            {getPolicyPayload(pendingPolicy)?.policy_profile || "-"}
                           </dd>
                         </div>
                         <div>
@@ -2158,6 +2165,12 @@ export default function Devices() {
                             {getRegistrationStateLabel(
                               getRegistrationState(selectedDevice, pendingPolicy)
                             )}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Policy Profile</dt>
+                          <dd>
+                            {getPolicyPayload(pendingPolicy)?.policy_profile || "-"}
                           </dd>
                         </div>
                         <div>
@@ -2433,14 +2446,7 @@ export default function Devices() {
                     <dt>Source IP</dt>
                     <dd>{selectedDevice.firewall_rule.source_ip || "-"}</dd>
                   </div>
-                  <div>
-                    <dt>Protocol</dt>
-                    <dd>{selectedDevice.firewall_rule.protocol || "-"}</dd>
-                  </div>
-                  <div>
-                    <dt>Port</dt>
-                    <dd>{selectedDevice.firewall_rule.dest_port ?? "-"}</dd>
-                  </div>
+                  <FirewallTrafficFields rule={selectedDevice.firewall_rule} />
                   <div>
                     <dt>Action</dt>
                     <dd>{selectedDevice.firewall_rule.action || "-"}</dd>

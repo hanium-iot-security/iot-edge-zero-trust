@@ -7,11 +7,14 @@ PENDING까지 한 흐름으로 이어지는지 확인합니다.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 from shutil import copyfile
+import signal
+from threading import Event
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -35,6 +38,7 @@ from edge.features.run_mqtt_feature_builder import (
     bootstrap_producer_checkpoint,
     run_producer_cycle,
 )
+from edge.orchestration import run_detection_orchestrator as runner
 from edge.orchestration.run_detection_orchestrator import (
     CYCLE_COMPLETED,
     CYCLE_SKIPPED_NO_NEW_WINDOW,
@@ -1749,6 +1753,178 @@ def test_single_instance_lock_is_reusable_after_release(tmp_path: Path):
 # --- Loop ------------------------------------------------------------------
 
 
+@pytest.fixture
+def restore_shutdown_handlers():
+    previous = {signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def test_shutdown_handler_avoids_logging_and_event_locks(
+    monkeypatch, restore_shutdown_handlers,
+):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("signal handlers must not acquire logging or Event locks")
+
+    monkeypatch.setattr(runner.logger, "info", forbidden)
+    monkeypatch.setattr(Event, "set", forbidden)
+    shutdown = GracefulShutdown()
+    shutdown.install()
+
+    signal.raise_signal(signal.SIGTERM)
+
+    assert shutdown.requested
+
+
+def test_shutdown_wait_handles_signal_with_bounded_polling(
+    monkeypatch, restore_shutdown_handlers,
+):
+    elapsed = [0.0]
+    sleeps = []
+    shutdown = GracefulShutdown()
+    shutdown.install()
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        elapsed[0] += seconds
+        signal.raise_signal(signal.SIGTERM)
+
+    monkeypatch.setattr(runner.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(runner.time, "sleep", sleep)
+
+    assert shutdown.wait(60)
+    assert sleeps == [0.1]
+
+
+def test_shutdown_wait_respects_deadline_without_signal(monkeypatch):
+    elapsed = [0.0]
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        elapsed[0] += seconds
+
+    monkeypatch.setattr(runner.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(runner.time, "sleep", sleep)
+    shutdown = GracefulShutdown()
+
+    assert not shutdown.wait(0.25)
+    assert sleeps == pytest.approx([0.1, 0.1, 0.05])
+    assert not shutdown.wait(0)
+    assert not shutdown.wait(-1)
+    shutdown.request(signal.SIGTERM, None)
+    assert shutdown.wait(0)
+
+
+@pytest.mark.parametrize("signal_during", ["registry", "lock"])
+def test_loop_sigterm_during_initialization_exits_cleanly_without_cycle(
+    monkeypatch, registry, restore_shutdown_handlers, signal_during,
+):
+    events = []
+
+    def unhandled_shutdown(_signum, _frame):
+        raise AssertionError("loop shutdown handler must exist before initialization")
+
+    signal.signal(signal.SIGTERM, unhandled_shutdown)
+
+    def load_registry():
+        events.append("registry")
+        if signal_during == "registry":
+            signal.raise_signal(signal.SIGTERM)
+        return registry
+
+    @contextmanager
+    def acquire_lock(_path):
+        events.append("locked")
+        if signal_during == "lock":
+            signal.raise_signal(signal.SIGTERM)
+        try:
+            yield
+        finally:
+            events.append("released")
+
+    monkeypatch.setattr(runner, "configure_logging", lambda: None)
+    monkeypatch.setattr(runner, "load_stage_registry", load_registry)
+    monkeypatch.setattr(runner, "single_instance_lock", acquire_lock)
+    monkeypatch.setattr(runner, "run_orchestration_cycle", lambda **_kwargs: events.append("cycle"))
+
+    assert runner.main(["--loop", "--interval", "0.01"]) == 0
+    assert events == ["registry", "locked", "released"]
+
+
+def test_loop_sigterm_drains_current_cycle_and_returns_zero(
+    monkeypatch, SessionLocal, registry, restore_shutdown_handlers,
+):
+    with SessionLocal() as db:
+        _flood_window(db, window_index=0)
+    run_producer_cycle(session_factory=SessionLocal, now=BASE + timedelta(seconds=11))
+    calls = []
+    feature_rule = registry.stages[0].stage
+    original_stage = feature_rule.run_until
+
+    def signal_in_stage(db, **kwargs):
+        calls.append("feature-rule")
+        signal.raise_signal(signal.SIGTERM)
+        return original_stage(db, **kwargs)
+
+    def run_cycle(**kwargs):
+        calls.append("cycle")
+        kwargs["session_factory"] = SessionLocal
+        return run_orchestration_cycle(**kwargs)
+
+    @contextmanager
+    def acquire_lock(_path, **kwargs):
+        if kwargs:
+            with _lock(_path, **kwargs):
+                yield
+            return
+        try:
+            yield
+        finally:
+            calls.append("released")
+
+    monkeypatch.setattr(feature_rule, "run_until", signal_in_stage)
+    monkeypatch.setattr(runner, "configure_logging", lambda: None)
+    monkeypatch.setattr(runner, "load_stage_registry", lambda: registry)
+    monkeypatch.setattr(runner, "single_instance_lock", acquire_lock)
+    monkeypatch.setattr(runner, "run_orchestration_cycle", run_cycle)
+
+    assert runner.main(["--loop", "--interval", "60"]) == 0
+    assert calls == ["cycle", "feature-rule", "released"]
+    with SessionLocal() as db:
+        cutoff = BASE + timedelta(seconds=10)
+        assert _completed(db, MQTT_FEATURE_RULE, "feature_logs") == cutoff
+        assert _completed(db, MQTT_MESSAGE_RULE, "mqtt_logs") == cutoff
+        assert _completed(db, TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE) == cutoff
+        assert _scalar(db, "SELECT COUNT(*) FROM detection_events WHERE processed_at IS NULL") == 0
+        assert _scalar(db, "SELECT trust_score FROM devices WHERE device_id='esp32_02'") == 80
+
+
+@pytest.mark.parametrize("mode", ["--once", "--status"])
+def test_non_loop_cli_does_not_install_shutdown_handlers(monkeypatch, registry, mode):
+    calls = []
+
+    def unexpected_install(_self):
+        raise AssertionError("only the service loop owns shutdown handlers")
+
+    @contextmanager
+    def acquire_lock(_path):
+        yield
+
+    monkeypatch.setattr(GracefulShutdown, "install", unexpected_install)
+    monkeypatch.setattr(runner, "configure_logging", lambda: None)
+    monkeypatch.setattr(runner, "load_stage_registry", lambda: registry)
+    monkeypatch.setattr(runner, "single_instance_lock", acquire_lock)
+    monkeypatch.setattr(runner, "run_orchestration_cycle", lambda **_kwargs: calls.append("once"))
+    monkeypatch.setattr(runner, "print_checkpoint_status", lambda: calls.append("status"))
+
+    assert runner.main([mode]) == 0
+    assert calls == [mode.removeprefix("--")]
+
+
 def test_loop_stops_after_max_cycles(SessionLocal, registry):
     completed = run_orchestrator_loop(
         registry=registry,
@@ -2044,3 +2220,171 @@ def test_producer_and_orchestrator_checkpoints_stay_consistent(SessionLocal, reg
                 == outcome.cutoff
             )
         assert _completed(db, TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE) == outcome.cutoff
+
+
+
+def _sign_bounded_orchestrator_audit(SessionLocal, state, *, allow_failed_target=False):
+    from edge.detection.packet_checkpoint_recovery import attach_plan_sha256
+    from edge.detection.packet_checkpoint_recovery_repository import bounded_replay_target_evidence
+
+    with SessionLocal() as db:
+        target = db.execute(text("SELECT * FROM packet_capture_sessions WHERE session_id=:id"),
+                            {"id": LIVE_RESUME_TARGET_SESSION_ID}).mappings().one()
+        segments = list(db.execute(text("SELECT * FROM packet_capture_segments WHERE capture_session_id=:id ORDER BY window_start,id"),
+                                   {"id": target["id"]}).mappings())
+        features = list(db.execute(text("SELECT f.* FROM packet_feature_logs f JOIN packet_capture_segments g ON g.id=f.capture_segment_id "
+                                       "WHERE g.capture_session_id=:id ORDER BY f.id"), {"id": target["id"]}).mappings())
+        bound = bounded_replay_target_evidence(target, segments, features,
+                                               allow_failed_target_session=allow_failed_target)
+        bound["later_running_session"] = None
+        plan = attach_plan_sha256({"mode": "bounded-replay", "bounded_replay": bound,
+            **({"allow_failed_target_session": True, "failed_target_tail": bound["failed_target_tail"]}
+               if allow_failed_target else {}),
+            "detector_name": PACKET_RULE, "source_table": "packet_feature_logs",
+            "current_session_id": PACKET_SESSION_ID, "target_session_id": LIVE_RESUME_TARGET_SESSION_ID,
+            "sessions_between": [], "checkpoint": {
+                "before": {"last_processed_id": state["previous_feature_id"], "last_completed_window_end": format_db_utc(state["boundary_before"])},
+                "after": {"last_processed_id": state["previous_feature_id"], "last_completed_window_end": format_db_utc(state["resume_boundary"])}}}, generated_at=BASE)
+        db.execute(text("UPDATE packet_checkpoint_recoveries SET plan_json=:plan,plan_sha256=:sha WHERE detector_name='packet_rule'"),
+                   {"plan": json.dumps(plan, sort_keys=True), "sha": plan["plan_sha256"]})
+        db.commit()
+    return plan
+
+
+def test_bounded_replay_audit_catches_up_then_consumes_closed_target_and_stops_before_later_session(SessionLocal):
+    state = _seed_live_resume_orchestrator_state(SessionLocal, target_status="COMPLETED")
+    _sign_bounded_orchestrator_audit(SessionLocal, state)
+    with SessionLocal() as db:
+        _insert_processed_packet_window(db, session_id="99999999-9999-4999-8999-999999999999",
+                                       window_start=state["producer_cutoff"] + timedelta(days=1), session_status="RUNNING",
+                                       packet_count=500, total_bytes=5000)
+        db.commit()
+    catchup = run_orchestration_cycle(session_factory=SessionLocal, registry=state["registry"])
+    assert catchup.status == CYCLE_COMPLETED and catchup.cutoff == state["resume_boundary"]
+    assert all(row.detector_name != PACKET_RULE for row in catchup.stage_results)
+    replay = run_orchestration_cycle(session_factory=SessionLocal, registry=state["registry"])
+    assert replay.status == CYCLE_COMPLETED and replay.cutoff == state["producer_cutoff"]
+    packet = next(row for row in replay.stage_results if row.detector_name == PACKET_RULE)
+    assert packet.capture_session_id == LIVE_RESUME_TARGET_SESSION_ID and packet.selected_count == 1
+    with SessionLocal() as db:
+        row = checkpoints.get_detector_checkpoint(db, detector_name=PACKET_RULE, source_table="packet_feature_logs")
+        assert row["last_processed_id"] == state["target_feature_id"]
+        assert _completed(db, TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE) == state["producer_cutoff"]
+    stopped = run_orchestration_cycle(session_factory=SessionLocal, registry=state["registry"])
+    assert stopped.status == CYCLE_SKIPPED_NO_NEW_WINDOW
+
+
+@pytest.mark.parametrize("mutation", ["unsigned", "wrong_end", "target_value", "missing_bound", "skipped_count"])
+def test_bounded_replay_catchup_rejects_unsigned_changed_or_incomplete_closed_target_audit(SessionLocal, mutation):
+    from edge.detection.packet_checkpoint_recovery import attach_plan_sha256
+    state = _seed_live_resume_orchestrator_state(SessionLocal, target_status="COMPLETED")
+    plan = _sign_bounded_orchestrator_audit(SessionLocal, state)
+    with SessionLocal() as db:
+        if mutation == "target_value":
+            db.execute(text("UPDATE packet_feature_logs SET total_bytes=999 WHERE id=:id"), {"id": state["target_feature_id"]})
+        elif mutation == "skipped_count":
+            db.execute(text("UPDATE packet_checkpoint_recoveries SET skipped_session_count=1"))
+        else:
+            if mutation == "missing_bound":
+                plan.pop("bounded_replay")
+            else:
+                plan["bounded_replay"]["replay_end"] = format_db_utc(state["producer_cutoff"] + timedelta(seconds=10))
+            if mutation != "unsigned":
+                plan = attach_plan_sha256(plan, generated_at=BASE)
+            db.execute(text("UPDATE packet_checkpoint_recoveries SET plan_json=:plan,plan_sha256=:sha"),
+                       {"plan": json.dumps(plan, sort_keys=True), "sha": plan["plan_sha256"]})
+        db.commit()
+    result = run_orchestration_cycle(session_factory=SessionLocal, registry=state["registry"])
+    assert result.status == CYCLE_SKIPPED_NO_NEW_WINDOW
+    with SessionLocal() as db:
+        assert _completed(db, TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE) == state["boundary_before"]
+
+
+
+def test_bounded_replay_catchup_does_not_adopt_an_older_unapproved_range(SessionLocal):
+    state = _seed_live_resume_orchestrator_state(SessionLocal, target_status="COMPLETED")
+    _sign_bounded_orchestrator_audit(SessionLocal, state)
+    with SessionLocal() as db:
+        db.execute(text("UPDATE detector_checkpoints SET last_processed_id=NULL,last_completed_window_end=:start,updated_at=:start "
+                        "WHERE detector_name=:detector AND source_table=:source"),
+                   {"start": format_db_utc(BASE), "detector": TRUST_DETECTOR_NAME, "source": TRUST_SOURCE_TABLE})
+        db.commit()
+        transition = resolve_packet_live_resume_transition(db, registry=state["registry"], range_start=BASE,
+                                                           cutoff=state["producer_cutoff"])
+    assert transition is None
+
+
+def _append_uncaptured_target_tail(SessionLocal, state):
+    start = state["producer_cutoff"]
+    end = start + timedelta(seconds=10)
+    with SessionLocal() as db:
+        db.execute(text("UPDATE packet_capture_sessions SET status='FAILED',ended_at=:ended WHERE session_id=:id"),
+                   {"ended": format_db_utc(start + timedelta(seconds=1)), "id": LIVE_RESUME_TARGET_SESSION_ID})
+        tail = db.execute(text("INSERT INTO packet_capture_segments (capture_session_id,file_name,capture_interface,"
+                               "window_start,window_end,status,error_code,start_delay_seconds,captured_duration_seconds) "
+                               "SELECT id,NULL,'eth0',:start,:end,'FAILED','LATE_CAPTURE',1.2,0 "
+                               "FROM packet_capture_sessions WHERE session_id=:id"),
+                          {"start": format_db_utc(start), "end": format_db_utc(end), "id": LIVE_RESUME_TARGET_SESSION_ID})
+        db.commit()
+        return int(tail.lastrowid)
+
+
+def test_bounded_failed_target_prefix_consumes_actual_rows_and_keeps_tail_unapproved(SessionLocal):
+    state = _seed_live_resume_orchestrator_state(SessionLocal, target_status="COMPLETED")
+    tail_id = _append_uncaptured_target_tail(SessionLocal, state)
+    _sign_bounded_orchestrator_audit(SessionLocal, state, allow_failed_target=True)
+    with SessionLocal() as db:
+        _insert_processed_packet_window(db, session_id="99999999-9999-4999-8999-999999999999",
+                                       window_start=state["producer_cutoff"] + timedelta(seconds=10), session_status="RUNNING",
+                                       packet_count=500, total_bytes=5000)
+        tail_before = dict(db.execute(text("SELECT * FROM packet_capture_segments WHERE id=:id"), {"id": tail_id}).mappings().one())
+        db.commit()
+    catchup = run_orchestration_cycle(session_factory=SessionLocal, registry=state["registry"])
+    assert catchup.status == CYCLE_COMPLETED and catchup.cutoff == state["resume_boundary"]
+    replay = run_orchestration_cycle(session_factory=SessionLocal, registry=state["registry"])
+    assert replay.status == CYCLE_COMPLETED and replay.cutoff == state["producer_cutoff"]
+    packet = next(row for row in replay.stage_results if row.detector_name == PACKET_RULE)
+    assert packet.selected_count == 1 and packet.capture_session_id == LIVE_RESUME_TARGET_SESSION_ID
+    stopped = run_orchestration_cycle(session_factory=SessionLocal, registry=state["registry"])
+    assert stopped.status == CYCLE_SKIPPED_NO_NEW_WINDOW
+    with SessionLocal() as db:
+        assert _completed(db, TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE) == state["producer_cutoff"]
+        assert dict(db.execute(text("SELECT * FROM packet_capture_segments WHERE id=:id"), {"id": tail_id}).mappings().one()) == tail_before
+        assert db.execute(text("SELECT status FROM packet_capture_sessions WHERE session_id=:id"), {"id": LIVE_RESUME_TARGET_SESSION_ID}).scalar() == "FAILED"
+        assert checkpoints.get_detector_checkpoint(db, detector_name=PACKET_RULE, source_table="packet_feature_logs")["last_processed_id"] == state["target_feature_id"]
+
+
+@pytest.mark.parametrize("mutation", ["default", "unsigned", "nonbool", "outer_tail", "tail_captured", "prefix_value", "gap", "tail_feature"])
+def test_bounded_failed_target_prefix_rejects_unapproved_or_changed_input(SessionLocal, mutation):
+    from edge.detection.packet_checkpoint_recovery import attach_plan_sha256
+    state = _seed_live_resume_orchestrator_state(SessionLocal, target_status="COMPLETED")
+    tail_id = _append_uncaptured_target_tail(SessionLocal, state)
+    plan = _sign_bounded_orchestrator_audit(SessionLocal, state, allow_failed_target=True)
+    with SessionLocal() as db:
+        if mutation == "tail_captured":
+            db.execute(text("UPDATE packet_capture_segments SET file_name='unexpected.pcap',error_code='CAPTURE_FAILED' WHERE id=:id"), {"id": tail_id})
+        elif mutation == "prefix_value":
+            db.execute(text("UPDATE packet_feature_logs SET total_bytes=777 WHERE id=:id"), {"id": state["target_feature_id"]})
+        elif mutation == "gap":
+            db.execute(text("UPDATE packet_capture_segments SET window_start=:time,window_end=:end WHERE id=:id"),
+                       {"time": format_db_utc(state["producer_cutoff"] + timedelta(seconds=10)),
+                        "end": format_db_utc(state["producer_cutoff"] + timedelta(seconds=20)), "id": tail_id})
+        elif mutation == "tail_feature":
+            db.execute(text("UPDATE packet_feature_logs SET capture_segment_id=:tail WHERE id=:id"),
+                       {"tail": tail_id, "id": state["target_feature_id"]})
+        else:
+            if mutation == "default":
+                plan.pop("allow_failed_target_session")
+            elif mutation == "nonbool":
+                plan["allow_failed_target_session"] = 1
+            else:
+                plan["failed_target_tail"]["segment_id"] += 1
+            if mutation != "unsigned":
+                plan = attach_plan_sha256(plan, generated_at=BASE)
+            db.execute(text("UPDATE packet_checkpoint_recoveries SET plan_json=:plan,plan_sha256=:sha"),
+                       {"plan": json.dumps(plan,sort_keys=True), "sha": plan["plan_sha256"]})
+        db.commit()
+    result = run_orchestration_cycle(session_factory=SessionLocal, registry=state["registry"])
+    assert result.status == CYCLE_SKIPPED_NO_NEW_WINDOW
+    with SessionLocal() as db:
+        assert _completed(db, TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE) == state["boundary_before"]

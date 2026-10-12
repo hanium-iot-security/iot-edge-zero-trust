@@ -12,6 +12,9 @@ from backend.app.security import RecoveryAdminContext
 from edge.packet.pcap_naming import format_utc_iso
 from edge.trust import firewall_release_repository
 from edge.trust.firewall_release_repository import DuplicatePendingReleaseRequest
+from backend.app.services.firewall_scope_extension_service import (
+    FirewallScopeExtensionError, firewall_command_transaction,
+)
 
 
 class FirewallReleaseRequestError(RuntimeError):
@@ -49,14 +52,16 @@ def create_firewall_release_request(
         )
 
     try:
-        request_id = firewall_release_repository.create_release_request(
-            db,
-            firewall_rule_id=rule_id,
-            requested_by=admin.principal,
-            reason=reason,
-            requested_at=_now_utc(),
-        )
-        db.commit()
+        with firewall_command_transaction(db):
+            request_id = firewall_release_repository.create_release_request(
+                db,
+                firewall_rule_id=rule_id,
+                requested_by=admin.principal,
+                reason=reason,
+                requested_at=_now_utc(),
+            )
+    except FirewallScopeExtensionError as exc:
+        raise FirewallReleaseRequestError(exc.status_code, exc.detail) from None
     except DuplicatePendingReleaseRequest as exc:
         db.rollback()
         raise FirewallReleaseRequestError(

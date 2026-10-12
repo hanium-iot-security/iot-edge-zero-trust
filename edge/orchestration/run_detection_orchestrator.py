@@ -36,7 +36,6 @@ import json
 import logging
 from pathlib import Path
 import signal
-from threading import Event
 import time
 
 from sqlalchemy import text
@@ -74,6 +73,8 @@ from edge.trust.trust_score_v2 import (
     resolve_ai_mode,
 )
 from edge.trust.run_firewall_worker import firewall_lock_path
+from edge.maintenance.planned import resolve_planned_transition
+from edge.maintenance.processing import cap_processing_cutoff
 
 logger = logging.getLogger(__name__)
 
@@ -109,25 +110,31 @@ class UtcFormatter(logging.Formatter):
 
 
 class GracefulShutdown:
-    """Signal-backed shutdown state with an interruptible wait."""
+    """Signal-backed flag with no lock or I/O inside the signal handler."""
 
     def __init__(self) -> None:
-        self._event = Event()
+        self._requested = False
 
     @property
     def requested(self) -> bool:
-        return self._event.is_set()
+        return self._requested
 
-    def request(self, signum: int, _frame: object | None) -> None:
-        logger.info("Shutdown signal received (signum=%s)", signum)
-        self._event.set()
+    def request(self, _signum: int, _frame: object | None) -> None:
+        # Event.set or logging can reenter a lock held by this same thread.
+        self._requested = True
 
     def install(self) -> None:
         signal.signal(signal.SIGTERM, self.request)
         signal.signal(signal.SIGINT, self.request)
 
     def wait(self, timeout: float) -> bool:
-        return self._event.wait(timeout)
+        deadline = time.monotonic() + max(0.0, timeout)
+        while not self.requested:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return self.requested
+            time.sleep(min(0.1, remaining))
+        return True
 
 
 def resolve_lock_path(app_settings: Settings = settings) -> Path:
@@ -329,6 +336,53 @@ def _target_has_live_resume_ready_shape(
     return status == "RUNNING"
 
 
+def _bounded_replay_audit_matches(db: Session, candidate, plan: dict, boundary: datetime, range_start: datetime) -> bool:
+    """Admit a new closed-target operation only with its actual signed input proof."""
+    from edge.detection.packet_checkpoint_recovery import PacketCheckpointRecoveryError, verify_plan_sha256
+    from edge.detection.packet_checkpoint_recovery_repository import bounded_replay_target_evidence
+
+    try:
+        verify_plan_sha256(plan)
+        evidence = plan["bounded_replay"]
+        before, after = plan["checkpoint"]["before"], plan["checkpoint"]["after"]
+        allow_failed_target = plan.get("allow_failed_target_session", False)
+        if type(allow_failed_target) is not bool:
+            return False
+        expected_status = "FAILED" if allow_failed_target else "COMPLETED"
+        if (candidate["status"] != expected_status or plan["target_session_id"] != candidate["target_capture_session_id"]
+                or plan["current_session_id"] != candidate["current_capture_session_id"]
+                or plan["detector_name"] != candidate["detector_name"]
+                or plan["source_table"] != candidate["source_table"]
+                or before["last_processed_id"] != candidate["last_processed_id_before"]
+                or after["last_processed_id"] != candidate["last_processed_id_after"]
+                or before["last_completed_window_end"] != candidate["last_completed_window_end_before"]
+                or parse_db_utc(before["last_completed_window_end"]) != range_start
+                or after["last_completed_window_end"] != format_db_utc(boundary)
+                or evidence["replay_start"] != format_db_utc(boundary)
+                or plan["sessions_between"] or candidate["skipped_session_count"] != 0
+                or candidate["skipped_processable_session_count"] != 0):
+            return False
+        session = db.execute(text("SELECT * FROM packet_capture_sessions WHERE session_id=:id"),
+                             {"id": candidate["target_capture_session_id"]}).mappings().one()
+        segments = list(db.execute(text("SELECT * FROM packet_capture_segments WHERE capture_session_id=:id "
+                                       "ORDER BY window_start,id"), {"id": session["id"]}).mappings())
+        features = list(db.execute(text("SELECT f.* FROM packet_feature_logs f JOIN packet_capture_segments g "
+                                       "ON g.id=f.capture_segment_id WHERE g.capture_session_id=:id ORDER BY f.id"),
+                                   {"id": session["id"]}).mappings())
+        actual = bounded_replay_target_evidence(
+            session, segments, features, allow_failed_target_session=allow_failed_target)
+        if actual is None or any(evidence.get(key) != value for key, value in actual.items()):
+            return False
+        if allow_failed_target:
+            return plan.get("failed_target_tail") == actual["failed_target_tail"]
+        return (session["ended_at"] is not None and actual["replay_end"] is not None
+                and parse_db_utc(session["ended_at"]) >= parse_db_utc(actual["replay_end"])
+                and all(row["status"] in {"PROCESSED", "EMPTY"} and row["error_code"] is None
+                        for row in segments))
+    except (PacketCheckpointRecoveryError, KeyError, TypeError, ValueError):
+        return False
+
+
 def _resolve_packet_stage_live_resume_audit(
     db: Session,
     *,
@@ -336,12 +390,12 @@ def _resolve_packet_stage_live_resume_audit(
     source_table: str,
     last_processed_id: object,
     boundary: datetime,
+    range_start: datetime,
 ) -> PacketLiveResumeTransition | None:
     candidates = db.execute(
         text(
             """
-            SELECT pcr.target_capture_session_id, pcr.plan_sha256,
-                   pcr.plan_json, pcs.status
+            SELECT pcr.*, pcs.status
             FROM packet_checkpoint_recoveries pcr
             JOIN packet_capture_sessions pcs
                 ON pcs.session_id = pcr.target_capture_session_id
@@ -351,7 +405,7 @@ def _resolve_packet_stage_live_resume_audit(
               AND pcr.last_processed_id_before IS :last_processed_id
               AND pcr.last_processed_id_after IS :last_processed_id
               AND pcs.first_window_start = :boundary
-              AND pcs.status IN ('RUNNING', 'COMPLETED')
+              AND pcs.status IN ('RUNNING', 'COMPLETED', 'FAILED')
             ORDER BY pcr.id DESC
             """
         ),
@@ -371,12 +425,14 @@ def _resolve_packet_stage_live_resume_audit(
             continue
         if (
             not isinstance(plan, dict)
-            or plan.get("mode") != "live-resume"
+            or plan.get("mode") not in {"live-resume", "bounded-replay"}
             or plan.get("plan_sha256") != candidate["plan_sha256"]
         ):
             continue
+        if plan["mode"] == "bounded-replay" and not _bounded_replay_audit_matches(db, candidate, plan, boundary, range_start):
+            continue
         target_session_id = str(candidate["target_capture_session_id"])
-        if not _target_has_live_resume_ready_shape(
+        if (plan["mode"] != "bounded-replay" or candidate["status"] != "FAILED") and not _target_has_live_resume_ready_shape(
             db,
             session_id=target_session_id,
             first_window_start=boundary,
@@ -388,6 +444,7 @@ def _resolve_packet_stage_live_resume_audit(
                 boundary=boundary,
                 target_session_id=target_session_id,
                 plan_sha256=str(candidate["plan_sha256"]),
+                mode=plan["mode"],
             )
         )
     return valid[0] if len(valid) == 1 else None
@@ -445,6 +502,18 @@ def resolve_packet_live_resume_transition(
         for detector_name in PACKET_STAGE_NAMES
     )
     if all(checkpoint is not None for checkpoint in paired_checkpoints):
+        planned = resolve_planned_transition(db, boundary, paired_checkpoints)
+        if planned is not None:
+            # Finalization already drained the source boundary. Only the recorded
+            # maintenance interval may be crossed, with ordinary MQTT/Trust processing.
+            source_boundary = parse_db_utc(planned["source_final_boundary"], "source_final_boundary")
+            if range_start == source_boundary:
+                return PacketLiveResumeTransition(
+                    boundary=boundary,
+                    target_session_id=str(planned["target_session_id"]),
+                    plan_sha256=str(planned["plan_sha256"]),
+                    mode="planned-maintenance",
+                )
         segment_gap = resolve_segment_gap_transition(
             db,
             boundary,
@@ -480,13 +549,14 @@ def resolve_packet_live_resume_transition(
             source_table=configured.stage.source_table,
             last_processed_id=checkpoint["last_processed_id"],
             boundary=boundary,
+            range_start=range_start,
         )
         if audit is None:
             return None
         audits.append(audit)
 
     target_session_id = audits[0].target_session_id
-    if any(audit.target_session_id != target_session_id for audit in audits[1:]):
+    if any(audit.target_session_id != target_session_id or audit.mode != audits[0].mode for audit in audits[1:]):
         return None
 
     packet_rule_index = next(
@@ -522,6 +592,7 @@ def run_orchestration_cycle(
                 MQTT_LOGS_SOURCE,
             )
             return CycleOutcome(status=CYCLE_SKIPPED_NO_WATERMARK)
+        cutoff = cap_processing_cutoff(db, cutoff)
         range_start = resolve_cycle_range_start(db, registry=registry, cutoff=cutoff)
         packet_activation_boundary: datetime | None = None
         packet_resume_transition: PacketLiveResumeTransition | None = None
@@ -540,6 +611,8 @@ def run_orchestration_cycle(
                     (
                         "PACKET_SEGMENT_GAP_CATCHUP"
                         if packet_resume_transition.mode == "segment-gap"
+                        else "PACKET_BOUNDED_REPLAY_CATCHUP"
+                        if packet_resume_transition.mode == "bounded-replay"
                         else "PACKET_LIVE_RESUME_CATCHUP"
                     ),
                     format_db_utc(range_start),
@@ -855,6 +928,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print_checkpoint_status()
         return 0
 
+    shutdown = GracefulShutdown()
+    if args.loop:
+        # systemd considers the service active during model loading and lock
+        # acquisition too. Remember a stop request before any cycle can start.
+        shutdown.install()
+
     registry = load_stage_registry()
     logger.info(
         "Orchestrator stages enabled=%s required=%s packet_layer_enabled=%s trust_ai_mode=%s",
@@ -875,8 +954,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.interval is not None
                 else settings.orchestrator_interval_seconds
             )
-            shutdown = GracefulShutdown()
-            shutdown.install()
             completed = run_orchestrator_loop(
                 registry=registry,
                 shutdown=shutdown,

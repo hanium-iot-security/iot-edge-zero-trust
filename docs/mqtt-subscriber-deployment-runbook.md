@@ -119,6 +119,19 @@ test "$after_count" -gt "$before_count"
 실제 DB 경로가 위 예시와 다르면 `.env`에 기록된 경로를 사용합니다. Row 증가가 다른
 Publisher의 메시지 때문이 아닌지 Topic, Device ID와 `received_at`도 함께 확인합니다.
 
+계획 종료 검증에서는 `SIGTERM`·`SIGINT`가 종료 요청만 기록하고, MQTT 연결을
+닫은 뒤 실행 중인 메시지 저장 Callback과 DB Commit이 끝날 때까지 기다린다.
+일시적인 연결 끊김의 재연결은 기존 Paho `loop_forever`가 담당한다. 저장 Callback·수신
+Loop의 예외, 연결 거부와 Subscribe API 호출 실패는 비정상 종료로 남긴다. Subscribe
+호출 성공만으로 Broker의 SUBACK 승인을 보장하지 않는다. 서비스가 `active`이거나
+재시작됐다는 사실만으로 수집 정상으로 인정하지 않는다.
+종료 제한 시간 15초를 넘긴 강제 종료도 정상 종료로 인정하지 않는다.
+
+실제 종료 검증은 수집 공백을 기록하는 승인된 운영 절차 안에서 수행한다. 정지 직후
+`systemctl show mqtt-subscriber.service -p Result -p ExecMainStatus`가 각각
+`success`, `0`인지 확인하고, 재개 이후 기기별 메시지 순서와 저장 오류 로그를 확인한다.
+계획 종료·재부팅은 [전용 Runbook](planned-maintenance-runbook.md)을 따른다.
+
 ## 8. 재부팅 후 자동 시작 검증
 
 재부팅 명령 자체는 다른 Phase 4 서비스와 운영 영향이 검토되고 **운영자 승인**을
