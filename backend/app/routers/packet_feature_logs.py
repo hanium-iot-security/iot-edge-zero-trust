@@ -10,6 +10,7 @@ from backend.app.services.packet_feature_query_service import (
     PacketFeatureDataError,
     list_packet_features,
 )
+from backend.app.services.feature_read_snapshot import SQLITE_MAX_ID
 
 
 router = APIRouter(prefix="/packet-feature-logs", tags=["packet-feature-logs"])
@@ -26,6 +27,7 @@ def get_packet_feature_logs(
     to_at: Annotated[datetime | None, Query(alias="to")] = None,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    snapshot_max_id: Annotated[int | None, Query(ge=0, le=SQLITE_MAX_ID)] = None,
     db: Session = Depends(get_db),
 ) -> dict:
     if capture_eligible is not None:
@@ -44,6 +46,7 @@ def get_packet_feature_logs(
             to_at=to_at,
             limit=limit,
             offset=offset,
+            snapshot_max_id=snapshot_max_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

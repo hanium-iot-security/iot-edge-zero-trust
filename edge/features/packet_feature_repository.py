@@ -300,6 +300,7 @@ def list_packet_feature_logs(
     to_at: datetime | None = None,
     limit: int = 100,
     offset: int = 0,
+    snapshot_max_id: int | None = None,
 ) -> list[dict[str, Any]]:
     where_clause, params = _packet_feature_filters(
         session_id=session_id,
@@ -308,6 +309,7 @@ def list_packet_feature_logs(
         direction=direction,
         from_at=from_at,
         to_at=to_at,
+        snapshot_max_id=snapshot_max_id,
     )
     params.update({"limit": limit, "offset": offset})
     has_broker_target = _has_broker_target_schema(db)
@@ -367,6 +369,7 @@ def count_packet_feature_logs(
     direction: str | None = None,
     from_at: datetime | None = None,
     to_at: datetime | None = None,
+    snapshot_max_id: int | None = None,
 ) -> int:
     where_clause, params = _packet_feature_filters(
         session_id=session_id,
@@ -375,6 +378,7 @@ def count_packet_feature_logs(
         direction=direction,
         from_at=from_at,
         to_at=to_at,
+        snapshot_max_id=snapshot_max_id,
     )
     row = db.execute(
         text(
@@ -401,9 +405,13 @@ def _packet_feature_filters(
     direction: str | None,
     from_at: datetime | None,
     to_at: datetime | None,
+    snapshot_max_id: int | None = None,
 ) -> tuple[str, dict[str, Any]]:
     filters: list[str] = []
     params: dict[str, Any] = {}
+    if snapshot_max_id is not None:
+        filters.append("pfl.id <= :snapshot_max_id")
+        params["snapshot_max_id"] = snapshot_max_id
     if session_id is not None:
         filters.append("pcs.session_id = :session_id")
         params["session_id"] = session_id

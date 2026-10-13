@@ -10,6 +10,7 @@ from .routers import (
     feature_logs,
     firewall_release_requests,
     firewall_rules,
+    firewall_runtime,
     gateway_metrics,
     health,
     isolation,
@@ -17,6 +18,7 @@ from .routers import (
     models,
     packet_pair_recovery,
     packet_feature_logs,
+    packet_capture_windows,
     recovery,
     trust_score,
 )
@@ -48,8 +50,10 @@ app.include_router(devices.router, prefix="/api")
 app.include_router(mqtt_logs.router, prefix="/api")
 app.include_router(feature_logs.router, prefix="/api")
 app.include_router(packet_feature_logs.router, prefix="/api")
+app.include_router(packet_capture_windows.router, prefix="/api")
 app.include_router(gateway_metrics.router, prefix="/api")
 app.include_router(firewall_rules.router, prefix="/api")
+app.include_router(firewall_runtime.router, prefix="/api")
 app.include_router(firewall_release_requests.router, prefix="/api")
 app.include_router(detection_events.router, prefix="/api")
 app.include_router(trust_score.router, prefix="/api")

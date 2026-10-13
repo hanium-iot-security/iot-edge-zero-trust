@@ -46,3 +46,4 @@ class PacketFeatureItem(BaseModel):
 class PacketFeatureListResponse(BaseModel):
     items: list[PacketFeatureItem]
     total: int
+    snapshot_max_id: int

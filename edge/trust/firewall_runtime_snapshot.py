@@ -57,6 +57,15 @@ def capture_firewall_runtime_snapshot(
     snapshot whenever the filesystem is writable. This prevents a previously
     successful snapshot from looking current after an observation failure.
     """
+    payload = observe_firewall_runtime(runner, observed_at=observed_at)
+    _write_json_atomically(Path(snapshot_path), payload)
+    return payload
+
+
+def observe_firewall_runtime(
+    runner: IptablesRunner, *, observed_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Observe once without publishing; the timer adds DB consistency atomically."""
     observed = _normalize_utc(observed_at or datetime.now(timezone.utc))
     try:
         result = runner.run_operation(LIST_RULES)
@@ -82,7 +91,6 @@ def capture_firewall_runtime_snapshot(
             "error": str(exc),
         }
 
-    _write_json_atomically(Path(snapshot_path), payload)
     return payload
 
 

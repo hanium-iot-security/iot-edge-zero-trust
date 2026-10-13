@@ -7,6 +7,8 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from backend.app.services.feature_read_snapshot import feature_read_snapshot
+
 from edge.features.packet_feature_repository import (
     count_packet_feature_logs,
     list_packet_feature_logs,
@@ -37,40 +39,45 @@ def list_packet_features(
     to_at: datetime | None = None,
     limit: int = 100,
     offset: int = 0,
+    snapshot_max_id: int | None = None,
 ) -> dict[str, Any]:
     from_utc = _normalize_optional_utc(from_at, "from")
     to_utc = _normalize_optional_utc(to_at, "to")
     _validate_time_range(from_utc, to_utc)
+    with feature_read_snapshot(db, "packet_feature_logs", snapshot_max_id) as snapshot_max_id:
 
-    rows = list_packet_feature_logs(
-        db,
-        session_id=session_id,
-        device_id=device_id,
-        peer_ip=peer_ip,
-        direction=direction,
-        from_at=from_utc,
-        to_at=to_utc,
-        limit=limit,
-        offset=offset,
-    )
-    total = count_packet_feature_logs(
-        db,
-        session_id=session_id,
-        device_id=device_id,
-        peer_ip=peer_ip,
-        direction=direction,
-        from_at=from_utc,
-        to_at=to_utc,
-    )
-    capture_policy = CapturePolicy.from_env()
+        rows = list_packet_feature_logs(
+            db,
+            session_id=session_id,
+            device_id=device_id,
+            peer_ip=peer_ip,
+            direction=direction,
+            from_at=from_utc,
+            to_at=to_utc,
+            limit=limit,
+            offset=offset,
+            snapshot_max_id=snapshot_max_id,
+        )
+        total = count_packet_feature_logs(
+            db,
+            session_id=session_id,
+            device_id=device_id,
+            peer_ip=peer_ip,
+            direction=direction,
+            from_at=from_utc,
+            to_at=to_utc,
+            snapshot_max_id=snapshot_max_id,
+        )
+        capture_policy = CapturePolicy.from_env()
 
-    return {
-        "items": [
-            _packet_feature_item(row, capture_policy=capture_policy)
-            for row in rows
-        ],
-        "total": total,
-    }
+        return {
+            "items": [
+                _packet_feature_item(row, capture_policy=capture_policy)
+                for row in rows
+            ],
+            "total": total,
+            "snapshot_max_id": snapshot_max_id,
+        }
 
 
 def _packet_feature_item(
@@ -143,7 +150,10 @@ def _normalize_optional_utc(value: datetime | None, field_name: str) -> datetime
         return None
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must include timezone")
-    return value.astimezone(timezone.utc)
+    try:
+        return value.astimezone(timezone.utc)
+    except OverflowError as exc:
+        raise ValueError(f"{field_name} is outside the supported UTC range") from exc
 
 
 def _validate_time_range(

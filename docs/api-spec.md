@@ -23,6 +23,7 @@ POST /api/devices/{device_id}/ai-policy-revisions
 GET /api/mqtt-logs
 GET /api/feature-logs
 GET /api/packet-feature-logs
+GET /api/packet-capture-windows
 GET /api/gateway-metrics
 GET /api/detection-events
 GET /api/trust-score/summary
@@ -30,6 +31,7 @@ GET /api/trust-score/{device_id}/history
 GET /api/trust-score/compensations
 GET /api/isolation/history
 GET /api/firewall-rules
+GET /api/firewall-runtime-status
 POST /api/firewall-rules/{source_rule_id}/scope-extension-requests
 POST /api/firewall-rules/{rule_id}/release-requests
 GET /api/firewall-release-requests/{request_id}
@@ -434,6 +436,7 @@ Root 프로세스 시작을 하지 않으며 `iot-edge-api.service`의 `NoNewPri
 - `device_id`: 기존 기기 필터
 - `from`, `to`: timezone이 있는 ISO 8601 시각. UTC로 비교하며 한쪽만 지정할 수 있습니다.
 - `limit`: 기본 100, 1~500. `offset`: 기본 0, 0 이상
+- `snapshot_max_id`: 첫 응답의 전역 Feature 최대 ID를 다음 페이지에 전달하는 선택 인자
 
 `window_start >= from`이고 `window_end <= to`인 **완전히 포함된 Window**만 반환합니다.
 경계와 같은 값은 포함하고, 일부만 겹치는 Window는 제외합니다. 기간의 끝과 시작이 같으면
@@ -443,15 +446,17 @@ Root 프로세스 시작을 하지 않으며 `iot-edge-api.service`의 `NoNewPri
 /api/feature-logs?device_id=esp32_01&from=2026-10-01T00:00:00Z&to=2026-10-01T01:00:00Z
 ```
 
-기존 `{items,total}`, `window_start DESC,id DESC` 정렬, 페이지 처리와 응답의 저장 시각 원문은
-유지합니다. total에도 동일한 기간·기기 필터가 적용됩니다. 기존 Feature writer의 Window 경계는
+응답은 `{items,total,snapshot_max_id}`입니다. 기존 `window_start DESC,id DESC` 정렬,
+페이지 처리와 응답의 저장 시각 원문은 유지합니다. total에도 동일한 기간·기기·최대 ID 필터가
+적용됩니다. 기존 Feature writer의 Window 경계는
 UTC 정수 초이며, 공백/T/Z/명시적 UTC offset 형식을 UTC 초로 비교합니다. 분수 초 요청은
 시작 경계를 올림·종료 경계를 내림하여 정수 초 Window의 포함 여부를 정확하게 판단합니다.
 기간을 생략하면 기존 조회와 같습니다.
 
-원본 MQTT 로그의 `received_at` 해석, 새 그래프·집계·Capture 누락 근거·페이지 snapshot 계약은
-이번 확장에 포함하지 않습니다. Feature 응답의 단일 메시지 간격 값만으로 실제 송신 주기를
-판정하지 않습니다.
+페이지 기준과 별도 Capture 관측은 [그래프용 읽기 API](phase9-graph-read-api.md)를 참조합니다.
+이 기준은 새로운 ID의 유입만 막으며 요청 사이 기존 행 수정·삭제까지 동결하지 않습니다.
+원본 MQTT 로그의 `received_at` 해석, 새 그래프·집계는 변경하지 않습니다. Feature 응답의
+단일 메시지 간격 값만으로 실제 송신 주기를 판정하지 않습니다.
 
 ### GET /api/packet-feature-logs
 
@@ -466,13 +471,15 @@ Query parameters:
 - `to`: timezone-aware ISO 8601 timestamp
 - `limit`: default `100`, minimum `1`, maximum `500`
 - `offset`: default `0`, minimum `0`
+- `snapshot_max_id`: optional insertion watermark returned by the first page
 
 Response wrapper:
 
 ```json
 {
   "items": [],
-  "total": 0
+  "total": 0,
+  "snapshot_max_id": 0
 }
 ```
 
@@ -482,6 +489,13 @@ IPv4 destination, TCP port 1883, and inbound SYN=1/ACK=0 packet count in the
 original 10-second window (including retransmissions). Historical or unconfigured
 rows return all three as `null`; a measured zero is `0`. Current environment
 settings never rewrite the meaning of historical rows.
+
+The existing Packet time filter uses `window_start >= from` and `window_start <= to`.
+This differs from MQTT's complete-window containment. The separate bounded
+`GET /api/packet-capture-windows` requires `session_id`, `from`, and `to`, returns at
+most one hour/360 fully contained windows, and distinguishes stored READY, EMPTY,
+FAILED, PROCESSED and absent records. See [graph read API](phase9-graph-read-api.md)
+for pagination and capture-state semantics.
 
 Each item includes packet window fields from `packet_feature_logs`, the joined `session_id`, UTC `Z` timestamps, and derived values based on the fixed 10 second packet window:
 
@@ -726,6 +740,7 @@ Migration 011의 두 scope는 `MQTT_IPV4_TCP_1883`(Pi INPUT의 TCP 1883)와
 미검증입니다. 자동 신규 광역 격리 정책·광역 확장 승인 Frontend는 후속 미완료 범위입니다.
 
 ### GET /api/firewall-rules
+GET /api/firewall-runtime-status
 
 Query parameters:
 
@@ -779,6 +794,16 @@ MQTT scope의 `protocol`/`dest_port`는 `tcp`/`1883`이고 광역 scope에서는
 scope 필터는 제공하지 않으며 `status`, `device_id`, `source_ip`로 조회합니다.
 
 The backend only reads DB state. It does not run Firewall Worker logic or iptables.
+
+### GET /api/firewall-runtime-status
+
+공개 읽기 전용 API로 기존 5초 Firewall runtime Snapshot과 현재 DB fingerprint를
+확인합니다. `MATCH`, `MISMATCH`, `WAITING`, `UNKNOWN`과 `warnings`/`waiting` 목록,
+경고의 최초·최신 관측시각 및 관측 간 지속시간을 반환합니다. PENDING 작업·해제와
+관측 이후 DB 변경은 `WAITING`, stale/future/boot·스키마·관측 오류는 `UNKNOWN`입니다.
+자동 repair나 sudo/iptables 실행, DB 쓰기는 하지 않습니다. `MATCH`는 Recovery 승인과
+다르며 기존 대상별 Recovery Gate는 유지됩니다. 응답 필드와 Pi 검증 범위는
+[Phase 9 방화벽 주기 대조](phase9-firewall-consistency.md)를 참조합니다.
 
 ### POST /api/firewall-rules/{source_rule_id}/scope-extension-requests
 
@@ -1127,6 +1152,7 @@ GET /api/trust-score/{device_id}/history
 GET /api/trust-score/compensations
 GET /api/isolation/history
 GET /api/firewall-rules
+GET /api/firewall-runtime-status
 POST /api/firewall-rules/{source_rule_id}/scope-extension-requests
 POST /api/firewall-rules/{rule_id}/release-requests
 GET /api/firewall-release-requests/{request_id}

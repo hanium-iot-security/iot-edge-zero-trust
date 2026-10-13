@@ -85,9 +85,9 @@ def test_filtered_total_pagination_and_original_sort_order_are_preserved(db_sess
     expected = db_session.execute(text("SELECT id FROM feature_logs WHERE device_id='device_a' "
                                        "ORDER BY window_start DESC, id DESC")).scalars().all()
     body = _get(device_id="device_a", limit=1, offset=1, **bounds).json()
-    assert set(body) == {"items", "total"} and body["total"] == 4
+    assert set(body) == {"items", "total", "snapshot_max_id"} and body["total"] == 4
     assert [row["id"] for row in body["items"]] == expected[1:2]
-    assert _get(device_id="device_a", offset=100, **bounds).json() == {"items": [], "total": 4}
+    assert _get(device_id="device_a", offset=100, **bounds).json() == {"items": [], "total": 4, "snapshot_max_id": 5}
     unbounded = _get(device_id="device_a").json()
     assert [row["id"] for row in unbounded["items"]] == expected
 
@@ -118,4 +118,4 @@ def test_microsecond_bounds_before_epoch_use_floor_and_ceiling(db_session):
     body = _get(device_id="old", **{"from": "1969-12-31T23:59:50.000001Z"}).json()
     assert body["total"] == 1 and body["items"][0]["id"] == 2
     body = _get(device_id="old", **{"to": "1969-12-31T23:59:59.999999Z"}).json()
-    assert body == {"items": [], "total": 0}
+    assert body == {"items": [], "total": 0, "snapshot_max_id": 2}
