@@ -20,12 +20,16 @@ def _row(**overrides):
     row = {
         "device_id": "esp32_01",
         "peer_ip": "192.168.0.4",
+        "direction": "INBOUND",
+        "broker_target_ip": "192.168.0.20",
+        "broker_target_port": 1883,
         "captured_duration_seconds": 10.0,
         "packet_count": 0,
         "total_bytes": 0,
         "distinct_dest_port_count": 0,
         "tcp_syn_count": 0,
         "mqtt_related_packet_count": 0,
+        "broker_target_syn_count": 0,
     }
     row.update(overrides)
     return row
@@ -38,7 +42,7 @@ def _event_types(row):
     }
 
 
-def test_default_packet_rule_policy_uses_calibrated_v3_contract() -> None:
+def test_default_packet_rule_policy_keeps_calibrated_thresholds_in_v4() -> None:
     policy = DEFAULT_PACKET_RULE_POLICY
 
     assert policy.packet_rate_threshold == 10.0
@@ -47,10 +51,10 @@ def test_default_packet_rule_policy_uses_calibrated_v3_contract() -> None:
     assert policy.port_scan_syn_threshold == 5
     assert policy.broker_dos_tcp_syn_threshold == 10
     assert policy.broker_dos_mqtt_packet_threshold == 20
-    assert policy.version == "packet-rule-policy-v3"
+    assert policy.version == "packet-rule-policy-v4"
 
 
-def test_backend_settings_defaults_match_packet_rule_policy_v3() -> None:
+def test_backend_settings_defaults_match_packet_rule_policy_v4() -> None:
     settings = Settings(_env_file=None)
 
     assert settings.packet_rule_packet_rate_threshold == 10.0
@@ -59,7 +63,7 @@ def test_backend_settings_defaults_match_packet_rule_policy_v3() -> None:
     assert settings.packet_rule_port_scan_syn_threshold == 5
     assert settings.packet_rule_broker_dos_tcp_syn_threshold == 10
     assert settings.packet_rule_broker_dos_mqtt_packet_threshold == 20
-    assert settings.packet_rule_policy_version == "packet-rule-policy-v3"
+    assert settings.packet_rule_policy_version == "packet-rule-policy-v4"
 
 
 @pytest.mark.parametrize(
@@ -68,10 +72,10 @@ def test_backend_settings_defaults_match_packet_rule_policy_v3() -> None:
         (_row(packet_count=100), "PACKET_RATE_ANOMALY"),
         (_row(total_bytes=25_000), "BYTE_RATE_ANOMALY"),
         (_row(distinct_dest_port_count=5, tcp_syn_count=5), "PORT_SCAN"),
-        (_row(tcp_syn_count=10, mqtt_related_packet_count=20), "BROKER_DOS_SUSPECTED"),
+        (_row(tcp_syn_count=10, broker_target_syn_count=10, mqtt_related_packet_count=20), "BROKER_DOS_SUSPECTED"),
     ],
 )
-def test_exact_v3_threshold_does_not_emit_event(row, expected_event) -> None:
+def test_exact_v4_threshold_does_not_emit_event(row, expected_event) -> None:
     assert expected_event not in _event_types(row)
 
 
@@ -81,10 +85,10 @@ def test_exact_v3_threshold_does_not_emit_event(row, expected_event) -> None:
         (_row(packet_count=101), "PACKET_RATE_ANOMALY"),
         (_row(total_bytes=25_001), "BYTE_RATE_ANOMALY"),
         (_row(distinct_dest_port_count=6, tcp_syn_count=6), "PORT_SCAN"),
-        (_row(tcp_syn_count=11, mqtt_related_packet_count=21), "BROKER_DOS_SUSPECTED"),
+        (_row(tcp_syn_count=11, broker_target_syn_count=11, mqtt_related_packet_count=21), "BROKER_DOS_SUSPECTED"),
     ],
 )
-def test_v3_threshold_exceedance_emits_expected_event(row, expected_event) -> None:
+def test_v4_threshold_exceedance_emits_expected_event(row, expected_event) -> None:
     assert _event_types(row) == {expected_event}
 
 
@@ -95,22 +99,22 @@ def test_v3_threshold_exceedance_emits_expected_event(row, expected_event) -> No
         _row(distinct_dest_port_count=5, tcp_syn_count=6),
     ],
 )
-def test_port_scan_v3_keeps_and_condition(row) -> None:
+def test_port_scan_v4_keeps_and_condition(row) -> None:
     assert "PORT_SCAN" not in _event_types(row)
 
 
 @pytest.mark.parametrize(
     "row",
     [
-        _row(tcp_syn_count=11, mqtt_related_packet_count=20),
-        _row(tcp_syn_count=10, mqtt_related_packet_count=21),
+        _row(tcp_syn_count=11, broker_target_syn_count=11, mqtt_related_packet_count=20),
+        _row(tcp_syn_count=10, broker_target_syn_count=10, mqtt_related_packet_count=21),
     ],
 )
-def test_broker_dos_v3_keeps_and_condition(row) -> None:
+def test_broker_dos_v4_keeps_and_condition(row) -> None:
     assert "BROKER_DOS_SUSPECTED" not in _event_types(row)
 
 
-def test_management_exclusion_skips_v3_rules_but_other_peers_remain_in_scope() -> None:
+def test_management_exclusion_skips_v4_rules_but_other_peers_remain_in_scope() -> None:
     policy = replace(
         DEFAULT_PACKET_RULE_POLICY,
         excluded_peer_ips=frozenset({"192.168.0.3"}),
@@ -122,6 +126,7 @@ def test_management_exclusion_skips_v3_rules_but_other_peers_remain_in_scope() -
         "distinct_dest_port_count": 6,
         "tcp_syn_count": 11,
         "mqtt_related_packet_count": 21,
+        "broker_target_syn_count": 11,
     }
 
     management = _row(device_id=None, peer_ip="192.168.0.3", **violating)

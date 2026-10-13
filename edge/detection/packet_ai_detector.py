@@ -28,6 +28,7 @@ from ai.predict_packet_isolation_forest import (
 )
 from backend.app.config import Settings, settings
 from edge.detection import runtime_checkpoint_repository as checkpoints
+from edge.detection.ai_run_evidence import AICompletionCollector, AICompletionRecord
 from edge.detection.detection_event_writer import write_detection_event
 from edge.detection.detector_contract import DetectorRunResult, validate_cycle_window
 from edge.detection.phase4_time import format_db_utc, parse_db_utc
@@ -40,6 +41,8 @@ from edge.packet.capture_policy import (
 )
 from edge.trust.trust_policy import AI_ONLY, AI_PACKET_ANOMALY
 from edge.policy.repository import load_policy_resolver
+from edge.policy.ai_window_decision import AIWindowDecision, require_observe_trust_mode
+from edge.policy.resolver import PolicyResolution
 
 
 logger = logging.getLogger(__name__)
@@ -52,6 +55,7 @@ PredictionFunction = Callable[
     [PacketIFArtifact, list[dict[str, Any]]],
     tuple[PacketIFPrediction, ...],
 ]
+AIWindowSelector = Callable[[PolicyResolution], AIWindowDecision]
 
 
 class PacketIsolationForestStage:
@@ -65,7 +69,14 @@ class PacketIsolationForestStage:
         expected_model_version: str,
         capture_policy: CapturePolicy,
         predict_rows: PredictionFunction = predict_packet_feature_rows,
+        ai_window_selector: AIWindowSelector | None = None,
+        completion_sink: Callable[[Session, tuple[AICompletionRecord, ...]], None] | None = None,
+        trust_ai_mode: str | None = None,
     ) -> None:
+        if ai_window_selector is not None:
+            require_observe_trust_mode(
+                settings.trust_ai_mode if trust_ai_mode is None else trust_ai_mode
+            )
         expected_version = expected_model_version.strip()
         if not expected_version:
             raise ValueError("PACKET_IF_EXPECTED_MODEL_VERSION must be configured")
@@ -85,6 +96,8 @@ class PacketIsolationForestStage:
         self.artifact = artifact
         self.capture_policy = capture_policy
         self.predict_rows = predict_rows
+        self.ai_window_selector = ai_window_selector
+        self.completion_sink = completion_sink
         self.policy_version = (
             f"{PACKET_IF_RUNTIME_POLICY_VERSION}:{artifact.model_version}:"
             f"{artifact.bundle_sha256[:12]}"
@@ -99,8 +112,12 @@ class PacketIsolationForestStage:
         expected_model_version: str | None = None,
         expected_bundle_sha256: str | None = None,
         capture_policy: CapturePolicy | None = None,
+        ai_window_selector: AIWindowSelector | None = None,
+        completion_sink: Callable[[Session, tuple[AICompletionRecord, ...]], None] | None = None,
     ) -> "PacketIsolationForestStage":
         configured_settings = app_settings or settings
+        if ai_window_selector is not None:
+            require_observe_trust_mode(configured_settings.trust_ai_mode)
         configured_path = (
             str(artifact_dir)
             if artifact_dir is not None
@@ -146,6 +163,9 @@ class PacketIsolationForestStage:
                 epsilon_seconds=configured_settings.capture_time_epsilon_seconds,
                 version=configured_settings.capture_policy_version,
             ),
+            ai_window_selector=ai_window_selector,
+            completion_sink=completion_sink,
+            trust_ai_mode=configured_settings.trust_ai_mode,
         )
 
     def run_until(
@@ -209,6 +229,7 @@ class PacketIsolationForestStage:
         eligible_rows: list[dict[str, Any]] = []
         eligible_source_rows: list[dict[str, Any]] = []
         exclusion_reasons: Counter[str] = Counter()
+        completion = AICompletionCollector(self.detector_name)
         last_processed_after = before["last_processed_id"]
 
         for source_row in rows:
@@ -221,14 +242,38 @@ class PacketIsolationForestStage:
                 row["registered_device_id"] = owner
                 row["registered_ip_address"] = row["peer_ip"] if owner else None
             source_id = int(row["id"])
+            window_start = parse_db_utc(row["window_start"], "window_start")
+            completion.input(row["device_id"], window_start)
             last_processed_after = _max_optional_id(
                 last_processed_after,
                 source_id,
             )
             _validate_source_window(row)
+            if self.ai_window_selector is not None:
+                if resolver is None or row["device_id"] is None:
+                    exclusion_reasons["AI_REGISTRATION_UNAVAILABLE"] += 1
+                    completion.exclude(row["device_id"], window_start,
+                                       "AI_REGISTRATION_UNAVAILABLE")
+                    continue
+                ai_decision = self.ai_window_selector(
+                    resolver.resolve(str(row["device_id"]), window_start)
+                )
+                if not ai_decision.infer:
+                    exclusion_reasons[ai_decision.reason] += 1
+                    completion.exclude(row["device_id"], window_start, ai_decision.reason,
+                                       ai_revision=ai_decision.ai_revision,
+                                       ai_mode=ai_decision.mode)
+                    continue
+                row["device_ai_revision"] = ai_decision.ai_revision
+                row["device_ai_mode"] = ai_decision.mode
+                row["ai_approved_start"] = format_db_utc(ai_decision.approved_start)
             eligibility = _runtime_eligibility(row, self.capture_policy)
             if not eligibility.eligible:
                 exclusion_reasons[str(eligibility.exclusion_reason)] += 1
+                completion.exclude(row["device_id"], window_start,
+                                   str(eligibility.exclusion_reason),
+                                   ai_revision=row.get("device_ai_revision"),
+                                   ai_mode=row.get("device_ai_mode"))
                 continue
             eligible_source_rows.append(row)
             eligible_rows.append(_prediction_row(row))
@@ -245,6 +290,14 @@ class PacketIsolationForestStage:
             predictions,
             strict=True,
         ):
+            completion.inferred(
+                row["device_id"], parse_db_utc(row["window_start"], "window_start"),
+                anomaly=prediction.is_anomaly,
+                model_version=self.artifact.model_version,
+                bundle_sha256=self.artifact.bundle_sha256,
+                ai_revision=row.get("device_ai_revision"),
+                ai_mode=row.get("device_ai_mode"),
+            )
             if not prediction.is_anomaly:
                 continue
             source_id = int(row["id"])
@@ -286,6 +339,9 @@ class PacketIsolationForestStage:
             if written.inserted:
                 created_count += 1
 
+        completion_records = completion.records(cutoff)
+        if self.completion_sink is not None:
+            self.completion_sink(db, completion_records)
         checkpoints.upsert_detector_checkpoint(
             db,
             detector_name=self.detector_name,
@@ -316,6 +372,7 @@ class PacketIsolationForestStage:
                 if expected_capture_session_id is not None
                 else _capture_session_id(rows)
             ),
+            ai_completion_records=completion_records,
         )
 
 
@@ -551,6 +608,9 @@ def _event_evidence(
         "capture_coverage_ratio": eligibility.coverage_ratio,
         "model": {
             "model_version": prediction.model_version,
+            "device_ai_revision": row.get("device_ai_revision"),
+            "device_ai_mode": row.get("device_ai_mode"),
+            "ai_approved_start": row.get("ai_approved_start"),
             "bundle_sha256": bundle_sha256,
             "raw_decision_score": prediction.raw_decision_score,
             "anomaly_score": prediction.anomaly_score,

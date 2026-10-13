@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime
+from decimal import Decimal
 from ipaddress import ip_address
 import logging
 from math import isfinite
@@ -37,7 +38,7 @@ from edge.packet.capture_policy import (
     CapturePolicy,
     is_capture_eligible,
 )
-from edge.trust.trust_policy import BROKER_DOS_SUSPECTED, BYTE_RATE_ANOMALY, PACKET_RATE_ANOMALY, POLICY_UNAVAILABLE, PORT_SCAN
+from edge.trust.trust_policy import BROKER_DOS_EVIDENCE_UNAVAILABLE, BROKER_DOS_SUSPECTED, BYTE_RATE_ANOMALY, PACKET_RATE_ANOMALY, POLICY_UNAVAILABLE, PORT_SCAN
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,7 @@ _SEVERITY_BY_EVENT = {
     BYTE_RATE_ANOMALY: "medium",
     PORT_SCAN: "high",
     BROKER_DOS_SUSPECTED: "high",
+    BROKER_DOS_EVIDENCE_UNAVAILABLE: "low",
 }
 
 
@@ -161,26 +163,39 @@ DEFAULT_PACKET_RULE_POLICY = PacketRulePolicy(
     port_scan_syn_threshold=5,
     broker_dos_tcp_syn_threshold=10,
     broker_dos_mqtt_packet_threshold=20,
-    version="packet-rule-policy-v3",
+    version="packet-rule-policy-v4",
 )
 
 
-def effective_packets_per_second(packet_count: float, captured_duration_seconds: float) -> float:
+def effective_packets_per_second(packet_count: int | float, captured_duration_seconds: float) -> float:
     """packets_per_second = packet_count / captured_duration_seconds.
 
     Packet IF의 10초 정규화(normalize_to_ten_second_rate)와 다른 계산식이다 --
     Packet Rule은 "Raw Count가 아니라" 이 값을 그대로 비교 기준으로 쓴다.
     """
-    if captured_duration_seconds <= 0:
-        raise ValueError("captured_duration_seconds must be > 0; caller must filter with is_capture_eligible() first")
-    return packet_count / captured_duration_seconds
+    return float(_decimal_rate(packet_count, captured_duration_seconds))
 
 
-def effective_bytes_per_second(total_bytes: float, captured_duration_seconds: float) -> float:
+def effective_bytes_per_second(total_bytes: int | float, captured_duration_seconds: float) -> float:
     """bytes_per_second = total_bytes / captured_duration_seconds."""
-    if captured_duration_seconds <= 0:
-        raise ValueError("captured_duration_seconds must be > 0; caller must filter with is_capture_eligible() first")
-    return total_bytes / captured_duration_seconds
+    return float(_decimal_rate(total_bytes, captured_duration_seconds))
+
+
+def _decimal_rate(count: int | float, duration: float) -> Decimal:
+    """Compare SQLite decimal values without a rounded binary quotient."""
+    decimal_count = Decimal(str(count))
+    if not decimal_count.is_finite() or decimal_count < 0:
+        raise ValueError("rate count must be finite and non-negative")
+    decimal_duration = Decimal(str(duration))
+    if not decimal_duration.is_finite() or decimal_duration <= 0:
+        raise ValueError("captured_duration_seconds must be finite and > 0")
+    return decimal_count / decimal_duration
+
+
+def _rate_exceeds(count: int | float, duration: float, threshold: float) -> bool:
+    # 115 / 9.2 is exactly 12.5 in the source decimal units.
+    _decimal_rate(count, duration)
+    return Decimal(str(count)) > Decimal(str(threshold)) * Decimal(str(duration))
 
 
 def detect_packet_rules(
@@ -210,8 +225,9 @@ def detect_packet_rules(
     events: list[dict[str, Any]] = []
     duration = float(row["captured_duration_seconds"])
 
-    packets_per_second = effective_packets_per_second(float(row["packet_count"]), duration)
-    if include_rate_rules and packets_per_second > policy.packet_rate_threshold:
+    packet_count = row["packet_count"]
+    packets_per_second = effective_packets_per_second(packet_count, duration)
+    if include_rate_rules and _rate_exceeds(packet_count, duration, policy.packet_rate_threshold):
         events.append(
             {
                 "event_type": PACKET_RATE_ANOMALY,
@@ -221,8 +237,9 @@ def detect_packet_rules(
             }
         )
 
-    bytes_per_second = effective_bytes_per_second(float(row["total_bytes"]), duration)
-    if include_rate_rules and bytes_per_second > policy.byte_rate_threshold:
+    total_bytes = row["total_bytes"]
+    bytes_per_second = effective_bytes_per_second(total_bytes, duration)
+    if include_rate_rules and _rate_exceeds(total_bytes, duration, policy.byte_rate_threshold):
         events.append(
             {
                 "event_type": BYTE_RATE_ANOMALY,
@@ -255,8 +272,40 @@ def detect_packet_rules(
         )
 
     mqtt_related_packet_count = int(row["mqtt_related_packet_count"])
-    if (
+    broker_syn_value = row.get("broker_target_syn_count")
+    # The feature owner supplies this count only for verified IPv4 Broker
+    # destination TCP SYN packets (SYN=1, ACK=0). Old rows remain unknown.
+    if broker_syn_value is not None and (
+        type(broker_syn_value) is not int or broker_syn_value < 0
+    ):
+        raise ValueError("broker_target_syn_count must be non-negative or NULL")
+    if broker_syn_value is not None:
+        broker_ip = row.get("broker_target_ip")
+        try:
+            valid_ip = isinstance(broker_ip, str) and ip_address(broker_ip).version == 4
+        except ValueError:
+            valid_ip = False
+        if not valid_ip:
+            raise ValueError("broker_target_syn_count requires a stored IPv4 broker_target_ip")
+        if type(row.get("broker_target_port")) is not int or row["broker_target_port"] != 1883:
+            raise ValueError("broker_target_syn_count requires stored broker_target_port 1883")
+        if broker_syn_value > 0 and row.get("direction") != "INBOUND":
+            raise ValueError("positive broker_target_syn_count requires INBOUND direction")
+    broker_syn_count = broker_syn_value
+    if broker_syn_count is None and (
         tcp_syn_count > policy.broker_dos_tcp_syn_threshold
+        and mqtt_related_packet_count > policy.broker_dos_mqtt_packet_threshold
+    ):
+        events.append({
+            "event_type": BROKER_DOS_EVIDENCE_UNAVAILABLE,
+            "severity": _SEVERITY_BY_EVENT[BROKER_DOS_EVIDENCE_UNAVAILABLE],
+            "observed_value": None,
+            "threshold": None,
+            "reason": "BROKER_TARGET_SYN_COUNT_MISSING",
+        })
+    if (
+        broker_syn_count is not None
+        and broker_syn_count > policy.broker_dos_tcp_syn_threshold
         and mqtt_related_packet_count > policy.broker_dos_mqtt_packet_threshold
     ):
         events.append(
@@ -264,11 +313,11 @@ def detect_packet_rules(
                 "event_type": BROKER_DOS_SUSPECTED,
                 "severity": _SEVERITY_BY_EVENT[BROKER_DOS_SUSPECTED],
                 "observed_value": {
-                    "tcp_syn_count": tcp_syn_count,
+                    "broker_target_syn_count": broker_syn_count,
                     "mqtt_related_packet_count": mqtt_related_packet_count,
                 },
                 "threshold": {
-                    "tcp_syn_count": policy.broker_dos_tcp_syn_threshold,
+                    "broker_target_syn_count": policy.broker_dos_tcp_syn_threshold,
                     "mqtt_related_packet_count": policy.broker_dos_mqtt_packet_threshold,
                 },
             }
@@ -512,9 +561,19 @@ def _select_packet_feature_rows(
     # 한다 (미매핑 IP도 Event 저장 대상, Packet IF보다 넓은 범위). PORT_SCAN·
     # BROKER_DOS_SUSPECTED 판정은 Pi로 "들어오는" 트래픽이 대상이므로
     # direction=INBOUND로 제한한다.
+    feature_columns = {
+        str(row["name"])
+        for row in db.execute(text("PRAGMA table_info(packet_feature_logs)")).mappings()
+    }
+    # Legacy schemas/rows have no verified endpoint evidence. Never infer it
+    # from today's environment while replaying historical rows.
+    broker_projection = ",\n                ".join(
+        f"{'pfl.' + name if name in feature_columns else 'NULL'} AS {name}"
+        for name in ("broker_target_ip", "broker_target_port", "broker_target_syn_count")
+    )
     rows = db.execute(
         text(
-            """
+            f"""
             SELECT
                 pfl.id,
                 pfl.capture_segment_id,
@@ -530,6 +589,7 @@ def _select_packet_feature_rows(
                 pfl.distinct_dest_port_count,
                 pfl.tcp_syn_count,
                 pfl.mqtt_related_packet_count,
+                {broker_projection},
                 pcs.window_start AS segment_window_start,
                 pcs.window_end AS segment_window_end,
                 pcs.status AS segment_status,
@@ -669,6 +729,9 @@ def _event_evidence(
         "window_start": row["window_start"],
         "observed_value": event["observed_value"],
         "threshold": event["threshold"],
+        "reason": event.get("reason"),
+        "broker_target_ip": row.get("broker_target_ip"),
+        "broker_target_port": row.get("broker_target_port"),
         "unit": (
             "packets/second" if event["event_type"] == PACKET_RATE_ANOMALY
             else "bytes/second" if event["event_type"] == BYTE_RATE_ANOMALY
@@ -680,6 +743,7 @@ def _event_evidence(
             "distinct_dest_port_count": row["distinct_dest_port_count"],
             "tcp_syn_count": row["tcp_syn_count"],
             "mqtt_related_packet_count": row["mqtt_related_packet_count"],
+            "broker_target_syn_count": row.get("broker_target_syn_count"),
         },
         "captured_duration_seconds": row["captured_duration_seconds"],
         "capture_coverage_ratio": eligibility.coverage_ratio,

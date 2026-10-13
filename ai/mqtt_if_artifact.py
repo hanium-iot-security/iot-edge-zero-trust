@@ -128,12 +128,15 @@ def inspect_mqtt_if_bundle(
     *,
     expected_bundle_sha256: str,
     expected_model_version: str | None = None,
+    maximum_file_bytes: int | None = None,
 ) -> MQTTIFInspection:
     """Read each file once; verify external pin and JSON before unpickling."""
+    if maximum_file_bytes is not None and (type(maximum_file_bytes) is not int or maximum_file_bytes <= 0):
+        raise ValueError("maximum_file_bytes must be a positive integer")
     expected_pin = _sha256(expected_bundle_sha256, "expected_bundle_sha256")
     artifact_dir = Path(artifact_dir)
     files = {
-        name: _read_regular_file(artifact_dir / name)
+        name: _read_regular_file(artifact_dir / name, maximum_file_bytes=maximum_file_bytes)
         for name in MQTT_IF_BUNDLE_FILENAMES
     }
     return _inspect_snapshot(artifact_dir, files, expected_pin, expected_model_version)
@@ -287,17 +290,24 @@ def _validate_libraries(versions: Any) -> None:
             raise ValueError(f"MQTT IF runtime library version mismatch: {key}")
 
 
-def _read_regular_file(path: Path) -> bytes:
+def _read_regular_file(path: Path, *, maximum_file_bytes: int | None = None) -> bytes:
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode):
         raise ValueError(f"MQTT IF Bundle member must be a regular non-symlink file: {path.name}")
+    if maximum_file_bytes is not None and info.st_size > maximum_file_bytes:
+        raise ValueError("MQTT IF Bundle member exceeds inspection size limit")
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     fd = os.open(path, flags)
     with os.fdopen(fd, "rb") as stream:
         opened = os.fstat(stream.fileno())
         if not stat.S_ISREG(opened.st_mode) or (info.st_dev, info.st_ino) != (opened.st_dev, opened.st_ino):
             raise ValueError(f"MQTT IF Bundle member changed while opening: {path.name}")
-        return stream.read()
+        if maximum_file_bytes is not None and opened.st_size > maximum_file_bytes:
+            raise ValueError("MQTT IF Bundle member exceeds inspection size limit")
+        content = stream.read() if maximum_file_bytes is None else stream.read(maximum_file_bytes + 1)
+        if maximum_file_bytes is not None and len(content) > maximum_file_bytes:
+            raise ValueError("MQTT IF Bundle member exceeds inspection size limit")
+        return content
 
 
 def _json_object(content: bytes, label: str) -> dict[str, Any]:

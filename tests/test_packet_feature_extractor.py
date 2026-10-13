@@ -1848,3 +1848,93 @@ def test_partial_feature_insert_failure_rolls_back_all(
 
     assert _feature_rows(db_session, segment["id"]) == []
     assert _segment_status(db_session, segment["id"])["status"] == "READY"
+
+
+@pytest.mark.parametrize("target,port", [("::1",1883),(PI_IP,9001),("192.168.0.99",1883),("",9001)])
+def test_invalid_broker_config_fails_before_database_or_files(tmp_path, monkeypatch, target, port):
+    import edge.features.run_packet_feature_extractor as mod
+    monkeypatch.setattr(mod.settings, "capture_interface_ip", PI_IP)
+    monkeypatch.setattr(mod.settings, "broker_target_ip", target)
+    monkeypatch.setattr(mod.settings, "broker_target_port", port)
+    monkeypatch.setattr(mod, "SessionLocal", lambda: pytest.fail("preflight must not open a database"))
+    ready = tmp_path / "ready"
+    ready.mkdir()
+    source = ready / "untouched.pcap"
+    source.write_bytes(b"unparsed source")
+    with pytest.raises(mod.ExtractorPreflightError, match="Broker"):
+        mod.extract_packet_features(ready_dir=ready, processed_dir=tmp_path/"processed",
+                                    failed_dir=tmp_path/"failed", lock_path=tmp_path/"lock")
+    assert source.read_bytes() == b"unparsed source"
+    assert not (tmp_path/"processed").exists()
+    assert not (tmp_path/"failed").exists()
+    assert not (tmp_path/"lock").exists()
+
+
+@pytest.mark.parametrize("direct", [False,True])
+def test_configured_broker_missing_schema_preserves_pcap_and_segment_state(tmp_path, monkeypatch, direct):
+    import shutil
+    import edge.features.run_packet_feature_extractor as mod
+    legacy = tmp_path / "legacy-migrations"
+    legacy.mkdir()
+    for path in MIGRATIONS_DIR.glob("*.sql"):
+        if int(path.name.split("_",1)[0]) <= 12:
+            shutil.copyfile(path, legacy/path.name)
+    path = tmp_path / "legacy.db"
+    apply_migrations(path, legacy)
+    sessions, engine = _make_test_session_factory(path)
+    with sessions() as db:
+        capture = _insert_capture_session(db, status="COMPLETED")
+        segment = _insert_segment(db,capture,file_name="ready.pcap")
+        orphan = _insert_segment(db,capture,file_name="orphan.pcap",
+                                 window_start="2026-07-16T10:00:10Z", window_end="2026-07-16T10:00:20Z")
+        db.execute(text("UPDATE packet_capture_segments SET status='PROCESSED' WHERE id=:id"), {"id":orphan["id"]})
+        db.commit()
+        before = db.execute(text("SELECT * FROM packet_capture_segments ORDER BY id")).all()
+    ready = tmp_path / "ready"
+    ready.mkdir()
+    for name in ("ready.pcap","orphan.pcap"):
+        (ready/name).write_bytes(b"must not parse or reconcile before schema preflight")
+    _configure_test_extractor(monkeypatch, mod, sessions)
+    monkeypatch.setattr(mod.settings,"broker_target_ip",PI_IP)
+    monkeypatch.setattr(mod.settings,"broker_target_port",1883)
+    try:
+        with pytest.raises(mod.ExtractorPreflightError):
+            if direct:
+                with sessions() as db:
+                    mod.process_segment(db, segment, ready, PI_IP, {}, broker_target_ip=PI_IP)
+            else:
+                mod.extract_packet_features(ready_dir=ready,processed_dir=tmp_path/"processed",
+                                            failed_dir=tmp_path/"failed",lock_path=tmp_path/"lock")
+        with sessions() as db:
+            assert db.execute(text("SELECT * FROM packet_capture_segments ORDER BY id")).all() == before
+            assert db.execute(text("SELECT COUNT(*) FROM packet_feature_logs")).scalar_one() == 0
+        assert sorted(item.name for item in ready.iterdir()) == ["orphan.pcap","ready.pcap"]
+        assert not (tmp_path/"processed").exists()
+        assert not (tmp_path/"failed").exists()
+    finally:
+        engine.dispose()
+
+
+def test_extractor_propagates_explicit_broker_config_to_stored_rows(tmp_path, monkeypatch):
+    import edge.features.run_packet_feature_extractor as mod
+    path = tmp_path/"broker.db"
+    apply_migrations(path, MIGRATIONS_DIR)
+    sessions,engine = _make_test_session_factory(path)
+    with sessions() as db:
+        capture = _insert_capture_session(db,status="COMPLETED")
+        _insert_segment(db,capture,file_name="broker.pcap")
+    ready = tmp_path/"ready"
+    _write_pcap(ready/"broker.pcap",[(WINDOW_TS,ESP_IP,PI_IP),(WINDOW_TS+1,ESP_IP,PI_IP),
+                                    (WINDOW_TS+2,PI_IP,ESP_IP)])
+    _configure_test_extractor(monkeypatch,mod,sessions)
+    monkeypatch.setattr(mod.settings,"broker_target_ip",PI_IP)
+    monkeypatch.setattr(mod.settings,"broker_target_port",1883)
+    try:
+        assert mod.extract_packet_features(ready_dir=ready,processed_dir=tmp_path/"processed",
+                                            failed_dir=tmp_path/"failed",lock_path=tmp_path/"lock") == 1
+        with sessions() as db:
+            rows = db.execute(text("SELECT direction,broker_target_ip,broker_target_port,broker_target_syn_count FROM packet_feature_logs ORDER BY direction")).all()
+            assert rows == [("INBOUND",PI_IP,1883,2),("OUTBOUND",PI_IP,1883,0)]
+        assert (tmp_path/"processed"/"broker.pcap").exists()
+    finally:
+        engine.dispose()

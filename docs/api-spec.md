@@ -172,7 +172,7 @@ Migration·이관을 실행하지 않으며, Pi 적용과 기기별 실제 추�
 
 ### GET /api/models
 
-관리자 키를 요구하지 않는 공개 조회입니다. 서버에 설정된 Packet IF Artifact의
+관리자 키를 요구하지 않는 공개 조회입니다. 서버에 설정된 Packet IF·MQTT IF Bundle의
 계약과 실제 실행 상태를 구분하며, 모델 활성화·역직렬화·추론은 실행하지 않습니다.
 응답은 `200 {observed_at, models}`이고 `models`에는 `packet_if`, `mqtt_if`가 들어갑니다.
 Artifact를 읽을 수 없거나 계약이 잘못된 경우도 해당 항목의 상태로 반환합니다.
@@ -190,15 +190,19 @@ Artifact를 읽을 수 없거나 계약이 잘못된 경우도 해당 항목의 
 | `artifact_status` | 의미 |
 | --- | --- |
 | `BUNDLE_METADATA_VERIFIED` | 외부 설정의 Bundle SHA·모델 Version, 개별 모델/Report SHA, Metadata 계약과 Report UTF-8 JSON 객체 형태 확인 |
-| `UNCONFIGURED` | Packet Artifact 경로·기대 Version·기대 Bundle SHA 중 필수 설정 누락 |
+| `UNCONFIGURED` | 해당 Artifact 경로·기대 Version·기대 Bundle SHA 중 필수 설정 누락. MQTT는 세 설정 모두 비어 있으면 아래 legacy 상태 |
 | `UNAVAILABLE` | 필수 파일 누락 또는 읽기 권한/파일 접근 실패 |
 | `INVALID` | Hash·Version·Metadata 계약 불일치, 잘못된 Report 형태, 크기 상한 초과 또는 안전하지 않은 경로 |
-| `LEGACY_CONTRACT_UNAVAILABLE` | MQTT 기존 단일 Joblib 경로에 같은 외부 pin·Bundle·Metadata 계약이 준비되지 않음 |
+| `LEGACY_CONTRACT_UNAVAILABLE` | MQTT Bundle 설정이 모두 비어 있어 기존 단일 Joblib 경로 사용. 해당 경로는 외부 pin·Bundle·Metadata 계약 없음 |
 
 공개 Metadata에는 모델·Feature·변환·Dataset·정상 정책 Version, Feature 순서,
 Threshold와 비교 방향·출처, 생성 시각, Bundle/Dataset/Manifest SHA, 분할별 행 수와
 정해진 CapturePolicy 필드만 포함합니다. 선택적인 `normal_policy_version`은 null일 수
 있습니다. 내부 경로·임의 확장 필드·Report 원문과 평가 수치는 노출하지 않습니다.
+MQTT Bundle은 모델·Feature·변환 Version, 5개 Feature 순서, nominal 10초 Window,
+`decision_function` 점수·낮을수록 이상인 방향·엄격한 `<` Threshold·출처와 Bundle SHA,
+한 건 Window의 5.0초 대체 간격 의미를 반환합니다. MQTT 설정은
+`MQTT_IF_ARTIFACT_DIR`, `MQTT_IF_EXPECTED_MODEL_VERSION`, `MQTT_IF_EXPECTED_BUNDLE_SHA256`입니다.
 MQTT 정책 Version을 모델 Version으로 표시하지 않습니다.
 
 검증 성공 시 `bundle_sha256_verified`, `metadata_contract_verified`,
@@ -391,6 +395,13 @@ Response wrapper:
   "total": 0
 }
 ```
+
+Each item also returns nullable `broker_target_ip`, `broker_target_port`, and
+`broker_target_syn_count` from the stored row. Migration 013 records the verified
+IPv4 destination, TCP port 1883, and inbound SYN=1/ACK=0 packet count in the
+original 10-second window (including retransmissions). Historical or unconfigured
+rows return all three as `null`; a measured zero is `0`. Current environment
+settings never rewrite the meaning of historical rows.
 
 Each item includes packet window fields from `packet_feature_logs`, the joined `session_id`, UTC `Z` timestamps, and derived values based on the fixed 10 second packet window:
 

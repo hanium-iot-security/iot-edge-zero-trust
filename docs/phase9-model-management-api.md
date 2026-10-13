@@ -9,7 +9,7 @@ HTTP 복구 실행은 포함하지 않는다. P9-06 전체 완료를 의미하�
 `GET /api/models`는 공개 조회다. 서버에 설정된 Artifact만 검사하고 내부 경로,
 임의 Metadata 확장 필드, Report 원문·평가 수치는 반환하지 않는다.
 
-Packet IF는 세 파일을 각각 한 번 읽어 외부 설정의 Bundle SHA, 모델 Version,
+Packet IF와 설정된 MQTT IF Bundle은 세 파일을 각각 한 번 읽어 외부 설정의 Bundle SHA, 모델 Version,
 개별 모델·Report SHA, Metadata 계약과 Report의 UTF-8 JSON 객체 형태를 확인한다.
 API 검사 크기 제한은 파일당 64 MiB이며 센서 Payload·정상 허용 범위 제한과는
 관계없다. 기존 추론 Loader도 동일한 역직렬화 이전 검증 Helper를 재사용한다.
@@ -21,8 +21,11 @@ Report 내부 평가 수치·Metadata와의 수치 일치, 학습 품질·학습
 현재 Orchestrator의 라이브러리 호환성·모델 로딩을 인증하지 않는다.
 
 설정이 일부라도 없으면 `UNCONFIGURED`, 읽을 수 없는 파일은 `UNAVAILABLE`,
-계약·Hash 불일치 등은 `INVALID`다. MQTT의 기존 단일 Joblib 경로에는 동일한
-Version·Bundle·Metadata 계약이 없어 `LEGACY_CONTRACT_UNAVAILABLE`로 반환한다.
+계약·Hash 불일치 등은 `INVALID`다. MQTT의 `MQTT_IF_ARTIFACT_DIR`,
+`MQTT_IF_EXPECTED_MODEL_VERSION`, `MQTT_IF_EXPECTED_BUNDLE_SHA256`이 모두 비어 있으면
+기존 단일 Joblib 경로에 해당하므로 `LEGACY_CONTRACT_UNAVAILABLE`로 반환한다.
+세 설정이 있으면 MQTT의 5개 Feature 순서·낮을수록 이상인 점수·엄격한 `<` Threshold와
+한 건 Window의 5.0초 대체 간격 의미도 공개 Metadata로 반환한다.
 MQTT 정책 Version을 모델 Artifact Version으로 바꾸어 표시하지 않는다.
 
 모든 모델의 `runtime.status`는 `UNKNOWN`이다. API 프로세스의 설정과 최근 이상

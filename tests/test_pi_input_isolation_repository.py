@@ -103,7 +103,7 @@ def test_migration_preserves_ids_values_release_fk_indexes_and_deleted_sequence(
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('sqlite_sequence','schema_migrations')")}
         assert len(tables) == 19
         indexes = {value[0] for value in connection.execute("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='firewall_rules'")}
-    assert apply_migrations(database, MIGRATIONS_DIR).applied_versions == [11, 12]
+    assert apply_migrations(database, MIGRATIONS_DIR).applied_versions == [11, 12, 13]
     with sqlite3.connect(database) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")

@@ -247,7 +247,9 @@ def test_successful_connection_plan_matches_actual_extractor_feature_contract() 
             ]
         )
 
-    rows = build_packet_features(packets, PI_IP, WINDOW_START, WINDOW_END)
+    rows = build_packet_features(
+        packets, PI_IP, WINDOW_START, WINDOW_END, broker_target_ip=PI_IP,
+    )
 
     assert len(rows) == 1
     row = rows[0]
@@ -257,6 +259,9 @@ def test_successful_connection_plan_matches_actual_extractor_feature_contract() 
     assert row["total_bytes"] == 2688
     assert row["distinct_dest_port_count"] == 1
     assert row["tcp_syn_count"] == 24
+    assert row["broker_target_ip"] == PI_IP
+    assert row["broker_target_port"] == 1883
+    assert row["broker_target_syn_count"] == 24
     assert row["mqtt_related_packet_count"] == 48
     assert row["tcp_syn_count"] > 10
     assert row["mqtt_related_packet_count"] > 20
@@ -299,7 +304,9 @@ def test_default_burst_remains_detectable_across_a_capture_window_boundary() -> 
         (datetime(2025, 1, 1, 0, 0, 10), datetime(2025, 1, 1, 0, 0, 20)),
     ]
     rows = [
-        build_packet_features(packets, PI_IP, window_start, window_end)[0]
+        build_packet_features(
+            packets, PI_IP, window_start, window_end, broker_target_ip=PI_IP,
+        )[0]
         for window_start, window_end in windows
     ]
 
@@ -308,6 +315,7 @@ def test_default_burst_remains_detectable_across_a_capture_window_boundary() -> 
         (12, 24),
     ]
     for row in rows:
+        assert row["broker_target_syn_count"] == 12
         row["captured_duration_seconds"] = 10.0
         event_types = {
             event["event_type"]
