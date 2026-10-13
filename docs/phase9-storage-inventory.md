@@ -15,7 +15,7 @@ python -m edge.maintenance.storage_inventory cleanup-dry-run --database backend/
 
 - DB, WAL/SHM, PCAP, 수집 진단 sidecar, Snapshot, 백업, 참조 문서 크기를 구분한다. WAL/SHM과 선택적인 기본 runtime 폴더가 없는 경우는 정상이다.
 - PCAP은 processed로 이동해도 sidecar가 ready에 남을 수 있다. 전체 지정 PCAP 루트에서 원래 파일명으로 `paired_paths`를 연결한다. 각 실제 경로를 별도로 기록하고 ready 폴더 전체를 삭제 대상으로 취급하지 않는다.
-- DB를 `mode=ro`, `query_only`의 짧은 트랜잭션으로 읽는다. Capture Session/Segment와 기존 Trust 보상·Packet 복구·계획 정비 감사의 경로·해시·Session 참조를 조회하고, 파일 해시를 계산하기 전에 DB 연결을 닫는다. 일반 SQLite 읽기 잠금/SHM 조정은 가능하며 `immutable=1`로 WAL을 무시하지 않는다.
+- DB를 `mode=ro`, `query_only`의 짧은 트랜잭션으로 읽는다. 목록에 있는 파일의 Capture Session/Segment만 파일명 인덱스로 조회하고, 기존 Trust 보상·Packet 복구·계획 정비 감사의 경로·해시·Session 참조를 연결한다. 파일 해시 계산 중에는 DB 트랜잭션을 유지하지 않는다. 일반 SQLite 읽기 잠금/SHM 조정은 가능하며 `immutable=1`로 WAL을 무시하지 않는다.
 - 명시한 참조 루트의 8MiB 이하 JSON에서 경로·파일명·SHA·Session UUID 문자열을 보수적으로 대조한다. 후보가 HOLD 또는 `training_approved=false`여도 참조를 보호한다. 참조 문서의 본문·센서 payload는 출력하지 않는다. 비JSON·과대 JSON은 내용/해시를 읽지 않고 미지원으로 남긴다.
 - RUNNING/FAILED Session, READY/FAILED Segment, incoming/ready/failed/samples, 임시 파일, DB/백업/참조 파일은 보존 사유에 표시한다. Session 미상·참조 검사 실패도 HOLD다. 완료된 Session의 processed 파일도 DB 참조가 있으면 명시한다.
 - 정상 일반 파일은 전체 SHA256을 계산하고 전후 파일 식별자·크기·수정 시각을 확인한다. DB/WAL·incoming·임시 파일은 살아 있는 파일로 취급해 해시를 생략한다. `verified_copy_paths`는 지정 백업 루트에서 전체 해시가 같은 별도 일반 파일이며 hardlink를 사본으로 세지 않는다. 사본의 별도 디스크 보관이나 백업 정책 충족까지 인증하지는 않는다.

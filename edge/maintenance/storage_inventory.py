@@ -66,22 +66,27 @@ def _pcap_name(name):
     return name.removesuffix(".tmp").removesuffix(".capture.json")
 
 
-def _read_database(path: Path):
-    """Copy only provenance metadata; release the read transaction before hashing."""
+def _read_database(path: Path, file_names):
+    """Copy provenance for inventoried files; never read historical Feature data."""
     if _linked(path):
         raise ValueError("LINK_NOT_FOLLOWED")
     with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA query_only=ON")
         db.execute("BEGIN")
-        segments = [dict(row) for row in db.execute("""
-            SELECT g.file_name, g.status AS segment_status, g.id AS segment_id,
-                   g.window_start, g.window_end,
-                   s.session_id, s.status AS session_status, s.ended_at
-            FROM packet_capture_segments g
-            JOIN packet_capture_sessions s ON s.id = g.capture_session_id
-            WHERE g.file_name IS NOT NULL
-        """)]
+        names = sorted(set(file_names))
+        segments = []
+        for offset in range(0, max(1, len(names)), 500):
+            batch = names[offset:offset + 500]
+            placeholders = ",".join("?" for _ in batch) or "NULL"
+            segments.extend(dict(row) for row in db.execute(f"""
+                SELECT g.file_name, g.status AS segment_status, g.id AS segment_id,
+                       g.window_start, g.window_end,
+                       s.session_id, s.status AS session_status, s.ended_at
+                FROM packet_capture_segments g
+                JOIN packet_capture_sessions s ON s.id = g.capture_session_id
+                WHERE g.file_name IN ({placeholders})
+            """, batch))
         references = []
         # Existing recovery audits contain paths and embedded plans. Never scan
         # raw MQTT payloads or load the large feature tables for this inventory.
@@ -191,7 +196,8 @@ def inventory(project_root: Path, database: Path, *, pcap_root: Path | None = No
             continue
         visit(path, category)
     try:
-        segments, reference_values = _read_database(database)
+        segments, reference_values = _read_database(database, [
+            _pcap_name(Path(row["path"]).name) for row in records if row["category"] in ("pcap", "sidecar")])
     except (OSError, ValueError, RecursionError, sqlite3.Error):
         segments, reference_values = [], []
         errors.append({"path": str(database), "reason": "DATABASE_REFERENCE_CHECK_FAILED"})
