@@ -1024,7 +1024,8 @@ def _execute_locked_recovery(
         data_version_before = int(connection.execute("PRAGMA data_version").fetchone()[0])
         operation_dir.mkdir()
         try:
-            backup = create_sqlite_backup(database, backup_path)
+            # The fresh checksum and full verification below remain mandatory.
+            backup = create_sqlite_backup(database, backup_path, verify=False)
             if backup.database_path != backup_path or backup.sha256_path != backup_sha256_path:
                 raise PacketCheckpointRecoveryError("backup artifact path mismatch")
             if file_sha256(backup_path) != backup.sha256:
