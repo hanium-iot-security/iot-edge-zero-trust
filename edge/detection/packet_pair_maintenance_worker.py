@@ -102,7 +102,7 @@ def prepare(*, plan_file, request_output):
     _require(not output.exists(), "request output must be new")
     request = core.attach_plan_sha256({"plan_schema_version": SCHEMA,
         "reference_plan_sha256": plan["plan_sha256"], "scope": _scope(plan),
-        "session_identities": identities}, generated_at=core._utc_now())
+        "session_identities": identities}, generated_at=core._utc_now().replace(microsecond=0))
     core._write_json_atomically(output, request)
     return request
 

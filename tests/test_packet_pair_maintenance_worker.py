@@ -206,8 +206,10 @@ def test_cli_classify_returns_structured_unknown_without_exitcode_inference(revi
     assert result["state"] == "UNKNOWN_HOLD" and result["database_committed"] is None
 
 
-def test_prepare_reads_database_without_changing_rows_or_bytes(reviewed):
+@pytest.mark.parametrize("microsecond", [0, 123456])
+def test_prepare_reads_database_without_changing_rows_or_bytes(reviewed, microsecond):
     f = reviewed
+    f["clock"][0] = f["clock"][0].replace(microsecond=microsecond)
     output = f["request_file"].with_name("second-request.json")
     before = f["database"].read_bytes()
     # The original plan requires its original later RUNNING observation.
@@ -215,6 +217,10 @@ def test_prepare_reads_database_without_changing_rows_or_bytes(reviewed):
         db.execute("UPDATE packet_capture_sessions SET status='RUNNING',ended_at=NULL WHERE session_id=?", (RUNNING_SESSION_A,))
     before = f["database"].read_bytes()
     request = worker.prepare(plan_file=f["output"], request_output=output)
+    saved = json.loads(output.read_text(encoding="utf-8"))
+    core.verify_plan_sha256(saved)
+    assert saved == request
+    assert request["generated_at"] == _db_utc(f["clock"][0].replace(microsecond=0))
     assert request["scope"] == f["request"]["scope"]
     assert f["database"].read_bytes() == before and _audits(f) == []
 
