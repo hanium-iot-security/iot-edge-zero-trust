@@ -16,6 +16,8 @@ GET /api/devices/{device_id}
 POST /api/devices
 GET /api/devices/{device_id}/policy
 POST /api/devices/{device_id}/policy-revisions
+GET /api/devices/{device_id}/ai-policy
+POST /api/devices/{device_id}/ai-policy-revisions
 GET /api/mqtt-logs
 GET /api/feature-logs
 GET /api/packet-feature-logs
@@ -111,6 +113,60 @@ auto_response_eligible, auto_response_exclusion_reason
 공용 Firewall lock 경로·권한을 확인한 뒤 활성화합니다. 관리자 키는 검증된 SSH 포워딩
 loopback 또는 HTTPS 경로에서 전송합니다. 세부 절차는
 [기기 정책 API 운영 확인](device-policy-api-runbook.md)을 따릅니다.
+
+## Device AI 설정 APIs
+
+Migration 012의 기기별 AI 설정을 읽고 새 revision으로 변경합니다. 기존 등록·Rule 정책
+API와 응답은 유지합니다. 선택 모드 저장만 수행하며 Stage 활성화, 모델 로딩, 시작
+Checkpoint 적용, 추론·Trust·방화벽 실행은 하지 않습니다. 실제 실행 상태와 구분해야 합니다.
+
+| 경로 | 요청·응답 |
+| --- | --- |
+| `GET /api/devices/{device_id}/ai-policy` | 관리자 키 없이 200 `{device_id,server_time,latest_revision,current,pending}` |
+| `POST /api/devices/{device_id}/ai-policy-revisions` | 기존 `X-Recovery-Admin-Key` 인증. 아래 세 필드만 입력하고 저장 후 201로 GET과 같은 구조 반환 |
+
+```json
+{
+  "expected_revision": 1,
+  "mode": "OBSERVE",
+  "reason": "검토한 후보의 관찰 설정"
+}
+```
+
+`expected_revision`은 양의 정수이며 숫자 문자열·실수·bool을 거부합니다. `mode`는
+`OFF` 또는 `OBSERVE`만 허용합니다. 사유는 기존 정책과 동일하게 앞뒤 공백 제거 후
+1~500자이며 제어 문자를 거부합니다. `created_by`, 효력 시각, 모델·Stage·기기 ID 등
+추가 필드를 입력할 수 없습니다. 작성자는 서버의 인증 principal입니다.
+
+current/pending은 null 또는 `device_id,revision,mode,effective_from,created_at,created_by,reason`
+객체입니다. 등록 직후에는 current=null, pending=OFF revision 1일 수 있습니다. 누락되거나
+손상된 AI 설정을 OFF로 만들어 반환하지 않습니다.
+
+쓰기 잠금 후 정한 시각의 **엄격히 다음 UTC 10초 경계**에 효력이 시작됩니다. 공용
+Firewall 파일 잠금 → DB 쓰기 잠금 순서를 기존 정책 명령과 공유하며 이전 revision은
+변경하지 않습니다. POST의 server_time/current/pending은 접수 시각 기준이므로 저장 후와
+효력 경계 이후에는 GET으로 확인합니다. 충돌·응답 유실 시 자동 재전송하지 않고 GET으로
+실제 저장 여부를 확인합니다.
+
+OBSERVE 변경은 `TRUST_AI_MODE=observe`일 때만 허용하고 DISABLED 기기는 거부합니다.
+OFF 변경과 GET은 전역 enforce에서도 허용합니다. OFF 저장 역시 실행 중 Stage를 끄거나
+즉시 처리를 중단하는 명령은 아닙니다. 기기별 설정의 Runtime 연결은 #118의 후속 통합입니다.
+
+| 상태 | 의미 |
+| --- | --- |
+| 401 | 관리자 키 누락·불일치 |
+| 404 | 미등록 기기 |
+| 409 | `REVISION_CONFLICT`, `PENDING_REVISION_EXISTS`, `NO_POLICY_CHANGE`, `STATE_TRANSITION_BLOCKED`, `POLICY_WRITE_BUSY` |
+| 422 | 잘못된 경로 ID·자료형·사유·모드 또는 추가 필드. ENFORCE 거부 |
+| 503 | 관리자 인증 설정 없음, AI Migration·이관·설정 불가/손상 또는 OBSERVE의 전역 모드 조건 불충족 |
+
+AI 설정 관련 503 코드는 `AI_POLICY_UNAVAILABLE`입니다. 기존 Rule 정책의 기반 스키마부터
+없으면 공용 연결의 `POLICY_UNAVAILABLE`, 잠금 설정이 잘못되면 `DEVICE_POLICY_CONFIG_UNAVAILABLE`을
+유지합니다. 409의 revision 충돌·예정 충돌은 기존 형식의 current_revision/pending_revision/latest_revision을
+제공하고, 422는 입력 원문 없이 type/loc/msg만 반환합니다.
+
+운영에서는 Migration 012와 기존 기기의 승인 목록 이관을 먼저 마쳐야 합니다. API 요청으로
+Migration·이관을 실행하지 않으며, Pi 적용과 기기별 실제 추론·화면 연결은 별도 검증 대상입니다.
 
 ## 모델 정보 API
 
@@ -285,7 +341,33 @@ Root 프로세스 시작을 하지 않으며 `iot-edge-api.service`의 `NoNewPri
 후속이며 P9-06 전체 완료가 아닙니다. 검증 기록과 세부 계약은
 [모델 정보·복구 관리 API](phase9-model-management-api.md)를 참조합니다.
 
-## Packet Gateway Read APIs
+## Feature 및 Packet Gateway Read APIs
+
+### GET /api/feature-logs
+
+기존 MQTT Feature 목록에 선택적인 `from`·`to` 기간 필터를 제공합니다.
+
+- `device_id`: 기존 기기 필터
+- `from`, `to`: timezone이 있는 ISO 8601 시각. UTC로 비교하며 한쪽만 지정할 수 있습니다.
+- `limit`: 기본 100, 1~500. `offset`: 기본 0, 0 이상
+
+`window_start >= from`이고 `window_end <= to`인 **완전히 포함된 Window**만 반환합니다.
+경계와 같은 값은 포함하고, 일부만 겹치는 Window는 제외합니다. 기간의 끝과 시작이 같으면
+일반적인 10초 Window는 포함되지 않습니다. 잘못된 시각·timezone 누락·역순 기간은 422입니다.
+
+```text
+/api/feature-logs?device_id=esp32_01&from=2026-10-01T00:00:00Z&to=2026-10-01T01:00:00Z
+```
+
+기존 `{items,total}`, `window_start DESC,id DESC` 정렬, 페이지 처리와 응답의 저장 시각 원문은
+유지합니다. total에도 동일한 기간·기기 필터가 적용됩니다. 기존 Feature writer의 Window 경계는
+UTC 정수 초이며, 공백/T/Z/명시적 UTC offset 형식을 UTC 초로 비교합니다. 분수 초 요청은
+시작 경계를 올림·종료 경계를 내림하여 정수 초 Window의 포함 여부를 정확하게 판단합니다.
+기간을 생략하면 기존 조회와 같습니다.
+
+원본 MQTT 로그의 `received_at` 해석, 새 그래프·집계·Capture 누락 근거·페이지 snapshot 계약은
+이번 확장에 포함하지 않습니다. Feature 응답의 단일 메시지 간격 값만으로 실제 송신 주기를
+판정하지 않습니다.
 
 ### GET /api/packet-feature-logs
 
