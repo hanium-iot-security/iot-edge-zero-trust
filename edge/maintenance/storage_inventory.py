@@ -148,11 +148,12 @@ def inventory(project_root: Path, database: Path, *, pcap_root: Path | None = No
                 errors.append({"path": str(path), "reason": "LINK_NOT_FOLLOWED"})
                 return
             if stat.S_ISDIR(info.st_mode):
-                for child in sorted(path.iterdir()):
-                    if len(records) >= max_files:
-                        errors.append({"path": str(path), "reason": "FILE_LIMIT_REACHED"})
-                        break
-                    visit(child, category)
+                with os.scandir(path) as entries:
+                    for entry in entries:
+                        if len(records) >= max_files:
+                            errors.append({"path": str(path), "reason": "FILE_LIMIT_REACHED"})
+                            break
+                        visit(Path(entry.path), category)
                 return
             if not stat.S_ISREG(info.st_mode):
                 errors.append({"path": str(path), "reason": "NOT_REGULAR_FILE"})
@@ -190,11 +191,16 @@ def inventory(project_root: Path, database: Path, *, pcap_root: Path | None = No
         except OSError:
             errors.append({"path": str(path), "reason": "PATH_READ_FAILED"})
 
+    optional_paths = {Path(str(database) + suffix) for suffix in ("-wal", "-shm")}
+    if not snapshot_roots:
+        optional_paths.add(root / "data/runtime")
     for path, category in sources:
-        # WAL/SHM and the default runtime directory may legitimately not exist.
-        if category in ("wal", "snapshot") and not Path(path).exists():
+        # Only absent WAL/SHM and the default runtime directory are optional.
+        # Explicit snapshot roots and dangling links must be reported.
+        if Path(path) in optional_paths and not os.path.lexists(path):
             continue
         visit(path, category)
+    records.sort(key=lambda row: row["path"])
     try:
         segments, reference_values = _read_database(database, [
             _pcap_name(Path(row["path"]).name) for row in records if row["category"] in ("pcap", "sidecar")])

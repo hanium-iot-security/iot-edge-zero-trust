@@ -13,7 +13,7 @@ python -m edge.maintenance.storage_inventory cleanup-dry-run --database backend/
 
 ## 관측 범위
 
-- DB, WAL/SHM, PCAP, 수집 진단 sidecar, Snapshot, 백업, 참조 문서 크기를 구분한다. WAL/SHM과 선택적인 기본 runtime 폴더가 없는 경우는 정상이다.
+- DB, WAL/SHM, PCAP, 수집 진단 sidecar, Snapshot, 백업, 참조 문서 크기를 구분한다. WAL/SHM과 선택적인 기본 runtime 폴더가 없는 경우는 정상이다. 명시한 `--snapshot-root`가 없으면 부분 조회로 표시하고 종료 코드 2를 반환한다.
 - PCAP은 processed로 이동해도 sidecar가 ready에 남을 수 있다. 전체 지정 PCAP 루트에서 원래 파일명으로 `paired_paths`를 연결한다. 각 실제 경로를 별도로 기록하고 ready 폴더 전체를 삭제 대상으로 취급하지 않는다.
 - DB를 `mode=ro`, `query_only`의 짧은 트랜잭션으로 읽는다. 목록에 있는 파일의 Capture Session/Segment만 파일명 인덱스로 조회하고, 기존 Trust 보상·Packet 복구·계획 정비 감사의 경로·해시·Session 참조를 연결한다. 파일 해시 계산 중에는 DB 트랜잭션을 유지하지 않는다. 일반 SQLite 읽기 잠금/SHM 조정은 가능하며 `immutable=1`로 WAL을 무시하지 않는다.
 - 명시한 참조 루트의 8MiB 이하 JSON에서 경로·파일명·SHA·Session UUID 문자열을 보수적으로 대조한다. 후보가 HOLD 또는 `training_approved=false`여도 참조를 보호한다. 참조 문서의 본문·센서 payload는 출력하지 않는다. 비JSON·과대 JSON은 내용/해시를 읽지 않고 미지원으로 남긴다.

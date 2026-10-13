@@ -1,5 +1,6 @@
 import hashlib
 import json
+from contextlib import contextmanager
 from pathlib import Path
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -116,6 +117,20 @@ def test_missing_database_is_not_created(source):
     assert any(row["reason"] == "DATABASE_REFERENCE_CHECK_FAILED" for row in report["errors"])
 
 
+def test_only_default_snapshot_root_is_optional(source, capsys):
+    root, db, _, _ = source
+    assert not (root / "data/runtime").exists()
+    assert inventory(root, db)["scan_complete"]
+    missing = root / "operator-snapshots"
+    report = inventory(root, db, snapshot_roots=[missing])
+    assert not report["scan_complete"]
+    assert {"path": str(missing), "reason": "PATH_NOT_FOUND"} in report["errors"]
+    assert report["cleanup_status"] == "HOLD"
+    assert main(["inventory", "--project-root", str(root), "--database", str(db),
+                 "--snapshot-root", str(missing)]) == 2
+    assert not json.loads(capsys.readouterr().out)["scan_complete"]
+
+
 def test_maintenance_session_and_backup_references_are_included(source):
     root, db, pcap, _ = source
     with sqlite3.connect(db) as conn:
@@ -173,6 +188,33 @@ def test_limit_marks_partial_and_space_budget_holds(source):
     assert len(result["items"]) == 1
     assert not result["scan_complete"]
     assert result["capacity"]["status"] == "HOLD"
+
+
+def test_file_limit_stops_directory_enumeration(source, monkeypatch):
+    root, db, _, _ = source
+    captures = root / "many-captures"
+    captures.mkdir()
+    for index in range(200):
+        (captures / f"capture-{index}.pcap").write_bytes(b"capture")
+    original_scandir = storage_inventory.os.scandir
+    consumed = []
+
+    @contextmanager
+    def counted_scandir(path):
+        with original_scandir(path) as entries:
+            def counted_entries():
+                for entry in entries:
+                    if Path(path) == captures:
+                        consumed.append(entry.name)
+                    yield entry
+            yield counted_entries()
+
+    monkeypatch.setattr(storage_inventory.os, "scandir", counted_scandir)
+    result = inventory(root, db, pcap_root=captures, max_files=1)
+    assert 1 <= len(consumed) <= 2
+    assert len(result["items"]) == 1
+    assert not result["scan_complete"]
+    assert {"path": str(captures), "reason": "FILE_LIMIT_REACHED"} in result["errors"]
 
 
 def test_growth_only_for_same_complete_scan(source):
