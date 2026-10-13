@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import parse_allowed_origins, settings
 from .routers import (
+    ai_runtime,
     dashboard,
     detection_events,
     devices,
@@ -41,6 +42,7 @@ app.add_middleware(
 )
 
 app.include_router(health.router, prefix="/api")
+app.include_router(ai_runtime.router, prefix="/api")
 app.include_router(dashboard.router, prefix="/api")
 app.include_router(devices.router, prefix="/api")
 app.include_router(mqtt_logs.router, prefix="/api")

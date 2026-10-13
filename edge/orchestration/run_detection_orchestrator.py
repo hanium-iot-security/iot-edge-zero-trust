@@ -63,6 +63,7 @@ from edge.orchestration.stage_registry import (
     StageRegistry,
     load_stage_registry,
 )
+from edge.orchestration.runtime_evidence import RuntimeEvidence, warning_policy_from_settings
 from edge.runtime_lock import RuntimeLockError, single_instance_lock
 from edge.runtime_lock import resolve_lock_path as _resolve_lock_path
 from edge.trust.trust_score_v2 import (
@@ -582,6 +583,10 @@ def run_orchestration_cycle(
     뒤에만 Trust를 호출합니다.
     """
     ai_mode = resolve_ai_mode()
+    evidence = registry.runtime_evidence
+    if evidence is not None:
+        evidence.trust_ai_mode = ai_mode
+        evidence.publish("RUNNING")
     with session_factory() as db:
         cutoff = resolve_cycle_cutoff(db)
         if cutoff is None:
@@ -729,8 +734,11 @@ def run_orchestration_cycle(
                 stages=(configured.stage,),
                 cycle_range_start=range_start,
                 cycle_cutoff=cutoff,
+                **({"stage_completion_sink": evidence.stage_completed} if evidence is not None else {}),
             )
         except Exception:
+            if evidence is not None:
+                evidence.stage_failed(configured.name)
             logger.exception(
                 "event=STAGE_FAILED detector_name=%s source_table=%s required=%s "
                 "cycle_range_start=%s cycle_cutoff=%s",
@@ -920,48 +928,57 @@ def configure_logging() -> None:
     logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
 
 
+def _run_configured(args, shutdown: GracefulShutdown, registry: StageRegistry) -> int:
+    logger.info(
+        "Orchestrator stages enabled=%s required=%s packet_layer_enabled=%s trust_ai_mode=%s",
+        ",".join(registry.enabled_names), ",".join(registry.required_names),
+        registry.packet_layer_enabled, settings.trust_ai_mode,
+    )
+    if args.once:
+        run_orchestration_cycle(registry=registry)
+        return 0
+    interval = args.interval if args.interval is not None else settings.orchestrator_interval_seconds
+    completed = run_orchestrator_loop(
+        registry=registry, shutdown=shutdown, interval_seconds=interval, max_cycles=args.cycles,
+    )
+    logger.info("Detection orchestrator stopped (cycles=%d)", completed)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     configure_logging()
-
     if args.status:
         print_checkpoint_status()
         return 0
 
     shutdown = GracefulShutdown()
     if args.loop:
-        # systemd considers the service active during model loading and lock
-        # acquisition too. Remember a stop request before any cycle can start.
+        # Handle stop requests during model loading and lock acquisition too.
         shutdown.install()
 
-    registry = load_stage_registry()
-    logger.info(
-        "Orchestrator stages enabled=%s required=%s packet_layer_enabled=%s trust_ai_mode=%s",
-        ",".join(registry.enabled_names),
-        ",".join(registry.required_names),
-        registry.packet_layer_enabled,
-        settings.trust_ai_mode,
-    )
-
+    # Keep the existing opt-out startup path independent of the new schema.
+    if not settings.runtime_evidence_enabled:
+        warning_policy_from_settings(settings)
+        registry = load_stage_registry()
     try:
         with single_instance_lock(resolve_lock_path()):
-            if args.once:
-                run_orchestration_cycle(registry=registry)
-                return 0
-
-            interval = (
-                args.interval
-                if args.interval is not None
-                else settings.orchestrator_interval_seconds
-            )
-            completed = run_orchestrator_loop(
-                registry=registry,
-                shutdown=shutdown,
-                interval_seconds=interval,
-                max_cycles=args.cycles,
-            )
-            logger.info("Detection orchestrator stopped (cycles=%d)", completed)
-            return 0
+            if not settings.runtime_evidence_enabled:
+                return _run_configured(args, shutdown, registry)
+            evidence = RuntimeEvidence(SessionLocal, settings)
+            phase = "INITIALIZATION_FAILED"
+            try:
+                evidence.publish("STARTING")
+                evidence.warning_policy = warning_policy_from_settings(settings)
+                registry = load_stage_registry(runtime_evidence=evidence)
+                evidence.publish("RUNNING")
+                phase = "RUNTIME_FAILED"
+                result = _run_configured(args, shutdown, registry)
+            except BaseException:
+                evidence.publish("FAILED", error_code=phase, best_effort=True)
+                raise
+            evidence.publish("STOPPED")
+            return result
     except RuntimeLockError as exc:
         logger.error("이미 다른 Orchestrator 인스턴스가 실행 중입니다: %s", exc)
         return 3

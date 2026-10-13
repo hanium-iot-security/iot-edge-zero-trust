@@ -613,6 +613,36 @@ READY를 기록하는 Transaction부터 source Session·Segment·Packet Feature�
 재개 검사에서 확인하고, 실제 재개 Write Transaction은 검증된 봉인과 대상 경계를
 재검증하여 기존 Session 전체를 다시 Hash하지 않습니다.
 
+## AI 실행 근거와 반복 경고 — Migration 013
+
+기존 정책·이벤트·Checkpoint·Trust 테이블의 값과 의미를 유지하는 추가 Migration입니다.
+운영 적용이나 초기 데이터 생성을 API에서 실행하지 않습니다.
+
+| 테이블 | 역할 |
+| --- | --- |
+| `ai_runtime_snapshot` | singleton JSON. 실제 Orchestrator run/Boot/관측 시각·설정·Stage 결과 |
+| `ai_device_completions` | `(detector_name,device_key)`별 마지막 원본 Window의 AI 완료 근거 JSON |
+| `ai_warning_keys` | 기기·탐지기·유형·모델·경고 버전 키, 고정 W/N/C, 최근 bucket·마지막 경고 결정 시각 |
+| `ai_warning_aggregates` | 키/bucket별 고유 집계, count·최초/최근 시각·억제·종료·결정 상태 |
+| `ai_warning_events` | 집계와 실제 detection event FK·원본 Window 연결. 이벤트 ID 중복 저장 방지 |
+
+완료의 입력 수는 추론+사유별 제외, 추론 수는 정상+이상과 일치해야 합니다. 같은 원본 Window의
+재시도는 합산하거나 관측 시각을 새 실행처럼 갱신하지 않습니다. `device_key=''`는 입력 없는
+Stage 표지이며 등록 기기로 반환하지 않습니다. 기기를 식별하지 못한 Packet 입력도 임의 기기의
+성공으로 만들지 않고 Stage 선택 행 수와 구분합니다. 과거 완료 기록은 실패로 덮지 않습니다.
+
+저장 함수는 caller의 Session을 사용하고 commit하지 않습니다. Stage 성공 기록·기기 결과·경고·
+이벤트·Checkpoint가 같은 트랜잭션에서 확정됩니다. 실패 관측은 기존 rollback 후 별도 짧은
+트랜잭션으로 기록합니다. API는 명시적인 읽기 트랜잭션을 사용하고 JSON을 공개 필드로 검증합니다.
+
+WarningLedger는 매번 해당 키의 최신/대상 bucket과 notification 상태를 복원합니다. rollback된
+메모리 집계를 재사용하지 않으며 전체 과거 ledger를 매 Cycle 읽지 않습니다. 원본 이벤트는
+삭제·재작성하지 않습니다. 동일 정책 버전에 다른 W/N/C를 붙이면 저장을 거부합니다.
+명시적 전량 제외·Stage 전체 무입력은 열린 집계를 `INPUT_INTERRUPTED`로 닫습니다. 이후 지연
+자료는 보존하지만 재통지하지 않습니다. 다른 기기 입력이 계속되는 동안 특정 기기만 무수신인
+상태는 완료 기록이 없어 이 저장 계층에서 자동 판정하지 않습니다.
+기기·기간 집계 조회 및 제한된 원본 이벤트 조회용 Index를 추가합니다.
+
 ## 주요 Index
 
 002 migration은 다음 조회를 위해 index를 추가합니다.

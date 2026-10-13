@@ -47,6 +47,12 @@ class Settings(BaseSettings):
     orchestrator_enabled_stages: str = "mqtt_feature_rule,mqtt_message_rule"
     orchestrator_required_stages: str = "mqtt_feature_rule,mqtt_message_rule"
     orchestrator_lock_path: str = ""
+    # Opt-in until the runtime evidence migration is installed.
+    runtime_evidence_enabled: bool = False
+    ai_warning_policy_version: str = ""
+    ai_warning_window_seconds: int | None = None
+    ai_warning_count_threshold: int | None = None
+    ai_warning_cooldown_seconds: int | None = None
     # AI inference/checkpoints keep running in both modes. Only Trust changes.
     trust_ai_mode: Literal["enforce", "observe"] = "enforce"
 
