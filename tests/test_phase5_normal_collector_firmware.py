@@ -40,7 +40,7 @@ def test_profiles_isolate_interval_and_payload_variation() -> None:
     source = _source()
 
     assert "PHASE5_NORMAL_PROFILE == 0 || PHASE5_NORMAL_PROFILE == 2" in source
-    assert "random(4000, 6001)" in source
+    assert "random(PHASE5_JITTER_MIN_MS, PHASE5_JITTER_MAX_MS + 1UL)" in source
     assert "PHASE5_NORMAL_PROFILE == 2 || PHASE5_NORMAL_PROFILE == 3" in source
     assert "sequence % 3" in source
 
@@ -58,8 +58,10 @@ def test_publish_rejects_oversize_and_commits_sequence_only_after_success() -> N
         source.index("bool publishNormalTelemetry()") : source.index("void setup()")
     ]
 
-    assert "MAX_PAYLOAD_BYTES = 100" in source
+    assert "MAX_PAYLOAD_BYTES = PHASE5_PAYLOAD_MAX_BYTES" in source
     assert "payload.length() > MAX_PAYLOAD_BYTES" in publish_body
+    assert "packetBytes > mqttClient.getBufferSize()" in publish_body
+    assert publish_body.index("packetBytes > mqttClient.getBufferSize()") < publish_body.index("mqttClient.publish")
     assert "return false;" in publish_body
     assert publish_body.index("mqttClient.publish") < publish_body.index(
         "sequenceNumber = nextSequence"
@@ -74,9 +76,23 @@ def test_reconnect_path_is_bounded_and_boot_log_identifies_run_contract() -> Non
     assert "while (true)" not in source
     assert "ESP.restart()" not in source
     assert "mqttClient.loop();" in source
+    setup_body = source[source.index("void setup()") : source.index("void loop()")]
+    assert "mqttBufferReady = mqttClient.setBufferSize(PHASE5_MQTT_BUFFER_BYTES)" in setup_body
+    assert "mqttClient.getBufferSize() == PHASE5_MQTT_BUFFER_BYTES" in setup_body
+    assert setup_body.index("if (!mqttBufferReady)") < setup_body.index("connectWifiWithTimeout();")
+    loop_body = source[source.index("void loop()") :]
+    assert loop_body.index("if (!mqttBufferReady)") < loop_body.index("mqttClient.loop();")
     for label in (
         "firmware_version=",
         "payload_schema_version=",
+        "firmware_limits_version=",
+        "payload_max_bytes=",
+        "canonical_payload_max_bytes=",
+        "mqtt_buffer_bytes_configured=",
+        "mqtt_buffer_bytes_actual=",
+        "fixed_publish_interval_ms=",
+        "jitter_min_ms=",
+        "jitter_max_ms=",
         "device_id=",
         "normal_profile=",
         "mqtt_topic=",
@@ -84,6 +100,9 @@ def test_reconnect_path_is_bounded_and_boot_log_identifies_run_contract() -> Non
     ):
         assert label in source
     assert "Serial.println(PHASE5_WIFI_PASSWORD)" not in source
+    assert "Serial.println(MQTT_PASSWORD)" not in source
+    assert 'FIRMWARE_VERSION = "phase9-normal-pilot-v2"' in source
+    assert 'PAYLOAD_SCHEMA_VERSION = "phase5-normal-payload-v1"' in source
 
 
 def test_profile_three_logs_the_pilot_approval_gate() -> None:
@@ -106,6 +125,15 @@ def test_mqtt_password_has_backward_compatible_fallback_default() -> None:
     source = _source()
     assert "#ifndef PHASE5_MQTT_PASSWORD" in source
     assert '#define PHASE5_MQTT_PASSWORD ""' in source
+    for name, default in (
+        ("PHASE5_PAYLOAD_MAX_BYTES", "128"),
+        ("PHASE5_MQTT_BUFFER_BYTES", "256"),
+        ("PHASE5_FIXED_PUBLISH_INTERVAL_MS", "5000UL"),
+        ("PHASE5_JITTER_MIN_MS", "4000UL"),
+        ("PHASE5_JITTER_MAX_MS", "6000UL"),
+    ):
+        assert f"#ifndef {name}" in source
+        assert f"#define {name} {default}" in source
 
 
 def test_connect_falls_back_to_anonymous_when_password_not_configured() -> None:

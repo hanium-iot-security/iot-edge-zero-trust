@@ -10,6 +10,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from edge.detection.phase4_time import format_db_utc, require_utc_whole_second
+from edge.trust.firewall_repository import has_scope_schema
+from edge.trust.firewall_scope import MQTT_IPV4_TCP_1883
 
 
 PENDING = "PENDING"
@@ -52,7 +54,7 @@ def create_release_request(
                     :requested_at
                 FROM firewall_rules
                 WHERE id = :firewall_rule_id
-                  AND status = 'APPLIED'
+                  AND status IN ('APPLIED', 'FAILED')
                 """
             ),
             {
@@ -67,7 +69,7 @@ def create_release_request(
             f"pending firewall release request already exists: {firewall_rule_id}"
         ) from exc
     if result.rowcount != 1:
-        raise ValueError(f"firewall rule is not APPLIED: {firewall_rule_id}")
+        raise ValueError(f"firewall rule is not releasable: {firewall_rule_id}")
     return int(result.lastrowid)
 
 
@@ -111,6 +113,11 @@ def list_pending_release_requests(
     *,
     limit: int,
 ) -> list[dict[str, Any]]:
+    scope_projection = ("rule.scope AS rule_scope, rule.source_rule_id AS rule_source_rule_id, "
+                        "rule.approved_policy_revision AS rule_approved_policy_revision, "
+                        "rule.requested_by AS rule_requested_by" if has_scope_schema(db) else
+                        "'" + MQTT_IPV4_TCP_1883 + "' AS rule_scope, NULL AS rule_source_rule_id, "
+                        "NULL AS rule_approved_policy_revision, NULL AS rule_requested_by")
     rows = db.execute(
         text(
             """
@@ -130,7 +137,8 @@ def list_pending_release_requests(
                 rule.protocol AS rule_protocol,
                 rule.dest_port AS rule_dest_port,
                 rule.action AS rule_action,
-                rule.status AS rule_status
+                rule.status AS rule_status,
+                """ + scope_projection + """
             FROM firewall_release_requests AS request
             JOIN firewall_rules AS rule
               ON rule.id = request.firewall_rule_id

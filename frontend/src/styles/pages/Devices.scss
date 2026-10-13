@@ -2,32 +2,49 @@
   width: 100%;
   max-width: 100%;
   min-width: 0;
-
   margin: 0 auto;
 
+  .device-admin-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 20px;
+    padding: 16px 18px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+    box-shadow: var(--shadow-sm);
 
-  /* ========================================
-     TABLE
-     ======================================== */
+    strong {
+      display: block;
+      margin-bottom: 5px;
+      color: var(--color-slate-950);
+      font-size: 14px;
+    }
+
+    p {
+      margin: 0;
+      color: var(--color-slate-500);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+  }
 
   .table-panel {
     width: 100%;
     max-width: 100%;
     min-width: 0;
-
     overflow: hidden;
   }
 
   .table-scroll {
     display: block;
-
     width: 100%;
     max-width: 100%;
     min-width: 0;
-
     overflow-x: auto;
     overflow-y: hidden;
-
     -webkit-overflow-scrolling: touch;
 
     > * {
@@ -37,34 +54,30 @@
 
   .device-id {
     display: block;
-
     max-width: 190px;
-
     overflow: hidden;
-
-    font-family:
-      ui-monospace,
-      SFMono-Regular,
-      Menlo,
-      Consolas,
-      monospace;
-
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
+  .registration-cell {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 5px;
 
-  /* ========================================
-     TRUST SCORE
-     ======================================== */
+    small {
+      color: var(--color-slate-500);
+      font-size: 10px;
+      line-height: 1.4;
+    }
+  }
 
   .score-cell {
     display: flex;
-
     min-width: 92px;
-
     flex-direction: column;
-
     gap: 6px;
 
     > strong {
@@ -75,19 +88,14 @@
   .score-bar {
     width: 100%;
     height: 6px;
-
     overflow: hidden;
-
     border-radius: var(--radius-pill);
-
     background: var(--color-slate-200);
   }
 
   .score-fill {
     height: 100%;
-
     border-radius: inherit;
-
     background: var(--color-primary);
   }
 
@@ -107,28 +115,16 @@
     background: var(--color-slate-900);
   }
 
-
-  /* ========================================
-     LAST SEEN
-     ======================================== */
-
   .last-seen {
     display: flex;
-
     flex-direction: column;
     align-items: flex-start;
-
     gap: 5px;
 
     small {
       color: var(--color-slate-500);
     }
   }
-
-
-  /* ========================================
-     ROW STATE
-     ======================================== */
 
   .row-warning {
     background: #fffbeb;
@@ -146,61 +142,48 @@
     }
   }
 
-
-  /* ========================================
-     DEVICE DETAIL
-     ======================================== */
-
   .detail {
     display: flex;
-
     min-width: 0;
-
     flex-direction: column;
-
     gap: 20px;
-
     padding: 0 20px;
   }
 
   .detail-grid {
     display: grid;
-
-    grid-template-columns:
-      repeat(3, minmax(0, 1fr));
-
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 12px;
   }
 
   .detail-item {
     min-width: 0;
-
     padding: 14px;
-
     border: 1px solid var(--border-color);
     border-radius: 9px;
-
     background: var(--color-slate-50);
 
     > span {
       display: block;
-
       margin-bottom: 7px;
-
       color: var(--color-slate-500);
-
       font-size: 11px;
       font-weight: 800;
     }
 
     strong {
       display: block;
-
       overflow-wrap: anywhere;
-
       color: var(--color-slate-900);
-
       font-size: 13px;
+    }
+
+    .detail-helper {
+      display: block;
+      margin-top: 7px;
+      color: var(--color-slate-500);
+      font-size: 10px;
+      line-height: 1.45;
     }
   }
 
@@ -209,42 +192,200 @@
 
     h3 {
       margin: 0 0 12px;
-
       color: var(--color-slate-950);
-
       font-size: 16px;
     }
   }
 
+  .section-heading {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
 
-  /* ========================================
-     TRUST HISTORY
-     ======================================== */
+    h3 {
+      margin-bottom: 5px;
+    }
+
+    p {
+      margin: 0;
+      color: var(--color-slate-500);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+  }
+
+  .admin-form,
+  .policy-form-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+  }
+
+  .full-width {
+    grid-column: 1 / -1;
+  }
+
+  .input-with-unit {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+
+    input {
+      min-width: 0;
+      flex: 1;
+    }
+
+    span {
+      flex: 0 0 auto;
+      color: var(--color-slate-500);
+      font-size: 11px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+  }
+
+  .readonly-value {
+    min-height: 40px;
+    padding: 10px 12px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background: var(--color-slate-50);
+    color: var(--color-slate-700);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    overflow-wrap: anywhere;
+  }
+
+  .help-text {
+    display: block;
+    margin-top: 6px;
+    color: var(--color-slate-500);
+    font-size: 11px;
+    line-height: 1.5;
+  }
+
+  .policy-note {
+    margin: 12px 0 0;
+    padding: 11px 13px;
+    border-radius: 8px;
+    background: var(--color-slate-50);
+    color: var(--color-slate-600);
+    font-size: 11px;
+    line-height: 1.55;
+  }
+
+  .policy-state-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+  }
+
+  .policy-card {
+    min-width: 0;
+    padding: 14px;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background: var(--color-slate-50);
+  }
+
+  .policy-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+
+  .policy-list,
+  .detail-list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    margin: 0;
+
+    > div {
+      min-width: 0;
+      padding: 10px;
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    dt {
+      margin-bottom: 4px;
+      color: var(--color-slate-500);
+      font-size: 10px;
+      font-weight: 800;
+    }
+
+    dd {
+      margin: 0;
+      overflow-wrap: anywhere;
+      color: var(--color-slate-800);
+      font-size: 12px;
+    }
+  }
+
+  .inline-error {
+    margin: 12px 0 0;
+    padding: 11px 13px;
+    border: 1px solid #fecaca;
+    border-radius: 8px;
+    background: #fef2f2;
+    color: var(--color-danger-dark);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+
+  .verification-box {
+    margin-top: 12px;
+    padding: 12px 14px;
+    border: 1px solid var(--border-color);
+    border-radius: 9px;
+    background: var(--color-slate-50);
+    font-size: 12px;
+    line-height: 1.55;
+
+    strong {
+      display: block;
+      margin-bottom: 5px;
+    }
+
+    p {
+      margin: 0;
+    }
+  }
+
+  .verification-checking {
+    border-color: #fde68a;
+    background: #fffbeb;
+    color: var(--color-warning-dark);
+  }
+
+  .verification-checked {
+    border-color: #bbf7d0;
+    background: #f0fdf4;
+    color: var(--color-success-dark);
+  }
 
   .history-list {
     display: flex;
-
     flex-direction: column;
-
     gap: 12px;
   }
 
   .history-item {
     padding: 15px;
-
     border: 1px solid var(--border-color);
     border-radius: 10px;
-
     background: var(--color-slate-50);
   }
 
   .history-score {
     display: flex;
-
     align-items: center;
-
     gap: 10px;
-
     margin-bottom: 10px;
 
     strong {
@@ -258,27 +399,18 @@
 
   .history-meta {
     display: flex;
-
     align-items: center;
-
     gap: 8px;
     flex-wrap: wrap;
-
     margin-bottom: 12px;
-
     color: var(--color-slate-500);
-
     font-size: 12px;
   }
 
   .history-info {
     display: grid;
-
-    grid-template-columns:
-      repeat(4, minmax(0, 1fr));
-
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 10px;
-
     margin: 0;
 
     > div {
@@ -287,47 +419,56 @@
 
     dt {
       margin-bottom: 4px;
-
       color: var(--color-slate-500);
-
       font-size: 10px;
       font-weight: 800;
     }
 
     dd {
       margin: 0;
-
       overflow-wrap: anywhere;
-
       font-size: 12px;
     }
   }
 
-
-  /* ========================================
-     RESPONSIVE
-     ======================================== */
-
   @media (max-width: 1280px) {
-    .detail-grid {
-      grid-template-columns:
-        repeat(2, minmax(0, 1fr));
+    .detail-grid,
+    .policy-state-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
     .history-info {
-      grid-template-columns:
-        repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
   }
 
   @media (max-width: 760px) {
+    .device-admin-bar {
+      flex-direction: column;
+      align-items: stretch;
+    }
+
     .detail {
       padding: 0;
     }
 
     .detail-grid,
-    .history-info {
+    .history-info,
+    .admin-form,
+    .policy-form-grid,
+    .policy-state-grid,
+    .policy-list,
+    .detail-list {
       grid-template-columns: 1fr;
+    }
+
+    .full-width {
+      grid-column: auto;
+    }
+
+    .input-with-unit {
+      align-items: stretch;
+      flex-direction: column;
     }
   }
 }

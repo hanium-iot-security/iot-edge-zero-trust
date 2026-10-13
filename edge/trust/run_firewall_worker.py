@@ -21,6 +21,7 @@ from backend.app.config import Settings, settings
 from backend.app.database import SessionLocal
 from edge.runtime_lock import RuntimeLockError, resolve_lock_path, single_instance_lock
 from edge.trust import firewall_repository
+from edge.trust.firewall_scope import MQTT_IPV4_TCP_1883
 from edge.trust.firewall_worker import (
     FirewallPolicy,
     FirewallValidationError,
@@ -229,6 +230,7 @@ def _print_dry_run(db: Session, *, policy: FirewallPolicy, now: datetime) -> Non
         spec, iptables_args = plan
         wrapper_command = " ".join(
             [policy.sudo_path, "-n", policy.wrapper_path, "insert", spec.source_ip, str(rule_id)]
+            + ([spec.scope] if spec.scope != MQTT_IPV4_TCP_1883 else [])
         )
         print(f"[rule_id={rule_id}] {wrapper_command}")
         print(f"[rule_id={rule_id}]   -> iptables {' '.join(iptables_args)}")

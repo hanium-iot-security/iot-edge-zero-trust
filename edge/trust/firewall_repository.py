@@ -6,12 +6,14 @@ from datetime import datetime, timedelta
 import ipaddress
 import sqlite3
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from edge.detection.phase4_time import format_db_utc, require_utc_whole_second
-from edge.policy.device_policy import DevicePolicyError, POLICY_FIELDS
+from edge.policy.device_policy import DevicePolicyError, POLICY_FIELDS, validate_actor, validate_reason
+from edge.trust.firewall_scope import MQTT_IPV4_TCP_1883, PI_INPUT_IPV4_ALL, row_scope
 from edge.policy.device_policy_repository import (
     auto_response_exclusion_reason,
     get_policy_snapshot,
@@ -28,6 +30,157 @@ MAX_TRANSIENT_RETRIES = 3
 
 class AutomaticResponseBlockedError(ValueError):
     """The current device policy does not authorize a new automatic block."""
+
+
+SCOPE_COLUMNS = {"scope", "source_rule_id", "approved_policy_revision", "requested_by", "request_id"}
+
+
+def has_scope_schema(db: Session) -> bool:
+    """Only fully pre-011 schemas may use the legacy column-free queries."""
+    connection = db.connection().connection.driver_connection
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(firewall_rules)")}
+    try:
+        version = connection.execute("SELECT max(version) FROM schema_migrations").fetchone()[0]
+        migration = connection.execute("SELECT name FROM schema_migrations WHERE version=11").fetchone()
+    except sqlite3.Error:
+        raise AutomaticResponseBlockedError("POLICY_UNAVAILABLE") from None
+    if type(version) is not int:
+        raise AutomaticResponseBlockedError("POLICY_UNAVAILABLE")
+    if SCOPE_COLUMNS <= columns and migration is not None and migration[0] == "pi_input_isolation":
+        return True
+    if not (columns & SCOPE_COLUMNS) and version < 11:
+        return False
+    raise AutomaticResponseBlockedError("FIREWALL_SCOPE_SCHEMA_UNAVAILABLE")
+
+
+def _pending_release(db: Session, rule_id: int) -> bool:
+    connection = db.connection().connection.driver_connection
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='firewall_release_requests'").fetchone() is None:
+        return False
+    return connection.execute("SELECT 1 FROM firewall_release_requests WHERE firewall_rule_id=? AND status='PENDING'", (rule_id,)).fetchone() is not None
+
+
+def _audited_removal(connection, row) -> bool:
+    # Completion may occur on a later cycle after REMOVED was committed. An
+    # older success cannot attest a different, later removal of the same ID.
+    return (row["status"] == REMOVED and row["released_at"] is not None
+            and connection.execute("""SELECT 1 FROM firewall_release_requests
+                WHERE firewall_rule_id=? AND status='SUCCEEDED'
+                  AND unixepoch(requested_at)<=unixepoch(?)
+                  AND unixepoch(?)<=unixepoch(processed_at)""",
+                                   (row["id"], row["released_at"], row["released_at"])).fetchone() is not None)
+
+
+def _require_wide_rule_eligible(db: Session, row: dict[str, Any], *, now: datetime) -> None:
+    """Bind a management approval to its original rule and current policy/IP."""
+    if not has_scope_schema(db):
+        raise AutomaticResponseBlockedError("MIGRATION_011_REQUIRED")
+    connection = db.connection().connection.driver_connection
+    source_id = row.get("source_rule_id")
+    revision = row.get("approved_policy_revision")
+    if type(source_id) is not int or source_id <= 0 or type(revision) is not int or revision <= 0:
+        raise AutomaticResponseBlockedError("WIDE_APPROVAL_UNAVAILABLE")
+    try:
+        validate_actor(row.get("requested_by"))
+        validate_reason(row.get("reason"))
+        _require_request_id(row.get("request_id"))
+    except (ValueError, DevicePolicyError):
+        raise AutomaticResponseBlockedError("WIDE_APPROVAL_UNAVAILABLE") from None
+    source = db.execute(text("SELECT * FROM firewall_rules WHERE id=:id"), {"id": source_id}).mappings().first()
+    if source is None:
+        raise AutomaticResponseBlockedError("SOURCE_RULE_NOT_FOUND")
+    try:
+        source_scope = row_scope(source)
+    except ValueError:
+        raise AutomaticResponseBlockedError("SOURCE_RULE_CHANGED") from None
+    if (source_scope != MQTT_IPV4_TCP_1883
+            or source["protocol"] != "tcp" or source["dest_port"] != 1883 or source["action"] != "DROP"
+            or source["device_id"] != row.get("device_id") or source["source_ip"] != row.get("source_ip")):
+        raise AutomaticResponseBlockedError("SOURCE_RULE_CHANGED")
+    audited_removal = row.get("status") == APPLIED and _audited_removal(connection, source)
+    if source["status"] != APPLIED and not audited_removal:
+        raise AutomaticResponseBlockedError("SOURCE_RULE_CHANGED")
+    device = connection.execute("SELECT ip_address,status FROM devices WHERE device_id=?", (row.get("device_id"),)).fetchone()
+    if device is None or device[0] != row.get("source_ip"):
+        raise AutomaticResponseBlockedError("DEVICE_IP_OWNERSHIP_MISMATCH")
+    if device[1] != "isolated":
+        raise AutomaticResponseBlockedError("DEVICE_NOT_ISOLATED")
+    if _pending_release(db, source_id) or (row.get("id") is not None and _pending_release(db, row["id"])):
+        raise AutomaticResponseBlockedError("FIREWALL_RELEASE_PENDING")
+    _require_automatic_response_eligible(db, row, now=now)
+    try:
+        snapshot = get_policy_snapshot(connection, row["device_id"], server_time=now)
+    except (DevicePolicyError, sqlite3.Error, ValueError, TypeError):
+        raise AutomaticResponseBlockedError("POLICY_UNAVAILABLE") from None
+    if snapshot.current is None or snapshot.current.revision != revision:
+        raise AutomaticResponseBlockedError("APPROVED_POLICY_REVISION_CHANGED")
+
+
+def _require_application_eligible(db: Session, row: dict[str, Any], *, now: datetime) -> None:
+    has_scope_schema(db)
+    try:
+        scope = row_scope(row)
+    except ValueError:
+        raise AutomaticResponseBlockedError("INVALID_FIREWALL_SCOPE") from None
+    if scope == PI_INPUT_IPV4_ALL:
+        _require_wide_rule_eligible(db, row, now=now)
+    else:
+        if row.get("id") is not None and _pending_release(db, row["id"]):
+            raise AutomaticResponseBlockedError("FIREWALL_RELEASE_PENDING")
+        _require_automatic_response_eligible(db, row, now=now)
+
+
+def _require_request_id(value: str) -> str:
+    try:
+        parsed = UUID(value)
+        if parsed.version != 4 or str(parsed) != value:
+            raise ValueError
+    except (ValueError, TypeError, AttributeError):
+        raise AutomaticResponseBlockedError("INVALID_REQUEST_ID") from None
+    return value
+
+
+def create_pending_scope_extension(db: Session, *, source_rule_id: int, device_id: str,
+                                   source_ip: str, approved_policy_revision: int, requested_by: str,
+                                   reason: str, request_id: str, scope: str, now: datetime) -> tuple[dict[str, Any], bool]:
+    """Caller holds Worker lock and BEGIN IMMEDIATE; no OS or old-row changes."""
+    if not db.connection().connection.driver_connection.in_transaction:
+        raise RuntimeError("Scope approval requires an explicit write transaction")
+    if not has_scope_schema(db):
+        raise AutomaticResponseBlockedError("MIGRATION_011_REQUIRED")
+    if scope != PI_INPUT_IPV4_ALL:
+        raise AutomaticResponseBlockedError("UNSUPPORTED_EXTENSION_SCOPE")
+    _require_request_id(request_id)
+    requested_by, reason = validate_actor(requested_by), validate_reason(reason)
+    try:
+        address = ipaddress.IPv4Address(source_ip)
+        private = any(address in ipaddress.IPv4Network(network) for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+        if str(address) != source_ip or not private:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise AutomaticResponseBlockedError("INVALID_SOURCE_IPV4") from None
+    binding = {"device_id": device_id, "source_rule_id": source_rule_id, "source_ip": source_ip,
+               "approved_policy_revision": approved_policy_revision, "requested_by": requested_by,
+               "reason": reason, "request_id": request_id, "scope": scope}
+    existing = db.execute(text("SELECT * FROM firewall_rules WHERE request_id=:request_id"), binding).mappings().first()
+    if existing is not None:
+        if not all(existing[key] == value for key, value in binding.items()):
+            raise AutomaticResponseBlockedError("REQUEST_ID_BINDING_MISMATCH")
+        return dict(existing), False
+    _require_wide_rule_eligible(db, binding, now=now)
+    previous = db.execute(text("SELECT id,status,released_at FROM firewall_rules WHERE scope=:scope AND (device_id=:device_id OR source_ip=:source_ip)"), binding).mappings().all()
+    connection = db.connection().connection.driver_connection
+    if any(not _audited_removal(connection, previous_row) or _pending_release(db, previous_row["id"])
+           for previous_row in previous):
+        raise AutomaticResponseBlockedError("WIDE_RULE_REQUIRES_EXACT_RELEASE")
+    instant = format_db_utc(require_utc_whole_second(now, "now"))
+    result = db.execute(text("""INSERT INTO firewall_rules
+        (device_id,source_ip,scope,protocol,dest_port,action,status,reason,source_rule_id,
+         approved_policy_revision,requested_by,request_id,created_at,updated_at)
+        VALUES (:device_id,:source_ip,:scope,NULL,NULL,'DROP','PENDING',:reason,:source_rule_id,
+                :approved_policy_revision,:requested_by,:request_id,:now,:now)"""), {**binding, "now": instant})
+    row = db.execute(text("SELECT * FROM firewall_rules WHERE id=:id"), {"id": result.lastrowid}).mappings().one()
+    return dict(row), True
 
 
 def _begin_authorization_transaction(db: Session, *, write: bool = False) -> None:
@@ -100,7 +253,7 @@ def authorized_automatic_rule(
         if result is None or result["status"] != required_status:
             raise AutomaticResponseBlockedError(f"firewall rule is not {required_status}: {rule_id}")
         row = dict(result)
-        _require_automatic_response_eligible(db, row, now=now)
+        _require_application_eligible(db, row, now=now)
         return row
     finally:
         db.rollback()
@@ -302,12 +455,12 @@ def mark_removed(db: Session, *, rule_id: int, released_at: datetime) -> None:
                 next_retry_at = NULL,
                 updated_at = :released_at
             WHERE id = :id
-              AND status = 'APPLIED'
+              AND status IN ('APPLIED', 'FAILED')
             """
         ),
         {"id": rule_id, "released_at": format_db_utc(released_utc)},
     )
-    _ensure_one_row_changed(result, f"firewall rule is not APPLIED: {rule_id}")
+    _ensure_one_row_changed(result, f"firewall rule is not APPLIED or FAILED: {rule_id}")
 
 
 def reset_failed_to_pending(
@@ -327,7 +480,7 @@ def reset_failed_to_pending(
         ).mappings().first()
         if row is None or row["status"] != FAILED:
             raise ValueError(f"firewall rule is not FAILED: {rule_id}")
-        _require_automatic_response_eligible(db, dict(row), now=requested_utc)
+        _require_application_eligible(db, dict(row), now=requested_utc)
     except Exception:
         db.rollback()
         raise

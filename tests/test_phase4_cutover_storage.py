@@ -50,6 +50,33 @@ def test_create_sqlite_backup_writes_consistent_snapshot_and_sha256(tmp_path: Pa
         )
 
 
+def test_create_sqlite_backup_defers_only_explicit_integrity_check(tmp_path,monkeypatch):
+    from edge.scripts import phase4_cutover_storage as storage
+    source=tmp_path/"source.db";create_source_database(source)
+    original=storage._database_checks;checked=[]
+    def checks(path):
+        checked.append(path);return original(path)
+    monkeypatch.setattr(storage,"_database_checks",checks)
+    default=storage.create_sqlite_backup(source,tmp_path/"default.db")
+    deferred=storage.create_sqlite_backup(source,tmp_path/"deferred.db",verify=False)
+    assert checked==[default.database_path]
+    assert default.integrity_check=="ok" and default.foreign_key_violations==()
+    assert deferred.integrity_check=="NOT_CHECKED" and deferred.foreign_key_violations==()
+    assert deferred.sha256==hashlib.sha256(deferred.database_path.read_bytes()).hexdigest()
+    assert deferred.sha256_path.read_text()==f"{deferred.sha256}  {deferred.database_path.name}\n"
+    assert storage.verify_database(deferred.database_path).integrity_check=="ok"
+    assert checked==[default.database_path,deferred.database_path]
+
+
+@pytest.mark.parametrize("option",[None,0,1,"false"])
+def test_backup_verification_option_refuses_nonboolean_before_artifacts(tmp_path,option):
+    source=tmp_path/"source.db";create_source_database(source)
+    backup=tmp_path/"backup.db"
+    with pytest.raises(CutoverSafetyError,match="must be boolean"):
+        create_sqlite_backup(source,backup,verify=option)
+    assert not backup.exists() and not backup.with_suffix(".db.sha256").exists()
+
+
 def test_create_sqlite_backup_rejects_source_as_destination(tmp_path: Path) -> None:
     source = tmp_path / "operational.db"
     create_source_database(source)

@@ -13,6 +13,8 @@ from .routers import (
     health,
     isolation,
     mqtt_logs,
+    models,
+    packet_pair_recovery,
     packet_feature_logs,
     recovery,
     trust_score,
@@ -51,3 +53,5 @@ app.include_router(detection_events.router, prefix="/api")
 app.include_router(trust_score.router, prefix="/api")
 app.include_router(isolation.router, prefix="/api")
 app.include_router(recovery.router, prefix="/api")
+app.include_router(models.router, prefix="/api")
+app.include_router(packet_pair_recovery.router, prefix="/api")

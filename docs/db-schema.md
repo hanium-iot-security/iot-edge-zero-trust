@@ -34,6 +34,23 @@ Migration 009 (`mqtt_raw_payload`)는 `mqtt_logs`에 수신 원본 바이트(`pa
 저장이 실패하고(오류 로그만 남고 해당 메시지는 저장되지 않는다) 수신 증적이 유실된다. 009는 컬럼 추가와
 Trigger만 포함하고 기존 컬럼의 값은 바꾸지 않는다.
 
+Migration 011 (`pi_input_isolation`)은 `firewall_rules`에 scope와 관리자 확장 승인
+메타데이터를 추가한다. 기존 행은 MQTT TCP 1883과 기존 ID·열 값을 유지하고 새 광역
+행만 별도 ID로 생성한다. Runner는 FK를 잠시 끄는 재구성 경로에서 011 전체를 원자적으로
+적용하고 `foreign_key_check`/`integrity_check` 후 commit한다. 오류면 테이블·행·인덱스·
+`sqlite_sequence`·011 완료 기록이 rollback되며 원래 FK 설정도 복구한다. 삭제된 높은 ID의
+sequence와 기존 Release FK를 보존한다. 완료 뒤 되돌리는 down Migration은 제공하지
+않으므로 운영 적용 전 일관된 백업과 사본 검증이 필요하다. 운영 DB의 011 적용/배포는 아직
+미실행 상태이며 로컬 검증을 운영 적용으로 표시하지 않는다.
+
+Migration 012 (`device_ai_policy_revisions`)는 기기별 AI 모드(OFF/OBSERVE) 불변 이력 테이블을
+추가한다. 기존 기기의 모드는 만들지 않으며, 운영자 승인 목록으로
+`python -m db.backfill_device_ai_policies --db <복사본> --manifest <목록.json>`(기본 dry-run)을
+실행하기 전까지 기존 기기는 AI 설정 누락 상태다. 배포 순서는 012 적용 → 승인 목록 이관 →
+이 설정을 읽는 API·탐지기 배포다. 신규 등록과 AI 초기 기록을 연동하는 코드도 012 적용 후
+배포하며, AI 초기 기록이 실패하면 기기·등록 정책을 포함한 전체 등록이 rollback된다.
+012만 적용해서는 기존 동작이 바뀌지 않는다.
+
 적용과 복구: 007은 컬럼 추가를 포함하며 되돌리는(down) Migration이 없다. 운영 DB에는 먼저
 일관된 백업(SQLite backup API 등, 쓰기 중 파일 하나만 복사하지 않는다)을 만든 뒤 **복사본에서**
 Migration과 backfill dry-run을 확인하고 적용한다. 적용 중 오류가 나면 Migration 전체가 rollback되어
@@ -133,6 +150,37 @@ ACTIVE revision 1을 만든다. 이때 `registration_effective_from`은 NULL로 
 등록 판정을 바꾸지 않고, 그 Window의 정책은 추정하지 않는다(`POLICY_UNAVAILABLE`).
 새 개발 DB는 `python db/create_tables.py` 뒤 `python db/seed_devices.py`가 기기와 초기 revision을
 한 트랜잭션으로 만든다.
+
+## device_ai_policy_revisions
+
+기기별 AI 모드 Revision을 쌓는 불변 이력이다. 등록 상태·정책 값(`device_policy_revisions`)과 별개의
+설정이며 행을 수정하거나 삭제할 수 없다(트리거). 변경은 새 revision으로만 한다.
+
+| 컬럼 | 타입 | 설명 |
+| --- | --- | --- |
+| id | INTEGER | primary key autoincrement |
+| device_id | TEXT | `devices(device_id)` FK, `ON DELETE RESTRICT` |
+| revision | INTEGER | 기기별 1부터 연속 증가(이전 revision + 1) |
+| mode | TEXT | `OFF` 또는 `OBSERVE`. ENFORCE는 저장할 수 없음 |
+| effective_from | TEXT | 효력 시작 시각. UTC `YYYY-MM-DDTHH:MM:SSZ`, 정수 초, 10초 경계. 이전 revision보다 커야 함 |
+| created_at | TEXT | 작성 시각(UTC `Z`, 소수 초 허용) |
+| created_by | TEXT | 서버 인증 결과의 작성자(1~128자) |
+| reason | TEXT | 변경 사유 1~500자 |
+
+`UNIQUE(device_id, revision)`, `UNIQUE(device_id, effective_from)`를 둔다. 신규 등록은 기기·정책
+revision 1과 같은 트랜잭션에서 **OFF revision 1**을 같은 효력 시각으로 만든다. 예정 revision은
+기기당 최대 1개이고 효력은 엄격히 다음 UTC 10초 경계다. 이 규칙과 "DISABLED 기기를 OBSERVE로 바꿀 수
+없음"은 서버 시각이나 다른 테이블이 필요해 `edge/policy`가 검사한다. 전역 `TRUST_AI_MODE` 확인은
+설정을 변경하는 API의 책임이다.
+
+설정이 없거나 손상된 기기는 OFF로 간주하지 않는다. 저장소는 `AI_POLICY_UNAVAILABLE`(API 503)을 알리고
+`resolve_ai_mode`는 그 Window의 AI를 제외할 근거를 반환한다. 다른 기기와 Raw·Feature·Rule 처리에는
+영향이 없다. Window 시작 시각에 효력이 있던 revision을 사용하므로 OFF→OBSERVE 전환이 과거 OFF
+구간을 되살리지 않는다.
+
+기존 기기의 초기 모드는 승인 목록(`device-ai-policy-backfill-v1`)으로만 만든다. DB의 모든 기기가 목록에
+있어야 하며 하나라도 빠지면 아무것도 변경하지 않는다. 이미 revision이 있는 기기는 건너뛰므로 재실행해도
+덮어쓰지 않는다. 이관 효력 시각 이전 Window는 설정 누락으로 남는다.
 
 ## mqtt_logs
 
@@ -418,19 +466,25 @@ Event와 Source Trust History를 수정하지 않고, 어떤 감점을 어떤 Ba
 
 ## firewall_rules
 
-Phase 4용 firewall 요청/상태 테이블입니다. 격리 진입 시 Trust Score v2 transaction에서 `PENDING` row를 만들 수 있고, Firewall Worker가 실제 iptables 적용·해제와 reconciliation을 담당합니다. Repository는 `PENDING -> APPLIED`, `PENDING -> PENDING/FAILED`, `APPLIED -> REMOVED`, 관리자 재시도용 `FAILED -> PENDING`만 허용합니다.
+Firewall 요청/상태 테이블입니다. 격리 진입 시 Trust Score v2 transaction은 기존 MQTT
+scope의 `PENDING` 행을 만들고, Migration 011 관리 API는 기존 isolated/APPLIED MQTT
+규칙에 연결된 새 광역 PENDING 행을 만듭니다. Worker가 실제 iptables 적용·해제와
+reconciliation을 담당합니다. Repository는 `PENDING -> APPLIED`, `PENDING -> PENDING/FAILED`,
+`APPLIED/FAILED -> REMOVED`, 관리자 재시도용 `FAILED -> PENDING`을 지원합니다.
+FAILED 정리는 정확한 PENDING 해제 감사 요청과 실제 규칙 부재 확인이 필요합니다.
 
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |
 | id | INTEGER | primary key autoincrement |
-| device_id | TEXT | 대상 기기 |
-| source_ip | TEXT | 차단 대상 IP |
-| protocol | TEXT | protocol, 기본 `tcp`, 1차 계약은 `tcp`만 허용 |
-| dest_port | INTEGER | destination port, 1차 계약은 `1883`만 허용 |
-| action | TEXT | firewall action, 1차 계약은 `DROP`만 허용 |
+| device_id | TEXT | 대상 `devices.device_id` FK, NULL 허용, `ON DELETE SET NULL` |
+| source_ip | TEXT | 차단 대상 IPv4, NOT NULL |
+| scope | TEXT | 011. NOT NULL, 기본 `MQTT_IPV4_TCP_1883`, 또는 `PI_INPUT_IPV4_ALL` |
+| protocol | TEXT | 기본 `tcp`; MQTT scope는 `tcp`, 광역 scope는 NULL |
+| dest_port | INTEGER | 기본 `1883`; MQTT scope는 `1883`, 광역 scope는 NULL |
+| action | TEXT | NOT NULL, 기본 `DROP`, `DROP`만 허용 |
 | status | TEXT | `PENDING`, `APPLIED`, `FAILED`, `REMOVED` |
 | reason | TEXT | 요청 사유 |
-| trigger_event_id | INTEGER | 관련 detection event |
+| trigger_event_id | INTEGER | `detection_events.id` FK, NULL 허용, `ON DELETE SET NULL` |
 | applied_at | DATETIME | 적용 시각 |
 | released_at | DATETIME | 해제 시각 |
 | last_error | TEXT | 마지막 오류 메시지 |
@@ -439,18 +493,48 @@ Phase 4용 firewall 요청/상태 테이블입니다. 격리 진입 시 Trust Sc
 | next_retry_at | DATETIME | 다음 재시도 가능 시각 |
 | created_at | DATETIME | 요청 생성 시각 |
 | updated_at | DATETIME | 수정 시각 |
+| source_rule_id | INTEGER | 011. 원본 `firewall_rules.id` FK, `ON DELETE RESTRICT`; 광역은 양수 필수, MQTT는 NULL |
+| approved_policy_revision | INTEGER | 011. 승인한 현재 ACTIVE policy revision; 광역은 양수 필수, MQTT는 NULL |
+| requested_by | TEXT | 011. 광역은 서버 인증 principal, 공백 제외 비어 있지 않아야 함; 기존 행은 NULL |
+| request_id | TEXT | 011. UNIQUE nullable; 광역은 소문자 정규 UUID4 필수, MQTT는 NULL |
 
-`PENDING`, `APPLIED` 상태에서는 `(source_ip, protocol, dest_port)` 조합이 중복될 수 없습니다.
+011 CHECK는 scope별 protocol/port/승인 메타데이터 조합을 강제합니다. MQTT는 `tcp`/`1883`,
+NULL source/revision/request ID이고 광역은 NULL protocol/port, 양의 source/revision, 정규 UUID4,
+비어 있지 않은 actor/reason이어야 합니다. `approved_policy_revision`은 별도 FK가 아니라
+승인값이며 현재 적용 정책과의 동일성은 API/Worker에서 다시 검사합니다.
+
+011부터 `PENDING`/`APPLIED`는 `(source_ip, scope)`가 유일합니다. 같은 IP의 MQTT와 광역
+규칙은 공존할 수 있으나 같은 scope의 활성 중복은 거부합니다. 기존 status/IP 인덱스는
+재생성됩니다. 자동 신규 규칙은 MQTT scope 기본값을 사용하며 기존 ID를 광역으로 바꾸지
+않습니다. 최초 광역에는 source APPLIED·현재 isolated 기기·동일 소유 IPv4·현재 ACTIVE
+revision·해제 대기 없음이 필요합니다. source ID/사양/device/IP 연결과 승인 revision은
+실제 적용·재시도·복원 직전 다시 검사합니다.
+
+동일 `request_id`의 동일 principal/source/device/IP/revision/scope/reason 재요청은 FAILED/
+REMOVED에서도 같은 행을 반환합니다. 다른 바인딩은 거부하며 새 UUID도 미해결 이전 광역을
+우회하지 못합니다. 기존 광역 REMOVED의 새 승인과 이미 APPLIED인 광역의 source REMOVED
+복원에는 정확한 ID의 SUCCEEDED 해제 감사, non-null `released_at`,
+`requested_at <= released_at <= processed_at`을 요구합니다. 최초 PENDING 광역은 source
+REMOVED에서 적용할 수 없고, 원본 MQTT는 자동 제거하지 않습니다.
+
+완전한 pre-011 DB는 기존 열과 `(source_ip, protocol, dest_port)` 활성 유일성을 유지합니다.
+조회와 Release JOIN은 MQTT scope/NULL 승인 메타데이터로 읽기 호환하며 기존 자동·해제
+경로를 유지합니다. 광역 승인에는 011이 필요하고 부분 열/완료 버전 불일치는 거부합니다.
 
 ## firewall_release_requests
 
 Phase 6-B용 관리자 승인 Firewall Release 요청 queue입니다. Backend API는 이 테이블에
 `PENDING` 요청을 생성할 뿐 sudo/iptables를 실행하지 않습니다. Firewall Worker가 공유
 lock 아래에서 `release_rule()`을 호출하고 요청을 `SUCCEEDED` 또는 `FAILED`로 종료합니다.
+API는 APPLIED 또는 FAILED 규칙에 대해 요청을 저장합니다. Worker의 FAILED 잔여 정리는
+정확한 rule ID의 PENDING 요청으로만 허용하고 scope/IP/ID를 모두 맞춰 삭제·부재 확인합니다.
+다른 scope는 제거하지 않으며 IP·정책·보호 목록 변경 후에도 정확한 과거 규칙 정리는 허용합니다.
 Recovery Preflight는 대상 Device/IP에 연결된 `PENDING` release request가 있으면
 Baseline Recovery를 거부합니다. `FAILED` release request는 감사 이력으로 보존하며,
-실제 Recovery 가능 여부는 Firewall Rule의 `REMOVED` 상태와 runtime
-`VERIFIED_RELEASED` 기준으로 판단합니다.
+실제 Recovery에는 대상 Device/같은 IP에 연결된 모든 scope의 활성 PENDING/APPLIED 규칙과
+PENDING 해제 요청이 없어야 하고 마지막 Firewall 시도/해제 처리 이후 fresh runtime
+`VERIFIED_RELEASED` 관측이 필요합니다.
+REMOVED 상태만으로 성공을 증명하지 않으며 FAILED 규칙의 runtime DROP이 남아 있어도 HOLD합니다.
 
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |
@@ -468,6 +552,9 @@ Baseline Recovery를 거부합니다. `FAILED` release request는 감사 이력�
 동일 `firewall_rule_id`에는 `status = 'PENDING'` 요청이 하나만 존재할 수 있습니다.
 `SUCCEEDED` 또는 `FAILED`로 종료된 뒤에는 새 요청을 만들 수 있습니다. `PENDING`은
 `processed_at`과 `last_error`가 없어야 하며, `SUCCEEDED`는 `last_error`가 없어야 합니다.
+요청 생성에는 대상 Rule이 APPLIED/FAILED여야 합니다. Rule REMOVED commit 뒤 Request 완료
+전에 중단되면 Worker는 다음 cycle에서 정확한 규칙 부재를 재확인하고 SUCCEEDED로 수렴시킵니다.
+`processed_at`은 실제 요청 완료 시각을 유지하므로 Rule의 `released_at`보다 늦을 수 있습니다.
 
 ## planned_maintenance_operations / planned_maintenance_resumes
 
@@ -546,6 +633,6 @@ READY를 기록하는 Transaction부터 source Session·Segment·Packet Feature�
 | `idx_trust_score_history_window` | window 기반 Trust Score history 조회 |
 | `idx_firewall_rules_status` | firewall status 조회 |
 | `idx_firewall_rules_source_ip` | source IP별 firewall rule 조회 |
-| `idx_firewall_rules_active_unique` | 활성 firewall rule 중복 방지 |
+| `idx_firewall_rules_active_unique` | PENDING/APPLIED `(source_ip, scope)` 유일성(011); pre-011은 `(source_ip, protocol, dest_port)` |
 | `uq_firewall_release_requests_pending_rule` | Rule별 PENDING release request 중복 방지 |
 | `idx_firewall_release_requests_status_requested` | Worker의 PENDING release request 조회 |

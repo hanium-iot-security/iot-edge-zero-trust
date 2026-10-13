@@ -151,8 +151,18 @@ def expected_backup_sha256(sha256_path: Path, backup_path: Path) -> str:
     return parts[0].lower()
 
 
-def create_sqlite_backup(source_path: str | Path, backup_path: str | Path) -> BackupArtifact:
-    """Create and verify a transactionally consistent SQLite backup."""
+def create_sqlite_backup(
+    source_path: str | Path, backup_path: str | Path, *, verify: bool = True
+) -> BackupArtifact:
+    """Create a consistent backup and SHA256 manifest; verify fully by default.
+
+    Explicit ``verify=False`` returns ``integrity_check='NOT_CHECKED'``. Its
+    empty foreign-key tuple is not verification evidence: the caller must check
+    the actual backup and checksum before using it for a recovery mutation.
+    """
+
+    if type(verify) is not bool:
+        raise CutoverSafetyError("Backup verification option must be boolean")
 
     source = Path(source_path).expanduser().resolve()
     backup = Path(backup_path).expanduser().resolve()
@@ -170,7 +180,9 @@ def create_sqlite_backup(source_path: str | Path, backup_path: str | Path) -> Ba
     with sqlite3.connect(source) as source_connection, sqlite3.connect(backup) as backup_connection:
         source_connection.backup(backup_connection)
 
-    integrity, foreign_key_violations = _database_checks(backup)
+    integrity, foreign_key_violations = (
+        _database_checks(backup) if verify else ("NOT_CHECKED", ())
+    )
     digest = file_sha256(backup)
     sha256_path.write_text(f"{digest}  {backup.name}\n", encoding="utf-8")
     return BackupArtifact(
