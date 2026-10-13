@@ -557,6 +557,7 @@ export default function Devices() {
       if (
         !isManualRefresh &&
         activeRequest?.controller &&
+        !activeRequest.controller.signal.aborted &&
         activeRequest.queryKey === queryKey
       ) {
         return;
@@ -680,6 +681,7 @@ export default function Devices() {
   useEffect(() => {
     return () => {
       listRequestRef.current?.controller?.abort();
+      listRequestRef.current = null;
       detailAbortRef.current?.abort();
     };
   }, []);

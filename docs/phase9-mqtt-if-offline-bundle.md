@@ -4,6 +4,8 @@
 
 [P9-02 계획](https://app.notion.com/p/3f296c0fdc1c80f78f50d43800e25b72)은 공식 학습 전에 P9-01 자료 적격성과 독립 Train/Validation 그룹을, 운영 적용 전에 P9-03 시작 경계 검증을 요구한다. 해당 계약과 구현은 별도 남은 작업이다. 기존 150분 후보 자료는 사용하지 않았다. 이 인터페이스는 Dataset manifest, 승인, 그룹 배정, split, 자료 해시, 정상 정책 버전, 평가 결과를 만들거나 검증하지 않는다.
 
+후속 개발 도구의 입력 연결·독립 Train/보정/평가·후보 Bundle 생성은 [MQTT IF 후보 학습](phase9-mqtt-if-training.md)에 정리했다. 기존 inspector가 자료 승인이나 보고서 통계의 진실성을 검증하지 않는 경계는 유지한다.
+
 ## 입력과 점수
 
 `ai.mqtt_if_contract`는 아래 순서를 유지하고 identity transform을 적용한다.
