@@ -396,6 +396,13 @@ Response wrapper:
 }
 ```
 
+Each item also returns nullable `broker_target_ip`, `broker_target_port`, and
+`broker_target_syn_count` from the stored row. Migration 013 records the verified
+IPv4 destination, TCP port 1883, and inbound SYN=1/ACK=0 packet count in the
+original 10-second window (including retransmissions). Historical or unconfigured
+rows return all three as `null`; a measured zero is `0`. Current environment
+settings never rewrite the meaning of historical rows.
+
 Each item includes packet window fields from `packet_feature_logs`, the joined `session_id`, UTC `Z` timestamps, and derived values based on the fixed 10 second packet window:
 
 ```text

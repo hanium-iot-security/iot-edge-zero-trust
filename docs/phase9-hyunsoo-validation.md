@@ -1,5 +1,14 @@
 # Phase 9 현수 구현·검증 기록
 
+## 2026/10/13 Broker Feature 후속 연결
+
+아래의 Broker Feature 미연결 기록은 당시 기준이다. #118의 Migration 013에서
+`broker_target_ip`, `broker_target_port`, `broker_target_syn_count`를 추가하고
+실제 PCAP 추출 → 저장 → 조회 API → Packet Rule 근거를 연결했다.
+기존 행·미설정은 NULL, 검증한 Pi IPv4/TCP 1883의 SYN=1/ACK=0만 집계한다.
+설정과 이관·검증 범위는 [Broker Feature 연결](phase9-broker-target-feature.md)을 따른다.
+운영 Pi 주소 확인·Migration 적용·공격 시험은 아직 수행하지 않았다.
+
 ## 기준선과 범위
 
 - 작업 전 로컬 `feature/hyunsu-phase8-policy-trust`는 깨끗했고 HEAD는 `8189cd3`였다. 원격 `develop`은 계획 기준 `53ec270`이며 Phase 8 PR #88 head `4ace33c`가 포함된다. 기존 브랜치를 유지하고 `codex/phase9-hyunsoo`를 `origin/develop`에서 생성했다. 이 작업에서 merge, 운영 DB 변경, Pi 배포·재시작은 하지 않았다.

@@ -388,6 +388,10 @@ class TestPacketRulePolicy:
 class TestDetectPacketRules:
     def _row(self, **overrides) -> dict:
         base = {
+            "direction": "INBOUND",
+            # Explicit endpoint evidence for handcrafted verified-count cases.
+            "broker_target_ip": "192.168.0.20",
+            "broker_target_port": 1883,
             "packet_count": 10,
             "total_bytes": 1000,
             "distinct_dest_port_count": 2,
@@ -505,6 +509,33 @@ class TestDetectPacketRules:
         event_types = {event["event_type"] for event in detect_packet_rules(row, TEST_POLICY)}
         assert ("BROKER_DOS_SUSPECTED" in event_types) is expected
 
+    @pytest.mark.parametrize("overrides", [
+        {"broker_target_syn_count": -1},
+        {"broker_target_syn_count": True},
+        {"broker_target_syn_count": 31.0},
+        {"broker_target_syn_count": "31"},
+        {"broker_target_ip": None},
+        {"broker_target_ip": "broker.local"},
+        {"broker_target_ip": "::1"},
+        {"broker_target_ip": 123},
+        {"broker_target_port": None},
+        {"broker_target_port": "1883"},
+        {"broker_target_port": 8883},
+        {"direction": "OUTBOUND"},
+        {"direction": None},
+    ])
+    def test_present_broker_count_requires_stored_endpoint_evidence(self, overrides) -> None:
+        row = self._row(
+            tcp_syn_count=40, broker_target_syn_count=31, mqtt_related_packet_count=101,
+        )
+        row.update(overrides)
+        with pytest.raises(ValueError, match="broker_target"):
+            detect_packet_rules(row, TEST_POLICY)
+
+    def test_outbound_zero_broker_count_is_not_a_broker_attack(self) -> None:
+        row = self._row(direction="OUTBOUND", broker_target_syn_count=0)
+        assert detect_packet_rules(row, TEST_POLICY) == []
+
     def test_multiple_rules_can_fire_together(self) -> None:
         row = self._row(
             packet_count=1000,
@@ -595,6 +626,25 @@ class TestDetectPacketRules:
 
 
 class TestPacketRuleDetectorStage:
+    def test_count_without_stored_endpoint_does_not_advance_checkpoint(self, SessionLocal) -> None:
+        with SessionLocal() as db:
+            db.execute(text("ALTER TABLE packet_feature_logs ADD COLUMN broker_target_syn_count INTEGER"))
+            session_pk = _insert_capture_session(db)
+            _insert_packet_source(
+                db, session_pk=session_pk, feature_id=1, segment_id=1,
+                tcp_syn_count=40, mqtt_related_packet_count=150,
+            )
+            db.execute(text("UPDATE packet_feature_logs SET broker_target_syn_count=40"))
+            db.commit()
+        with SessionLocal() as db:
+            with pytest.raises(ValueError, match="stored IPv4 broker_target_ip"):
+                with db.begin():
+                    _stage().run_until(db, cycle_range_start=RANGE_START, cycle_cutoff=CUTOFF)
+            assert get_detector_checkpoint(
+                db, detector_name="packet_rule", source_table="packet_feature_logs",
+            ) is None
+            assert db.execute(text("SELECT COUNT(*) FROM detection_events")).scalar_one() == 0
+
     def test_missing_broker_metric_cannot_reduce_trust_or_request_firewall(
         self, SessionLocal,
     ) -> None:
@@ -634,6 +684,8 @@ class TestPacketRuleDetectorStage:
         with SessionLocal() as db:
             if broker_syn is not None:
                 db.execute(text("ALTER TABLE packet_feature_logs ADD COLUMN broker_target_syn_count INTEGER"))
+                db.execute(text("ALTER TABLE packet_feature_logs ADD COLUMN broker_target_ip TEXT"))
+                db.execute(text("ALTER TABLE packet_feature_logs ADD COLUMN broker_target_port INTEGER"))
             session_pk = _insert_capture_session(db)
             _insert_packet_source(
                 db, session_pk=session_pk, feature_id=1, segment_id=1,
@@ -641,7 +693,8 @@ class TestPacketRuleDetectorStage:
                 mqtt_related_packet_count=150,
             )
             if broker_syn is not None:
-                db.execute(text("UPDATE packet_feature_logs SET broker_target_syn_count=:count"),
+                db.execute(text("""UPDATE packet_feature_logs SET broker_target_syn_count=:count,
+                    broker_target_ip='192.168.0.20', broker_target_port=1883"""),
                            {"count": broker_syn})
             db.commit()
 
@@ -653,6 +706,10 @@ class TestPacketRuleDetectorStage:
                 ORDER BY id
             """)).mappings().all()
             event_types = {row["event_type"] for row in events}
+            for event in events:
+                evidence = json.loads(event["evidence_json"])
+                assert evidence["broker_target_ip"] == ("192.168.0.20" if broker_syn is not None else None)
+                assert evidence["broker_target_port"] == (1883 if broker_syn is not None else None)
             assert "PORT_SCAN" in event_types
             if expected_broker_event is None:
                 assert "BROKER_DOS_SUSPECTED" not in event_types

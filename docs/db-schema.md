@@ -355,10 +355,15 @@ Packet segment에서 추출한 peer/direction별 feature row입니다.
 | tcp_syn_count | INTEGER | TCP SYN 수 |
 | mqtt_related_packet_count | INTEGER | MQTT 관련 packet 수 |
 | non_mqtt_tcp_udp_packet_count | INTEGER | MQTT 외 TCP/UDP packet 수 |
+| broker_target_ip | TEXT | Migration 013: 검증한 Broker IPv4, 미설정·과거 행 NULL |
+| broker_target_port | INTEGER | Migration 013: 목적지 TCP 1883, 미설정·과거 행 NULL |
+| broker_target_syn_count | INTEGER | Migration 013: 해당 목적지의 SYN=1/ACK=0 패킷 수, 미설정·과거 행 NULL |
 | capture_scope | TEXT | capture scope |
 | created_at | DATETIME | 생성 시각 |
 
 `(capture_segment_id, peer_ip, direction)`은 중복될 수 없습니다. `window_start`, `window_end`는 정수 초 UTC 경계의 `YYYY-MM-DDTHH:MM:SSZ` 형식이어야 하며, feature window는 정확히 10초여야 합니다. 소수점 이하 초가 포함된 시각은 저장하지 않습니다. 격리 상태 기기의 feature 저장을 막는 DB 제약은 두지 않습니다.
+
+Migration 013은 세 Broker 필드를 함께 NULL 또는 함께 유효한 값으로 저장합니다. 기존 행은 재계산하거나 0으로 채우지 않습니다. 설정된 대상에서 SYN이 없을 때만 0이며 재전송도 패킷 횟수에 포함합니다. 기존 SYN·MQTT 지표와 Packet IF의 6개 입력은 유지합니다. 상세 설정은 [Broker Feature 연결](phase9-broker-target-feature.md)을 따릅니다.
 
 ## gateway_metrics
 

@@ -169,6 +169,7 @@ def apply_migrations(
         _ensure_schema_migrations_table(connection)
         applied_versions = _fetch_applied_versions(connection)
         _validate_applied_migration_files_present(applied_versions, migrations)
+        _validate_applied_migration_names(connection, migrations)
         applied_versions.update(
             _baseline_legacy_001_if_needed(
                 connection,
@@ -226,6 +227,21 @@ def _validate_applied_migration_files_present(
             "Applied migration files are missing from the current branch: "
             f"{missing_applied_versions}"
         )
+
+
+def _validate_applied_migration_names(
+    connection: sqlite3.Connection,
+    migrations: list[Migration],
+) -> None:
+    expected_names = {migration.version: migration.name for migration in migrations}
+    for row in connection.execute("SELECT version, name FROM schema_migrations"):
+        expected = expected_names[row["version"]]
+        if row["name"] != expected:
+            raise MigrationError(
+                f"Applied migration {row['version']:03d} name mismatch: "
+                f"database={row['name']!r}, current branch={expected!r}. "
+                "Preserve this database and reconcile its migration history before applying."
+            )
 
 
 def _baseline_legacy_001_if_needed(

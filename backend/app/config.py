@@ -85,6 +85,10 @@ class Settings(BaseSettings):
     packet_if_expected_model_version: str = ""
     packet_if_expected_bundle_sha256: str = ""
 
+    # Explicit IPv4/TCP 1883 Broker target; empty IP leaves its metric unknown.
+    broker_target_ip: str = ""
+    broker_target_port: int = 1883
+
     # Packet Rule Detector
     packet_rule_packet_rate_threshold: float = 10.0
     packet_rule_byte_rate_threshold: float = 2_500.0

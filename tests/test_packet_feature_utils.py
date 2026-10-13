@@ -548,3 +548,59 @@ class TestExportPacketFeaturesCsv:
         with open(out, newline="") as f:
             lines = f.readlines()
         assert len(lines) == 1  # header only
+
+
+class TestBrokerTargetFeatures:
+    @pytest.mark.parametrize("target,port", [
+        ("::1",1883), ("192.168.0.020",1883), (" 192.168.0.20",1883),
+        ("192.168.0.99",1883), (PI_IP,9001), ("",9001), (None,9001),
+        (PI_IP,True), (PI_IP,1883.0),
+    ])
+    def test_invalid_configuration_rejected_even_without_packets(self, target, port):
+        with pytest.raises(ValueError, match="Broker"):
+            build_packet_features([], PI_IP, WINDOW_START, WINDOW_END,
+                                  broker_target_ip=target, broker_target_port=port)
+
+    def test_missing_target_is_unknown_but_configured_no_syn_is_zero(self):
+        packets = [_tcp_pkt(ESP_IP, PI_IP, 50000, 1883, flags=0x10)]
+        unknown = build_packet_features(packets, PI_IP, WINDOW_START, WINDOW_END)[0]
+        measured = build_packet_features(packets, PI_IP, WINDOW_START, WINDOW_END,
+                                         broker_target_ip=PI_IP)[0]
+        keys = ("broker_target_ip", "broker_target_port", "broker_target_syn_count")
+        assert tuple(unknown[key] for key in keys) == (None,None,None)
+        assert tuple(measured[key] for key in keys) == (PI_IP,1883,0)
+        assert {key:value for key,value in unknown.items() if key not in keys} == {
+            key:value for key,value in measured.items() if key not in keys}
+
+    def test_only_destination_syn_without_ack_inbound_in_half_open_window(self):
+        retransmit = _tcp_pkt(ESP_IP, PI_IP, 50000, 1883, flags=0x02, offset=1)
+        packets = [
+            _tcp_pkt(ESP_IP, PI_IP, 50000, 1883, flags=0x02),
+            retransmit, retransmit,
+            _tcp_pkt(ESP_IP, PI_IP, 50000, 1883, flags=0x12, offset=2),
+            _tcp_pkt(ESP_IP, PI_IP, 1883, 9001, flags=0x02, offset=3),
+            _udp_pkt(ESP_IP, PI_IP, 50000, 1883, offset=4),
+            _tcp_pkt(PI_IP, ESP_IP, 50000, 1883, flags=0x02, offset=5),
+            _tcp_pkt(ESP_IP, EXTERNAL_IP, 50000, 1883, flags=0x02, offset=6),
+            _tcp_pkt(ESP_IP, PI_IP, 50000, 1883, flags=0x02, offset=-0.1),
+            _tcp_pkt(ESP_IP, PI_IP, 50000, 1883, flags=0x02, offset=10),
+        ]
+        rows = build_packet_features(packets, PI_IP, WINDOW_START, WINDOW_END,
+                                     broker_target_ip=PI_IP)
+        by_direction = {row["direction"]:row for row in rows}
+        assert by_direction[INBOUND]["broker_target_syn_count"] == 3
+        assert by_direction[OUTBOUND]["broker_target_syn_count"] == 0
+        assert by_direction[INBOUND]["tcp_syn_count"] == 5
+        assert by_direction[INBOUND]["mqtt_related_packet_count"] == 5
+        for row in rows:
+            assert (row["broker_target_ip"], row["broker_target_port"]) == (PI_IP,1883)
+
+    def test_csv_contract_does_not_gain_broker_columns(self, tmp_path):
+        packets = [_tcp_pkt(ESP_IP, PI_IP, 50000, 1883, flags=0x02)]
+        rows = build_packet_features(packets, PI_IP, WINDOW_START, WINDOW_END,
+                                     broker_target_ip=PI_IP)
+        output = tmp_path / "unchanged.csv"
+        export_packet_features_csv(rows, output)
+        with output.open(newline="",encoding="utf-8") as handle:
+            assert tuple(csv.DictReader(handle).fieldnames) == CSV_FIELDS
+        assert all(not field.startswith("broker_") for field in CSV_FIELDS)

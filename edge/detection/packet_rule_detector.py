@@ -279,6 +279,18 @@ def detect_packet_rules(
         type(broker_syn_value) is not int or broker_syn_value < 0
     ):
         raise ValueError("broker_target_syn_count must be non-negative or NULL")
+    if broker_syn_value is not None:
+        broker_ip = row.get("broker_target_ip")
+        try:
+            valid_ip = isinstance(broker_ip, str) and ip_address(broker_ip).version == 4
+        except ValueError:
+            valid_ip = False
+        if not valid_ip:
+            raise ValueError("broker_target_syn_count requires a stored IPv4 broker_target_ip")
+        if type(row.get("broker_target_port")) is not int or row["broker_target_port"] != 1883:
+            raise ValueError("broker_target_syn_count requires stored broker_target_port 1883")
+        if broker_syn_value > 0 and row.get("direction") != "INBOUND":
+            raise ValueError("positive broker_target_syn_count requires INBOUND direction")
     broker_syn_count = broker_syn_value
     if broker_syn_count is None and (
         tcp_syn_count > policy.broker_dos_tcp_syn_threshold
@@ -553,11 +565,11 @@ def _select_packet_feature_rows(
         str(row["name"])
         for row in db.execute(text("PRAGMA table_info(packet_feature_logs)")).mappings()
     }
-    # Migration owner adds this nullable column. Until then, and for old rows
-    # after migration, the Broker-specific verdict is unavailable.
-    broker_projection = (
-        "pfl.broker_target_syn_count"
-        if "broker_target_syn_count" in feature_columns else "NULL"
+    # Legacy schemas/rows have no verified endpoint evidence. Never infer it
+    # from today's environment while replaying historical rows.
+    broker_projection = ",\n                ".join(
+        f"{'pfl.' + name if name in feature_columns else 'NULL'} AS {name}"
+        for name in ("broker_target_ip", "broker_target_port", "broker_target_syn_count")
     )
     rows = db.execute(
         text(
@@ -577,7 +589,7 @@ def _select_packet_feature_rows(
                 pfl.distinct_dest_port_count,
                 pfl.tcp_syn_count,
                 pfl.mqtt_related_packet_count,
-                {broker_projection} AS broker_target_syn_count,
+                {broker_projection},
                 pcs.window_start AS segment_window_start,
                 pcs.window_end AS segment_window_end,
                 pcs.status AS segment_status,
@@ -718,6 +730,8 @@ def _event_evidence(
         "observed_value": event["observed_value"],
         "threshold": event["threshold"],
         "reason": event.get("reason"),
+        "broker_target_ip": row.get("broker_target_ip"),
+        "broker_target_port": row.get("broker_target_port"),
         "unit": (
             "packets/second" if event["event_type"] == PACKET_RATE_ANOMALY
             else "bytes/second" if event["event_type"] == BYTE_RATE_ANOMALY
