@@ -10,6 +10,8 @@ Phase 8 기기 등록·정책 API는 [기기 정책 v1 계약](contracts/device-
 ```txt
 GET /api/health
 GET /api/models
+GET /api/runtime-status
+GET /api/ai-warnings
 GET /api/dashboard/summary
 GET /api/devices
 GET /api/devices/{device_id}
@@ -167,6 +169,84 @@ AI 설정 관련 503 코드는 `AI_POLICY_UNAVAILABLE`입니다. 기존 Rule 정
 
 운영에서는 Migration 012와 기존 기기의 승인 목록 이관을 먼저 마쳐야 합니다. API 요청으로
 Migration·이관을 실행하지 않으며, Pi 적용과 기기별 실제 추론·화면 연결은 별도 검증 대상입니다.
+
+## 실제 실행 근거와 AI 경고 조회
+
+두 API는 관리자 키 없는 읽기 전용입니다. Migration 014이 필요하며 요청 중 Migration·
+모델 로딩·Stage 활성화·서비스 제어를 수행하지 않습니다. SQLite의 한 읽기 snapshot에서
+실행 관측과 완료 기록 또는 경고 목록·total을 함께 읽습니다.
+
+### GET /api/runtime-status
+
+선택적인 `device_id`는 completion 목록만 필터링합니다. Stage 관측은 프로세스 전체 정보입니다.
+기존 등록 API와 동일한 대소문자·숫자·밑줄·하이픈 ID를 허용합니다.
+
+- `server_time`, `observed_at`, `run_id`, `boot_id`: 응답 시각과 실제 Orchestrator 관측의 출처.
+- `status`: 같은 Boot에서 45초 이내에 관측한 STARTING/RUNNING/FAILED/STOPPED 또는 UNKNOWN.
+  이는 마지막 관측 결과이며 현재 프로세스 생존을 보장하는 값이 아닙니다.
+- `last_observation_status`: 만료되어도 보존하는 마지막 기록의 상태.
+- `freshness`, `age_seconds`, `max_age_seconds`, `reason_code`: FRESH/STALE/MISSING/FUTURE/
+  BOOT_MISMATCH/BOOT_UNAVAILABLE 구분. 미래·다른 Boot·Boot 확인 불가도 UNKNOWN입니다.
+  Windows처럼 `/proc` Boot ID가 없는 환경에서 임의의 현재 Boot를 만들지 않습니다.
+- `stages`: 실제 실행 프로세스의 enabled/required, 초기화·완료·무입력·실패 관측,
+  실제 모델 version/hash, 마지막 완료 데이터 경계·입력 ID, 선택 행·이벤트 수.
+  `trust_ai_mode`는 실행 Cycle의 전역 Trust 모드이며 기기별 AI 선택 모드와 다릅니다.
+  `ai_device_policy_enabled`는 실제 Stage의 저장 정책 연결 사용 여부입니다. 과거 관측에는 null일 수 있습니다.
+- `completions`: 기기·탐지기별 마지막 원본 Window의 입력/추론/정상/이상/사유별 제외 수,
+  실제 모델·AI revision/mode와 run/Boot/관측 시각. CURRENT는 같은 최근 실행의 근거,
+  HISTORICAL은 이전 실행·오래된 근거입니다. CURRENT도 해당 기기의 현재 추론 성공 보장은 아닙니다.
+
+정상 추론은 `normal_count`로 확인하며 이벤트 없음·Checkpoint·API 설정으로 추정하지 않습니다.
+무입력은 `device_id=null, window_start=null`의 Stage 기록으로만 남깁니다. 다른 기기 전진이나
+빈 목록을 선택 기기의 정상으로 바꾸지 않습니다. 처리한 원본 Window 경계와 실제 관측 시각은
+서로 다르며, 과거 자료 replay가 최근 실행됐더라도 최근 데이터 처리 완료를 뜻하지 않습니다.
+현재 정책은 기존 `ai-policy` API에서 별도로 조회하며 완료 기록의 과거 revision을 덮지 않습니다.
+
+저장소는 있으나 관측이 없으면 200 UNKNOWN/MISSING과 null 시각·빈 목록을 반환합니다.
+스키마 누락·저장 자료 손상·DB 읽기 실패는 503 `RUNTIME_EVIDENCE_UNAVAILABLE`입니다.
+마지막 성공 완료 자료는 이후 Stage 실패·프로세스 재시작으로 삭제하지 않습니다.
+
+### GET /api/ai-warnings
+
+`device_id`, timezone 포함 `from`/`to`, `limit`(기본100, 1~500), `offset`(기본0)을 받습니다.
+한쪽 시각만 지정할 수 있고 UTC로 비교합니다. 기간에 완전히 포함되는 집계 bucket만 반환하며
+경계는 포함합니다. 역순·timezone 누락·UTC 범위 초과는 422, 같은 시작/종료는 빈 기간입니다.
+`bucket_start DESC,id DESC` 정렬과 같은 필터의 `{items,total}`을 제공합니다.
+
+목록은 버전별 기준 N에 도달하고 경고 생성 결정 또는 cooldown 억제 이력이 있는 집계만 포함합니다.
+N 미달 집계와 중단 뒤 지연 자료로만 N에 도달한 집계는 내부 보존하되 새 경고로 표시하지 않습니다.
+항목에는 기기·탐지기·이벤트 유형·모델·경고 정책 버전, bucket 시작/끝, 중복 Window를 제외한 count,
+최초/최근 Window, `notified_at`, `suppressed_count`, `closed`, `last_decision`, `updated_at`,
+원본 `event_ids`/`analysis_windows`가 있습니다. `notified_at`은 집계기의 경고 생성 결정 시각이며
+외부 알림 전송 성공을 뜻하지 않습니다. 이 변경은 외부 메시지를 전송하지 않습니다.
+
+기기별 추론 0·명시적 제외 또는 Stage 전체 무입력은 열린 집계를 `INPUT_INTERRUPTED`로 닫습니다.
+이후 같은 bucket의 지연 자료는 참조에 추가하되 새 경고를 만들지 않습니다. 다른 기기는 계속
+입력되지만 특정 기기의 행만 누락된 경우에는 개별 무수신을 자동 판정하지 않습니다.
+
+`server_time`, `observed_at`, `source_status`, `reason_code`로 자료 생성 상태를 함께 제공합니다.
+FRESH/RUNNING 관측과 명시된 경고 정책이 있을 때 AVAILABLE, 기준이 미설정이면
+POLICY_UNCONFIGURED, 관측 없음·만료·실패 등은 UNKNOWN입니다. 과거 집계는 그대로 조회하므로
+AVAILABLE은 최근 관측과 정책 존재를 뜻하며 기기별 selector 연결·추론·알림 전송을 보장하지 않습니다.
+실제 기기별 처리는 runtime-status의 완료 근거로 별도 확인합니다. 스키마·자료·DB 오류는
+503 `AI_WARNING_DATA_UNAVAILABLE`이며 원본 SQL·설정 경로·예외 메시지를 노출하지 않습니다.
+
+### 실행 기록 연결 범위
+
+Migration 014 뒤 `RUNTIME_EVIDENCE_ENABLED=true`인 기존 Orchestrator에서만 기록을 발행합니다.
+성공 Stage 관측·AI 완료·경고 저장은 기존 이벤트·Checkpoint와 같은 트랜잭션입니다.
+저장 실패 시 함께 rollback하며 초기화·실행 실패는 rollback 후 별도 실패 관측을 시도합니다.
+실패 기록도 저장하지 못하면 기존 관측의 만료로 확인 불가를 표시하고 원래 오류를 보존합니다.
+새 상주 프로세스나 메시지별 상태 쓰기를 만들지 않습니다.
+
+반복 경고는 `AI_WARNING_POLICY_VERSION`, `AI_WARNING_WINDOW_SECONDS`,
+`AI_WARNING_COUNT_THRESHOLD`, `AI_WARNING_COOLDOWN_SECONDS`를 모두 명시해야 합니다.
+운영 W/N/C 기본값은 없고 일부 설정만 있으면 Orchestrator 기동을 거부합니다. 실제 저장된
+OBSERVE 이상 이벤트와 일치하는 완료 근거만 집계합니다. 저장된 기기별 OFF/OBSERVE 적용은
+`AI_DEVICE_POLICY_ENABLED=true`와 Migration 015의 모델별 승인 시작 기록이 별도로 필요합니다.
+[기기별 추론 연결 절차](phase9-ai-policy-runtime.md)를 따르며 조회 API나 관측 설정만으로
+Stage·모델을 활성화하지 않습니다. 독립 detector runner의 관측 저장·실제 Pi·부하·화면 연결은
+별도 검증 대상입니다.
 
 ## 모델 정보 API
 

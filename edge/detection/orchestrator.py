@@ -34,6 +34,7 @@ def run_detection_cycle(
     stages: Iterable[DetectorStage],
     cycle_range_start: datetime,
     cycle_cutoff: datetime,
+    stage_completion_sink: Callable[[Session, DetectorRunResult], None] | None = None,
 ) -> OrchestratorRunResult:
     range_start, cutoff = validate_cycle_window(
         cycle_range_start=cycle_range_start,
@@ -51,6 +52,8 @@ def run_detection_cycle(
                     cycle_range_start=range_start,
                     cycle_cutoff=cutoff,
                 )
+                if stage_completion_sink is not None:
+                    stage_completion_sink(db, result)
             results.append(result)
         finally:
             db.close()
