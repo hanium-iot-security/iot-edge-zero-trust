@@ -103,13 +103,13 @@ def test_migration_preserves_ids_values_release_fk_indexes_and_deleted_sequence(
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('sqlite_sequence','schema_migrations')")}
         assert len(tables) == 19
         indexes = {value[0] for value in connection.execute("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='firewall_rules'")}
-    assert apply_migrations(database, MIGRATIONS_DIR).applied_versions == [11, 12, 13]
+    assert apply_migrations(database, MIGRATIONS_DIR).applied_versions == [11, 12, 13, 14]
     with sqlite3.connect(database) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         after = dict(connection.execute("SELECT * FROM firewall_rules WHERE id=?", (source,)).fetchone())
         assert {key: after[key] for key in before} == before
-        assert {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('sqlite_sequence','schema_migrations')")} == tables | {"device_ai_policy_revisions", "ai_runtime_snapshot", "ai_device_completions", "ai_warning_keys", "ai_warning_aggregates", "ai_warning_events"}  # Migrations 012/013
+        assert {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('sqlite_sequence','schema_migrations')")} == tables | {"device_ai_policy_revisions", "ai_runtime_snapshot", "ai_device_completions", "ai_warning_keys", "ai_warning_aggregates", "ai_warning_events", "ai_stage_activations"}  # Migrations 012/013/014
         assert after["scope"] == MQTT_IPV4_TCP_1883
         assert all(after[key] is None for key in rules.SCOPE_COLUMNS - {"scope"})
         assert connection.execute("SELECT firewall_rule_id FROM firewall_release_requests WHERE id=?", (release,)).fetchone()[0] == source

@@ -30,6 +30,7 @@ class RuntimeStage(EvidenceModel):
     status: str
     observed_at: str | None = None
     trust_ai_mode: Literal["observe", "enforce"] | None = None
+    ai_device_policy_enabled: bool | None = None
     model_version: str | None = None
     bundle_sha256: BundleHash | None = None
     last_completed_window_end: str | None = None

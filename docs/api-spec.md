@@ -191,6 +191,7 @@ Migration·이관을 실행하지 않으며, Pi 적용과 기기별 실제 추�
 - `stages`: 실제 실행 프로세스의 enabled/required, 초기화·완료·무입력·실패 관측,
   실제 모델 version/hash, 마지막 완료 데이터 경계·입력 ID, 선택 행·이벤트 수.
   `trust_ai_mode`는 실행 Cycle의 전역 Trust 모드이며 기기별 AI 선택 모드와 다릅니다.
+  `ai_device_policy_enabled`는 실제 Stage의 저장 정책 연결 사용 여부입니다. 과거 관측에는 null일 수 있습니다.
 - `completions`: 기기·탐지기별 마지막 원본 Window의 입력/추론/정상/이상/사유별 제외 수,
   실제 모델·AI revision/mode와 run/Boot/관측 시각. CURRENT는 같은 최근 실행의 근거,
   HISTORICAL은 이전 실행·오래된 근거입니다. CURRENT도 해당 기기의 현재 추론 성공 보장은 아닙니다.
@@ -241,9 +242,11 @@ Migration 013 뒤 `RUNTIME_EVIDENCE_ENABLED=true`인 기존 Orchestrator에서�
 반복 경고는 `AI_WARNING_POLICY_VERSION`, `AI_WARNING_WINDOW_SECONDS`,
 `AI_WARNING_COUNT_THRESHOLD`, `AI_WARNING_COOLDOWN_SECONDS`를 모두 명시해야 합니다.
 운영 W/N/C 기본값은 없고 일부 설정만 있으면 Orchestrator 기동을 거부합니다. 실제 저장된
-OBSERVE 이상 이벤트와 일치하는 완료 근거만 집계합니다. 기기 selector·승인 활성화 경계는
-#118의 별도 연결 대상이므로 이 관측 설정을 켜도 기기별 OFF/OBSERVE나 새 Stage를 활성화하지 않습니다.
-독립 detector runner·실제 Pi·부하·화면 연결은 별도 검증 대상입니다.
+OBSERVE 이상 이벤트와 일치하는 완료 근거만 집계합니다. 저장된 기기별 OFF/OBSERVE 적용은
+`AI_DEVICE_POLICY_ENABLED=true`와 Migration 014의 모델별 승인 시작 기록이 별도로 필요합니다.
+[기기별 추론 연결 절차](phase9-ai-policy-runtime.md)를 따르며 조회 API나 관측 설정만으로
+Stage·모델을 활성화하지 않습니다. 독립 detector runner의 관측 저장·실제 Pi·부하·화면 연결은
+별도 검증 대상입니다.
 
 ## 모델 정보 API
 

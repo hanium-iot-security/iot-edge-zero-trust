@@ -40,6 +40,7 @@ from edge.packet.capture_policy import (
     is_capture_eligible,
 )
 from edge.trust.trust_policy import AI_ONLY, AI_PACKET_ANOMALY
+from edge.policy.ai_runtime_selector import load_ai_runtime_selector
 from edge.policy.repository import load_policy_resolver
 from edge.policy.ai_window_decision import AIWindowDecision, require_observe_trust_mode
 from edge.policy.resolver import PolicyResolution
@@ -72,8 +73,11 @@ class PacketIsolationForestStage:
         ai_window_selector: AIWindowSelector | None = None,
         completion_sink: Callable[[Session, tuple[AICompletionRecord, ...]], None] | None = None,
         trust_ai_mode: str | None = None,
+        ai_device_policy_enabled: bool = False,
     ) -> None:
-        if ai_window_selector is not None:
+        if ai_device_policy_enabled and ai_window_selector is not None:
+            raise ValueError("stored AI policy and an external selector cannot be combined")
+        if ai_window_selector is not None or ai_device_policy_enabled:
             require_observe_trust_mode(
                 settings.trust_ai_mode if trust_ai_mode is None else trust_ai_mode
             )
@@ -96,6 +100,7 @@ class PacketIsolationForestStage:
         self.artifact = artifact
         self.capture_policy = capture_policy
         self.predict_rows = predict_rows
+        self.ai_device_policy_enabled = ai_device_policy_enabled
         self.ai_window_selector = ai_window_selector
         self.completion_sink = completion_sink
         self.policy_version = (
@@ -116,7 +121,9 @@ class PacketIsolationForestStage:
         completion_sink: Callable[[Session, tuple[AICompletionRecord, ...]], None] | None = None,
     ) -> "PacketIsolationForestStage":
         configured_settings = app_settings or settings
-        if ai_window_selector is not None:
+        if configured_settings.ai_device_policy_enabled and ai_window_selector is not None:
+            raise ValueError("stored AI policy and an external selector cannot be combined")
+        if ai_window_selector is not None or configured_settings.ai_device_policy_enabled:
             require_observe_trust_mode(configured_settings.trust_ai_mode)
         configured_path = (
             str(artifact_dir)
@@ -166,6 +173,7 @@ class PacketIsolationForestStage:
             ai_window_selector=ai_window_selector,
             completion_sink=completion_sink,
             trust_ai_mode=configured_settings.trust_ai_mode,
+            ai_device_policy_enabled=configured_settings.ai_device_policy_enabled,
         )
 
     def run_until(
@@ -209,7 +217,28 @@ class PacketIsolationForestStage:
             cycle_range_start=cycle_range_start,
             cycle_cutoff=cycle_cutoff,
         )
-        before = _checkpoint_before(db)
+        selector = self.ai_window_selector
+        if self.ai_device_policy_enabled:
+            selector = load_ai_runtime_selector(
+                db, stage_name=self.detector_name, source_table=self.source_table,
+                model_version=self.artifact.model_version,
+                bundle_sha256=self.artifact.bundle_sha256,
+                cycle_range_start=range_start)
+            before = selector.checkpoint
+            resolver = selector.resolver
+            if cutoff <= before["last_completed_window_end"]:
+                return DetectorRunResult(
+                    detector_name=self.detector_name, source_table=self.source_table,
+                    range_start=range_start, cutoff=cutoff, selected_count=0,
+                    created_event_count=0, last_processed_id_before=before["last_processed_id"],
+                    last_processed_id_after=before["last_processed_id"],
+                    completed_window_end_before=before["last_completed_window_end"],
+                    completed_window_end_after=before["last_completed_window_end"],
+                    capture_session_id=expected_capture_session_id)
+            range_start = before["last_completed_window_end"]
+        else:
+            before = _checkpoint_before(db)
+            resolver = load_policy_resolver(db)
         if expected_capture_session_id is not None:
             _validate_expected_capture_session(
                 db,
@@ -224,7 +253,6 @@ class PacketIsolationForestStage:
             expected_capture_session_id=expected_capture_session_id,
         )
         _validate_single_capture_session(rows)
-        resolver = load_policy_resolver(db)
 
         eligible_rows: list[dict[str, Any]] = []
         eligible_source_rows: list[dict[str, Any]] = []
@@ -249,13 +277,13 @@ class PacketIsolationForestStage:
                 source_id,
             )
             _validate_source_window(row)
-            if self.ai_window_selector is not None:
+            if selector is not None:
                 if resolver is None or row["device_id"] is None:
                     exclusion_reasons["AI_REGISTRATION_UNAVAILABLE"] += 1
                     completion.exclude(row["device_id"], window_start,
                                        "AI_REGISTRATION_UNAVAILABLE")
                     continue
-                ai_decision = self.ai_window_selector(
+                ai_decision = selector(
                     resolver.resolve(str(row["device_id"]), window_start)
                 )
                 if not ai_decision.infer:

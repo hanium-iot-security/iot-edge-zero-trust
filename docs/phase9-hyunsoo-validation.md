@@ -1,5 +1,14 @@
 # Phase 9 현수 구현·검증 기록
 
+## 2026/10/13 후속 통합
+
+아래의 미연결/HOLD 기록은 각 검증 당시의 기준이다. 후속 #127에서 기존 #118 판정·Stage를
+사용해 Migration 012의 실제 기기별 revision snapshot, Migration 014의 승인 시작 경계,
+기존 Orchestrator 실행 경로를 연결한다. 완료·경고 저장과 runtime-status는 Migration 013을
+사용한다. 현재 연결·관리 명령·제한은 [기기별 추론 연결 절차](phase9-ai-policy-runtime.md)와
+PR의 최종 로컬 시험 결과를 기준으로 확인한다. 실제 Pi 활성화·공식 모델 평가·화면 연결은
+별도 검증이며 P9-03/P9-06 전체 운영 완료를 뜻하지 않는다.
+
 ## 기준선과 범위
 
 - 작업 전 로컬 `feature/hyunsu-phase8-policy-trust`는 깨끗했고 HEAD는 `8189cd3`였다. 원격 `develop`은 계획 기준 `53ec270`이며 Phase 8 PR #88 head `4ace33c`가 포함된다. 기존 브랜치를 유지하고 `codex/phase9-hyunsoo`를 `origin/develop`에서 생성했다. 이 작업에서 merge, 운영 DB 변경, Pi 배포·재시작은 하지 않았다.

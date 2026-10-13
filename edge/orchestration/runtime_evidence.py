@@ -58,13 +58,14 @@ class RuntimeEvidence:
         required = {name.strip() for name in app_settings.orchestrator_required_stages.split(',') if name.strip()}
         names = tuple(dict.fromkeys((*KNOWN_STAGE_NAMES, *sorted(enabled | required))))
         self._stage_names: dict[tuple[str, str], str] = {}
+        self._device_policy_stages: set[str] = set()
         self._initial = {
             'run_id': self.run_id, 'boot_id': self.boot_id,
             'started_at': self.started_at, 'observed_at': self.started_at,
             'status': 'STARTING', 'error_code': None, 'warning_policy': None,
             'stages': [dict(name=name, enabled=name in enabled, required=name in required,
                             status='UNKNOWN' if name in enabled else 'DISABLED',
-                            observed_at=None, trust_ai_mode=None, model_version=None,
+                            observed_at=None, trust_ai_mode=None, ai_device_policy_enabled=None, model_version=None,
                             bundle_sha256=None, last_completed_window_end=None,
                             last_processed_id=None, selected_count=None, created_event_count=None,
                             error_code=None) for name in names],
@@ -100,8 +101,12 @@ class RuntimeEvidence:
         delegate = getattr(stage, 'delegate', stage)
         artifact = getattr(delegate, 'artifact', None)
         identity = getattr(artifact, 'inspection', artifact)
+        device_policy_enabled = getattr(delegate, 'ai_device_policy_enabled', None)
+        if device_policy_enabled is True:
+            self._device_policy_stages.add(name)
         self.publish('STARTING', stage_name=name, fields={
             'status': 'INITIALIZED', 'error_code': None,
+            'ai_device_policy_enabled': device_policy_enabled,
             'model_version': getattr(identity, 'model_version', None),
             'bundle_sha256': getattr(identity, 'bundle_sha256', None),
         })
@@ -119,6 +124,11 @@ class RuntimeEvidence:
 
     def stage_completed(self, db, result) -> None:
         name = self._stage_names[(result.detector_name, result.source_table)]
+        if (name in self._device_policy_stages
+                and result.completed_window_end_before == result.completed_window_end_after
+                and not result.ai_completion_records):
+            # A replay/no-op is not a new processing observation.
+            return
         fields = {
             'status': 'NO_INPUT' if result.selected_count == 0 else 'COMPLETED',
             'error_code': None,

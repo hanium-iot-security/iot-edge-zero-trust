@@ -35,6 +35,7 @@ from edge.detection.rule_detector import (
     detect_feature_rules,
     detect_mqtt_rules,
 )
+from edge.policy.ai_runtime_selector import load_ai_runtime_selector
 from edge.policy.repository import load_policy_resolver
 from edge.policy.resolver import DevicePolicyRevision, POLICY_AVAILABLE, PolicyResolution
 from edge.policy.ai_window_decision import AIWindowDecision, require_observe_trust_mode
@@ -304,8 +305,13 @@ class MqttIsolationForestStage:
         ai_window_selector: Callable[[PolicyResolution], AIWindowDecision] | None = None,
         completion_sink: Callable[[Session, tuple[AICompletionRecord, ...]], None] | None = None,
         trust_ai_mode: str | None = None,
+        ai_device_policy_enabled: bool = False,
     ) -> None:
-        if ai_window_selector is not None or artifact is not None:
+        if ai_device_policy_enabled and ai_window_selector is not None:
+            raise ValueError("stored AI policy and an external selector cannot be combined")
+        if ai_device_policy_enabled and artifact is None:
+            raise ValueError("AI_DEVICE_POLICY_ENABLED requires a pinned MQTT Bundle")
+        if ai_window_selector is not None or artifact is not None or ai_device_policy_enabled:
             require_observe_trust_mode(
                 settings.trust_ai_mode if trust_ai_mode is None else trust_ai_mode
             )
@@ -324,6 +330,7 @@ class MqttIsolationForestStage:
                 f"{MQTT_IF_POLICY_VERSION}:{artifact.inspection.model_version}:"
                 f"{artifact.inspection.bundle_sha256[:12]}"
             )
+        self.ai_device_policy_enabled = ai_device_policy_enabled
         self.ai_window_selector = ai_window_selector
         self.completion_sink = completion_sink
 
@@ -333,6 +340,10 @@ class MqttIsolationForestStage:
         ai_window_selector: Callable[[PolicyResolution], AIWindowDecision] | None = None,
         completion_sink: Callable[[Session, tuple[AICompletionRecord, ...]], None] | None = None,
     ) -> "MqttIsolationForestStage":
+        if app_settings.ai_device_policy_enabled:
+            require_observe_trust_mode(app_settings.trust_ai_mode)
+            if ai_window_selector is not None:
+                raise ValueError("stored AI policy and an external selector cannot be combined")
         configured = (app_settings.mqtt_if_artifact_dir.strip(),
                       app_settings.mqtt_if_expected_model_version.strip(),
                       app_settings.mqtt_if_expected_bundle_sha256.strip())
@@ -348,7 +359,8 @@ class MqttIsolationForestStage:
             )
             artifact = load_inspected_mqtt_if_artifact(inspection)
         return cls(artifact=artifact, ai_window_selector=ai_window_selector,
-                   completion_sink=completion_sink, trust_ai_mode=app_settings.trust_ai_mode)
+                   completion_sink=completion_sink, trust_ai_mode=app_settings.trust_ai_mode,
+                   ai_device_policy_enabled=app_settings.ai_device_policy_enabled)
 
     def run_until(
         self,
@@ -365,11 +377,27 @@ class MqttIsolationForestStage:
             # OFF is a policy decision, not proof that an enabled model stage
             # is healthy. A missing/broken model must not advance its CP.
             load_model(self.model_path)
-        before = _checkpoint_before(db, self.detector_name, self.source_table)
+        selector = self.ai_window_selector
+        if self.ai_device_policy_enabled:
+            selector = load_ai_runtime_selector(
+                db, stage_name=self.detector_name, source_table=self.source_table,
+                model_version=self.artifact.inspection.model_version,
+                bundle_sha256=self.artifact.inspection.bundle_sha256,
+                cycle_range_start=range_start)
+            before = selector.checkpoint
+            resolver = selector.resolver
+            if cutoff <= before["last_completed_window_end"]:
+                return replace(_run_result(self.detector_name, self.source_table,
+                                           range_start, cutoff, [], 0, before,
+                                           before["last_processed_id"]),
+                               completed_window_end_after=before["last_completed_window_end"])
+            range_start = before["last_completed_window_end"]
+        else:
+            before = _checkpoint_before(db, self.detector_name, self.source_table)
+            resolver = load_policy_resolver(db)
         require_processing_cutoff(db, cutoff)
         maintenance = maintenance_windows(db)
         device_ips = _registered_device_ips(db)
-        resolver = load_policy_resolver(db)
         rows = _select_feature_rows(
             db,
             range_start=range_start,
@@ -391,10 +419,10 @@ class MqttIsolationForestStage:
                 if resolver is not None else None
             )
             ai_decision = None
-            if self.ai_window_selector is not None:
+            if selector is not None:
                 if resolution is None:
                     raise RuntimeError("Phase 9 AI policy requires a registration snapshot")
-                ai_decision = self.ai_window_selector(resolution)
+                ai_decision = selector(resolution)
                 if not ai_decision.infer:
                     completion.exclude(device_id, window_start, ai_decision.reason,
                                        ai_revision=ai_decision.ai_revision,

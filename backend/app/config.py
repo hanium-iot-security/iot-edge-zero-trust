@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     orchestrator_lock_path: str = ""
     # Opt-in until the runtime evidence migration is installed.
     runtime_evidence_enabled: bool = False
+    ai_device_policy_enabled: bool = False
     ai_warning_policy_version: str = ""
     ai_warning_window_seconds: int | None = None
     ai_warning_count_threshold: int | None = None

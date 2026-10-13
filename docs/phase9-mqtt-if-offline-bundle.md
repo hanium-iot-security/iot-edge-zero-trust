@@ -84,8 +84,9 @@ Bundle 판정은 위 offline scorer를 그대로 사용한다. 이벤트에 모�
 내부 경로·임의 확장 필드·Report 원문은 공개하지 않는다. 이 조회의 `runtime.status`는 여전히
 `UNKNOWN`이다. 설정된 파일의 검사 성공은 실행 중 Stage의 snapshot을 증명하지 않는다.
 
-기기별 revision 저장은 Migration 012에 있지만 운영 Stage Registry의 selector 주입,
-활성화 감사·시작 경계·완료 기록의 영속 저장은 아직 미연결이다. 따라서 이번 연결은
+이 로더의 최초 검증 당시에는 기기별 selector·활성화 감사·완료 저장이 미연결이었다.
+후속 #127의 [기기별 추론 연결](phase9-ai-policy-runtime.md)은 Migration 012의 revision,
+013의 실행 근거, 014의 승인 시작 경계를 기존 Stage에 연결한다. 로컬 코드 연결은
 P9-03·P9-06 운영 완료나 모델 활성화 승인이 아니다. 실제 `.env`·Stage 활성화 목록·모델·DB를
 변경하지 않았고 Pi 배포, 실제 자료 학습·정상/공격 성능 평가는 수행하지 않았다.
 

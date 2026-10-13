@@ -643,6 +643,19 @@ WarningLedger는 매번 해당 키의 최신/대상 bucket과 notification 상�
 상태는 완료 기록이 없어 이 저장 계층에서 자동 판정하지 않습니다.
 기기·기간 집계 조회 및 제한된 원본 이벤트 조회용 Index를 추가합니다.
 
+## ai_stage_activations
+
+Migration 014는 AI Stage별 최초 승인 시작 경계를 불변 저장합니다. Stage·source table·모델
+version/SHA256·경계 B·계획 hash/JSON·적용 시각을 담고 Stage마다 한 행만 허용합니다.
+계획에는 이전 Checkpoint, Trust/required Stage 경계, 과거 제외 범위·행 수·내용 hash,
+승인자·사유·준비 시각과 검토한 실행 구성을 보존합니다. UPDATE·DELETE는 거부합니다.
+
+준비는 읽기 전용입니다. 명시적 적용은 기존 Orchestrator 잠금과 하나의 DB 트랜잭션 안에서
+계획을 다시 검증하고 감사와 해당 Stage의 시작 Checkpoint만 함께 기록합니다. 재시도는 같은
+계획과 실제 저장 결과를 대조하고 이미 전진한 처리 위치를 되돌리지 않습니다. Migration은
+승인 행을 seed하지 않습니다. 모델 교체·새 승인 이력 확장은 별도 작업입니다.
+사용법과 범위는 [기기별 추론 연결 절차](phase9-ai-policy-runtime.md)를 참고합니다.
+
 ## 주요 Index
 
 002 migration은 다음 조회를 위해 index를 추가합니다.
