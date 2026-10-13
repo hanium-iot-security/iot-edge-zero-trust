@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from math import inf, nan
 
 import pytest
@@ -247,7 +247,9 @@ def test_successful_connection_plan_matches_actual_extractor_feature_contract() 
             ]
         )
 
-    rows = build_packet_features(packets, PI_IP, WINDOW_START, WINDOW_END)
+    rows = build_packet_features(
+        packets, PI_IP, WINDOW_START, WINDOW_END, broker_target_ip=PI_IP,
+    )
 
     assert len(rows) == 1
     row = rows[0]
@@ -257,6 +259,9 @@ def test_successful_connection_plan_matches_actual_extractor_feature_contract() 
     assert row["total_bytes"] == 2688
     assert row["distinct_dest_port_count"] == 1
     assert row["tcp_syn_count"] == 24
+    assert row["broker_target_ip"] == PI_IP
+    assert row["broker_target_port"] == 1883
+    assert row["broker_target_syn_count"] == 24
     assert row["mqtt_related_packet_count"] == 48
     assert row["tcp_syn_count"] > 10
     assert row["mqtt_related_packet_count"] > 20
@@ -299,7 +304,9 @@ def test_default_burst_remains_detectable_across_a_capture_window_boundary() -> 
         (datetime(2025, 1, 1, 0, 0, 10), datetime(2025, 1, 1, 0, 0, 20)),
     ]
     rows = [
-        build_packet_features(packets, PI_IP, window_start, window_end)[0]
+        build_packet_features(
+            packets, PI_IP, window_start, window_end, broker_target_ip=PI_IP,
+        )[0]
         for window_start, window_end in windows
     ]
 
@@ -307,19 +314,7 @@ def test_default_burst_remains_detectable_across_a_capture_window_boundary() -> 
         (12, 24),
         (12, 24),
     ]
-    for (window_start, window_end), row in zip(windows, rows, strict=True):
-        # P9-08 Rule consumes the Broker-destination-only SYN metric. The
-        # extractor/storage migration is owned separately, so this fixture
-        # derives that metric from the same source packets explicitly.
-        start_ts = window_start.replace(tzinfo=timezone.utc).timestamp()
-        end_ts = window_end.replace(tzinfo=timezone.utc).timestamp()
-        row["broker_target_syn_count"] = sum(
-            1 for packet in packets
-            if start_ts <= packet.timestamp < end_ts
-            and packet.dst_ip == PI_IP and packet.dst_port == 1883
-            and packet.protocol == "TCP" and packet.tcp_flags is not None
-            and packet.tcp_flags & 0x02 and not packet.tcp_flags & 0x10
-        )
+    for row in rows:
         assert row["broker_target_syn_count"] == 12
         row["captured_duration_seconds"] = 10.0
         event_types = {

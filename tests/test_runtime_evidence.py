@@ -373,7 +373,7 @@ def test_registry_sink_persists_explicit_observe_warning_in_the_stage_transactio
         with session_factory() as db:
             assert repository.list_ai_warnings(db) == warnings
 
-def test_pre_012_013_database_keeps_opt_out_startup_and_refuses_enabled_writes(tmp_path, monkeypatch):
+def test_pre_policy_and_evidence_database_keeps_opt_out_startup_and_refuses_enabled_writes(tmp_path, monkeypatch):
     import shutil
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker

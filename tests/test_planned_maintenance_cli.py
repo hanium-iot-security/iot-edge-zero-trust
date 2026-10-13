@@ -567,5 +567,7 @@ def test_default_resume_artifacts_remain_ignored_after_first_backup(tmp_path):
     assert cli.safety.validate_generated_path(root, default, field_name="artifact_dir") == directory
     legacy = root / "data/recovery/planned"
     legacy.mkdir(parents=True)
+    assert cli.safety.validate_generated_path(root, legacy, field_name="artifact_dir") == legacy
+    unignored = root / "private-recovery"
     with pytest.raises(cli.safety.PacketCheckpointRecoveryError, match="artifact_dir must be Git-ignored"):
-        cli.safety.validate_generated_path(root, legacy, field_name="artifact_dir")
+        cli.safety.validate_generated_path(root, unignored, field_name="artifact_dir")

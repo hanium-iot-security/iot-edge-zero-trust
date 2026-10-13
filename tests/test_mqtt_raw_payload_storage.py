@@ -214,7 +214,7 @@ class TestMigrationOnExistingDatabase:
 
         result = apply_migrations(database, MIGRATIONS_DIR)
 
-        assert result.applied_versions == [9, 10, 11, 12, 13, 14]
+        assert result.applied_versions == [9, 10, 11, 12, 13, 14, 15]
         with _connect(database) as connection:
             row = connection.execute(
                 "SELECT payload, payload_size, is_json_valid, payload_raw, payload_decode_status "

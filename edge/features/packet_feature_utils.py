@@ -7,6 +7,7 @@ import csv
 import struct
 from dataclasses import dataclass
 from datetime import datetime
+from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ INBOUND = "INBOUND"
 OUTBOUND = "OUTBOUND"
 MQTT_PORT = 1883
 TCP_SYN = 0x02
+TCP_ACK = 0x10
 
 # pcap 파일 구조 상수
 PCAP_GLOBAL_HEADER_SIZE = 24   # magic + version + zone + sigfigs + snaplen + network
@@ -208,11 +210,32 @@ def _is_non_mqtt_tcp_udp(
     return True
 
 
+def validate_broker_target(pi_ip: str, broker_target_ip: str | None = None,
+                           broker_target_port: int = MQTT_PORT) -> str | None:
+    """Only explicitly configured Pi IPv4/TCP 1883 has a measured Broker count."""
+    if type(broker_target_port) is not int or broker_target_port != MQTT_PORT:
+        raise ValueError("Broker target port must be TCP 1883; other ports are unsupported")
+    if broker_target_ip is None or broker_target_ip == "":
+        return None
+    try:
+        address = IPv4Address(broker_target_ip)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Broker target must be a canonical IPv4 address") from exc
+    if str(address) != broker_target_ip:
+        raise ValueError("Broker target must be a canonical IPv4 address")
+    if broker_target_ip != pi_ip:
+        raise ValueError("Broker target must equal CAPTURE_INTERFACE_IP")
+    return broker_target_ip
+
+
 def build_packet_features(
     packets: list[ParsedPacket],
     pi_ip: str,
     window_start: datetime,
     window_end: datetime,
+    *,
+    broker_target_ip: str | None = None,
+    broker_target_port: int = MQTT_PORT,
 ) -> list[dict[str, Any]]:
     """peer_ip + direction 기준 그룹별 Packet Feature row 리스트를 반환합니다.
 
@@ -220,6 +243,7 @@ def build_packet_features(
     timezone 정보가 없는 값은 UTC로 간주하며, UTC-aware 값도 허용합니다.
     window에 해당 패킷이 없으면 빈 리스트를 반환합니다.
     """
+    broker_ip = validate_broker_target(pi_ip, broker_target_ip, broker_target_port)
     # UTC datetime을 epoch second로 변환
     window_start_ts = float(calendar.timegm(window_start.timetuple()))
     window_end_ts = float(calendar.timegm(window_end.timetuple()))
@@ -250,6 +274,16 @@ def build_packet_features(
             "direction": direction,
             "window_start": window_start_str,
             "window_end": window_end_str,
+            "broker_target_ip": broker_ip,
+            "broker_target_port": broker_target_port if broker_ip is not None else None,
+            "broker_target_syn_count": (
+                sum(1 for pkt in group
+                    if direction == INBOUND and pkt.protocol == "TCP"
+                    and pkt.dst_ip == broker_ip and pkt.dst_port == broker_target_port
+                    and pkt.tcp_flags is not None
+                    and pkt.tcp_flags & TCP_SYN and not pkt.tcp_flags & TCP_ACK)
+                if broker_ip is not None else None
+            ),
             "packet_count": len(group),
             "total_bytes": sum(lengths),
             "avg_packet_size": sum(lengths) / len(lengths),

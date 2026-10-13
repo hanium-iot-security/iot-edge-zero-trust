@@ -19,9 +19,16 @@ SESSION_B = "22222222-2222-4222-8222-222222222222"
 
 
 @pytest.fixture
-def api_client(tmp_path: Path):
+def api_client(tmp_path: Path, request):
     db_path = tmp_path / "packet-gateway-api.db"
-    apply_migrations(db_path, MIGRATIONS_DIR)
+    migrations = MIGRATIONS_DIR
+    if getattr(request, "param", None) == "legacy_broker":
+        migrations = tmp_path / "legacy-migrations"
+        migrations.mkdir()
+        for source in MIGRATIONS_DIR.glob("*.sql"):
+            if int(source.name.split("_", 1)[0]) <= 12:
+                (migrations / source.name).write_bytes(source.read_bytes())
+    apply_migrations(db_path, migrations)
 
     engine = create_engine(
         f"sqlite:///{db_path}",
@@ -653,3 +660,37 @@ def test_query_services_call_repository_functions(monkeypatch) -> None:
     assert gateway_calls == ["list", "count"]
     assert packet_result["items"][0]["packets_per_second"] == 1.0
     assert gateway_result["items"][0]["interface_metrics"]["usb_lan"]["exists"] is False
+
+
+def test_packet_feature_logs_return_stored_broker_endpoint_and_zero(api_client, monkeypatch):
+    from backend.app.config import settings
+    client, db_path = api_client
+    seed_packet_gateway_rows(db_path)
+    # The response must describe the row's capture-time endpoint, not today's config.
+    monkeypatch.setattr(settings, "broker_target_ip", "192.168.99.99")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("""UPDATE packet_feature_logs SET broker_target_ip='192.168.0.20',
+            broker_target_port=1883, broker_target_syn_count=3 WHERE peer_ip='10.0.0.8'""")
+        connection.execute("""UPDATE packet_feature_logs SET broker_target_ip='192.168.0.20',
+            broker_target_port=1883, broker_target_syn_count=0 WHERE peer_ip='10.0.0.9'""")
+    response = client.get("/api/packet-feature-logs")
+    assert response.status_code == 200
+    items = {row["peer_ip"]: row for row in response.json()["items"]}
+    assert response.json()["total"] == 3
+    assert [items["10.0.0.8"][key] for key in
+            ("broker_target_ip", "broker_target_port", "broker_target_syn_count")] == ["192.168.0.20", 1883, 3]
+    assert items["10.0.0.9"]["broker_target_syn_count"] == 0
+    assert items["10.0.0.9"]["broker_target_ip"] == "192.168.0.20"
+    assert all(items["10.0.0.10"][key] is None for key in
+               ("broker_target_ip", "broker_target_port", "broker_target_syn_count"))
+
+
+@pytest.mark.parametrize("api_client", ["legacy_broker"], indirect=True)
+def test_packet_feature_logs_project_null_on_pre_broker_schema(api_client):
+    client, db_path = api_client
+    seed_packet_gateway_rows(db_path)
+    response = client.get("/api/packet-feature-logs")
+    assert response.status_code == 200
+    assert response.json()["total"] == 3
+    assert all(row[key] is None for row in response.json()["items"] for key in
+               ("broker_target_ip", "broker_target_port", "broker_target_syn_count"))

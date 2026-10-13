@@ -37,6 +37,7 @@ from edge.features.packet_feature_repository import (
     get_reconcilable_segment_statuses_by_file_names,
     insert_packet_feature_rows,
     load_ip_device_map,
+    require_broker_target_schema,
     update_capture_segment_status,
 )
 from edge.features.packet_feature_utils import (
@@ -46,6 +47,7 @@ from edge.features.packet_feature_utils import (
     UnsupportedPcapFormat,
     build_packet_features,
     parse_pcap,
+    validate_broker_target,
 )
 from edge.packet.capture_session_repository import get_capture_session_by_session_id
 
@@ -273,12 +275,21 @@ def process_segment(
     pi_ip: str,
     ip_device_map: dict[str, str],
     capture_scope: str = CAPTURE_SCOPE_DEFAULT,
+    *,
+    broker_target_ip: str | None = None,
+    broker_target_port: int = 1883,
 ) -> str:
     """READY segment 하나를 처리하고 최종 status를 반환합니다.
 
     성공/영구 실패(PROCESSED, EMPTY, FAILED): db.commit() 후 반환.
     DB 오류: 예외를 전파. caller가 rollback 처리.
     """
+    try:
+        broker_ip = validate_broker_target(pi_ip, broker_target_ip, broker_target_port)
+        if broker_ip is not None:
+            require_broker_target_schema(db)
+    except ValueError as exc:
+        raise ExtractorPreflightError(str(exc)) from exc
     segment_id = int(segment["id"])
     pcap_path = ready_dir / segment["file_name"]
     window_start = parse_db_datetime(segment["window_start"])
@@ -328,7 +339,10 @@ def process_segment(
         return "FAILED"
 
     packet_count = len(packets)
-    feature_rows = build_packet_features(packets, pi_ip, window_start, window_end)
+    broker_options = ({"broker_target_ip": broker_ip, "broker_target_port": broker_target_port}
+                      if broker_ip is not None else {})
+    feature_rows = build_packet_features(packets, pi_ip, window_start, window_end,
+                                         **broker_options)
 
     if not feature_rows:
         if packet_count > 0 and not _any_in_window(packets, window_start, window_end):
@@ -370,9 +384,21 @@ def extract_packet_features(
     if not pi_ip:
         raise ValueError("CAPTURE_INTERFACE_IP가 설정되지 않았습니다.")
     _validate_ip(pi_ip)
+    try:
+        broker_ip = validate_broker_target(pi_ip, settings.broker_target_ip,
+                                          settings.broker_target_port)
+    except ValueError as exc:
+        raise ExtractorPreflightError(str(exc)) from exc
+    broker_options = ({"broker_target_ip": broker_ip, "broker_target_port": settings.broker_target_port}
+                      if broker_ip is not None else {})
 
     with _acquire_lock(lock_path):
         with SessionLocal() as db:
+            if broker_ip is not None:
+                try:
+                    require_broker_target_schema(db)
+                except ValueError as exc:
+                    raise ExtractorPreflightError(str(exc)) from exc
             if selected_session_id is None:
                 logger.warning(
                     "--session-id 미지정: 모든 Capture Session의 전체 READY backlog와 "
@@ -401,7 +427,8 @@ def extract_packet_features(
             try:
                 with SessionLocal() as db:
                     status = process_segment(
-                        db, segment, ready_dir, pi_ip, ip_device_map, capture_scope
+                        db, segment, ready_dir, pi_ip, ip_device_map, capture_scope,
+                        **broker_options,
                     )
             except OperationalError as exc:
                 err_lower = str(exc).lower()

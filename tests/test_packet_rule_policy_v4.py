@@ -20,6 +20,9 @@ def _row(**overrides):
     row = {
         "device_id": "esp32_01",
         "peer_ip": "192.168.0.4",
+        "direction": "INBOUND",
+        "broker_target_ip": "192.168.0.20",
+        "broker_target_port": 1883,
         "captured_duration_seconds": 10.0,
         "packet_count": 0,
         "total_bytes": 0,
@@ -103,8 +106,8 @@ def test_port_scan_v4_keeps_and_condition(row) -> None:
 @pytest.mark.parametrize(
     "row",
     [
-        _row(tcp_syn_count=11, mqtt_related_packet_count=20),
-        _row(tcp_syn_count=10, mqtt_related_packet_count=21),
+        _row(tcp_syn_count=11, broker_target_syn_count=11, mqtt_related_packet_count=20),
+        _row(tcp_syn_count=10, broker_target_syn_count=10, mqtt_related_packet_count=21),
     ],
 )
 def test_broker_dos_v4_keeps_and_condition(row) -> None:
