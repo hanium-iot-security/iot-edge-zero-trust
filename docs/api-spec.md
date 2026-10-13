@@ -172,7 +172,7 @@ Migration·이관을 실행하지 않으며, Pi 적용과 기기별 실제 추�
 
 ## 실제 실행 근거와 AI 경고 조회
 
-두 API는 관리자 키 없는 읽기 전용입니다. Migration 013이 필요하며 요청 중 Migration·
+두 API는 관리자 키 없는 읽기 전용입니다. Migration 014이 필요하며 요청 중 Migration·
 모델 로딩·Stage 활성화·서비스 제어를 수행하지 않습니다. SQLite의 한 읽기 snapshot에서
 실행 관측과 완료 기록 또는 경고 목록·total을 함께 읽습니다.
 
@@ -233,7 +233,7 @@ AVAILABLE은 최근 관측과 정책 존재를 뜻하며 기기별 selector 연�
 
 ### 실행 기록 연결 범위
 
-Migration 013 뒤 `RUNTIME_EVIDENCE_ENABLED=true`인 기존 Orchestrator에서만 기록을 발행합니다.
+Migration 014 뒤 `RUNTIME_EVIDENCE_ENABLED=true`인 기존 Orchestrator에서만 기록을 발행합니다.
 성공 Stage 관측·AI 완료·경고 저장은 기존 이벤트·Checkpoint와 같은 트랜잭션입니다.
 저장 실패 시 함께 rollback하며 초기화·실행 실패는 rollback 후 별도 실패 관측을 시도합니다.
 실패 기록도 저장하지 못하면 기존 관측의 만료로 확인 불가를 표시하고 원래 오류를 보존합니다.
@@ -243,7 +243,7 @@ Migration 013 뒤 `RUNTIME_EVIDENCE_ENABLED=true`인 기존 Orchestrator에서�
 `AI_WARNING_COUNT_THRESHOLD`, `AI_WARNING_COOLDOWN_SECONDS`를 모두 명시해야 합니다.
 운영 W/N/C 기본값은 없고 일부 설정만 있으면 Orchestrator 기동을 거부합니다. 실제 저장된
 OBSERVE 이상 이벤트와 일치하는 완료 근거만 집계합니다. 저장된 기기별 OFF/OBSERVE 적용은
-`AI_DEVICE_POLICY_ENABLED=true`와 Migration 014의 모델별 승인 시작 기록이 별도로 필요합니다.
+`AI_DEVICE_POLICY_ENABLED=true`와 Migration 015의 모델별 승인 시작 기록이 별도로 필요합니다.
 [기기별 추론 연결 절차](phase9-ai-policy-runtime.md)를 따르며 조회 API나 관측 설정만으로
 Stage·모델을 활성화하지 않습니다. 독립 detector runner의 관측 저장·실제 Pi·부하·화면 연결은
 별도 검증 대상입니다.

@@ -396,7 +396,7 @@ def test_pre_012_013_database_keeps_opt_out_startup_and_refuses_enabled_writes(t
         with factory() as db:
             before = db.execute(text('SELECT * FROM detector_checkpoints ORDER BY detector_name')).all()
         settings.runtime_evidence_enabled = True
-        with pytest.raises(repository.RuntimeEvidenceUnavailable, match='Migration 013'):
+        with pytest.raises(repository.RuntimeEvidenceUnavailable, match='Migration 014'):
             runner.main(['--once'])
         with factory() as db:
             assert db.execute(text('SELECT * FROM detector_checkpoints ORDER BY detector_name')).all() == before

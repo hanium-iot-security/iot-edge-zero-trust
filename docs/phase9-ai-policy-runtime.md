@@ -2,8 +2,8 @@
 
 기존 MQTT·Packet IF Stage가 Migration 012의 저장된 AI revision을 읽어 추론 대상을 선택한다.
 `AI_DEVICE_POLICY_ENABLED=false`가 기본값이며 운영 설정을 자동 변경하지 않는다.
-새 모드에는 검증된 모델 Bundle, `TRUST_AI_MODE=observe`, Migration 014의 승인된 Stage 시작 기록이 필요하다.
-실제 실행 근거와 경고를 조회하려면 Migration 013 및 `RUNTIME_EVIDENCE_ENABLED=true`도 사용한다.
+새 모드에는 검증된 모델 Bundle, `TRUST_AI_MODE=observe`, Migration 015의 승인된 Stage 시작 기록이 필요하다.
+실제 실행 근거와 경고를 조회하려면 Migration 014 및 `RUNTIME_EVIDENCE_ENABLED=true`도 사용한다.
 
 ## 처리 기준
 

@@ -613,7 +613,7 @@ READY를 기록하는 Transaction부터 source Session·Segment·Packet Feature�
 재개 검사에서 확인하고, 실제 재개 Write Transaction은 검증된 봉인과 대상 경계를
 재검증하여 기존 Session 전체를 다시 Hash하지 않습니다.
 
-## AI 실행 근거와 반복 경고 — Migration 013
+## AI 실행 근거와 반복 경고 — Migration 014
 
 기존 정책·이벤트·Checkpoint·Trust 테이블의 값과 의미를 유지하는 추가 Migration입니다.
 운영 적용이나 초기 데이터 생성을 API에서 실행하지 않습니다.
@@ -645,7 +645,7 @@ WarningLedger는 매번 해당 키의 최신/대상 bucket과 notification 상�
 
 ## ai_stage_activations
 
-Migration 014는 AI Stage별 최초 승인 시작 경계를 불변 저장합니다. Stage·source table·모델
+Migration 015는 AI Stage별 최초 승인 시작 경계를 불변 저장합니다. Stage·source table·모델
 version/SHA256·경계 B·계획 hash/JSON·적용 시각을 담고 Stage마다 한 행만 허용합니다.
 계획에는 이전 Checkpoint, Trust/required Stage 경계, 과거 제외 범위·행 수·내용 hash,
 승인자·사유·준비 시각과 검토한 실행 구성을 보존합니다. UPDATE·DELETE는 거부합니다.

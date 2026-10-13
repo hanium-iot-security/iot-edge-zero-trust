@@ -80,7 +80,7 @@ def test_upgrade_012_preserves_data_and_second_apply_is_noop(tmp_path):
     with sqlite3.connect(path) as db:
         db.execute("INSERT INTO devices(device_id) VALUES('sensor1')")
         before = db.execute("SELECT * FROM devices").fetchall()
-    assert apply_migrations(path, MIGRATIONS).applied_versions == [13, 14]
+    assert apply_migrations(path, MIGRATIONS).applied_versions == [13, 14, 15]
     assert apply_migrations(path, MIGRATIONS).applied_versions == []
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT * FROM devices").fetchall() == before
@@ -160,7 +160,7 @@ def test_invalid_completion_counters_and_metadata_rejected(engine, changes):
 
 def test_missing_schema_and_corrupt_json_state_are_unavailable(engine):
     with sqlite3.connect(":memory:") as db:
-        with pytest.raises(RuntimeEvidenceUnavailable, match="013"):
+        with pytest.raises(RuntimeEvidenceUnavailable, match="014"):
             read_runtime_snapshot(db)
     with Session(engine) as db, db.begin():
         save_runtime_snapshot(db, snapshot())

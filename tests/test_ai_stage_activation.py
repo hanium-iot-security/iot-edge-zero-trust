@@ -269,18 +269,18 @@ def test_packet_contiguous_empty_prefix_is_valid_exclusion_evidence(environment)
         assert receipt["source_table"] == "packet_feature_logs"
 
 
-def test_upgrade_013_preserves_runtime_evidence_and_is_idempotent(tmp_path):
+def test_upgrade_014_preserves_runtime_evidence_and_is_idempotent(tmp_path):
     old = tmp_path / "old"
     old.mkdir()
     for path in MIGRATIONS.glob("*.sql"):
-        if int(path.name[:3]) <= 13:
+        if int(path.name[:3]) <= 14:
             shutil.copy2(path, old / path.name)
     path = tmp_path / "upgrade.db"
     apply_migrations(path, old)
     with sqlite3.connect(path) as db:
         db.execute("INSERT INTO ai_runtime_snapshot VALUES(1,'{}')")
         before = db.execute("SELECT * FROM ai_runtime_snapshot").fetchall()
-    assert apply_migrations(path, MIGRATIONS).applied_versions == [14]
+    assert apply_migrations(path, MIGRATIONS).applied_versions == [15]
     assert apply_migrations(path, MIGRATIONS).applied_versions == []
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT * FROM ai_runtime_snapshot").fetchall() == before

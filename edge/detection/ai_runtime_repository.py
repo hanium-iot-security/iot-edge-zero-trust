@@ -20,7 +20,7 @@ from edge.detection.ai_warning_aggregation import (
 
 
 class RuntimeEvidenceUnavailable(ValueError):
-    """Migration 013 or a readable, internally consistent stored record is missing."""
+    """Migration 014 or a readable, internally consistent stored record is missing."""
 
 
 _TABLES = (
@@ -50,7 +50,7 @@ def _require_schema(db):
     found = {row["name"] for row in _rows(
         db, "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'ai_%'")}
     if not set(_TABLES).issubset(found):
-        raise RuntimeEvidenceUnavailable("Migration 013 AI runtime evidence is not installed")
+        raise RuntimeEvidenceUnavailable("Migration 014 AI runtime evidence is not installed")
 
 
 def _utc(value):

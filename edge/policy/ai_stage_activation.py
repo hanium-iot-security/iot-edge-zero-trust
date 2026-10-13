@@ -73,13 +73,13 @@ def _execute(db, sql, values=None):
 
 
 def _schema(db):
-    receipt = _execute(db, "SELECT name FROM schema_migrations WHERE version=14").scalar_one_or_none()
+    receipt = _execute(db, "SELECT name FROM schema_migrations WHERE version=15").scalar_one_or_none()
     columns = {row[1] for row in _execute(db, "PRAGMA table_info(ai_stage_activations)")}
     if receipt != "ai_stage_activations" or not {
         "activation_id", "stage_name", "source_table", "model_version", "bundle_sha256",
         "boundary", "plan_sha256", "plan_json", "applied_at",
     } <= columns:
-        _hold("Migration 014 must be installed explicitly", "AI_STAGE_ACTIVATION_UNAVAILABLE")
+        _hold("Migration 015 must be installed explicitly", "AI_STAGE_ACTIVATION_UNAVAILABLE")
 
 
 def _identity(stage_name, model_version, bundle_sha256):
