@@ -311,9 +311,13 @@ def test_phase9_mqtt_ai_rejects_global_enforce_mode() -> None:
         )
 
 
+@pytest.mark.parametrize("model_kind", ["missing", "wrong_type", "unfitted"])
 def test_phase9_all_off_still_requires_a_healthy_mqtt_model(
-    session_factory, tmp_path,
+    session_factory, tmp_path, model_kind,
 ):
+    import joblib
+    from sklearn.ensemble import IsolationForest
+
     with session_factory() as db:
         _seed(db, status="ACTIVE")
         db.execute(text("""INSERT INTO feature_logs
@@ -322,8 +326,10 @@ def test_phase9_all_off_still_requires_a_healthy_mqtt_model(
             {"start": START, "end": END})
         db.commit()
     missing_model = tmp_path / "missing-mqtt.joblib"
+    if model_kind != "missing":
+        joblib.dump({} if model_kind == "wrong_type" else IsolationForest(), missing_model)
     with session_factory() as db:
-        with pytest.raises(FileNotFoundError, match="모델 파일이 없습니다"):
+        with pytest.raises(FileNotFoundError if model_kind == "missing" else ValueError):
             with db.begin():
                 MqttIsolationForestStage(
                     model_path=missing_model,

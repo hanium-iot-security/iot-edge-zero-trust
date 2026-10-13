@@ -15,6 +15,9 @@ from typing import Any
 import joblib
 import numpy as np
 from sklearn.ensemble import IsolationForest
+from sklearn.utils.validation import check_is_fitted
+
+from ai.mqtt_if_artifact import MQTTIFArtifact, score_mqtt_feature_rows
 
 from edge.detection.rule_detector import AI_ANOMALY, DETECTOR_AI, ISOLATION_FOREST_FEATURES
 
@@ -38,7 +41,19 @@ def load_model(model_path: Path = DEFAULT_MODEL_PATH) -> IsolationForest:
     if resolved_path not in _model_cache:
         if not resolved_path.exists():
             raise FileNotFoundError(f"모델 파일이 없습니다: {resolved_path}")
-        _model_cache[resolved_path] = joblib.load(resolved_path)
+        model = joblib.load(resolved_path)
+        if type(model) is not IsolationForest:
+            raise ValueError("MQTT legacy model must be an IsolationForest")
+        check_is_fitted(model, ("estimators_", "estimators_features_", "offset_", "n_features_in_"))
+        if model.n_features_in_ != len(ISOLATION_FOREST_FEATURES):
+            raise ValueError("MQTT legacy model must have exactly five features")
+        names = getattr(model, "feature_names_in_", None)
+        if names is not None and tuple(names) != ISOLATION_FOREST_FEATURES:
+            raise ValueError("MQTT legacy model feature order mismatch")
+        scores = np.asarray(model.decision_function(np.zeros((1, len(ISOLATION_FOREST_FEATURES)))))
+        if scores.shape != (1,) or not np.isfinite(scores).all():
+            raise ValueError("MQTT legacy model returned invalid decision scores")
+        _model_cache[resolved_path] = model
     return _model_cache[resolved_path]
 
 
@@ -66,4 +81,24 @@ def predict_feature_window(
         "anomaly_score": anomaly_score,
         "detector_type": DETECTOR_AI,
         "event_type": AI_ANOMALY if is_anomaly else None,
+    }
+
+
+def predict_bundle_feature_window(
+    feature_row: dict[str, Any], artifact: MQTTIFArtifact,
+) -> dict[str, Any]:
+    """Use the inspected Bundle's threshold, not sklearn's implicit zero boundary."""
+    result = score_mqtt_feature_rows(artifact, [feature_row])[0]
+    return {
+        "is_anomaly": result.is_anomaly,
+        "prediction": -1 if result.is_anomaly else 1,
+        "anomaly_score": result.anomaly_score,
+        "detector_type": DETECTOR_AI,
+        "event_type": AI_ANOMALY if result.is_anomaly else None,
+        "model_version": result.model_version,
+        "bundle_sha256": result.bundle_sha256,
+        "raw_decision_score": result.raw_decision_score,
+        "threshold": result.threshold,
+        "feature_values": dict(zip(ISOLATION_FOREST_FEATURES, result.feature_values, strict=True)),
+        "interval_is_fallback": result.interval_is_fallback,
     }

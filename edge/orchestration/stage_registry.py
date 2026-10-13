@@ -78,7 +78,7 @@ def _build_packet_if(app_settings: Settings) -> DetectorStage:
 STAGE_BUILDERS: dict[str, StageBuilder] = {
     MQTT_FEATURE_RULE: lambda _settings: MqttFeatureRuleStage(),
     MQTT_MESSAGE_RULE: lambda _settings: MqttMessageRuleStage(),
-    MQTT_IF: lambda _settings: MqttIsolationForestStage(),
+    MQTT_IF: lambda app_settings: MqttIsolationForestStage.from_settings(app_settings=app_settings),
     PACKET_RULE: _build_packet_rule,
     PACKET_IF: _build_packet_if,
 }

@@ -391,7 +391,7 @@ def apply_trust_score_v2_until(
 
 
 def _phase9_ai_mode(event: dict[str, Any]) -> str | None:
-    """Read explicit per-device AI evidence; absent fields are legacy events."""
+    """Validate MQTT/Packet AI evidence; absent or complete NULL pairs are legacy."""
     if event["detector_type"] != "AI" or event["event_type"] not in AI_EVENT_TYPES:
         return None
     try:
@@ -400,18 +400,29 @@ def _phase9_ai_mode(event: dict[str, Any]) -> str | None:
         return None
     if not isinstance(evidence, dict):
         return None
-    fields = evidence
-    if "device_ai_mode" not in fields and isinstance(evidence.get("model"), dict):
-        fields = evidence["model"]
-    if "device_ai_mode" not in fields or fields["device_ai_mode"] is None:
-        return None
-    revision = fields.get("device_ai_revision")
-    if type(revision) is not int or revision < 1:
-        return "INVALID"
-    selected_mode = fields["device_ai_mode"]
-    if isinstance(selected_mode, str) and selected_mode in {"OFF", "OBSERVE"}:
-        return selected_mode
-    return "INVALID"
+    containers = [evidence]
+    if isinstance(evidence.get("model"), dict):
+        containers.append(evidence["model"])
+    selected = None
+    for fields in containers:
+        has_mode = "device_ai_mode" in fields
+        has_revision = "device_ai_revision" in fields
+        if not has_mode and not has_revision:
+            continue
+        mode = fields.get("device_ai_mode")
+        revision = fields.get("device_ai_revision")
+        # Existing stages emit a complete NULL pair without a Phase 9 selector.
+        # A partial pair is damaged evidence, not a legacy enforcement request.
+        if has_mode and has_revision and mode is None and revision is None:
+            continue
+        if (type(revision) is not int or revision < 1
+                or not isinstance(mode, str) or mode not in {"OFF", "OBSERVE"}):
+            return "INVALID"
+        decision = (revision, mode)
+        if selected is not None and selected != decision:
+            return "INVALID"
+        selected = decision
+    return selected[1] if selected is not None else None
 
 
 def _record_ai_observation(db: Session, event: dict[str, Any], cutoff: datetime) -> None:

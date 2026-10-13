@@ -75,6 +75,11 @@ class Settings(BaseSettings):
     capture_time_epsilon_seconds: float = 0.01
     capture_policy_version: str = "packet-capture-policy-v1"
 
+    # MQTT Isolation Forest: all empty keeps the legacy joblib loader.
+    mqtt_if_artifact_dir: str = ""
+    mqtt_if_expected_model_version: str = ""
+    mqtt_if_expected_bundle_sha256: str = ""
+
     # Packet Isolation Forest
     packet_if_artifact_dir: str = ""
     packet_if_expected_model_version: str = ""

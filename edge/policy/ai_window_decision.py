@@ -67,23 +67,23 @@ def decide_ai_window(
     if policy.reason != POLICY_AVAILABLE:
         return result(policy.reason)
 
-    rows = sorted((row for row in revisions if row.device_id == policy.device_id),
-                  key=lambda row: (row.effective_from, row.revision))
-    if not rows:
-        return result("AI_POLICY_UNAVAILABLE")
-    # A scheduled or later corrupt revision cannot change the verdict of an
-    # already completed source window. Validate only the historical prefix.
-    effective = [row for row in rows if row.effective_from <= window_start]
-    if not effective:
-        return result("AI_POLICY_NOT_EFFECTIVE")
     try:
+        rows = sorted((row for row in revisions if row.device_id == policy.device_id),
+                      key=lambda row: (row.effective_from, row.revision))
+        if not rows:
+            return result("AI_POLICY_UNAVAILABLE")
+        # A scheduled or later corrupt revision cannot change the verdict of an
+        # already completed source window. Validate only the historical prefix.
+        effective = [row for row in rows if row.effective_from <= window_start]
+        if not effective:
+            return result("AI_POLICY_NOT_EFFECTIVE")
         for index, row in enumerate(effective, start=1):
             require_window_start(row.effective_from)
             if (type(row.revision) is not int or row.revision != index
                     or row.mode not in AI_ALLOWED_MODES
                     or (index > 1 and row.effective_from <= effective[index - 2].effective_from)):
                 return result("INVALID_AI_REVISION")
-    except ValueError:
+    except (TypeError, ValueError):
         return result("INVALID_AI_REVISION")
     current = effective[-1]
     if current.mode == AI_OFF:

@@ -53,7 +53,7 @@ def test_latest_approved_registration_mode_and_stage_boundary_wins() -> None:
     assert decision(20, revisions, activation=20).infer
 
 
-@pytest.mark.parametrize("mode", ["ENFORCE", "observe", "", "OFF/OBSERVE"])
+@pytest.mark.parametrize("mode", ["ENFORCE", "observe", "", "OFF/OBSERVE", None, ["OBSERVE"]])
 def test_unsupported_mode_is_not_silently_interpreted_as_off(mode: str) -> None:
     assert decision(0, [AIRevision("esp32_02", 1, mode, at(0))]).reason == "INVALID_AI_REVISION"
 
@@ -78,3 +78,22 @@ def test_disabled_is_excluded_but_pending_can_feed_predictor() -> None:
     revisions = [AIRevision("esp32_02", 1, "OBSERVE", at(0))]
     assert decision(0, revisions, state="DISABLED").reason == "DISABLED_AT_WINDOW"
     assert decision(0, revisions, state="PENDING").infer
+
+
+@pytest.mark.parametrize("effective_from", [at(20).replace(tzinfo=None), "2026-10-10T00:00:20Z", None])
+def test_uncomparable_revision_time_excludes_only_its_device(effective_from) -> None:
+    revisions = [
+        AIRevision("esp32_02", 1, "OFF", at(0)),
+        AIRevision("esp32_02", 2, "OBSERVE", effective_from),
+    ]
+    assert decision(0, revisions).reason == "INVALID_AI_REVISION"
+    revisions[-1] = AIRevision("esp32_03", 2, "OBSERVE", effective_from)
+    assert decision(0, revisions).reason == "AI_OFF_AT_WINDOW"
+
+
+def test_mixed_revision_types_at_same_boundary_are_invalid() -> None:
+    revisions = [
+        AIRevision("esp32_02", 1, "OFF", at(0)),
+        AIRevision("esp32_02", "2", "OBSERVE", at(0)),
+    ]
+    assert decision(0, revisions).reason == "INVALID_AI_REVISION"

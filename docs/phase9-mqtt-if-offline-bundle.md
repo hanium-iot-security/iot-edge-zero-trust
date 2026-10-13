@@ -1,6 +1,6 @@
 # MQTT IF 독립 offline 계약
 
-이번 준비 인터페이스는 타입이 있는 MQTT 입력 행, 세 파일 Bundle의 무결성, 모델의 학습 상태·입력 차원·라이브러리 호환성, 점수 판정 계약을 검증한다. 학습, 자료 편입·QC, 운영 loader, Orchestrator, API, DB, Pi 활성화에는 연결하지 않았다. 공식 MQTT 후보를 학습하거나 승인하지 않았으며 시험에서만 synthetic fixture를 fit한다.
+이 인터페이스는 타입이 있는 MQTT 입력 행, 세 파일 Bundle의 무결성, 모델의 학습 상태·입력 차원·라이브러리 호환성, 점수 판정 계약을 검증한다. 최초 #112는 offline 범위였으며 #118의 로더·API 연결은 아래 별도 절에 기록한다. 공식 MQTT 후보를 학습하거나 승인하지 않았으며 시험에서만 synthetic fixture를 fit한다.
 
 [P9-02 계획](https://app.notion.com/p/3f296c0fdc1c80f78f50d43800e25b72)은 공식 학습 전에 P9-01 자료 적격성과 독립 Train/Validation 그룹을, 운영 적용 전에 P9-03 시작 경계 검증을 요구한다. 해당 계약과 구현은 별도 남은 작업이다. 기존 150분 후보 자료는 사용하지 않았다. 이 인터페이스는 Dataset manifest, 승인, 그룹 배정, split, 자료 해시, 정상 정책 버전, 평가 결과를 만들거나 검증하지 않는다.
 
@@ -58,6 +58,34 @@ metadata schema v1의 필수 필드는 다음과 같다.
 보고서는 `model_version`, `feature_order`, 점수 함수·방향, 비교 연산, threshold·source, 간격 의미를 반복 기록한다. 다른 보고서 주장은 보관하지만 인증하지 않는다. JSON key 중복과 비표준 NaN/Infinity 상수는 거부한다. load는 정확한 sklearn `IsolationForest` 클래스, 학습된 estimator 상태, 입력 다섯 개, 저장된 Feature 이름이 있으면 순서 일치, 유한한 offset, 유효한 유한 점수 출력을 요구한다. metadata가 현재 버전이라고 주장하더라도 모델 역직렬화의 sklearn 버전 불일치 경고는 실패 처리한다. 공식 학습 metadata의 설정·seed, 출처, split·그룹별 행 수, Commit, 정책, 보정 근거는 실제 P9-01·trainer 계약으로 추가해야 한다. 이번 인터페이스에서 검증하지 않는다는 이유로 공식 학습에서 생략할 수는 없다.
 
 inspect 요약은 `data_eligibility_verified`, `report_claims_verified`, `operational_activation_verified`를 false로 명시한다. offline 추론 성공은 이벤트·checkpoint·Trust 변경·활성화를 만들지 않는다.
+
+## #118 로더·모델 정보 API 연결 (2026-10-13)
+
+Orchestrator의 `mqtt_if` Stage는 다음 세 설정이 모두 비어 있으면 기존 단일 joblib 경로를 유지한다.
+일부만 설정하면 초기화에 실패한다. 세 값이 있으면 `TRUST_AI_MODE=observe`를 먼저 요구하고,
+외부 pin·모델 Version을 검사한 동일 메모리 snapshot을 한 번 로드한다.
+
+| 설정 | 의미 |
+| --- | --- |
+| `MQTT_IF_ARTIFACT_DIR` | 검토한 Bundle 디렉터리 |
+| `MQTT_IF_EXPECTED_MODEL_VERSION` | 검토한 모델 Version |
+| `MQTT_IF_EXPECTED_BUNDLE_SHA256` | 검토 경로에서 받은 외부 신뢰 pin |
+
+Bundle 판정은 위 offline scorer를 그대로 사용한다. 이벤트에 모델 Version·Bundle SHA,
+원점수·Threshold·5개 Feature 값·대체 간격 여부를 남기고, 완료 수집기에도 동일한 모델 식별자를
+전달한다. 정상 추론은 이벤트가 없어도 완료 수집기에 추론/정상 수를 남긴다. Stage 인스턴스는
+처음 로드한 snapshot을 유지한다. 파일 교체 후 새 Stage를 만들려면 새 Bundle과 일치하는 설정이
+필요하며 자동 재로딩은 하지 않는다. legacy 경로는 모델 타입·학습 상태·5개 입력·점수 유효성을
+확인하되 기존 `predict()` 판정을 유지한다.
+
+`GET /api/models`는 MQTT Bundle도 역직렬화 없이 검사한다. 파일당 64 MiB를 넘으면 거부하며
+내부 경로·임의 확장 필드·Report 원문은 공개하지 않는다. 이 조회의 `runtime.status`는 여전히
+`UNKNOWN`이다. 설정된 파일의 검사 성공은 실행 중 Stage의 snapshot을 증명하지 않는다.
+
+기기별 revision 저장은 Migration 012에 있지만 운영 Stage Registry의 selector 주입,
+활성화 감사·시작 경계·완료 기록의 영속 저장은 아직 미연결이다. 따라서 이번 연결은
+P9-03·P9-06 운영 완료나 모델 활성화 승인이 아니다. 실제 `.env`·Stage 활성화 목록·모델·DB를
+변경하지 않았고 Pi 배포, 실제 자료 학습·정상/공격 성능 평가는 수행하지 않았다.
 
 ## 검증
 

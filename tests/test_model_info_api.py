@@ -12,6 +12,7 @@ from ai.packet_if_contract import (
     PACKET_IF_METADATA_FILENAME, PACKET_IF_MODEL_FILENAME, PACKET_IF_TRAINING_REPORT_FILENAME,
 )
 from ai import predict_packet_isolation_forest as predictor
+from ai import mqtt_if_artifact as mqtt_bundle
 from backend.app.config import settings
 from backend.app.main import app
 from test_predict_packet_isolation_forest import _write_artifact
@@ -211,3 +212,132 @@ def test_report_scores_are_not_semantically_verified_or_exposed(artifact, monkey
     assert item["artifact_status"] == "BUNDLE_METADATA_VERIFIED"
     assert item["checks"]["report_semantics_verified"] is False
     assert "accuracy" not in response.text and "anomaly_rate" not in response.text
+
+
+@pytest.fixture
+def mqtt_artifact(tmp_path, monkeypatch):
+    from tests.test_mqtt_if_artifact import _fixture, _pin, _write_contract
+
+    path = tmp_path / "mqtt-if-test"
+    metadata = _fixture(path, stored_object={"opaque": "must never be loaded by the API"})
+    (path / mqtt_bundle.MQTT_IF_MODEL_FILENAME).write_bytes(b"unauthorized opaque blob, not pickle")
+    metadata["model_sha256"] = hashlib.sha256((path / mqtt_bundle.MQTT_IF_MODEL_FILENAME).read_bytes()).hexdigest()
+    metadata.update(private_metadata_marker="DO_NOT_EXPOSE_METADATA", raw_provenance={"path": str(tmp_path)})
+    _write_contract(path, metadata)
+    report_path = path / mqtt_bundle.MQTT_IF_REPORT_FILENAME
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report.update(private_report_marker="DO_NOT_EXPOSE_REPORT", accuracy=900,
+                  raw_provenance={"path": str(tmp_path)})
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    _write_contract(path, metadata, update_report=False)
+    monkeypatch.setattr(settings, "mqtt_if_artifact_dir", str(path))
+    monkeypatch.setattr(settings, "mqtt_if_expected_model_version", metadata["model_version"])
+    monkeypatch.setattr(settings, "mqtt_if_expected_bundle_sha256", _pin(path))
+    monkeypatch.setattr(joblib, "load", lambda *_a, **_k: pytest.fail("API deserialized model"))
+    monkeypatch.setattr(mqtt_bundle, "load_inspected_mqtt_if_artifact",
+                        lambda *_a, **_k: pytest.fail("API used model loader"))
+    return path, metadata, TestClient(app)
+
+
+def mqtt(response):
+    assert response.status_code == 200, response.text
+    return next(item for item in response.json()["models"] if item["detector"] == "mqtt_if")
+
+
+def mqtt_repin(path, monkeypatch):
+    from tests.test_mqtt_if_artifact import _pin
+
+    monkeypatch.setattr(settings, "mqtt_if_expected_bundle_sha256", _pin(path))
+
+
+def test_mqtt_inspection_exposes_only_contract_and_never_deserializes(mqtt_artifact):
+    path, metadata, client = mqtt_artifact
+    before = {member.name: member.read_bytes() for member in path.iterdir()}
+    response = client.get("/api/models")
+    item = mqtt(response)
+    assert item["artifact_status"] == "BUNDLE_METADATA_VERIFIED"
+    assert item["artifact"]["model_version"] == metadata["model_version"]
+    assert item["artifact"]["score_method"] == "decision_function"
+    assert item["artifact"]["threshold_operator"] == "<"
+    assert item["artifact"]["threshold"] == 0.0
+    assert item["artifact"]["interval_semantics"]["single_message_is_observed_interval"] is False
+    assert item["artifact"]["bundle_sha256"] == settings.mqtt_if_expected_bundle_sha256
+    assert item["checks"]["bundle_sha256_verified"] is True
+    assert item["checks"]["metadata_contract_verified"] is True
+    assert item["checks"]["report_sha256_verified"] is True
+    assert item["checks"]["report_json_object_verified"] is True
+    assert item["runtime"]["status"] == "UNKNOWN"
+    for field in ("report_semantics_verified", "model_deserialized", "inference_verified"):
+        assert item["checks"][field] is False
+    for marker in ("DO_NOT_EXPOSE", "raw_provenance", "accuracy", str(path), "dataset_version", "capture_policy"):
+        assert marker not in json.dumps(item)
+    assert {member.name: member.read_bytes() for member in path.iterdir()} == before
+
+
+@pytest.mark.parametrize("field", ["mqtt_if_artifact_dir", "mqtt_if_expected_model_version", "mqtt_if_expected_bundle_sha256"])
+def test_mqtt_partial_configuration_reports_incomplete(mqtt_artifact, monkeypatch, field):
+    _, _, client = mqtt_artifact
+    monkeypatch.setattr(settings, field, "")
+    item = mqtt(client.get("/api/models"))
+    assert item["artifact_status"] == "UNCONFIGURED"
+    assert item["error_code"] == "MQTT_IF_CONFIGURATION_INCOMPLETE"
+    assert item["artifact"] is None and item["runtime"]["status"] == "UNKNOWN"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("mqtt_if_expected_bundle_sha256", "0" * 64),
+    ("mqtt_if_expected_bundle_sha256", "not-a-pin"),
+    ("mqtt_if_expected_model_version", "wrong-model"),
+])
+def test_mqtt_wrong_external_identity_is_invalid(mqtt_artifact, monkeypatch, field, value):
+    _, _, client = mqtt_artifact
+    monkeypatch.setattr(settings, field, value)
+    item = mqtt(client.get("/api/models"))
+    assert item["artifact_status"] == "INVALID"
+    assert item["error_code"] == "MQTT_IF_ARTIFACT_INVALID"
+    assert item["artifact"] is None and item["checks"]["model_deserialized"] is False
+
+
+@pytest.mark.parametrize("field", ["feature_order", "threshold", "interval_semantics", "score_method"])
+def test_mqtt_missing_required_metadata_is_invalid_even_when_repinned(mqtt_artifact, monkeypatch, field):
+    path, metadata, client = mqtt_artifact
+    del metadata[field]
+    (path / mqtt_bundle.MQTT_IF_METADATA_FILENAME).write_text(json.dumps(metadata), encoding="utf-8")
+    mqtt_repin(path, monkeypatch)
+    item = mqtt(client.get("/api/models"))
+    assert item["artifact_status"] == "INVALID"
+    assert item["artifact"] is None and item["checks"]["metadata_contract_verified"] is False
+
+
+@pytest.mark.parametrize("filename", mqtt_bundle.MQTT_IF_BUNDLE_FILENAMES)
+def test_mqtt_missing_member_is_unavailable(mqtt_artifact, filename):
+    path, _, client = mqtt_artifact
+    (path / filename).unlink()
+    item = mqtt(client.get("/api/models"))
+    assert item["artifact_status"] == "UNAVAILABLE"
+    assert item["error_code"] == "MQTT_IF_ARTIFACT_UNAVAILABLE"
+
+
+def test_mqtt_api_passes_bounded_limit_and_rejects_oversized_file(mqtt_artifact, monkeypatch):
+    from backend.app.services import model_info_service
+
+    path, _, client = mqtt_artifact
+    monkeypatch.setattr(model_info_service, "MAX_ARTIFACT_FILE_BYTES", 8)
+    item = mqtt(client.get("/api/models"))
+    assert item["artifact_status"] == "INVALID"
+    assert item["error_code"] == "MQTT_IF_ARTIFACT_INVALID"
+    assert str(path) not in json.dumps(item)
+
+
+def test_mqtt_api_rejects_symlink_member(mqtt_artifact, tmp_path):
+    path, _, client = mqtt_artifact
+    member = path / mqtt_bundle.MQTT_IF_MODEL_FILENAME
+    saved = tmp_path / "saved-model"
+    member.rename(saved)
+    try:
+        member.symlink_to(saved)
+    except OSError as error:
+        pytest.skip(f"host does not permit symlink creation: {error.errno}")
+    item = mqtt(client.get("/api/models"))
+    assert item["artifact_status"] == "INVALID"
+    assert item["runtime"]["status"] == "UNKNOWN"

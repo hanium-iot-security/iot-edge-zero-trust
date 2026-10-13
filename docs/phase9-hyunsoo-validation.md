@@ -1,4 +1,4 @@
-# Phase 9 현수 구현·검증 기록 (2026-10-10)
+# Phase 9 현수 구현·검증 기록
 
 ## 기준선과 범위
 
@@ -12,6 +12,30 @@
 - PR #112의 `ai/mqtt_if_artifact.py`와 `docs/phase9-mqtt-if-offline-bundle.md`는 **offline** Bundle 검사 계약을 제공한다. 현재 이 브랜치의 MQTT Stage는 여전히 legacy loader를 사용한다. 모델 해시·Feature 순서·점수 방향·Threshold·비교 연산을 운영 Runtime까지 연결하고 새 develop 위에서 다시 검증해야 한다.
 - PR #114의 Migration 012와 `edge/policy/device_ai_policy_resolver.py`는 `device_ai_policy_revisions` 저장·조회 계약을 제공한다. 이 브랜치의 `ai_window_selector`는 아직 해당 resolver 또는 운영 Stage Registry에 연결되지 않았다. 활성화 감사·경고·완료 기록의 영속 저장 계약도 이 merge 결과에서 확인되지 않았다. 따라서 아래의 관련 HOLD는 "저장 revision 부재"가 아니라 "확정된 저장 revision과 실행 경로의 미연결"로 읽어야 한다.
 - Broker 목적지 전용 Feature/Migration은 이 `develop`에서 확인되지 않았다. 기존 로컬 시험은 이전 기준 `53ec270` 위에서 실행했다. 최신 develop과의 통합 diff·회귀 및 Pi 결과는 미검증이며 병합 전에 별도로 확인해야 한다.
+
+## 2026-10-13 #118 재검토·MQTT Bundle 연결
+
+- PR 기존 head `20338fa`에 원격 `develop`의 `f752230`을 충돌 없이 병합했다(`da54a48`). 위 10/10·10/12 절과 문서 하단 전체 회귀 수치는 당시 기록이며 이번 통합 결과와 구별한다.
+- #112의 검사 snapshot·scorer를 MQTT Stage Registry에 연결했다. 세 Bundle 설정은 함께 지정해야 하며 외부 pin·모델 Version·`TRUST_AI_MODE=observe` 검사가 선행한다. 모두 빈 기본값은 legacy 경로를 유지한다. 자세한 설정과 범위는 `docs/phase9-mqtt-if-offline-bundle.md`의 #118 절을 따른다.
+- 이벤트와 완료 수집기에 실제 모델 Version·Bundle SHA를 연결하고, 이벤트에는 원점수·엄격한 `<` Threshold·5개 Feature·단일 메시지 간격 대체 여부를 기록한다. `/api/models`는 MQTT Bundle도 파일당 64 MiB 이내에서 역직렬화 없이 검사하고 `runtime=UNKNOWN`을 유지한다.
+- 손상된 AI 모드/revision의 일부만 남은 근거가 legacy 강제 감점으로 넘어가는 오류를 수정했다. MQTT 최상위·Packet 중첩 근거가 충돌해도 자동 감점 대상에서 제외한다. 필드가 없거나 두 필드가 모두 NULL인 기존 이벤트의 동작은 유지한다.
+- AI revision의 시각이 NULL·문자열·naive datetime 등으로 손상되면 예외로 중단하던 경로를 `INVALID_AI_REVISION` 제외 판정으로 바꿨다.
+- 모든 기기가 OFF인 legacy Stage도 잘못된 객체·미학습 모델을 정상으로 취급하지 않도록 모델 타입·학습 상태·입력 차원·점수를 확인한다. 실패 시 Checkpoint를 전진시키지 않는다.
+- 실제 `.env`, 운영 DB·모델, Pi 서비스를 변경하지 않았다. 공식 자료 학습·모델 활성화는 수행하지 않았다. 기기별 selector 주입, 활성화 감사·시작 경계, 경고·완료 기록 저장은 여전히 후속 통합이다.
+
+### 이번 통합 검증
+
+Windows Python 3.10.11, numpy 2.0.2, scipy 1.15.3, scikit-learn 1.6.1,
+joblib 1.4.2의 기존 가상환경에서 임시 SQLite·합성 Bundle로 실행했다.
+
+```powershell
+python -m pytest -q --tb=short tests/test_ai_detector.py tests/test_ai_runner.py tests/test_phase8_trust_gates.py tests/test_detection_orchestrator_runner.py tests/test_packet_ai_detector.py tests/test_run_packet_ai_detector.py tests/test_packet_rule_detector.py tests/test_packet_rule_policy_v4.py tests/test_packet_rule_runner.py tests/test_rule_detector.py tests/test_rule_runner.py tests/test_broker_dos_attack.py tests/test_phase9_ai_window_decision.py tests/test_phase9_ai_warning_aggregation.py tests/test_phase9_ai_run_evidence.py tests/test_phase9_packet_rate_boundaries.py tests/test_ai_observation.py tests/test_phase4_trust_firewall.py
+python -m pytest -q --tb=short tests/test_mqtt_if_runtime.py tests/test_model_info_api.py tests/test_mqtt_if_artifact.py tests/test_mqtt_feature_pipeline.py tests/test_predict_packet_isolation_forest.py
+```
+
+- 첫 명령: **450 passed**, 55.72초. Rule·Trust·AI·Orchestrator와 세 결함의 회귀를 포함한다.
+- 둘째 명령: **212 passed, 2 skipped**, 36.88초. Windows symlink 생성 권한이 없는 두 fixture만 건너뛰었다. 신규 MQTT Runtime 20개, 실제 SQLite 이벤트·완료근거·중복방지·OFF 추론 제외·정상 무이벤트 완료와 추론/저장 실패 rollback을 포함한다.
+- 합계 **662 passed, 2 skipped, 0 failed**. `git diff --check`도 통과했다. 이번 수정 후 전체 `tests backend/tests` 재실행과 Pi 시험은 하지 않았다. 아래 3,352개 전체 통과는 이전 기준선 결과다.
 
 ## 정상 운용 기준 v1 검토 — P9-08/V06·V07
 
@@ -47,12 +71,12 @@ AI 저장 접점 **제안**: `device_ai_policy_revisions`의 device_id·양의 r
 
 경고 집계 저장은 원본 이벤트를 변경하지 않고 집계 키·처리한 ID/Window·최근 경계·마지막 알림·억제 수를 원자적으로 보존해야 한다. `WarningLedger`는 저장 소유자가 트랜잭션에서 읽고 저장할 판정 상태다. 알림은 DB commit 뒤에만 발행해야 한다. W/N/C의 운영값은 승인 자료로 아직 확정되지 않았으므로 테스트 값 60초/3회/120초를 운영값으로 사용하지 않는다.
 
-P9-06 저장/조회는 `AICompletionRecord`를 Stage Event·Checkpoint와 같은 트랜잭션으로 확정하고, API는 Boot·observed_at·만료와 대조해야 한다. MQTT legacy loader는 실제 모델 버전/hash를 보증하지 않으므로 해당 필드를 NULL로 내보낸다. Packet은 검증된 Artifact의 model version/hash를 기록한다. 이벤트 없음·다른 기기의 전진·DB health를 정상 추론으로 변환하지 않는다.
+P9-06 저장/조회는 `AICompletionRecord`를 Stage Event·Checkpoint와 같은 트랜잭션으로 확정하고, API는 Boot·observed_at·만료와 대조해야 한다. MQTT legacy loader는 실제 모델 버전/hash를 보증하지 않으므로 해당 필드를 NULL로 내보낸다. MQTT Bundle과 Packet은 검증된 Artifact의 model version/hash를 기록한다. 이벤트 없음·다른 기기의 전진·DB health를 정상 추론으로 변환하지 않는다.
 
 ## 미완료 접점 — Phase 10 인계
 
-- **P9-02/V09:** 우민의 새 MQTT Bundle metadata/외부 hash·Feature 순서·낮을수록 이상인 점수·Validation Threshold·비교 연산 계약이 미확정이다. 현재 `ai_detector.py`는 legacy joblib `predict()`를 사용한다. 새 Bundle 로더/오프라인·Runtime 동일 판정과 1건 Window 5.0 대체 표시를 연결한 뒤 활성화한다. #110의 모델 정보 API는 MQTT를 `LEGACY_CONTRACT_UNAVAILABLE`로 명시한다.
-- **P9-03/V14~V15:** 종민 AI revision·활성화 감사 Migration, 원자적 CP 적용, 과거 공백 제외 저장이 없다. 이 브랜치의 순수 결정/Stage 주입만으로 운영 전환을 승인할 수 없다. 우민 API와 실제 Stage Registry 연결, 모델 장애·required/optional 실패 및 커밋 후 응답 유실 회귀가 필요하다.
+- **P9-02/V09:** MQTT Bundle 로더·scorer·모델 정보 API와 1건 Window 5.0 대체 표시의 로컬 연결은 완료했다. 공식 자료 QC·학습·Threshold 평가, P9-03 시작 경계와 실제 Pi 활성화는 미완료다. Bundle 설정이 없는 경우에만 API는 `LEGACY_CONTRACT_UNAVAILABLE`을 반환한다.
+- **P9-03/V14~V15:** AI revision 저장은 Migration 012에 있다. 운영 Stage의 일관된 revision 조회·selector 주입, 활성화 감사·원자적 CP 적용·과거 공백 제외 저장은 아직 연결하지 않았다. 순수 결정/Stage 주입만으로 운영 전환을 승인할 수 없으며 required/optional 실패와 커밋 후 응답 유실의 실제 승인 경로 회귀가 필요하다.
 - **P9-03/V17:** 종민 경고 저장/Migration과 우민 `GET /api/ai-warnings`, commit 후 알림 경로가 없다. 로컬 집계 판정을 운영 경고 완료로 표시하지 않는다.
 - **P9-04:** 기존 Packet Loader의 외부 Bundle SHA·Feature 6개·높을수록 이상인 점수와 `>` Threshold 검증은 기존 코드에 있다. 세 기기 안정/재접속/희소 Packet 자료의 비교·채택은 우민·종민 후속이다.
 - **P9-05/V22:** 복구 후 서비스 active만으로 완료 판정하지 않는다. #108의 관리자 명령을 통합할 때 동일 Boot/대상에서 필수 처리 경계가 두 차례 실제 전진했는지, 입력/FAILED/품질/신선도를 함께 확인한다. 이 PR의 운영 복구 실행은 미검증이다.
@@ -67,9 +91,9 @@ P9-06 저장/조회는 `AICompletionRecord`를 Stage Event·Checkpoint와 같은
 | --- | --- | --- |
 | V06 | 부분 통과: 114/115/116 ÷ 9.2와 상한 12.5의 엄격한 `>` 경계, 기존 Packet·MQTT Rule 회귀 | 네 임계값의 기기별 개발 자료 replay·당시 운영 revision/Pi 대조 |
 | V07 | 부분 통과: 기존 Rule·Trust 회귀와 정상 자료 검토 | P0/P1/P2 공식 후보 replay·공격 민감도 평가 |
-| V09 | 부분 통과: Packet 기존 Bundle/6개 입력 회귀; MQTT 1건의 5.0 대체는 기존 Feature 코드 확인 | MQTT Bundle hash·Feature 순서·점수 방향·Threshold 계약 및 QC 대조 |
+| V09 | 로컬 부분 통과: MQTT Bundle 외부 pin·5개 입력·낮을수록 이상·엄격한 `<`·대체 간격·모델 교체 snapshot, Packet 기존 Bundle/6개 입력 회귀 | 공식 자료 QC·학습·Threshold 평가·Pi 적용 |
 | V13 | 순수/주입 시험 통과: OFF→OBSERVE→OFF 원본 10초 Window, OFF의 AI 추론/이벤트 제외·Stage CP 전진 | 저장 revision/운영 Stage 연결 |
-| V14 | 부분 통과: 미이관·DISABLED·손상 revision 구별. MQTT 전부 OFF여도 legacy 모델 누락 시 CP 미전진 | 새 Bundle hash 오류와 required/optional Stage 통합 |
+| V14 | 부분 통과: 미이관·DISABLED·손상 revision 구별. 전부 OFF인 legacy Stage의 누락·잘못된 타입·미학습 모델 거부, 새 Bundle hash·Version 오류 시 초기화 실패 | 활성화 승인 경로의 required/optional Stage 통합 |
 | V15 | 미검증: 활성화 감사·시작 CP의 원자 저장 계약 부재 | 종민 Migration/승인 적용 경로 |
 | V16 | 로컬 통과: 기기 OBSERVE evidence가 전역 enforce여도 AI 무감점·무격리, 같은 Window Rule 감점 유지 | 기기별 revision의 실제 저장·Stage 활성화 연결 |
 | V17 | 로컬 판정 통과: N회·중복·쿨다운·지연·재시작 상태·OFF·품질 제외 | 집계 저장/조회/알림의 원자성·운영 W/N/C |
@@ -79,7 +103,7 @@ P9-06 저장/조회는 `AICompletionRecord`를 Stage Event·Checkpoint와 같은
 | V28 | 로컬 부분 통과: NULL Broker 지표 근거 부족, Packet IF 6개 입력 불변 | 9001/IPv6/미설정 대상의 실제 Feature·운영 판정 |
 | V39·V41 | 기존 자동 차단 범위 및 AI OBSERVE 무차단 회귀 확인 | #111 범위 동시 존재·부분 해제·Worker/API/Pi 상태 대조 |
 
-여기의 “로컬 통과”는 SQLite fixture·합성 입력의 결과이며 실장비 결과가 아니다. `edge/features/collect_feature_logs.py`는 MQTT 1건 Window의 두 간격 Feature를 5.0초로 채운다. 이는 실측이 아니라 대체값이며, 운영 Feature 행에는 아직 별도의 출처 필드가 없다. 새 MQTT Bundle을 연결할 때 출처 표시 계약을 추가해야 한다.
+여기의 “로컬 통과”는 SQLite fixture·합성 입력의 결과이며 실장비 결과가 아니다. `edge/features/collect_feature_logs.py`는 MQTT 1건 Window의 두 간격 Feature를 5.0초로 채운다. 이는 실측이 아니라 대체값이며, 운영 Feature 행에는 아직 별도의 출처 필드가 없다. 새 MQTT Bundle 결과·이벤트는 기존 Feature 의미에 따라 `interval_is_fallback`을 표시한다.
 
 ## 재검토에서 수정한 판정 근거
 
@@ -91,7 +115,9 @@ P9-06 저장/조회는 `AICompletionRecord`를 Stage Event·Checkpoint와 같은
 - 선택기를 주입한 Stage가 전역 enforce 설정으로 생성될 수 있었다. MQTT/Packet IF 생성 시 `TRUST_AI_MODE=observe`를 요구하고, Packet `from_settings`는 모델을 읽기 전에 설정을 검사한다. 저장/API 승인 경로와 운영 Registry 연결은 아직 없다.
 - MQTT IF의 모든 기기가 OFF이면 추론 경로가 없어 모델 파일 누락을 발견하지 못한 채 Checkpoint가 전진했다. 선택기가 활성화된 Stage는 OFF 여부와 무관하게 기존 loader로 모델을 먼저 확인한다. 이는 legacy 파일의 로드 검증이며 새 Bundle hash 검증을 의미하지 않는다.
 
-운영 경로 확인: `stage_registry.py`와 독립 runner는 현재 `ai_window_selector`·`completion_sink`를 주입하지 않는다. 따라서 위 로컬 주입 시험은 실제 기기별 AI 활성화나 실행 기록의 영속화를 증명하지 않는다. AI revision/활성화·경고/완료 저장 Migration과 MQTT Bundle 계약이 확정된 뒤 연결·검증해야 한다. 이 전에는 P9-03·P9-06을 운영 완료로 표시하지 않는다.
+운영 경로 확인: `stage_registry.py`와 독립 runner는 현재 `ai_window_selector`·`completion_sink`를 주입하지 않는다. 따라서 위 로컬 주입 시험은 실제 기기별 AI 활성화나 실행 기록의 영속화를 증명하지 않는다. 확정된 AI revision 저장과 이번 MQTT Bundle 로더에 더해 활성화 감사·경고·완료 저장 계약을 연결·검증해야 한다. 이 전에는 P9-03·P9-06을 운영 완료로 표시하지 않는다.
+
+### 기존 기준선의 실행 명령·결과
 
 ```powershell
 $env:PATH = 'C:\Users\Hyunsoo\AppData\Local\Programs\Git\bin;' + $env:PATH

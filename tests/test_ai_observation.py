@@ -425,3 +425,69 @@ def test_legacy_guard_blocks_phase4_before_first_observation(database, monkeypat
     with factory() as db:
         assert _snapshot(db) == before
         _assert_no_enforcement(db, 100, "normal")
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("fields", [
+    {"device_ai_revision": 2},
+    {"device_ai_revision": 2, "device_ai_mode": None},
+    {"device_ai_mode": None},
+    {"device_ai_revision": None},
+])
+def test_partial_phase9_evidence_never_falls_back_to_legacy_enforcement(database, nested, fields):
+    _, factory = database
+    evidence = {"model": fields} if nested else fields
+    event_type = "AI_PACKET_ANOMALY" if nested else "AI_ANOMALY"
+    with factory.begin() as db:
+        _device(db, score=35, status="danger")
+        event_id = _event(db, event_type, evidence=json.dumps(evidence))
+        result = _run(db, ai_mode="enforce")
+        _assert_no_enforcement(db, 35, "danger")
+        row = _event_row(db, event_id)
+        assert row["processing_reason"] == "INVALID_AI_POLICY_EVIDENCE"
+        assert row["applied_to_score"] == 0 and row["processed_at"] is not None
+        assert result.changes == []
+
+
+@pytest.mark.parametrize("evidence", [
+    {},
+    {"device_ai_mode": None, "device_ai_revision": None},
+    {"model": {"device_ai_mode": None, "device_ai_revision": None}},
+])
+def test_absent_and_complete_null_ai_markers_keep_legacy_enforcement(database, evidence):
+    _, factory = database
+    with factory.begin() as db:
+        _device(db)
+        event_id = _event(db, evidence=json.dumps(evidence))
+        result = _run(db, ai_mode="enforce")
+        assert result.changes[0].actual_delta == -15
+        assert db.execute(text("SELECT trust_score FROM devices")).scalar_one() == 85
+        assert _event_row(db, event_id)["processing_reason"] == "APPLIED_TO_TRUST"
+
+
+@pytest.mark.parametrize("top,nested,reason", [
+    ({"device_ai_mode": None, "device_ai_revision": None},
+     {"device_ai_mode": "OBSERVE", "device_ai_revision": 2}, OBSERVED),
+    ({"device_ai_mode": "OBSERVE", "device_ai_revision": 2},
+     {"device_ai_mode": None, "device_ai_revision": None}, OBSERVED),
+    ({"device_ai_mode": "OBSERVE", "device_ai_revision": 2},
+     {"device_ai_mode": "OBSERVE", "device_ai_revision": 2}, OBSERVED),
+    ({"device_ai_mode": "OBSERVE", "device_ai_revision": 2},
+     {"device_ai_mode": "OFF", "device_ai_revision": 2}, "INVALID_AI_POLICY_EVIDENCE"),
+    ({"device_ai_mode": "OBSERVE", "device_ai_revision": 2},
+     {"device_ai_mode": "OBSERVE", "device_ai_revision": 3}, "INVALID_AI_POLICY_EVIDENCE"),
+    ({"device_ai_revision": 2},
+     {"device_ai_mode": "OBSERVE", "device_ai_revision": 2}, "INVALID_AI_POLICY_EVIDENCE"),
+    ({"device_ai_mode": "OBSERVE", "device_ai_revision": 2},
+     {"device_ai_mode": "OBSERVE", "device_ai_revision": True}, "INVALID_AI_POLICY_EVIDENCE"),
+])
+def test_mixed_mqtt_and_packet_ai_evidence_cannot_hide_partial_or_conflicting_policy(
+    database, top, nested, reason,
+):
+    _, factory = database
+    with factory.begin() as db:
+        _device(db, score=35, status="danger")
+        event_id = _event(db, evidence=json.dumps({**top, "model": nested}))
+        _run(db, ai_mode="enforce")
+        _assert_no_enforcement(db, 35, "danger")
+        assert _event_row(db, event_id)["processing_reason"] == reason

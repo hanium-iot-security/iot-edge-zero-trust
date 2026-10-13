@@ -10,9 +10,14 @@ from typing import Any, Callable
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from backend.app.config import settings
+from ai.mqtt_if_artifact import (
+    MQTTIFArtifact, inspect_mqtt_if_bundle, load_inspected_mqtt_if_artifact,
+)
+from backend.app.config import Settings, settings
 from edge.detection import runtime_checkpoint_repository as checkpoints
-from edge.detection.ai_detector import DEFAULT_MODEL_PATH, load_model, predict_feature_window
+from edge.detection.ai_detector import (
+    DEFAULT_MODEL_PATH, load_model, predict_bundle_feature_window, predict_feature_window,
+)
 from edge.detection.ai_run_evidence import AICompletionCollector, AICompletionRecord
 from edge.detection.detection_event_writer import write_detection_event
 from edge.detection.detector_contract import DetectorRunResult, validate_cycle_window
@@ -295,17 +300,55 @@ class MqttIsolationForestStage:
 
     def __init__(
         self, *, model_path: Path = DEFAULT_MODEL_PATH,
+        artifact: MQTTIFArtifact | None = None,
         ai_window_selector: Callable[[PolicyResolution], AIWindowDecision] | None = None,
         completion_sink: Callable[[Session, tuple[AICompletionRecord, ...]], None] | None = None,
         trust_ai_mode: str | None = None,
     ) -> None:
-        if ai_window_selector is not None:
+        if ai_window_selector is not None or artifact is not None:
             require_observe_trust_mode(
                 settings.trust_ai_mode if trust_ai_mode is None else trust_ai_mode
             )
         self.model_path = model_path
+        if artifact is not None and model_path != DEFAULT_MODEL_PATH:
+            raise ValueError("configure either a MQTT Bundle or a legacy model path")
+        self.artifact = artifact
+        self.bundle_evidence = {}
+        if artifact is not None:
+            metadata = artifact.inspection.metadata
+            self.bundle_evidence = {key: metadata[key] for key in (
+                "feature_version", "feature_order", "transform_version", "score_method",
+                "score_direction", "threshold_operator", "threshold_source", "interval_semantics",
+            )}
+            self.policy_version = (
+                f"{MQTT_IF_POLICY_VERSION}:{artifact.inspection.model_version}:"
+                f"{artifact.inspection.bundle_sha256[:12]}"
+            )
         self.ai_window_selector = ai_window_selector
         self.completion_sink = completion_sink
+
+    @classmethod
+    def from_settings(
+        cls, *, app_settings: Settings = settings,
+        ai_window_selector: Callable[[PolicyResolution], AIWindowDecision] | None = None,
+        completion_sink: Callable[[Session, tuple[AICompletionRecord, ...]], None] | None = None,
+    ) -> "MqttIsolationForestStage":
+        configured = (app_settings.mqtt_if_artifact_dir.strip(),
+                      app_settings.mqtt_if_expected_model_version.strip(),
+                      app_settings.mqtt_if_expected_bundle_sha256.strip())
+        artifact = None
+        if any(configured):
+            if not all(configured):
+                raise ValueError("MQTT_IF_ARTIFACT_DIR, MQTT_IF_EXPECTED_MODEL_VERSION and "
+                                 "MQTT_IF_EXPECTED_BUNDLE_SHA256 must be configured together")
+            require_observe_trust_mode(app_settings.trust_ai_mode)
+            inspection = inspect_mqtt_if_bundle(
+                Path(configured[0]), expected_model_version=configured[1],
+                expected_bundle_sha256=configured[2],
+            )
+            artifact = load_inspected_mqtt_if_artifact(inspection)
+        return cls(artifact=artifact, ai_window_selector=ai_window_selector,
+                   completion_sink=completion_sink, trust_ai_mode=app_settings.trust_ai_mode)
 
     def run_until(
         self,
@@ -318,7 +361,7 @@ class MqttIsolationForestStage:
             cycle_range_start=cycle_range_start,
             cycle_cutoff=cycle_cutoff,
         )
-        if self.ai_window_selector is not None:
+        if self.ai_window_selector is not None and self.artifact is None:
             # OFF is a policy decision, not proof that an enabled model stage
             # is healthy. A missing/broken model must not advance its CP.
             load_model(self.model_path)
@@ -362,10 +405,11 @@ class MqttIsolationForestStage:
                                    ai_revision=ai_decision.ai_revision if ai_decision else None,
                                    ai_mode=ai_decision.mode if ai_decision else None)
                 continue
-            result = predict_feature_window(feature_row, self.model_path)
+            result = (predict_bundle_feature_window(feature_row, self.artifact)
+                      if self.artifact is not None else predict_feature_window(feature_row, self.model_path))
             completion.inferred(
                 device_id, window_start, anomaly=bool(result["is_anomaly"]),
-                model_version=None, bundle_sha256=None,
+                model_version=result.get("model_version"), bundle_sha256=result.get("bundle_sha256"),
                 ai_revision=(ai_decision.ai_revision if ai_decision else None),
                 ai_mode=(ai_decision.mode if ai_decision else None),
             )
@@ -404,12 +448,15 @@ class MqttIsolationForestStage:
                         "prediction": result["prediction"],
                         "anomaly_score": result["anomaly_score"],
                     },
-                    "thresholds": {},
-                    # The legacy joblib loader does not verify an immutable
-                    # MQTT model version or hash. Keep the detector policy
-                    # version separate from model identity.
-                    "model_version": None,
-                    "detection_policy_version": self.policy_version,
+                    "thresholds": ({"anomaly_score": result["threshold"], "operator": "<"}
+                                   if self.artifact is not None else {}),
+                    "model_version": result.get("model_version"),
+                    "bundle_sha256": result.get("bundle_sha256"),
+                    "detection_policy_version": MQTT_IF_POLICY_VERSION,
+                    **self.bundle_evidence,
+                    **({key: result[key] for key in (
+                        "raw_decision_score", "feature_values", "interval_is_fallback",
+                    )} if self.artifact is not None else {}),
                     "device_ai_revision": (
                         ai_decision.ai_revision if ai_decision is not None else None
                     ),
