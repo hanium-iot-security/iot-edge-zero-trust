@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from contextlib import nullcontext
 import json
 import sqlite3
 
@@ -419,7 +420,7 @@ def test_packet_feature_logs_return_empty_result(api_client) -> None:
     response = client.get("/api/packet-feature-logs")
 
     assert response.status_code == 200
-    assert response.json() == {"items": [], "total": 0}
+    assert response.json() == {"items": [], "total": 0, "snapshot_max_id": 0}
 
 
 def test_packet_feature_logs_reject_invalid_queries(api_client) -> None:
@@ -650,6 +651,7 @@ def test_query_services_call_repository_functions(monkeypatch) -> None:
 
     monkeypatch.setattr(packet_feature_query_service, "list_packet_feature_logs", fake_packet_list)
     monkeypatch.setattr(packet_feature_query_service, "count_packet_feature_logs", fake_packet_count)
+    monkeypatch.setattr(packet_feature_query_service, "feature_read_snapshot", lambda *_: nullcontext(1))
     monkeypatch.setattr(gateway_metrics_query_service, "list_gateway_metrics", fake_gateway_list)
     monkeypatch.setattr(gateway_metrics_query_service, "count_gateway_metrics", fake_gateway_count)
 

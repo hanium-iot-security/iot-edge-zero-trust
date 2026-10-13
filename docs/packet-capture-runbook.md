@@ -40,6 +40,8 @@ Test Pack(`tests/fixtures/packet/pcap/`) 수집 절차·검증 기준을 정리�
 | `PCAP_RETENTION_HOURS` / `PCAP_MAX_STORAGE_MB` | `1` / `1024` | `processed` 보관 정책 (정리 로직은 별도 구현 필요) |
 | `FAILED_PCAP_RETENTION_HOURS` / `FAILED_PCAP_MAX_STORAGE_MB` / `FAILED_PCAP_MAX_FILES` | `24` / `256` / `20` | `failed` 보관 정책 (정리 로직은 별도 구현 필요) |
 
+읽기 전용 파일 목록·참조 보호·정리 미리보기는 [Phase 9 저장 공간 도구](phase9-storage-inventory.md)를 사용한다. 위 retention 값에 따른 자동 삭제는 아직 없으며, 미리보기는 삭제 승인이 아니다.
+
 ## 3. 실행 방법
 
 ### 3.1 수동 실행 (개발/검증용)
