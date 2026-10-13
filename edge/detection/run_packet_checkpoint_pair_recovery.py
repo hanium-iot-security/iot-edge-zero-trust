@@ -28,6 +28,13 @@ def build_parser():
         if name != "status":
             command.add_argument("--confirm", required=True)
             command.add_argument("--confirm-skip-processable")
+        else:
+            command.add_argument("--capture-continuation-file")
+            command.add_argument("--expected-capture-session-id")
+    continuation = commands.add_parser("record-capture-continuation")
+    for field in ("plan-file", "db-path", "artifact-dir", "expected-capture-session-id",
+                  "approved-by", "reason", "receipt-output"):
+        continuation.add_argument("--" + field, required=True)
     return parser
 
 
@@ -60,6 +67,8 @@ def main(argv=None):
             payload = pair.inspect_pair(**fields)
         elif args.command == "status":
             payload = pair.status_pair(**fields)
+        elif args.command == "record-capture-continuation":
+            payload = pair.record_capture_continuation(**fields)
         else:
             payload = pair.execute_pair(**fields, resume=args.command == "resume")
     except Exception as exc:
@@ -69,6 +78,8 @@ def main(argv=None):
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     if args.command == "dry-run":
         return 0 if payload["can_execute"] else 2
+    if args.command == "record-capture-continuation":
+        return 0
     if payload["operation_status"] in pair.COMPLETE_STATUSES:
         return 0
     return 2 if payload["database_committed"] is False else 3
