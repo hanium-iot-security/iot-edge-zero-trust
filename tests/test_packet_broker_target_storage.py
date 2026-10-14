@@ -63,13 +63,15 @@ def test_migration_preserves_history_and_leaves_three_nulls(tmp_path):
             before = db.execute("SELECT * FROM packet_feature_logs").fetchone()
             indexes = db.execute("SELECT name,sql FROM sqlite_master WHERE type='index' "
                                  "AND tbl_name='packet_feature_logs' ORDER BY name").fetchall()
-        assert apply_migrations(path, MIGRATIONS_DIR).applied_versions == [13, 14, 15]
+        assert apply_migrations(path, MIGRATIONS_DIR).applied_versions == [13, 14, 15, 16]
         with sqlite3.connect(path) as db:
             row = db.execute("SELECT * FROM packet_feature_logs").fetchone()
             assert row[:-3] == before
             assert row[-3:] == (None, None, None)
-            assert db.execute("SELECT name,sql FROM sqlite_master WHERE type='index' "
-                              "AND tbl_name='packet_feature_logs' ORDER BY name").fetchall() == indexes
+            after_indexes = dict(db.execute("SELECT name,sql FROM sqlite_master WHERE type='index' "
+                                            "AND tbl_name='packet_feature_logs' ORDER BY name").fetchall())
+            assert dict(indexes).items() <= after_indexes.items()
+            assert set(after_indexes) == set(dict(indexes)) | {"idx_packet_features_gap_end"}
             assert db.execute("PRAGMA foreign_key_check").fetchall() == []
             assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert apply_migrations(path, MIGRATIONS_DIR).applied_versions == []

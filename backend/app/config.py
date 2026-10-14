@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     ai_warning_window_seconds: int | None = None
     ai_warning_count_threshold: int | None = None
     ai_warning_cooldown_seconds: int | None = None
+    packet_confirmed_gap_policy_enabled: bool = False
     # AI inference/checkpoints keep running in both modes. Only Trust changes.
     trust_ai_mode: Literal["enforce", "observe"] = "enforce"
 

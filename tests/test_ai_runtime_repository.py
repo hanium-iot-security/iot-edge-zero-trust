@@ -80,7 +80,7 @@ def test_upgrade_012_preserves_data_and_second_apply_is_noop(tmp_path):
     with sqlite3.connect(path) as db:
         db.execute("INSERT INTO devices(device_id) VALUES('sensor1')")
         before = db.execute("SELECT * FROM devices").fetchall()
-    assert apply_migrations(path, MIGRATIONS).applied_versions == [13, 14, 15]
+    assert apply_migrations(path, MIGRATIONS).applied_versions == [13, 14, 15, 16]
     assert apply_migrations(path, MIGRATIONS).applied_versions == []
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT * FROM devices").fetchall() == before

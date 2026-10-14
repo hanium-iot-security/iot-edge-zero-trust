@@ -23,7 +23,8 @@ Required이면 MQTT Producer Watermark와 Packet Feature Ready Through 중 이�
 공통 cutoff로 사용합니다. Packet 계층이
 비활성화됐거나 `required=false`이면 MQTT 단독 Trust Cycle은 기존 계약대로 동작합니다.
 Gap을 정상 데이터로 연결하지 않으며, 운영자가 Gap을 확인하고 새 연속 구간으로 재개하는
-절차는 별도 운영 단계에서 수행합니다.
+절차는 별도 운영 단계에서 수행합니다. 선택적으로 확인된 미수집 공백을 미검사로
+기록하고 다음 정상 Session을 처리할 수 있으며, 원본 실패와 Trust 처리 순서는 유지합니다.
 """
 
 from __future__ import annotations
@@ -58,6 +59,7 @@ from edge.orchestration.packet_stage_readiness import (
     require_packet_feature_ready_range,
 )
 from edge.orchestration.stage_registry import (
+    PACKET_IF,
     PACKET_RULE,
     PACKET_STAGE_NAMES,
     StageRegistry,
@@ -76,6 +78,10 @@ from edge.trust.trust_score_v2 import (
 from edge.trust.run_firewall_worker import firewall_lock_path
 from edge.maintenance.planned import resolve_planned_transition
 from edge.maintenance.processing import cap_processing_cutoff
+from edge.packet.confirmed_gaps import (
+    advance_confirmed_packet_gap,
+    resolve_confirmed_packet_gap,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -503,6 +509,17 @@ def resolve_packet_live_resume_transition(
         for detector_name in PACKET_STAGE_NAMES
     )
     if all(checkpoint is not None for checkpoint in paired_checkpoints):
+        confirmed = resolve_confirmed_packet_gap(
+            db, range_start=range_start, boundary=boundary,
+            checkpoint_rows=paired_checkpoints,
+        )
+        if confirmed is not None:
+            return PacketLiveResumeTransition(
+                boundary=boundary,
+                target_session_id=str(confirmed["target_session_id"]),
+                plan_sha256=str(confirmed["plan_sha256"]),
+                mode="confirmed-gap",
+            )
         planned = resolve_planned_transition(db, boundary, paired_checkpoints)
         if planned is not None:
             # Finalization already drained the source boundary. Only the recorded
@@ -613,13 +630,11 @@ def run_orchestration_cycle(
                 logger.info(
                     "event=%s range_start=%s "
                     "resume_boundary=%s target_session_id=%s plan_sha256=%s",
-                    (
-                        "PACKET_SEGMENT_GAP_CATCHUP"
-                        if packet_resume_transition.mode == "segment-gap"
-                        else "PACKET_BOUNDED_REPLAY_CATCHUP"
-                        if packet_resume_transition.mode == "bounded-replay"
-                        else "PACKET_LIVE_RESUME_CATCHUP"
-                    ),
+                    {
+                        "confirmed-gap": "PACKET_UNINSPECTED_GAP_CATCHUP",
+                        "segment-gap": "PACKET_SEGMENT_GAP_CATCHUP",
+                        "bounded-replay": "PACKET_BOUNDED_REPLAY_CATCHUP",
+                    }.get(packet_resume_transition.mode, "PACKET_LIVE_RESUME_CATCHUP"),
                     format_db_utc(range_start),
                     format_db_utc(packet_resume_transition.boundary),
                     packet_resume_transition.target_session_id,
@@ -663,6 +678,35 @@ def run_orchestration_cycle(
                     )
                 else:
                     packet_ready_through = packet_readiness.packet_feature_ready_through
+                    if (
+                        settings.packet_confirmed_gap_policy_enabled
+                        and set(PACKET_STAGE_NAMES).issubset(registry.required_names)
+                        and (packet_ready_through is None or packet_ready_through <= range_start)
+                    ):
+                        gap = advance_confirmed_packet_gap(
+                            db, range_start=range_start, cutoff=cutoff,
+                        )
+                        if gap is not None:
+                            if evidence is not None:
+                                evidence.input_interrupted(
+                                    db, detector_name=PACKET_IF, boundary=range_start)
+                            # Loss audit, Packet boundaries and warning interruption
+                            # commit together; no inference completion is fabricated.
+                            # MQTT/Trust catch up before the next normal input.
+                            db.commit()
+                            packet_ready_through = parse_db_utc(gap["window_end"])
+                            packet_resume_transition = PacketLiveResumeTransition(
+                                boundary=packet_ready_through,
+                                target_session_id=str(gap["target_session_id"]),
+                                plan_sha256=str(gap["plan_sha256"]),
+                                mode="confirmed-gap",
+                            )
+                            logger.warning(
+                                "event=PACKET_UNINSPECTED_GAP window_start=%s window_end=%s "
+                                "target_session_id=%s evidence_sha256=%s",
+                                gap["window_start"], gap["window_end"],
+                                gap["target_session_id"], gap["plan_sha256"],
+                            )
                     if packet_ready_through is None:
                         logger.info(
                             "event=CYCLE_SKIPPED reason=PACKET_NOT_READY "
