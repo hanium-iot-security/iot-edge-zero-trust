@@ -2,42 +2,45 @@
   width: 100%;
   max-width: 100%;
   min-width: 0;
-
   margin: 0 auto;
-
 
   /* ========================================
      FILTER
      ======================================== */
-
   .filters {
-    grid-template-columns:
-      repeat(3, minmax(0, 1fr));
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 14px;
   }
 
+  .filters .filter-item {
+    min-width: 0;
+
+    input,
+    select {
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
+    }
+  }
 
   /* ========================================
      TABLE
      ======================================== */
-
   .table-panel {
     width: 100%;
     max-width: 100%;
     min-width: 0;
-
     overflow: hidden;
   }
 
   .table-scroll {
     display: block;
-
     width: 100%;
     max-width: 100%;
     min-width: 0;
-
     overflow-x: auto;
     overflow-y: hidden;
-
     -webkit-overflow-scrolling: touch;
 
     > * {
@@ -47,45 +50,44 @@
 
   .device-info {
     display: flex;
-
+    min-width: 0;
     flex-direction: column;
     align-items: flex-start;
-
     gap: 5px;
+
+    > span,
+    small {
+      max-width: 100%;
+      overflow-wrap: anywhere;
+    }
 
     small {
       color: var(--color-slate-500);
+      font-size: 11px;
     }
   }
 
   .event-name {
     display: block;
-
     max-width: 320px;
-
     overflow: hidden;
-
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .delta-negative {
     color: var(--color-danger);
-
     font-weight: 700;
   }
 
   .reason-warning {
     color: var(--color-warning-dark);
-
     font-weight: 700;
   }
-
 
   /* ========================================
      TABLE ROW STATE
      ======================================== */
-
   .row-warning {
     background: #fffbeb;
 
@@ -110,58 +112,41 @@
     }
   }
 
-
   /* ========================================
-     EVENT DETAIL
+     EVENT / AI WARNING DETAIL
      ======================================== */
-
   .detail {
     display: flex;
-
     min-width: 0;
-
     flex-direction: column;
-
     gap: 20px;
   }
 
   .detail-grid {
     display: grid;
-
-    grid-template-columns:
-      repeat(3, minmax(0, 1fr));
-
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 12px;
   }
 
   .detail-item {
     min-width: 0;
-
     padding: 14px;
-
     border: 1px solid var(--border-color);
     border-radius: 9px;
-
     background: var(--color-slate-50);
 
     > span {
       display: block;
-
       margin-bottom: 7px;
-
       color: var(--color-slate-500);
-
       font-size: 11px;
       font-weight: 800;
     }
 
     strong {
       display: block;
-
       overflow-wrap: anywhere;
-
       color: var(--color-slate-900);
-
       font-size: 13px;
     }
   }
@@ -171,65 +156,134 @@
 
     h3 {
       margin: 0 0 12px;
-
       color: var(--color-slate-950);
-
       font-size: 16px;
+    }
+
+    .break-word,
+    dd {
+      overflow-wrap: anywhere;
     }
   }
 
   .window {
     display: flex;
-
     align-items: center;
-
     gap: 10px;
     flex-wrap: wrap;
-
     padding: 13px;
-
     border: 1px solid var(--border-color);
     border-radius: 9px;
-
     background: var(--color-slate-50);
-
     color: var(--color-slate-700);
-
     font-size: 13px;
   }
 
   .detail-section > .description {
     margin: 0;
-
     padding: 14px;
-
     border: 1px solid var(--border-color);
     border-radius: 9px;
-
     background: var(--color-slate-50);
-
     color: var(--color-slate-700);
-
     font-size: 13px;
     line-height: 1.6;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
 
+  /* ========================================
+     PHASE 9 - AI WARNING PANEL
+     JSX: aria-label="Phase 9 AI 경고"
+     ======================================== */
+  [aria-label="Phase 9 AI 경고"] {
+    min-width: 0;
+
+    .panel-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+
+      > div {
+        min-width: 0;
+        flex: 1 1 320px;
+      }
+
+      h2 {
+        margin-bottom: 6px;
+      }
+
+      .panel-description {
+        max-width: 850px;
+        color: var(--color-slate-600);
+        line-height: 1.6;
+        overflow-wrap: anywhere;
+      }
+
+      .button {
+        flex: 0 0 auto;
+      }
+    }
+
+    .table-scroll {
+      margin-top: 12px;
+    }
+
+    .device-info small {
+      overflow-wrap: anywhere;
+    }
+
+    .event-name {
+      max-width: 280px;
+    }
+
+    .page-warning-banner {
+      margin: 12px 0;
+
+      p {
+        margin-bottom: 0;
+        overflow-wrap: anywhere;
+      }
+    }
+
+    .text-muted {
+      margin: 14px 0 0;
+      color: var(--color-slate-500);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+  }
+
+  /* ========================================
+     FETCH WARNING / REFRESH ACTIONS
+     ======================================== */
+  .page-warning-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    gap: 10px;
+
+    span {
+      color: var(--color-slate-500);
+      font-size: 12px;
+    }
+  }
 
   /* ========================================
      RESPONSIVE
      ======================================== */
-
   @media (max-width: 1280px) {
     .detail-grid {
-      grid-template-columns:
-        repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
   }
 
   @media (max-width: 1100px) {
     .filters {
-      grid-template-columns:
-        repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
   }
 
@@ -237,6 +291,25 @@
     .filters,
     .detail-grid {
       grid-template-columns: 1fr;
+    }
+
+    [aria-label="Phase 9 AI 경고"] {
+      .panel-header {
+        flex-direction: column;
+        align-items: stretch;
+
+        > div {
+          flex-basis: auto;
+        }
+
+        .button {
+          width: 100%;
+        }
+      }
+    }
+
+    .page-warning-actions {
+      justify-content: flex-start;
     }
   }
 }
