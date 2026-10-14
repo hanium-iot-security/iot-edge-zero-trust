@@ -21,6 +21,10 @@ Capture를 정상 종료하는 `bounded-replay` 정비다. 계획에 `allow_capt
 - 수집 유지 모드는 `detection-orchestrator.service`, `packet-feature-extractor.service`,
   `packet-feature-extractor.timer`만 멈춘다. Capture·MQTT 수신/특징·API·방화벽과
   브로커는 제어하지 않는다. 기존 실행 중 상태가 확인된 처리 서비스만 복귀한다.
+- 수집 유지 Worker와 감사 분류기는 `Nice=10`, `IOSchedulingClass=idle`로 실행한다.
+  대용량 백업의 SD카드 쓰기가 Capture sidecar 저장을 지연시킬 수 있으므로 수집보다
+  낮은 우선순위를 사용한다. 읽기 전용 원본에서 만든 사본도 저장장치 부하를 만들며,
+  사본 시험 전후의 실제 Capture Session·실패 구간을 함께 확인한다.
 - 실제 기기 차단, 펌웨어 변경, 재부팅, Migration은 이 명령에 포함하지 않는다.
 
 서비스 제어는 root, SQLite 읽기·백업·적용은 `pi`가 수행한다. 컨트롤러는 제품

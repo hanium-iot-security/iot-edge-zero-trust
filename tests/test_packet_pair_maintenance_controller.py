@@ -417,10 +417,11 @@ def test_capture_preserving_classifier_checks_capture_again_after_read(retained,
 
 
 @pytest.mark.parametrize("cancelled", [False, True])
-def test_capture_preserving_full_controller_only_pauses_packet_processing(retained, monkeypatch, cancelled):
+@pytest.mark.parametrize("keep", [True, False])
+def test_controller_mode_pauses_only_approved_services_and_sets_worker_priority(retained, monkeypatch, cancelled, keep):
     f, m = retained, retained.m
     state = f.temp / "retained-full-controller"
-    spec = f.spec | dict(driver_sha256=m.digest(SOURCE), boot_id="owned-boot",
+    spec = f.spec | dict(allow_capture_appends=keep, driver_sha256=m.digest(SOURCE), boot_id="owned-boot",
                         spec_file=str(f.temp / "spec.json"))
     for name in m.ALL:
         f.rows[name] = dict(f.original[name])
@@ -429,7 +430,13 @@ def test_capture_preserving_full_controller_only_pauses_packet_processing(retain
     real_read = Path.read_text
     monkeypatch.setattr(Path, "read_text", lambda path, *args, **kwargs:
         "0::/owned/controller" if path.as_posix() == "/proc/self/cgroup" else real_read(path, *args, **kwargs))
-    monkeypatch.setattr(m, "graceful_capture_term", lambda *args: pytest.fail("Capture must not receive TERM"))
+    capture = dict(spec["capture_session"])
+    monkeypatch.setattr(m, "session_row", lambda _: dict(capture))
+    def terminate(*args):
+        assert not keep, "Retained Capture must not receive TERM"
+        f.rows[m.CAPTURE].update(ActiveState="inactive", MainPID="0")
+        capture.update(status="COMPLETED", ended_at="owned-end")
+    monkeypatch.setattr(m, "graceful_capture_term", terminate)
     dispatched = []
     def run(command, **kwargs):
         dispatched.append(command)
@@ -454,12 +461,19 @@ def test_capture_preserving_full_controller_only_pauses_packet_processing(retain
                         else observation(spec, "COMMITTED_VERIFIED"))
     m.execute(spec, state)
     packet = {"detection-orchestrator.service", "packet-feature-extractor.service", "packet-feature-extractor.timer"}
-    assert {name for action, name in f.events if action == "stop" and name in m.ALL} <= packet
-    assert set(starts(f)) <= packet
+    if keep:
+        assert {name for action, name in f.events if action == "stop" and name in m.ALL} <= packet
+        assert set(starts(f)) <= packet
     assert all(f.rows[name] == value for name, value in before.items())
     assert len(dispatched) == (1 if cancelled else 2)
+    if not cancelled:
+        priority = [value for value in dispatched[-1] if value.startswith(("--property=Nice=", "--property=IOSchedulingClass="))]
+        assert priority == (["--property=Nice=10", "--property=IOSchedulingClass=idle"]
+                            if keep else ["--property=Nice=0"])
+        assert (state / "accepted.json").exists()
     assert (state / "worker-launch-requested.json").exists() is not cancelled
-    assert not (state / "capture-term.json").exists() and not (state / "capture-closed.json").exists()
+    assert (state / "capture-term.json").exists() is not keep
+    assert (state / "capture-closed.json").exists() is not keep
     receipt = json.loads((state / "restored.json").read_text())
     assert receipt["classification"] == ("NOT_STARTED" if cancelled else "COMMITTED_VERIFIED")
 
@@ -488,3 +502,21 @@ def test_capture_preserving_full_restore_allows_timer_to_run_previously_inactive
     assert receipt["held_processing_units"] == []
     assert "packet-feature-extractor.service" not in starts(f)
     assert f.rows["packet-feature-extractor.service"]["ActiveState"] == "active"
+
+
+
+@pytest.mark.parametrize("case", ["retained", "fixture"])
+def test_classifier_priority_is_lowered_only_while_capture_is_retained(case, request, monkeypatch):
+    f = request.getfixturevalue(case)
+    result = observation(f.spec, "COMMITTED_VERIFIED")
+    classifier_transport(f, monkeypatch, result)
+    run = f.m.subprocess.run
+    commands = []
+    def observed(command, **kwargs):
+        commands.append(command)
+        return run(command, **kwargs)
+    monkeypatch.setattr(f.m.subprocess, "run", observed)
+    assert f.m.classify(f.spec, f.state, f.original) == result
+    assert len(commands) == 1
+    priority = [value for value in commands[0] if value.startswith(("--property=Nice=", "--property=IOSchedulingClass="))]
+    assert priority == (["--property=Nice=10", "--property=IOSchedulingClass=idle"] if case == "retained" else [])

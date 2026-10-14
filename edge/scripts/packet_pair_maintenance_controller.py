@@ -254,6 +254,7 @@ def classify(spec, state, original):
     subprocess.run(['/usr/bin/systemd-run', '--unit=' + spec['classifier_unit'].removesuffix('.service'),
         '--property=Type=exec', '--property=User=pi', '--property=Group=pi',
         '--property=WorkingDirectory=' + str(PROJECT), '--property=RuntimeMaxSec=20',
+        *(('--property=Nice=10', '--property=IOSchedulingClass=idle') if service_scope(spec)['keep'] else ()),
         '--property=TimeoutStopSec=3', '--property=KillMode=control-group',
         '--property=StandardOutput=append:' + str(output),
         *worker_command(spec, 'classify')], check=True, capture_output=True, timeout=3)
@@ -435,7 +436,8 @@ def execute(spec, state):
         record(state, 'worker-launch-requested', dict(monotonic=time.monotonic()))
         subprocess.run(['/usr/bin/systemd-run', '--unit=' + spec['worker_unit'].removesuffix('.service'),
             '--property=Type=exec', '--property=User=pi', '--property=Group=pi', '--property=RuntimeMaxSec=90',
-            '--property=TimeoutStopSec=3', '--property=KillMode=control-group', '--property=Nice=0',
+            '--property=TimeoutStopSec=3', '--property=KillMode=control-group',
+            *(('--property=Nice=10', '--property=IOSchedulingClass=idle') if scope['keep'] else ('--property=Nice=0',)),
             '/usr/bin/python3', '-I', '-B', str(Path(__file__).resolve()), '--worker', '--state', str(state)],
             check=True, capture_output=True, timeout=3)
         private = show(spec['worker_unit'])
