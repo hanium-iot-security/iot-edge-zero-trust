@@ -5,13 +5,18 @@ service, serial port, external firewall worker, or live device is accessed.
 """
 from contextlib import closing
 from datetime import timedelta
+import json
+from pathlib import Path
 import sqlite3
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
 from edge.maintenance import planned
 from edge.maintenance.processing import dataset_maintenance_windows, overlaps_maintenance
+from edge.packet.confirmed_gaps import advance_confirmed_packet_gap
 from tests.test_planned_maintenance import (
     NEW_BOOT, OLD_BOOT, SOURCE, TARGET, add_segment, add_session, close_source,
     db as maintenance_db, protected, ready, transaction, utc,
@@ -277,7 +282,8 @@ def test_drain_requires_real_consumption_and_does_not_skip_failed_tail(prefix_db
     assert all(row["last_completed_window_end"] == utc(90) for row in conn.execute("SELECT * FROM detector_checkpoints"))
 
 
-def test_rule_drain_uses_inbound_maximum_and_if_uses_all_directions(prefix_db):
+@pytest.mark.parametrize("confirmed_gap", [False, True])
+def test_rule_drain_uses_inbound_maximum_and_if_uses_all_directions(prefix_db, confirmed_gap):
     conn, directory, operation, ids = prefix_db
     conn.execute("INSERT INTO packet_feature_logs(capture_segment_id,device_id,peer_ip,direction,window_start,window_end,"
                  "packet_count,total_bytes,avg_packet_size,max_packet_size) VALUES (?,'esp32_01','192.168.0.4','OUTBOUND',?,?,1,10,10,10)",
@@ -288,22 +294,115 @@ def test_rule_drain_uses_inbound_maximum_and_if_uses_all_directions(prefix_db):
     rule = conn.execute("SELECT last_processed_id FROM detector_checkpoints WHERE detector_name='packet_rule'").fetchone()[0]
     ai = conn.execute("SELECT last_processed_id FROM detector_checkpoints WHERE detector_name='packet_if'").fetchone()[0]
     assert rule < ai
-    assert planned.check_prefix_drain(conn, operation["operation_id"])["result"] == "PREFIX_DRAINED_RECOVERY_REQUIRED"
+    if confirmed_gap:
+        record_confirmed_tail(conn)
+        advance_for_drain(conn, 100)
+    assert planned.check_prefix_drain(conn, operation["operation_id"])["result"] == (
+        "PREFIX_DRAINED_CONFIRMED_GAP" if confirmed_gap else "PREFIX_DRAINED_RECOVERY_REQUIRED")
 
 
-def test_new_unconsumed_pre_prefix_message_or_pending_event_holds_drain(prefix_db):
+def record_confirmed_tail(conn):
+    """Use the actual gap transition after the fixture simulates prefix processing."""
+    path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    engine = create_engine(f"sqlite:///{path.as_posix()}")
+    try:
+        with Session(engine) as db:
+            result = advance_confirmed_packet_gap(db, range_start=planned.parse_db_utc(utc(90)),
+                                                  cutoff=planned.parse_db_utc(utc(110)))
+            assert result is not None
+            db.commit()
+    finally:
+        engine.dispose()
+
+
+def test_confirmed_tail_waits_for_mqtt_trust_and_accepts_later_real_progress(prefix_db):
     conn, directory, operation, _ = prefix_db
     apply(conn, inspect(conn, operation), directory)
     advance_for_drain(conn)
+    originals = protected(conn)
+    record_confirmed_tail(conn)
+    assert planned.check_prefix_drain(conn, operation["operation_id"])["result"] == "WAIT"
+    advance_for_drain(conn, 100)  # The gap is caught up; source IDs are still the prefix IDs.
+    for end in (100, 110):
+        advance_for_drain(conn, end)
+        before = checkpoint_rows(conn), conn.total_changes
+        result = planned.check_prefix_drain(conn, operation["operation_id"])
+        assert result["result"] == "PREFIX_DRAINED_CONFIRMED_GAP"
+        assert result["gap_status"] == "UNINSPECTED" and result["gap_end"] == utc(100)
+        assert (checkpoint_rows(conn), conn.total_changes) == before
+    assert protected(conn) == originals
+
+
+@pytest.mark.parametrize("change", [
+    "no_audit", "bad_digest", "invalid_json", "wrong_source", "wrong_target", "wrong_window",
+    "wrong_reason", "wrong_failure", "wrong_first_segment", "wrong_boundary", "missing_pair",
+    "wrong_rule_id", "wrong_if_id", "packet_boundary_split", "current_id_regressed",
+])
+def test_later_prefix_progress_needs_exact_unmodified_gap_consumption_evidence(prefix_db, change):
+    conn, directory, operation, _ = prefix_db
+    apply(conn, inspect(conn, operation), directory)
+    advance_for_drain(conn)
+    if change != "no_audit":
+        record_confirmed_tail(conn)
+    advance_for_drain(conn, 110)
+    if change == "packet_boundary_split":
+        conn.execute("UPDATE detector_checkpoints SET last_completed_window_end=? WHERE detector_name='packet_if'", (utc(90),))
+    elif change == "current_id_regressed":
+        conn.execute("UPDATE detector_checkpoints SET last_processed_id=3 WHERE detector_name='packet_if'")
+    elif change != "no_audit":
+        audit = dict(conn.execute("SELECT * FROM packet_detection_gaps").fetchone())
+        evidence = json.loads(audit["evidence_json"])
+        if change in ("wrong_source", "wrong_target"):
+            key = "source" if change == "wrong_source" else "target"
+            evidence[key]["session_id"] = SOURCE
+            audit[key + "_session_id"] = SOURCE
+        elif change == "wrong_window":
+            audit["window_end"] = evidence["window_end"] = utc(110)
+        elif change == "wrong_reason":
+            audit["reason"] = evidence["reason"] = "RECORDED_CAPTURE_GAP"
+        elif change == "wrong_failure":
+            evidence["source_last_segment"]["id"] += 1
+        elif change == "wrong_first_segment":
+            evidence["target_first_segment"]["id"] += 1
+        elif change == "wrong_boundary":
+            evidence["checkpoints_before"][0]["last_completed_window_end"] = utc(80)
+        elif change == "missing_pair":
+            evidence["checkpoints_before"].pop()
+        elif change in ("wrong_rule_id", "wrong_if_id"):
+            name = "packet_rule" if change == "wrong_rule_id" else "packet_if"
+            next(row for row in evidence["checkpoints_before"] if row["detector_name"] == name)["last_processed_id"] = 3
+        audit["evidence_json"] = "{" if change == "invalid_json" else json.dumps(evidence)
+        audit["plan_sha256"] = "0" * 64 if change == "bad_digest" else planned._digest(evidence)
+        trigger = conn.execute("SELECT sql FROM sqlite_master WHERE name='packet_detection_gaps_no_update'").fetchone()[0]
+        conn.execute("DROP TRIGGER packet_detection_gaps_no_update")
+        conn.execute("UPDATE packet_detection_gaps SET source_session_id=:source_session_id,target_session_id=:target_session_id,"
+                     "window_end=:window_end,reason=:reason,evidence_json=:evidence_json,plan_sha256=:plan_sha256", audit)
+        conn.execute(trigger)
+    conn.commit()
+    before = protected(conn), checkpoint_rows(conn), conn.total_changes
+    with pytest.raises(planned.PlannedMaintenanceError):
+        planned.check_prefix_drain(conn, operation["operation_id"])
+    assert (protected(conn), checkpoint_rows(conn), conn.total_changes) == before
+
+
+@pytest.mark.parametrize("confirmed_gap", [False, True])
+def test_new_unconsumed_pre_prefix_message_or_pending_event_holds_drain(prefix_db, confirmed_gap):
+    conn, directory, operation, _ = prefix_db
+    apply(conn, inspect(conn, operation), directory)
+    advance_for_drain(conn)
+    if confirmed_gap:
+        record_confirmed_tail(conn)
+        advance_for_drain(conn, 110)
+    boundary = 100 if confirmed_gap else 90
     conn.execute("INSERT INTO mqtt_logs(device_id,topic,payload,payload_size,received_at) "
-                 "VALUES ('esp32_01','iot/esp32_01/sensor','{}',2,?)", (utc(75),))
+                 "VALUES ('esp32_01','iot/esp32_01/sensor','{}',2,?)", (utc(boundary - 5),))
     conn.commit()
     with pytest.raises(planned.PlannedMaintenanceError):
         planned.check_prefix_drain(conn, operation["operation_id"])
     last_id = conn.execute("SELECT MAX(id) FROM mqtt_logs").fetchone()[0]
     conn.execute("UPDATE detector_checkpoints SET last_processed_id=? WHERE source_table='mqtt_logs'", (last_id,))
     conn.execute("INSERT INTO detection_events(detector_type,event_type,analysis_window_start,analysis_window_end,detected_at) "
-                 "VALUES ('RULE','PENDING',?,?,?)", (utc(80), utc(90), utc(90)))
+                 "VALUES ('RULE','PENDING',?,?,?)", (utc(boundary - 10), utc(boundary), utc(boundary)))
     conn.commit()
     with pytest.raises(planned.PlannedMaintenanceError):
         planned.check_prefix_drain(conn, operation["operation_id"])
@@ -347,7 +446,8 @@ def test_enabled_mqtt_if_is_required_to_drain_supported_seven_stage_profile(main
     assert result["checkpoints"]["mqtt_if"]["last_completed_window_end"] == utc(90)
 
 
-def test_real_pipeline_processes_empty_and_normal_prefix_then_waits_at_new_loss(pipeline_db):
+@pytest.mark.parametrize("confirmed_gap", [False, True])
+def test_real_pipeline_processes_empty_and_normal_prefix_then_waits_at_new_loss(pipeline_db, monkeypatch, confirmed_gap):
     from edge.detection.packet_rule_detector import PacketRuleDetectorStage
     from edge.detection.mqtt_adapters import MqttFeatureRuleStage, MqttMessageRuleStage
     from edge.features.collect_feature_logs import produce_mqtt_features_until
@@ -355,6 +455,10 @@ def test_real_pipeline_processes_empty_and_normal_prefix_then_waits_at_new_loss(
     from edge.orchestration.run_detection_orchestrator import run_orchestration_cycle, CYCLE_COMPLETED
     from edge.orchestration.stage_registry import StageRegistry, ConfiguredStage
     from edge.packet.capture_policy import CapturePolicy
+    from edge.orchestration import run_detection_orchestrator as orchestration
+
+    monkeypatch.setattr(orchestration, "settings", orchestration.settings.model_copy(
+        update={"packet_confirmed_gap_policy_enabled": confirmed_gap}))
 
     path, factory, operation = pipeline_db
     target, successor, boot = str(uuid4()), str(uuid4()), str(uuid4())
@@ -372,7 +476,7 @@ def test_real_pipeline_processes_empty_and_normal_prefix_then_waits_at_new_loss(
         failed = late_tail(conn, target_pk, 60, pipeline_utc)
         successor_pk = insert(conn, "packet_capture_sessions", session_id=successor, capture_interface="eth0",
                               started_at=pipeline_utc(61), first_window_start=pipeline_utc(70), status="RUNNING")
-        packet(conn, successor_pk, 70)
+        successor_feature = packet(conn, successor_pk, 70)
         for start in (10, 20):
             messages(conn, start, malformed=True)
         for start in (30, 40, 50, 60, 70):
@@ -401,13 +505,25 @@ def test_real_pipeline_processes_empty_and_normal_prefix_then_waits_at_new_loss(
     assert processing.status == CYCLE_COMPLETED and processing.cutoff == PIPELINE_BASE + timedelta(seconds=60)
     assert len(predicted) == 2 and all(row["packet_count"] == 2 for row in predicted)
     waiting = run_orchestration_cycle(session_factory=factory, registry=registry)
-    assert waiting.status != CYCLE_COMPLETED
+    if confirmed_gap:
+        assert waiting.status == CYCLE_COMPLETED and waiting.cutoff == PIPELINE_BASE + timedelta(seconds=70)
+        continued = run_orchestration_cycle(session_factory=factory, registry=registry)
+        assert continued.status == CYCLE_COMPLETED and continued.cutoff == PIPELINE_BASE + timedelta(seconds=80)
+        assert len(predicted) == 3
+    else:
+        assert waiting.status != CYCLE_COMPLETED
     with closing(sqlite3.connect(path)) as conn:
         conn.row_factory = sqlite3.Row
         for name in planned.PACKET_DETECTORS:
             cp = conn.execute("SELECT * FROM detector_checkpoints WHERE detector_name=?", (name,)).fetchone()
-            assert cp["last_completed_window_end"] == pipeline_utc(60) and cp["last_processed_id"] == last_feature
-        assert planned.check_prefix_drain(conn, operation)["result"] == "PREFIX_DRAINED_RECOVERY_REQUIRED"
+            assert cp["last_completed_window_end"] == pipeline_utc(80 if confirmed_gap else 60)
+            assert cp["last_processed_id"] == (successor_feature if confirmed_gap else last_feature)
+        before_check = conn.total_changes
+        result = planned.check_prefix_drain(conn, operation)
+        assert result["result"] == ("PREFIX_DRAINED_CONFIRMED_GAP" if confirmed_gap else "PREFIX_DRAINED_RECOVERY_REQUIRED")
+        assert conn.total_changes == before_check
+        if confirmed_gap:
+            assert result["gap_status"] == "UNINSPECTED"
         assert conn.execute("SELECT status,error_code FROM packet_capture_segments WHERE id=?", (failed,)).fetchone()[:] == ("FAILED", "LATE_CAPTURE")
         assert conn.execute("SELECT packet_count FROM packet_capture_segments WHERE id=?", (empty,)).fetchone()[0] == 16
         for table, rows in originals.items():

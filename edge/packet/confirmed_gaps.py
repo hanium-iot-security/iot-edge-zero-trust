@@ -173,6 +173,23 @@ def advance_confirmed_packet_gap(db: Session, *, range_start: datetime, cutoff: 
     return result
 
 
+def validated_confirmed_gap_evidence(audit) -> dict | None:
+    """Validate stored digest and bindings; callers also verify source and progress."""
+    try:
+        evidence = json.loads(audit['evidence_json'])
+        if (evidence['version'] != 1 or evidence['status'] != audit['status'] or audit['status'] != 'UNINSPECTED'
+                or _digest(evidence) != audit['plan_sha256'] or evidence['reason'] != audit['reason']
+                or evidence['window_start'] != audit['window_start'] or evidence['window_end'] != audit['window_end']
+                or evidence['source']['session_id'] != audit['source_session_id']
+                or evidence['target']['session_id'] != audit['target_session_id']):
+            return None
+        if not _complete_pair(evidence['checkpoints_before'], audit['window_start']):
+            return None
+        return evidence
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
 def resolve_confirmed_packet_gap(db: Session, *, range_start: datetime, boundary: datetime, checkpoint_rows) -> dict | None:
     """Revalidate immutable loss evidence while allowing target capture appends."""
     if not _schema_exists(db):
@@ -182,18 +199,11 @@ def resolve_confirmed_packet_gap(db: Session, *, range_start: datetime, boundary
     rows = _rows(db, 'SELECT * FROM packet_detection_gaps WHERE window_start=:start AND window_end=:end', {'start': start, 'end': end})
     if len(rows) != 1:
         return None
-    audit = rows[0]
+    evidence = validated_confirmed_gap_evidence(rows[0])
+    if evidence is None:
+        return None
     try:
-        evidence = json.loads(audit['evidence_json'])
-        if (evidence['version'] != 1 or evidence['status'] != audit['status'] or audit['status'] != 'UNINSPECTED'
-                or _digest(evidence) != audit['plan_sha256'] or evidence['reason'] != audit['reason']
-                or evidence['window_start'] != start or evidence['window_end'] != end
-                or evidence['source']['session_id'] != audit['source_session_id']
-                or evidence['target']['session_id'] != audit['target_session_id']):
-            return None
         before = evidence['checkpoints_before']
-        if not _complete_pair(before, start):
-            return None
         expected = sorted([dict(row, last_completed_window_end=end, updated_at=end) for row in before], key=lambda row: row['detector_name'])
         supplied = sorted([dict(row) for row in checkpoint_rows], key=lambda row: row['detector_name'])
         if _pair(db) != expected or supplied != expected:

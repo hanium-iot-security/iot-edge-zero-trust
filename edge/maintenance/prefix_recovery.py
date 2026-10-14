@@ -7,6 +7,7 @@ from datetime import timedelta
 
 from edge.detection.phase4_time import parse_db_utc
 from edge.maintenance import planned as p
+from edge.packet.confirmed_gaps import SESSION_FIELDS, validated_confirmed_gap_evidence
 
 
 def _ready_evidence(db, session, policy):
@@ -153,6 +154,31 @@ def validate_prefix_audit(db, operation, plan):
                "Successor EMPTY prefix gained Packet Features.")
 
 
+def _confirmed_tail_audit(db, proof, expected_ids):
+    """Bind later progress to the recorded pair at this exact failed prefix end."""
+    p._require(p._one(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='packet_detection_gaps'"),
+               "Packet progress beyond the prefix requires a confirmed gap audit.")
+    failure = proof["failure"]
+    audit = p._one(db, "SELECT * FROM packet_detection_gaps WHERE window_start=:start AND window_end=:end",
+                   {"start": proof["prefix_end"], "end": failure["window_end"]})
+    evidence = validated_confirmed_gap_evidence(audit) if audit else None
+    p._require(evidence is not None, "Missing or invalid confirmed gap audit for the failed tail.")
+    source = proof["target_snapshot"]["session"]
+    target = p._session(db, proof["successor_session_id"])
+    successor = proof["successor_evidence"]
+    first = successor["empty_prefix"][0] if successor["empty_prefix"] else successor["segment"]
+    p._require(evidence["reason"] == "LATE_CAPTURE"
+               and evidence["source"] == {key: source[key] for key in SESSION_FIELDS + ("status", "ended_at")}
+               and evidence["target"] == {key: target[key] for key in SESSION_FIELDS}
+               and evidence.get("source_last_segment") == failure
+               and evidence.get("target_first_segment") == first,
+               "Confirmed gap audit does not match the preserved failed tail and successor.")
+    p._require(all("last_processed_id" in row and row["last_processed_id"] == expected_ids[row["detector_name"]]
+                   for row in evidence["checkpoints_before"]),
+               "Confirmed gap audit does not prove healthy prefix source consumption.")
+    return audit
+
+
 def check_prefix_drain(db, operation_id):
     audit = p.get_resume_audit(db, operation_id)
     plan = json.loads(audit["plan_json"])
@@ -163,10 +189,8 @@ def check_prefix_drain(db, operation_id):
     end = proof["prefix_end"]
     if any(parse_db_utc(row["last_completed_window_end"]) < parse_db_utc(end) for row in checkpoints.values()):
         return {"result": "WAIT", "reason": "Healthy prefix processing is incomplete.", "prefix_end": end}
-    p._require(all(checkpoints[name]["last_completed_window_end"] == end for name in p.PACKET_DETECTORS),
-               "Packet checkpoints must stop exactly before the unapproved failed tail.")
-    p._fully_drained(db, checkpoints, end, exact_boundaries=False)
     session_id = proof["target_snapshot"]["session"]["id"]
+    expected_ids = {}
     for name in p.PACKET_DETECTORS:
         direction = "AND f.direction='INBOUND' " if name == "packet_rule" else ""
         rows = p._rows(db, "SELECT MAX(f.id) AS id FROM packet_feature_logs f JOIN packet_capture_segments s "
@@ -175,7 +199,27 @@ def check_prefix_drain(db, operation_id):
         expected = rows[0]["id"]
         if expected is None:
             expected = plan["checkpoints"][name]["before"]["last_processed_id"]
-        p._require(checkpoints[name]["last_processed_id"] == expected, "Healthy prefix source IDs have not been consumed.")
-    return {"result": "PREFIX_DRAINED_RECOVERY_REQUIRED", "operation_id": operation_id,
+        expected_ids[name] = expected
+    result = {"result": "PREFIX_DRAINED_RECOVERY_REQUIRED", "operation_id": operation_id,
             "prefix_end": end, "failed_segment_id": proof["failure"]["id"],
             "successor_session_id": proof["successor_session_id"], "checkpoints": checkpoints}
+    if all(checkpoints[name]["last_completed_window_end"] == end for name in p.PACKET_DETECTORS):
+        p._fully_drained(db, checkpoints, end, exact_boundaries=False)
+        p._require(all(checkpoints[name]["last_processed_id"] == expected_ids[name] for name in p.PACKET_DETECTORS),
+                   "Healthy prefix source IDs have not been consumed.")
+        return result
+    gap = _confirmed_tail_audit(db, proof, expected_ids)
+    gap_end = parse_db_utc(gap["window_end"])
+    p._require(all(parse_db_utc(checkpoints[name]["last_completed_window_end"]) >= gap_end
+                   and (expected_ids[name] is None or (checkpoints[name]["last_processed_id"] is not None
+                        and checkpoints[name]["last_processed_id"] >= expected_ids[name])) for name in p.PACKET_DETECTORS),
+               "Packet checkpoints do not preserve the confirmed prefix consumption.")
+    if any(parse_db_utc(row["last_completed_window_end"]) < gap_end for row in checkpoints.values()):
+        return {"result": "WAIT", "reason": "Confirmed gap MQTT/Trust catchup is incomplete.", "prefix_end": end}
+    # Packet consumption is proven by the exact historical pair above. The
+    # unchanged shutdown helper requires Packet boundaries to be stationary;
+    # use its source/Trust checks only for the remaining stages during catchup.
+    p._fully_drained(db, {name: row for name, row in checkpoints.items() if name not in p.PACKET_DETECTORS},
+                     gap["window_end"], exact_boundaries=False)
+    return {**result, "result": "PREFIX_DRAINED_CONFIRMED_GAP", "gap_status": "UNINSPECTED",
+            "gap_end": gap["window_end"], "gap_plan_sha256": gap["plan_sha256"]}
