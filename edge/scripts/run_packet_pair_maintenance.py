@@ -82,10 +82,11 @@ def seal(path, data, mode):
 
 
 def launch(*, request_file, request_file_sha256, controller_sha256,
-           approval_reference, approve_capture_pause=False, wait_seconds=190):
+           approval_reference, approve_capture_pause=False, approve_processing_pause=False, wait_seconds=190):
     require(os.name == 'posix' and os.getuid() == 0, 'Root Linux launcher only')
-    require(approve_capture_pause is True and approval_reference.strip(),
-            'Explicit operating Capture pause and recovery approval required')
+    require(type(approve_capture_pause) is bool and type(approve_processing_pause) is bool
+        and approve_capture_pause != approve_processing_pause and approval_reference.strip(),
+        'Exactly one explicit operating pause and recovery approval required')
     require(0 <= wait_seconds <= 210, 'Observer wait must be between 0 and 210 seconds')
     request_bytes = reviewed_bytes(request_file, request_file_sha256)
     driver_bytes = reviewed_bytes(CONTROLLER, controller_sha256)
@@ -95,6 +96,9 @@ def launch(*, request_file, request_file_sha256, controller_sha256,
             and request['scope']['repository_root'] == str(PROJECT)
             and request['scope']['database_path'] == str(PROJECT / 'backend/data/iot_security.db'),
             'Request schema or operating paths differ')
+    keep_capture = request['scope'].get('allow_capture_appends', False)
+    require(type(keep_capture) is bool and keep_capture == approve_processing_pause,
+            'Pause approval differs from signed capture mode')
     # This is the only SQLite preflight, and it runs as pi in a read-only process.
     observed = subprocess.run(['/usr/sbin/runuser', '-u', 'pi', '--', '/usr/bin/python3',
         '-I', '-B', '-c', PI_CAPTURE], capture_output=True, text=True, check=True, timeout=3)
@@ -102,6 +106,8 @@ def launch(*, request_file, request_file_sha256, controller_sha256,
     require(type(capture.get('id')) is int and capture['id'] > 0
             and capture.get('status') == 'RUNNING' and capture.get('ended_at') is None,
             'Exactly one actual RUNNING Capture is required')
+    require(not keep_capture or request.get('capture_session_identity') == capture,
+            'Reviewed retained Capture identity changed')
     process = subprocess.run(['/usr/bin/systemctl', 'show', 'packet-capture.service',
         '--property=ActiveState,MainPID'], capture_output=True, text=True, check=True, timeout=2)
     fields = dict(line.split('=', 1) for line in process.stdout.splitlines() if '=' in line)
@@ -126,7 +132,8 @@ def launch(*, request_file, request_file_sha256, controller_sha256,
     # pi must read the request and source; only the root specification is private.
     seal(request_copy, request_bytes, 0o444)
     spec = dict(schema='packet-pair-maintenance-v1', token=token,
-        approval_received=True, approval_scope='capture-pause-canonical-pair-recovery',
+        approval_received=True, approval_scope=('capture-retained-canonical-pair-recovery' if keep_capture
+            else 'capture-pause-canonical-pair-recovery'), allow_capture_appends=keep_capture,
         approval_reference=approval_reference,
         boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
         capture_session_id=capture['id'], capture_session_uuid=capture['session_id'],
@@ -164,6 +171,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--execute', action='store_true')
     parser.add_argument('--approve-capture-pause', action='store_true')
+    parser.add_argument('--approve-processing-pause', action='store_true')
     parser.add_argument('--approval-reference', default='')
     parser.add_argument('--request-file', type=Path)
     parser.add_argument('--request-file-sha256')

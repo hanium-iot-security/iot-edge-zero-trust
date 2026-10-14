@@ -106,6 +106,9 @@ def _load_pair(path):
         raise Error("failed-target-session approval must be boolean")
     if allow_failed_target and plan["mode"] != core.BOUNDED_REPLAY_MODE:
         raise Error("failed-target prefix approval requires bounded replay")
+    allow_capture_appends = plan.get("allow_capture_appends", False)
+    if type(allow_capture_appends) is not bool:
+        raise Error("capture append approval must be boolean")
     children = plan.get("children", [])
     if [child.get("detector") for child in children] != list(DETECTORS):
         raise Error("paired detectors must be Rule then IF")
@@ -118,7 +121,9 @@ def _load_pair(path):
                     "current_session_id", "target_session_id", "approved_by", "reason", "locks", "mode"):
             if signed[key] != plan[key]:
                 raise Error("child approval binding mismatch")
-        if (signed["detector_name"] != child["detector"] or signed["source_table"] != SOURCE
+        if (type(signed.get("allow_capture_appends", False)) is not bool
+                or signed.get("allow_capture_appends", False) != allow_capture_appends
+                or signed["detector_name"] != child["detector"] or signed["source_table"] != SOURCE
                 or type(signed.get("allow_failed_current_session")) is not bool
                 or signed["allow_failed_current_session"] != allow_failed
                 or type(signed.get("allow_failed_target_session", False)) is not bool
@@ -142,7 +147,7 @@ def _load_pair(path):
 
 def inspect_pair(*, db_path, repository_root, current_session_id, target_session_id,
                  approved_by, reason, plan_output, allow_failed_current_session=False,
-                 allow_failed_target_session=False, mode=core.LIVE_RESUME_MODE):
+                 allow_failed_target_session=False, allow_capture_appends=False, mode=core.LIVE_RESUME_MODE):
     if mode not in (core.LIVE_RESUME_MODE, core.BOUNDED_REPLAY_MODE):
         raise Error("unsupported paired recovery mode")
     if type(allow_failed_current_session) is not bool:
@@ -178,6 +183,7 @@ def inspect_pair(*, db_path, repository_root, current_session_id, target_session
                 approved_by=approved_by, reason=reason, lock_entries=entries, mode=mode,
                 allow_failed_current_session=allow_failed_current_session,
                 allow_failed_target_session=allow_failed_target_session,
+                allow_capture_appends=allow_capture_appends,
             ), generated_at=core._utc_now().replace(microsecond=0))
             children.append({"detector": name, "child_operation_id": str(uuid.uuid5(pair_id, name)), "plan": signed})
     first = children[0]["plan"]
@@ -194,6 +200,8 @@ def inspect_pair(*, db_path, repository_root, current_session_id, target_session
                "current_session_id", "target_session_id", "approved_by", "reason", "locks", "mode",
                "allow_failed_current_session")}
     payload["allow_failed_target_session"] = allow_failed_target_session
+    if allow_capture_appends:
+        payload["allow_capture_appends"] = True
     if mode == core.BOUNDED_REPLAY_MODE:
         payload["bounded_replay"] = first["bounded_replay"]
         if allow_failed_target_session:

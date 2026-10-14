@@ -1,10 +1,11 @@
-"""One-use planned Capture pause around the canonical Rule/IF pair command.
+"""One-use approved processing pause around the canonical Rule/IF pair command.
 
 Root only controls OS services. The database worker and audit classifier run as
 pi. The caller must seal this source/spec/request, launch the controller with
 RuntimeMaxSec=145 and arm its independent 150s rescue before any pause. Unknown
-writer teardown prevents restoration; partial/unknown audits restore ingress but
-hold Orchestrator and Firewall worker. Default HOLD; no automatic retry.
+writer teardown prevents restoration. Capture-retained mode controls only packet
+processing; legacy pause mode restores ingress but holds Orchestrator/Firewall
+on partial or unknown audits. Default HOLD; no automatic retry.
 """
 import argparse
 import fcntl
@@ -39,6 +40,26 @@ class Hold(RuntimeError):
 def require(condition, reason):
     if not condition:
         raise Hold(reason)
+
+
+def service_scope(spec):
+    keep = spec.get('allow_capture_appends', False)
+    require(type(keep) is bool, 'Invalid capture mode')
+    timers = ('packet-feature-extractor.timer',) if keep else TIMERS
+    writers = ('detection-orchestrator.service', 'packet-feature-extractor.service') if keep else WRITERS
+    paused = (*timers, *writers) if keep else (CAPTURE, *WRITERS, *TIMERS)
+    return dict(keep=keep, timers=timers, writers=writers, paused=paused,
+        held=frozenset(paused) if keep else PROCESSING,
+        retained=tuple(name for name in ALL if name not in paused))
+
+
+def relevant_jobs(spec):
+    value = jobs()
+    scope = service_scope(spec)
+    if not scope['keep']:
+        return value
+    units = {*scope['paused'], spec['worker_unit'], spec['classifier_unit']}
+    return '\n'.join(line for line in value.splitlines() if set(line.split()) & units)
 
 
 def digest(path):
@@ -120,7 +141,8 @@ def load_spec(path, fresh=False):
     require(os.name == 'posix' and os.getuid() == 0, 'Root Linux controller only')
     spec = json.loads(sealed(path).read_text())
     require(spec['schema'] == 'packet-pair-maintenance-v1' and spec['approval_received'] is True
-        and spec['approval_scope'] == 'capture-pause-canonical-pair-recovery'
+        and spec['approval_scope'] == ('capture-retained-canonical-pair-recovery'
+            if service_scope(spec)['keep'] else 'capture-pause-canonical-pair-recovery')
         and type(spec['capture_session_id']) is int and spec['capture_session_id'] > 0
         and re.fullmatch(r'[0-9a-f-]{36}', spec['capture_session_uuid']),
         'Operating maintenance approval/header missing')
@@ -139,6 +161,12 @@ def load_spec(path, fresh=False):
     request = sealed(spec['request_file'])
     require(request.parent == Path(path).parent and digest(request) == spec['request_file_sha256']
         and json.loads(request.read_text())['plan_sha256'] == spec['request_sha256'], 'Reviewed request changed')
+    reviewed = json.loads(request.read_text())
+    require(type(reviewed['scope'].get('allow_capture_appends', False)) is bool
+        and reviewed['scope'].get('allow_capture_appends', False) == service_scope(spec)['keep'],
+        'Signed capture mode changed')
+    require(not service_scope(spec)['keep'] or reviewed.get('capture_session_identity') == spec['capture_session'],
+        'Signed retained Capture identity changed')
     artifact = Path(spec['artifact_dir'])
     require(artifact == OPS / token and artifact.resolve() == artifact and artifact.is_dir()
         and artifact.stat().st_uid == 1000 and not artifact.stat().st_mode & 0o077,
@@ -172,6 +200,20 @@ def process_birth(pid):
     return Path('/proc', str(pid), 'stat').read_text().rsplit(')', 1)[1].split()[19]
 
 
+def verify_retained_capture(spec):
+    if not service_scope(spec)['keep']:
+        return
+    def same_process():
+        current = show(CAPTURE)
+        return (current['ActiveState'] == 'active'
+            and current.get('MainPID') == str(spec['capture_main_pid'])
+            and process_birth(spec['capture_main_pid']) == spec['capture_main_birth'])
+    require(same_process(), 'Retained Capture process changed')
+    current = session_row(spec)
+    require(current == spec['capture_session'] and current['status'] == 'RUNNING'
+        and current['ended_at'] is None and same_process(), 'Retained Capture full identity changed')
+
+
 def graceful_capture_term(original):
     pid = int(original['MainPID'])
     descriptor = os.pidfd_open(pid)
@@ -201,8 +243,9 @@ def classify(spec, state, original):
     """The stopped pi worker's actual audits decide restoration, never exit code."""
     if not (state / 'worker-launch-requested.json').exists():
         return {'state': 'NOT_STARTED', 'database_committed': False, 'rerun': False}
-    require(all(stopped(name, original[name].get('ControlGroup')) for name in (CAPTURE, *WRITERS, *TIMERS)),
-            'Classification requires all operating writers quiescent')
+    verify_retained_capture(spec)
+    require(all(stopped(name, original[name].get('ControlGroup')) for name in service_scope(spec)['paused']),
+            'Classification requires approved processing units quiescent')
     stop_owned(spec['classifier_unit'], None, time.monotonic() + 5)
     output = state / ('classification-output-' + str(time.monotonic_ns()) + '.json')
     with output.open('x'):
@@ -238,15 +281,18 @@ def classify(spec, state, original):
                 and sum(value == 'APPLIED' for value in children.values()) == expected[0]
                 and not (children['packet_if'] == 'APPLIED' and children['packet_rule'] != 'APPLIED'),
                 'Classifier child ordering/count differs')
+        verify_retained_capture(spec)
         return result
     finally:
         stop_owned(spec['classifier_unit'], None, time.monotonic() + 5)
 
 
-def restoration_units(original, result):
+def restoration_units(original, result, spec=None):
+    scope = service_scope(spec or {})
     full = result['state'] in ('NOT_STARTED', 'NOT_COMMITTED_VERIFIED', 'COMMITTED_VERIFIED')
-    return [name for name in (CAPTURE, *WRITERS) if original[name]['ActiveState'] == 'active'
-            and (full or name not in PROCESSING)]
+    units = scope['writers'] if scope['keep'] else (CAPTURE, *scope['writers'])
+    return [name for name in units if original[name]['ActiveState'] == 'active'
+            and (full or name not in scope['held'])]
 
 
 def restore(spec, state, independent):
@@ -266,6 +312,7 @@ def restore(spec, state, independent):
             return
         try:
             original = json.loads((state / 'original.json').read_text())
+            scope = service_scope(spec)
             receipt = state / 'worker-cgroup.json'
             group = json.loads(receipt.read_text())['group'] if receipt.exists() else None
             stop_owned(spec['worker_unit'], group, time.monotonic() + 5)
@@ -273,6 +320,7 @@ def restore(spec, state, independent):
             stop_owned(spec['classifier_unit'], None, time.monotonic() + 5)
             require(show(BROKER)['MainPID'] == original[BROKER]['MainPID']
                 and show(BROKER)['ActiveState'] == 'active', 'Retained Broker identity changed')
+            verify_retained_capture(spec)
             if (state / 'restored.json').exists():
                 previous = json.loads((state / 'restored.json').read_text())
                 require(all(show(name)['ActiveState'] == 'active' for name in previous['restored_units']),
@@ -290,8 +338,13 @@ def restore(spec, state, independent):
                 result = {'state': 'UNKNOWN_HOLD', 'database_committed': None, 'rerun': False,
                           'error': type(error).__name__}
             record(state, 'classification', result)
-            active = restoration_units(original, result)
-            held = sorted(name for name in PROCESSING if name not in active and original[name]['ActiveState'] == 'active')
+            verify_retained_capture(spec)
+            active = restoration_units(original, result, spec)
+            full = result['state'] in ('NOT_STARTED', 'NOT_COMMITTED_VERIFIED', 'COMMITTED_VERIFIED')
+            timers = [name for name in scope['timers'] if original[name]['ActiveState'] == 'active'
+                      and (full or name not in scope['held'])]
+            held = [] if full else sorted(name for name in scope['held']
+                if scope['keep'] or original[name]['ActiveState'] == 'active')
             require(all(stopped(name, original[name].get('ControlGroup')) for name in held),
                     'Held processing unit unexpectedly active')
             deadline = time.monotonic() + 25
@@ -299,15 +352,16 @@ def restore(spec, state, independent):
                 ctl('--no-block', 'start', *active)
             poll(lambda: all(show(name)['ActiveState'] == 'active' for name in active), deadline,
                  'Original active service restoration incomplete')
-            require(all(show(name)['ActiveState'] != 'active' for name in ALL
+            require(all(show(name)['ActiveState'] != 'active' for name in scope['paused']
                 if original[name]['ActiveState'] != 'active'), 'Originally inactive unit unexpectedly activated')
-            timers = [name for name in TIMERS if original[name]['ActiveState'] == 'active']
             if timers:
                 ctl('--no-block', 'start', *timers)
             poll(lambda: all(show(name)['ActiveState'] == 'active' for name in timers), deadline,
                  'Original timers did not resume')
             require(all(stopped(name) for name in held), 'Restoration dependency started held processing')
+            verify_retained_capture(spec)
             record(state, 'restored', dict(monotonic=time.monotonic(), independent=independent,
+                allow_capture_appends=scope['keep'], retained_units=list(scope['retained']),
                 elapsed_since_first_stop=time.monotonic() - original['_first_stop'],
                 original_active_only=True, measured_180_seconds_guarantee=False,
                 worker_quiesced=True, classifier_quiesced=True, root_operating_sqlite_connections=0,
@@ -319,6 +373,7 @@ def restore(spec, state, independent):
 
 
 def execute(spec, state):
+    scope = service_scope(spec)
     require(not state.exists(), 'One-use state already exists; no retry')
     BASE.mkdir(mode=0o755, exist_ok=True)
     state.mkdir(mode=0o755)
@@ -330,7 +385,7 @@ def execute(spec, state):
     original = {unit: show(unit) for unit in ALL}
     require(original[BROKER]['ActiveState'] == 'active' and int(original[BROKER]['MainPID']) > 1,
             'Broker must stay active')
-    poll(lambda: not jobs(), time.monotonic() + 3, 'Controller Type=exec startup jobs did not settle')
+    poll(lambda: not relevant_jobs(spec), time.monotonic() + 3, 'Controller Type=exec startup jobs did not settle')
     require(original[CAPTURE]['ActiveState'] == 'active' and int(original[CAPTURE]['MainPID']) > 1,
             'Fresh active Capture required')
     original[CAPTURE]['birth'] = process_birth(int(original[CAPTURE]['MainPID']))
@@ -354,24 +409,28 @@ def execute(spec, state):
         require(fresh['status'] == 'RUNNING' and fresh['ended_at'] is None, 'Fresh Capture is not RUNNING')
         require(fresh == spec['capture_session'], 'Capture full identity changed')
         record(state, 'capture-before', fresh)
-        record(state, 'capture-term', dict(monotonic=time.monotonic()))
-        graceful_capture_term(original[CAPTURE])
-        poll(lambda: stopped(CAPTURE) and show(CAPTURE)['ActiveState'] == 'inactive'
-            and show(CAPTURE)['Result'] == 'success' and show(CAPTURE)['ExecMainStatus'] == '0',
-            time.monotonic() + 15, 'Capture graceful TERM incomplete; recovery forbidden')
-        closed = session_row(spec)
-        require(closed['status'] == 'COMPLETED' and closed['ended_at'] is not None,
-                'Actual Capture closure unproved; recovery forbidden')
-        record(state, 'capture-closed', closed)
-        ctl('--no-block', 'stop', *TIMERS)
-        poll(lambda: all(stopped(name) for name in TIMERS), time.monotonic() + 3, 'Writer timers did not stop')
-        require(all(show(name)['ActiveState'] != 'active' for name in WRITERS
+        if scope['keep']:
+            verify_retained_capture(spec)
+        else:
+            record(state, 'capture-term', dict(monotonic=time.monotonic()))
+            graceful_capture_term(original[CAPTURE])
+            poll(lambda: stopped(CAPTURE) and show(CAPTURE)['ActiveState'] == 'inactive'
+                and show(CAPTURE)['Result'] == 'success' and show(CAPTURE)['ExecMainStatus'] == '0',
+                time.monotonic() + 15, 'Capture graceful TERM incomplete; recovery forbidden')
+            closed = session_row(spec)
+            require(closed['status'] == 'COMPLETED' and closed['ended_at'] is not None,
+                    'Actual Capture closure unproved; recovery forbidden')
+            record(state, 'capture-closed', closed)
+        ctl('--no-block', 'stop', *scope['timers'])
+        poll(lambda: all(stopped(name) for name in scope['timers']), time.monotonic() + 3, 'Writer timers did not stop')
+        require(all(show(name)['ActiveState'] != 'active' for name in scope['writers']
             if original[name]['ActiveState'] != 'active'), 'Previously inactive writer started during timer stop')
-        active = [name for name in WRITERS if original[name]['ActiveState'] == 'active']
+        active = [name for name in scope['writers'] if original[name]['ActiveState'] == 'active']
         if active:
             ctl('--no-block', 'stop', *active)
-        poll(lambda: all(stopped(name, original[name].get('ControlGroup')) for name in WRITERS)
-            and not jobs(), time.monotonic() + 30, 'Operating writers not quiescent; recovery forbidden')
+        poll(lambda: all(stopped(name, original[name].get('ControlGroup')) for name in scope['writers'])
+            and not relevant_jobs(spec), time.monotonic() + 30, 'Operating writers not quiescent; recovery forbidden')
+        verify_retained_capture(spec)
         require(not (state / 'cancelled.json').exists(), 'Rescue cancelled operation before private launch')
         record(state, 'worker-launch-requested', dict(monotonic=time.monotonic()))
         subprocess.run(['/usr/bin/systemd-run', '--unit=' + spec['worker_unit'].removesuffix('.service'),
@@ -383,12 +442,14 @@ def execute(spec, state):
         require(private['ActiveState'] == 'active' and int(private['MainPID']) > 1
             and private['User'] == private['Group'] == 'pi', 'Recovery UID unit missing')
         record(state, 'worker-cgroup', dict(group=private['ControlGroup']))
-        poll(lambda: not jobs(), time.monotonic() + 3, 'Type=exec startup job did not settle')
-        require(all(stopped(name, original[name].get('ControlGroup')) for name in (CAPTURE, *WRITERS, *TIMERS))
+        poll(lambda: not relevant_jobs(spec), time.monotonic() + 3, 'Type=exec startup job did not settle')
+        require(all(stopped(name, original[name].get('ControlGroup')) for name in scope['paused'])
             and not (state / 'cancelled.json').exists(), 'Inactive/uncancelled accepted-GO gate failed')
+        verify_retained_capture(spec)
         record(state, 'accepted', dict(monotonic=time.monotonic()), public=True)
         poll(lambda: stopped(spec['worker_unit'], private['ControlGroup']), time.monotonic() + 93,
              'Recovery worker exceeded90s+teardown; HOLD')
+        verify_retained_capture(spec)
         record(state, 'worker-exited', dict(monotonic=time.monotonic(),
             service_result=show(spec['worker_unit'])['Result'],
             exit_status=show(spec['worker_unit'])['ExecMainStatus'], classification_required=True))

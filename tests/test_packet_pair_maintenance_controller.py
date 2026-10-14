@@ -336,3 +336,155 @@ def test_controller_root_imports_no_product_database_and_session_probe_is_pi_rea
     assert "mode=ro" in probe and "PRAGMA query_only=ON" in probe and "os.getuid()==os.getgid()==1000" in probe
     session = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "session_row")
     assert "runuser" in ast.get_source_segment(SOURCE.read_text(), session)
+
+
+def test_capture_preserving_restoration_controls_packet_units_only(fixture):
+    spec = fixture.spec | {"allow_capture_appends": True}
+    allowed = {"detection-orchestrator.service", "packet-feature-extractor.service"}
+    units = fixture.m.restoration_units(fixture.original,
+        observation(spec, "COMMITTED_VERIFIED"), spec=spec)
+    assert set(units) <= allowed
+    assert "detection-orchestrator.service" in units
+    assert fixture.m.restoration_units(fixture.original,
+        observation(spec, "PARTIAL_HOLD"), spec=spec) == []
+
+
+
+@pytest.fixture
+def retained(fixture, monkeypatch):
+    f, m = fixture, fixture.m
+    f.spec.update(allow_capture_appends=True,
+        capture_main_pid=int(f.original[m.CAPTURE]["MainPID"]), capture_main_birth="owned-birth",
+        capture_session=dict(id=117, session_id="owned-capture", status="RUNNING", ended_at=None,
+                             first_window_start="2026-10-14T00:00:00Z"))
+    for name in m.service_scope(f.spec)["retained"]:
+        f.rows[name] = dict(f.original[name])
+    monkeypatch.setattr(m, "process_birth", lambda pid: "owned-birth")
+    monkeypatch.setattr(m, "session_row", lambda _: dict(f.spec["capture_session"]))
+    return f
+
+
+@pytest.mark.parametrize("state,independent", [("COMMITTED_VERIFIED", False),
+    ("NOT_COMMITTED_VERIFIED", True), ("PARTIAL_HOLD", True), ("UNKNOWN_HOLD", False)])
+def test_capture_preserving_restore_leaves_all_retained_services_untouched(retained, monkeypatch, state, independent):
+    f, m = retained, retained.m
+    before = {name: dict(f.rows[name]) for name in m.service_scope(f.spec)["retained"]}
+    monkeypatch.setattr(m, "classify", lambda *args: observation(f.spec, state))
+    m.restore(f.spec, f.state, independent=independent)
+    receipt = json.loads((f.state / "restored.json").read_text())
+    packet = {"detection-orchestrator.service", "packet-feature-extractor.service", "packet-feature-extractor.timer"}
+    if state in ("PARTIAL_HOLD", "UNKNOWN_HOLD"):
+        assert not starts(f) and set(receipt["held_processing_units"]) == packet
+        assert all(m.stopped(name) for name in packet)
+    else:
+        assert set(starts(f)) == {"detection-orchestrator.service", "packet-feature-extractor.timer"}
+        assert receipt["held_processing_units"] == []
+    assert all(f.rows[name] == value for name, value in before.items())
+    assert set(starts(f)).isdisjoint(before)
+    assert not any(name in before for action, name in f.events if action == "stop")
+    assert receipt["allow_capture_appends"] is True and receipt["recovery_complete"] is False
+
+
+@pytest.mark.parametrize("change", ["pid", "birth", "session", "closed"])
+def test_capture_preserving_identity_change_blocks_any_resume(retained, monkeypatch, change):
+    f, m = retained, retained.m
+    if change == "pid":
+        f.rows[m.CAPTURE]["MainPID"] = "888"
+    elif change == "birth":
+        monkeypatch.setattr(m, "process_birth", lambda pid: "reused-pid")
+    else:
+        value = f.spec["capture_session"] | ({"first_window_start": "other"} if change == "session"
+                                            else {"status": "COMPLETED", "ended_at": "later"})
+        monkeypatch.setattr(m, "session_row", lambda _: value)
+    monkeypatch.setattr(m, "classify", lambda *args: pytest.fail("No classification after identity failure"))
+    with pytest.raises(m.Hold, match="Capture"):
+        m.restore(f.spec, f.state, independent=False)
+    assert not starts(f) and not (f.state / "restored.json").exists()
+
+
+def test_capture_preserving_classifier_checks_capture_again_after_read(retained, monkeypatch):
+    f, m = retained, retained.m
+    classifier_transport(f, monkeypatch, observation(f.spec, "COMMITTED_VERIFIED"))
+    run = m.subprocess.run
+    def changed(command, **kwargs):
+        result = run(command, **kwargs)
+        f.rows[m.CAPTURE]["MainPID"] = "restarted"
+        return result
+    monkeypatch.setattr(m.subprocess, "run", changed)
+    with pytest.raises(m.Hold, match="Capture"):
+        m.classify(f.spec, f.state, f.original)
+    assert not starts(f) and f.rows[f.spec["classifier_unit"]]["MainPID"] == "0"
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_capture_preserving_full_controller_only_pauses_packet_processing(retained, monkeypatch, cancelled):
+    f, m = retained, retained.m
+    state = f.temp / "retained-full-controller"
+    spec = f.spec | dict(driver_sha256=m.digest(SOURCE), boot_id="owned-boot",
+                        spec_file=str(f.temp / "spec.json"))
+    for name in m.ALL:
+        f.rows[name] = dict(f.original[name])
+    before = {name: dict(f.rows[name]) for name in m.service_scope(spec)["retained"]}
+    f.rows[spec["controller_unit"]].update(MainPID=str(os.getpid()), ControlGroup="/owned/controller")
+    real_read = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda path, *args, **kwargs:
+        "0::/owned/controller" if path.as_posix() == "/proc/self/cgroup" else real_read(path, *args, **kwargs))
+    monkeypatch.setattr(m, "graceful_capture_term", lambda *args: pytest.fail("Capture must not receive TERM"))
+    dispatched = []
+    def run(command, **kwargs):
+        dispatched.append(command)
+        if "--on-active=150s" in command:
+            f.rows[spec["rescue_unit"]+".timer"]["ActiveState"] = "active"
+        else:
+            assert "--worker" in command and "--property=User=pi" in command
+            f.rows[spec["worker_unit"]].update(ActiveState="active", MainPID="501",
+                ControlGroup="/owned/worker", User="pi", Group="pi")
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(m.subprocess, "run", run)
+    real_poll = m.poll
+    def poll(predicate, deadline, reason):
+        if reason == "Recovery worker exceeded90s+teardown; HOLD":
+            f.rows[spec["worker_unit"]].update(ActiveState="inactive", MainPID="0")
+        real_poll(predicate, deadline, reason)
+        if cancelled and reason == "Operating writers not quiescent; recovery forbidden":
+            f.record(state, "cancelled", {})
+    monkeypatch.setattr(m, "poll", poll)
+    original_classify = m.classify
+    monkeypatch.setattr(m, "classify", lambda *args: original_classify(*args) if cancelled
+                        else observation(spec, "COMMITTED_VERIFIED"))
+    m.execute(spec, state)
+    packet = {"detection-orchestrator.service", "packet-feature-extractor.service", "packet-feature-extractor.timer"}
+    assert {name for action, name in f.events if action == "stop" and name in m.ALL} <= packet
+    assert set(starts(f)) <= packet
+    assert all(f.rows[name] == value for name, value in before.items())
+    assert len(dispatched) == (1 if cancelled else 2)
+    assert (state / "worker-launch-requested.json").exists() is not cancelled
+    assert not (state / "capture-term.json").exists() and not (state / "capture-closed.json").exists()
+    receipt = json.loads((state / "restored.json").read_text())
+    assert receipt["classification"] == ("NOT_STARTED" if cancelled else "COMMITTED_VERIFIED")
+
+
+def test_capture_preserving_unrelated_periodic_jobs_do_not_block_packet_gate(retained, monkeypatch):
+    m, spec = retained.m, retained.spec
+    monkeypatch.setattr(m, "jobs", lambda: "7 firewall-runtime-snapshot.service start running")
+    assert m.relevant_jobs(spec) == ""
+    monkeypatch.setattr(m, "jobs", lambda: "7 packet-feature-extractor.service start running")
+    assert m.relevant_jobs(spec)
+
+
+
+def test_capture_preserving_full_restore_allows_timer_to_run_previously_inactive_extractor(retained, monkeypatch):
+    f, m = retained, retained.m
+    monkeypatch.setattr(m, "classify", lambda *args: observation(f.spec, "COMMITTED_VERIFIED"))
+    ctl = m.ctl
+    def start_timer(*args, **kwargs):
+        result = ctl(*args, **kwargs)
+        if "start" in args and "packet-feature-extractor.timer" in args:
+            f.rows["packet-feature-extractor.service"].update(ActiveState="active", MainPID="999")
+        return result
+    monkeypatch.setattr(m, "ctl", start_timer)
+    m.restore(f.spec, f.state, independent=False)
+    receipt = json.loads((f.state / "restored.json").read_text())
+    assert receipt["held_processing_units"] == []
+    assert "packet-feature-extractor.service" not in starts(f)
+    assert f.rows["packet-feature-extractor.service"]["ActiveState"] == "active"

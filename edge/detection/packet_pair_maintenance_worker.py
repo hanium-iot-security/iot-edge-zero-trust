@@ -34,9 +34,11 @@ def _require_pi():
              "maintenance SQLite worker requires pi UID1000")
 
 
-def _require_quiescent():
+def _require_quiescent(keep_capture=False):
     """Read OS state only; root independently owns stopping and writer reap."""
-    for unit in UNITS:
+    units = ("packet-feature-extractor.timer", "detection-orchestrator.service",
+             "packet-feature-extractor.service") if keep_capture else UNITS
+    for unit in units:
         result = subprocess.run(["systemctl", "show", unit, "--property=LoadState", "--property=ActiveState",
                                  "--property=MainPID", "--property=ControlGroup"],
                                 capture_output=True, text=True, timeout=5, check=True)
@@ -53,29 +55,70 @@ def _require_quiescent():
                      "writer cgroup is populated: " + unit)
     jobs = subprocess.run(["systemctl", "list-jobs", "--no-legend", "--no-pager"],
                           capture_output=True, text=True, timeout=5, check=True)
-    _require(not jobs.stdout.strip(), "systemd jobs are pending")
+    pending = jobs.stdout.strip()
+    if keep_capture:
+        pending = "\n".join(line for line in pending.splitlines() if set(line.split()) & set(units))
+    _require(not pending, "systemd jobs are pending")
 
 
-def _scope(plan):
-    """Keep all reviewed evidence except explicit maintenance lifecycle fields."""
-    value = core.canonical_plan_binding(plan)
-    value.pop("pair_id")
-    value["runtime"].pop("services")
-    value["bounded_replay"].pop("later_running_session")
-    for child in value["children"]:
-        child.pop("child_operation_id")
-        signed = child["plan"]
-        signed.pop("running_sessions")
-        signed["summary"].pop("running_sessions")
-        signed["bounded_replay"].pop("later_running_session")
+def _keep_capture(scope):
+    value = scope.get("allow_capture_appends", False)
+    _require(type(value) is bool, "capture append approval must be boolean")
     return value
 
 
+def _check_quiescent(request):
+    if _keep_capture(request["scope"]):
+        _require_quiescent(True)
+    else:
+        _require_quiescent()
+
+
+def _scope(plan):
+    """Only pause mode may replace the reviewed running Capture lifecycle."""
+    value = core.canonical_plan_binding(plan)
+    value.pop("pair_id")
+    value["runtime"].pop("services")
+    keep = _keep_capture(plan)
+    if not keep:
+        value["bounded_replay"].pop("later_running_session")
+    for child in value["children"]:
+        child.pop("child_operation_id")
+        signed = child["plan"]
+        if not keep:
+            signed.pop("running_sessions")
+            signed["summary"].pop("running_sessions")
+            signed["bounded_replay"].pop("later_running_session")
+    return value
+
+
+def _same_scope(request, plan):
+    current, expected = _scope(plan), request["scope"]
+    if _keep_capture(expected) and expected["mode"] == core.LIVE_RESUME_MODE:
+        # Reuse the core's exact comparison, including its sole readiness-growth exception.
+        _require(len(current["children"]) == len(expected["children"]), "child scope changed")
+        for before, after in zip(expected["children"], current["children"]):
+            _require(before["detector"] == after["detector"], "child order changed")
+            core._require_same_canonical_plan(before["plan"], after["plan"])
+        current, expected = dict(current), dict(expected)
+        current.pop("children")
+        expected.pop("children")
+    _require(current == expected, "fresh plan differs from reviewed semantic scope")
+
+
 def _eligible(plan):
-    _require(plan["mode"] == core.BOUNDED_REPLAY_MODE and plan["can_execute"] is True
+    keep = _keep_capture(plan)
+    mode_ok = plan["mode"] == core.BOUNDED_REPLAY_MODE or (keep and plan["mode"] == core.LIVE_RESUME_MODE)
+    _require(mode_ok and plan["can_execute"] is True
              and plan["skips_processable"] is False
              and all(not child["plan"]["sessions_between"] for child in plan["children"]),
-             "maintenance requires an executable bounded pair without skipped sessions")
+             "maintenance requires an executable approved pair without skipped sessions")
+
+
+def _running_identity(db):
+    rows = pair.repository.list_running_capture_sessions(db)
+    _require(len(rows) == 1, "exactly one retained RUNNING Capture required")
+    return dict(pair.repository.get_capture_session(db, rows[0]["session_id"]))
 
 
 def _identities(db, plan):
@@ -97,12 +140,15 @@ def prepare(*, plan_file, request_output):
         states, _, _ = pair._states(db, plan, Path(plan["repository_root"]))
         _require(all(state == "PENDING" for state in states.values()), "reviewed operation already applied")
         identities = _identities(db, plan)
+        capture = _running_identity(db) if _keep_capture(plan) else None
     output = core.validate_generated_paths(repository_root=Path(plan["repository_root"]),
                                            plan_output=Path(request_output))["plan_output"]
     _require(not output.exists(), "request output must be new")
-    request = core.attach_plan_sha256({"plan_schema_version": SCHEMA,
-        "reference_plan_sha256": plan["plan_sha256"], "scope": _scope(plan),
-        "session_identities": identities}, generated_at=core._utc_now().replace(microsecond=0))
+    fields = {"plan_schema_version": SCHEMA,
+        "reference_plan_sha256": plan["plan_sha256"], "scope": _scope(plan), "session_identities": identities}
+    if capture is not None:
+        fields["capture_session_identity"] = capture
+    request = core.attach_plan_sha256(fields, generated_at=core._utc_now().replace(microsecond=0))
     core._write_json_atomically(output, request)
     return request
 
@@ -129,16 +175,25 @@ def _artifacts(request, artifact_dir):
 
 def _verify_paused(request, plan, database):
     _eligible(plan)
-    _require(_scope(plan) == request["scope"], "fresh plan differs from reviewed semantic scope")
-    _require(plan["bounded_replay"]["later_running_session"] is None,
-             "maintenance plan must have no RUNNING Capture")
+    _same_scope(request, plan)
+    if not _keep_capture(request["scope"]):
+        _require(plan["bounded_replay"]["later_running_session"] is None,
+                 "maintenance plan must have no RUNNING Capture")
     pair._same_boot(plan, pair._runtime_observation())
     pair._require_configured_locks(plan, database)
     _require(core.canonical_plan_binding(core.inspect_repository_state(plan["repository_root"]))
              == request["scope"]["repository_state"], "approved repository changed")
     with closing(pair._read_db(database)) as db:
-        _require(not pair.repository.list_running_capture_sessions(db), "RUNNING Capture exists")
+        _verify_capture(db, request)
         _require(_identities(db, plan) == request["session_identities"], "approved session identity changed")
+
+
+def _verify_capture(db, request):
+    if _keep_capture(request["scope"]):
+        _require(_running_identity(db) == request.get("capture_session_identity"),
+                 "retained Capture full identity changed")
+    else:
+        _require(not pair.repository.list_running_capture_sessions(db), "RUNNING Capture exists")
 
 
 def classify(*, request_file, request_sha256, artifact_dir):
@@ -151,7 +206,7 @@ def classify(*, request_file, request_sha256, artifact_dir):
         _require(intent == {"request_sha256": request_sha256}, "worker intent changed")
         _, plan = pair._load_pair(directory / "plan.json")
         database = core.require_plan_database_path(plan, request["scope"]["database_path"])
-        _require_quiescent()
+        _check_quiescent(request)
         _verify_paused(request, plan, database)
         checked = pair.verify_database_readonly(database)
         _require(checked.integrity_check == "ok" and not checked.foreign_key_violations,
@@ -161,7 +216,8 @@ def classify(*, request_file, request_sha256, artifact_dir):
             pair._intent(plan, group)
         with closing(pair._read_db(database)) as db:
             states, checkpoints, _ = pair._states(db, plan, group)
-        _require_quiescent()
+            _verify_capture(db, request)
+        _check_quiescent(request)
         applied = sum(value == "APPLIED" for value in states.values())
         state = {0: "NOT_COMMITTED_VERIFIED", 1: "PARTIAL_HOLD", 2: "COMMITTED_VERIFIED"}[applied]
         return dict(STATE_FLAGS, state=state, children=states, checkpoints=checkpoints,
@@ -180,11 +236,11 @@ def execute(*, request_file, request_sha256, artifact_dir):
     request = _request(request_file, request_sha256)
     directory = _artifacts(request, artifact_dir)
     _require(not any(directory.iterdir()), "artifact directory is already used; classify instead")
-    _require_quiescent()
+    _check_quiescent(request)
     scope = request["scope"]
     database = core.resolve_database_path(scope["database_path"])
     with closing(pair._read_db(database)) as db:
-        _require(not pair.repository.list_running_capture_sessions(db), "RUNNING Capture exists")
+        _verify_capture(db, request)
     # Exclusive creation survives worker death and forbids an automatic second execute.
     with (directory / "worker-intent.json").open("x", encoding="utf-8") as stream:
         json.dump({"request_sha256": request_sha256}, stream, sort_keys=True)
@@ -194,12 +250,13 @@ def execute(*, request_file, request_sha256, artifact_dir):
     try:
         plan = pair.inspect_pair(db_path=database, repository_root=scope["repository_root"],
             current_session_id=scope["current_session_id"], target_session_id=scope["target_session_id"],
-            approved_by=scope["approved_by"], reason=scope["reason"], mode=core.BOUNDED_REPLAY_MODE,
+            approved_by=scope["approved_by"], reason=scope["reason"], mode=scope["mode"],
             allow_failed_current_session=scope["allow_failed_current_session"],
-            allow_failed_target_session=scope["allow_failed_target_session"], plan_output=directory / "plan.json")
+            allow_failed_target_session=scope["allow_failed_target_session"], plan_output=directory / "plan.json",
+            **({"allow_capture_appends": True} if _keep_capture(scope) else {}))
         _verify_paused(request, plan, database)
         _require(_request(request_file, request_sha256) == request, "approved request replaced")
-        _require_quiescent()
+        _check_quiescent(request)
         pair.execute_pair(plan_file=directory / "plan.json", db_path=database, artifact_dir=directory,
                           confirm=pair.confirmation_prefix(plan) + plan["plan_sha256"])
     except Exception as exc:

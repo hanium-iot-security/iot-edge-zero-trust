@@ -268,3 +268,135 @@ def test_real_host_guard_handles_timer_without_mainpid_but_refuses_writers(monke
     else:
         with pytest.raises(pair.Error):
             worker._require_quiescent()
+
+
+def test_capture_preserving_live_eligibility_requires_explicit_optin():
+    plan = {"mode": core.LIVE_RESUME_MODE, "can_execute": True,
+            "allow_capture_appends": True, "skips_processable": False,
+            "children": [{"plan": {"sessions_between": []}}]}
+    worker._eligible(plan)
+    plan.pop("allow_capture_appends")
+    with pytest.raises(pair.Error):
+        worker._eligible(plan)
+
+
+
+def _prepare_retained(f, monkeypatch, mode):
+    monkeypatch.setattr(worker, "_require_pi", lambda: None)
+    monkeypatch.setattr(worker, "_require_private_directory", lambda directory: None)
+    monkeypatch.setattr(worker, "_require_quiescent", lambda *args: None)
+    if mode == core.BOUNDED_REPLAY_MODE:
+        with sqlite3.connect(f["database"]) as db:
+            db.execute("UPDATE packet_capture_sessions SET status='RUNNING',ended_at=NULL WHERE session_id=?",
+                       (RUNNING_SESSION_A,))
+    output = f["output"].with_name("retained-pair-plan.json")
+    plan = pair.inspect_pair(db_path=f["database"], repository_root=f["root"],
+        current_session_id=CURRENT_SESSION, target_session_id=TARGET_SESSION,
+        approved_by="admin-fixture", reason="approved retained Capture local recovery",
+        mode=mode, allow_capture_appends=True,
+        allow_failed_current_session=mode == core.BOUNDED_REPLAY_MODE,
+        allow_failed_target_session=mode == core.BOUNDED_REPLAY_MODE, plan_output=output)
+    assert plan["can_execute"], plan["blocking_reasons"]
+    request_file = output.with_name("retained-request.json")
+    request = worker.prepare(plan_file=output, request_output=request_file)
+    f.update(output=output, plan=plan, request_file=request_file, request=request)
+    # Host observations: Capture/MQTT stay active; packet processing is quiescent.
+    f["runtime"]["services"] = {name: name not in (
+        "detection-orchestrator.service", "packet-feature-extractor.timer") for name in pair.SERVICES}
+    return f
+
+
+@pytest.fixture
+def retained_bounded(reviewed, monkeypatch):
+    return _prepare_retained(reviewed, monkeypatch, core.BOUNDED_REPLAY_MODE)
+
+
+@pytest.fixture
+def retained_live(fixture, monkeypatch):
+    return _prepare_retained(fixture, monkeypatch, core.LIVE_RESUME_MODE)
+
+
+@pytest.mark.parametrize("case", ["retained_bounded", "retained_live"])
+def test_capture_preserving_real_apply_and_readonly_classification(case, request):
+    f = request.getfixturevalue(case)
+    protected = _protected(f)
+    result = worker.execute(**_args(f))
+    assert result["state"] == "COMMITTED_VERIFIED", result
+    assert len(_audits(f)) == 2 and _protected(f) == protected
+    with sqlite3.connect(f["database"]) as db:
+        db.row_factory = sqlite3.Row
+        current = dict(db.execute("SELECT * FROM packet_capture_sessions WHERE status='RUNNING'").fetchone())
+    assert current == f["request"]["capture_session_identity"]
+    before = f["database"].read_bytes()
+    assert worker.classify(**_args(f))["state"] == "COMMITTED_VERIFIED"
+    assert f["database"].read_bytes() == before
+    with pytest.raises(pair.Error, match="already used"):
+        worker.execute(**_args(f))
+
+
+@pytest.mark.parametrize("change", ["close", "identity", "second_running"])
+def test_capture_preserving_changed_capture_never_creates_intent(retained_bounded, change):
+    f = retained_bounded
+    with sqlite3.connect(f["database"]) as db:
+        if change == "close":
+            db.execute("UPDATE packet_capture_sessions SET status='COMPLETED',ended_at=? WHERE session_id=?",
+                (_db_utc(TARGET_FIRST + timedelta(seconds=50)), RUNNING_SESSION_A))
+        elif change == "identity":
+            db.execute("UPDATE packet_capture_sessions SET capture_interface='other' WHERE session_id=?", (RUNNING_SESSION_A,))
+        else:
+            db.execute("UPDATE packet_capture_sessions SET status='RUNNING',ended_at=NULL WHERE session_id=?", (TARGET_SESSION,))
+    protected = _protected(f)
+    with pytest.raises(pair.Error, match="Capture"):
+        worker.execute(**_args(f))
+    assert list(f["artifacts"].iterdir()) == [] and _audits(f) == [] and _protected(f) == protected
+
+
+def test_capture_preserving_live_allows_only_monotonic_readiness(retained_live):
+    f = retained_live
+    with sqlite3.connect(f["database"]) as db:
+        pk = db.execute("SELECT id FROM packet_capture_sessions WHERE session_id=?", (TARGET_SESSION,)).fetchone()[0]
+        start = TARGET_FIRST + timedelta(seconds=20)
+        _insert_capture_segment(db, session_pk=pk, capture_interface="eth-target", window_start=start, status="EMPTY")
+        db.execute("UPDATE packet_capture_segments SET start_delay_seconds=.1,captured_duration_seconds=9.9 WHERE window_start=?", (_db_utc(start),))
+    f["clock"][0] += timedelta(seconds=10)
+    result = worker.execute(**_args(f))
+    assert result["state"] == "COMMITTED_VERIFIED", result
+    _, fresh = pair._load_pair(f["artifacts"] / "plan.json")
+    assert fresh["children"][0]["plan"]["target_session"]["packet_feature_ready_through"] > f["plan"]["children"][0]["plan"]["target_session"]["packet_feature_ready_through"]
+
+
+def test_capture_preserving_response_loss_keeps_partial_audit(retained_bounded, monkeypatch):
+    f = retained_bounded
+    original = core._execute_locked_recovery
+    def lose(**prepared):
+        result = original(**prepared)
+        if prepared["plan"]["detector_name"] == "packet_rule":
+            raise ConnectionError("lost after actual Rule COMMIT")
+        return result
+    monkeypatch.setattr(core, "_execute_locked_recovery", lose)
+    result = worker.execute(**_args(f))
+    assert result["state"] == "PARTIAL_HOLD", result
+    assert len(_audits(f)) == 1
+    assert worker.classify(**_args(f))["state"] == "PARTIAL_HOLD"
+    with sqlite3.connect(f["database"]) as db:
+        db.execute("UPDATE packet_capture_sessions SET capture_interface='replaced' WHERE session_id=?", (RUNNING_SESSION_A,))
+    assert worker.classify(**_args(f))["state"] == "UNKNOWN_HOLD"
+    assert len(_audits(f)) == 1
+
+
+@pytest.mark.parametrize("packet_job", [False, True])
+def test_capture_preserving_quiescence_checks_packet_units_not_retained_jobs(monkeypatch, packet_job):
+    observed = []
+    def command(argv, **kwargs):
+        if argv[1] == "list-jobs":
+            unit = "packet-feature-extractor.timer" if packet_job else "firewall-runtime-snapshot.service"
+            return SimpleNamespace(stdout=f"1 {unit} start running\n")
+        observed.append(argv[2])
+        return SimpleNamespace(stdout="LoadState=loaded\nActiveState=inactive\nMainPID=0\nControlGroup=\n")
+    monkeypatch.setattr(worker.subprocess, "run", command)
+    if packet_job:
+        with pytest.raises(pair.Error, match="jobs"):
+            worker._require_quiescent(True)
+    else:
+        worker._require_quiescent(True)
+    assert set(observed) == {"packet-feature-extractor.timer", "packet-feature-extractor.service", "detection-orchestrator.service"}

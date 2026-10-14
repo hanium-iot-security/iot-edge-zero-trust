@@ -17,6 +17,8 @@ def build_parser():
         dry_run.add_argument("--" + name, required=True)
     dry_run.add_argument("--mode", choices=(pair.core.LIVE_RESUME_MODE, pair.core.BOUNDED_REPLAY_MODE),
                          default=pair.core.LIVE_RESUME_MODE)
+    dry_run.add_argument("--allow-capture-appends", action="store_true",
+                         help="Keep approved Capture running; reject changes to frozen recovery evidence")
     dry_run.add_argument("--allow-failed-current-session", action="store_true",
                          help="approve only the existing uncaptured LATE_CAPTURE source-tail contract")
     dry_run.add_argument("--allow-failed-target-session", action="store_true",

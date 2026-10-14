@@ -211,3 +211,40 @@ def test_launcher_imports_no_database_and_pi_probe_is_readonly():
         and any(isinstance(target, ast.Name) and target.id == "PI_CAPTURE" for target in node.targets))
     assert "mode=ro" in probe and "PRAGMA query_only=ON" in probe and "os.getuid()==os.getgid()==1000" in probe
     assert "assert len(rows)==1" in probe
+
+
+def test_capture_preserving_request_requires_processing_pause_approval(fixture):
+    fixture.request["scope"]["allow_capture_appends"] = True
+    fixture.request["capture_session_identity"] = fixture.result.capture
+    fixture.request_file.write_text(json.dumps(fixture.request), encoding="utf-8")
+    fixture.args["request_file_sha256"] = hashlib.sha256(fixture.request_file.read_bytes()).hexdigest()
+    result = fixture.m.launch(**(fixture.args | {
+        "approve_capture_pause": False, "approve_processing_pause": True}))
+    assert result["status"] == "OBSERVATION_PENDING"
+    spec = json.loads(next(raw for path, raw, _ in fixture.seals if path.name == "spec.json"))
+    assert spec["allow_capture_appends"] is True
+    assert spec["approval_scope"] == "capture-retained-canonical-pair-recovery"
+
+
+
+@pytest.mark.parametrize("keep,capture_approval,processing_approval", [
+    (True, True, False), (False, False, True), (True, True, True),
+    (True, False, 1), ("true", False, True), (1, False, True)])
+def test_capture_preserving_mode_cannot_reuse_other_approval(fixture, keep, capture_approval, processing_approval):
+    fixture.request["scope"]["allow_capture_appends"] = keep
+    fixture.request_file.write_text(json.dumps(fixture.request), encoding="utf-8")
+    fixture.args["request_file_sha256"] = hashlib.sha256(fixture.request_file.read_bytes()).hexdigest()
+    with pytest.raises(RuntimeError):
+        fixture.m.launch(**(fixture.args | dict(approve_capture_pause=capture_approval,
+                                               approve_processing_pause=processing_approval)))
+    assert not fixture.calls and not fixture.seals and not fixture.directories
+
+
+def test_capture_preserving_launcher_checks_reviewed_full_capture_before_sealing(fixture):
+    fixture.request["scope"]["allow_capture_appends"] = True
+    fixture.request["capture_session_identity"] = fixture.result.capture | {"first_window_start": "different"}
+    fixture.request_file.write_text(json.dumps(fixture.request), encoding="utf-8")
+    fixture.args["request_file_sha256"] = hashlib.sha256(fixture.request_file.read_bytes()).hexdigest()
+    with pytest.raises(RuntimeError, match="Capture identity"):
+        fixture.m.launch(**(fixture.args | dict(approve_capture_pause=False, approve_processing_pause=True)))
+    assert len(fixture.calls) == 1 and not fixture.seals and not dispatches(fixture)
