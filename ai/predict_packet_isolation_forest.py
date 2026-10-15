@@ -43,6 +43,7 @@ from ai.packet_if_artifact import (
 from ai.packet_if_dataset import load_packet_if_dataset
 from ai.packet_if_phase5_manifest import (
     PACKET_IF_DATASET_VERSION_V2,
+    PACKET_IF_DATASET_VERSION_V3,
     SUPPORTED_PACKET_IF_DATASET_VERSIONS,
 )
 from edge.packet.capture_policy import CapturePolicy
@@ -453,7 +454,7 @@ def _validate_normal_policy_version(
     dataset_version: str,
 ) -> str | None:
     value = metadata.get("normal_policy_version")
-    if dataset_version == PACKET_IF_DATASET_VERSION_V2:
+    if dataset_version in {PACKET_IF_DATASET_VERSION_V2, PACKET_IF_DATASET_VERSION_V3}:
         return _require_non_empty_string(metadata, "normal_policy_version")
     if value is None:
         return None

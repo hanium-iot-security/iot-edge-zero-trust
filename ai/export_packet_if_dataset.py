@@ -1048,6 +1048,15 @@ def _snapshot_session_factory(db_snapshot: Path):
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if json.loads(args.spec.read_text(encoding="utf-8")).get("schema_version") == "packet-bounded-export-v1":
+        from ai.packet_if_bounded import export_bounded_packet_if_dataset
+        if args.db_snapshot is not None:
+            raise ValueError("bounded export pins its own snapshots; --db-snapshot must be omitted")
+        result = export_bounded_packet_if_dataset(args.spec, output_path=args.output, manifest_path=args.manifest_output)
+        print(f"exported_count={result.exported_count}")
+        print(f"dataset_sha256={result.dataset_sha256}")
+        print(f"manifest_sha256={result.manifest_sha256}")
+        return 0
     (
         capture_filter,
         source_commit_sha,
