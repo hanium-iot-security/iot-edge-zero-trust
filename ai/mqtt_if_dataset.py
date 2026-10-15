@@ -19,8 +19,9 @@ from ai.export_normal_collection import (
     _metadata, _path, _require, _time, _within,
 )
 from ai.mqtt_if_contract import MQTT_IF_FEATURES, MQTT_IF_INTEGER_FEATURES, mqtt_feature_matrix
-from ai.normal_admission import REPORT_SCHEMA, load_request
+from ai.normal_admission import REPORT_SCHEMA, TERMINAL_REQUEST_SCHEMA, load_request, validate_terminal_selection
 from ai.normal_selection_policy import PHASE9_POLICY, exclusion_reasons
+from ai.pico_reception_qc import STRICT_POLICY, WIRE_JITTER_POLICY
 
 DATASET_SCHEMA = "mqtt-if-candidate-dataset-v1"
 ROLE_SPLITS = {"train": "train", "calibration": "validation", "validation": "validation"}
@@ -152,11 +153,18 @@ def load_mqtt_if_dataset(manifest_path: Path) -> MQTTIFDataset:
         request = load_request(_path(inputs.root, group["admission_request"]["path"]))
         report = inputs.json(group["admission_report"])
         _unapproved(report)
+        reception_policy = request.get("reception_policy", STRICT_POLICY)
+        _require(report.get("reception_policy", STRICT_POLICY) == reception_policy, "reception_policy_link")
         _require(report.get("schema_version") == REPORT_SCHEMA and report.get("status") == "PASS"
                  and report.get("official_admission") == "BOUNDED_ELIGIBLE"
                  and report.get("blockers") == [], "admission_not_eligible")
-        _require(report.get("final_snapshot_sha256") == request["final_snapshot"]["sha256"]
-                 and report.get("whole_session", {}).get("session_status") == "COMPLETED", "final_snapshot_link")
+        terminal = request.get("terminal_source")
+        _require(report.get("final_snapshot_sha256") == request["final_snapshot"]["sha256"], "final_snapshot_link")
+        if request["schema_version"] == TERMINAL_REQUEST_SCHEMA:
+            _require(report.get("terminal_source") == terminal, "terminal_source_link")
+        else:
+            _require("terminal_source" not in report
+                     and report.get("whole_session", {}).get("session_status") == "COMPLETED", "final_snapshot_link")
         capture = report["capture_group"]
         group_id, split = capture["source_capture_group_id"], capture["split"]
         _require(group_id not in seen_groups, "duplicate_capture_group")
@@ -178,7 +186,8 @@ def load_mqtt_if_dataset(manifest_path: Path) -> MQTTIFDataset:
         for entry in group["runs"]:
             _exact(entry, ("manifest", "qc_report", "mqtt_features"), "run_fields")
             source = inputs.json(entry["manifest"])
-            start, end, included = _metadata(source, allow_completed=True)
+            start, end, included = _metadata(source, allow_completed=True,
+                                             allow_reception_hold=reception_policy == WIRE_JITTER_POLICY)
             run_id = source["run_id"]
             _require(run_id not in seen_runs, "duplicate_run")
             seen_runs.add(run_id)
@@ -196,6 +205,9 @@ def load_mqtt_if_dataset(manifest_path: Path) -> MQTTIFDataset:
             _require(slot["split"] == split and consistency[run_id].get("match") is True, "run_split_or_consistency")
             qc = inputs.json(entry["qc_report"])
             _unapproved(qc)
+            _require(qc.get("reception_policy", STRICT_POLICY)
+                     == reviewed.get("reception_policy", STRICT_POLICY) == reception_policy,
+                     "reception_policy_link")
             _require(qc.get("schema_version") == CANDIDATE_SCHEMA and qc.get("status") == "PASS"
                      and qc.get("hold_reasons") == [] and reviewed.get("candidate_qc") == "PASS"
                      and reviewed.get("hold_reasons") == [], "candidate_qc_not_pass")
@@ -207,6 +219,34 @@ def load_mqtt_if_dataset(manifest_path: Path) -> MQTTIFDataset:
                      and {device: value["profile"] for device, value in qc["qc_policy"].items()} == profiles,
                      "qc_profile_link")
             _require(reviewed["counts"] == qc["counts"], "qc_counts_link")
+            if reception_policy == WIRE_JITTER_POLICY:
+                _require(reviewed.get("derived_qc_sha256") == entry["qc_report"]["sha256"],
+                         "derived_qc_checksum")
+                source_qc = qc.get("source_qc", {})
+                expected_sha = request_runs[directory]["source_qc_sha256"]
+                _require(source.get("status") == "HOLD" and source.get("qc_report") == "qc-report.json"
+                         and source.get("collection_issues") == []
+                         and qc.get("source_manifest_status") == reviewed.get("source_manifest_status") == "HOLD"
+                         and source_qc == reviewed.get("source_qc")
+                         and source_qc.get("sha256") == expected_sha
+                         and source_qc.get("path") == "qc-report.json", "source_qc_link")
+                original_path = (Path(entry["manifest"]["path"]).parent / "qc-report.json").as_posix()
+                original = inputs.json({"path": original_path, "sha256": expected_sha})
+                _unapproved(original)
+                _require(original.get("status") == source_qc.get("status") == "HOLD"
+                         and original.get("hold_reasons") == source_qc.get("hold_reasons")
+                         == ["mqtt:pico_01:reception_gap_or_burst"]
+                         and all(original.get(key) == source[key] for key in
+                                 ("run_id", "start_utc", "end_utc", "capture_session_pk",
+                                  "source_capture_group_id", "code_commit")), "source_qc_link")
+                evidence = qc.get("reception_jitter", {})
+                _require(evidence == reviewed.get("reception_jitter")
+                         and evidence.get("policy") == reception_policy
+                         and evidence.get("status") == "VERIFIED_SINGLE_RECOVERY"
+                         and evidence.get("physical_cause") == "UNDETERMINED"
+                         and evidence.get("run_id") == run_id
+                         and evidence.get("source_capture_group_id") == group_id,
+                         "reception_evidence_link")
             candidate = _read_rows(inputs.read(entry["mqtt_features"]), source, start, end, included)
             _require(type(qc["counts"]["mqtt_features"]) is int
                      and len(candidate) == qc["counts"]["mqtt_features"], "mqtt_csv_count")
@@ -226,17 +266,21 @@ def load_mqtt_if_dataset(manifest_path: Path) -> MQTTIFDataset:
             run_records.append({"run_id": run_id, "collection_slot_id": slot["collection_slot_id"],
                                 "start_utc": source["start_utc"], "end_utc": source["end_utc"],
                                 "code_commit": source["code_commit"], "inputs": entry,
-                                "counts_by_device": counts})
+                                "counts_by_device": counts, "reception_policy": reception_policy,
+                                "reception_jitter": qc.get("reception_jitter")})
         actual_runs = {run["run_id"] for run in run_records}
         _require(actual_runs == set(report_runs) == set(slots) == set(consistency)
                  and directories == set(request_runs), "admission_run_set")
         _require(group_devices == set(specs), "group_device_specs")
         bounds.sort()
         _require(all(left[1] <= right[0] for left, right in zip(bounds, bounds[1:])), "group_runs_overlap")
+        if terminal is not None:
+            validate_terminal_selection(terminal, report.get("whole_session", {}), capture, bounds)
         roles[role]["group_ids"].append(group_id)
         groups.append({"role": role, **capture, "runs": run_records,
                        "admission_request": group["admission_request"],
-                       "admission_report": group["admission_report"]})
+                       "admission_report": group["admission_report"],
+                       **({"terminal_source": terminal} if terminal is not None else {})})
 
     for role in ROLE_SPLITS:
         _require(roles[role]["group_ids"] and all(count["selected_rows"] > 0

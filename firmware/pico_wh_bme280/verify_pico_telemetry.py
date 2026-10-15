@@ -62,7 +62,7 @@ def received_utc(value):
     return parsed.astimezone(timezone.utc)
 
 
-def verify(records, *, mode, payload_max, min_samples):
+def verify(records, *, mode, payload_max, min_samples, check_reception_cadence=True):
     if mode not in ("sensor-proof", "gateway"):
         raise ValueError("Unknown verification mode")
     require_int(payload_max, "payload_max", 1)
@@ -135,7 +135,7 @@ def verify(records, *, mode, payload_max, min_samples):
         reception_intervals = [(right - left).total_seconds() for left, right in zip(received, received[1:])]
         if any(value <= 0 for value in reception_intervals):
             raise ValueError("Gateway received_at must increase")
-        if any(value < 3.0 or value > 10.0 for value in reception_intervals):
+        if any(value > 10.0 or (check_reception_cadence and value < 3.0) for value in reception_intervals):
             raise ValueError("Gateway reception has a burst or interruption requiring inspection")
     return {
         "status": "CAPTURED_CONTENT_CHECKS_PASSED",

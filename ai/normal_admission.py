@@ -2,7 +2,7 @@
 
 A candidate Run passes content QC for its selected interval only. This review re-runs that QC into
 a new directory and adds what the QC does not decide: per-device firmware/payload provenance, the
-final COMPLETED snapshot (including failures outside the selected interval), and one consistent
+final snapshot (COMPLETED by default, or explicitly pinned terminal FAILED in v3), and one consistent
 capture group and split. `training_approved` and `whole_capture_session_approved` stay false.
 Evidence hashes are format-checked only; the evidence files themselves are reviewed at approval time.
 """
@@ -35,12 +35,15 @@ from ai.export_normal_collection import (
     _uuid,
     export_normal_collection,
 )
-from ai.packet_if_dataset import VALID_SPLITS
+from ai.pico_reception_qc import STRICT_POLICY, WIRE_JITTER_POLICY
 from edge.packet.capture_policy import CaptureEligibilitySegment, CapturePolicy, is_capture_eligible
 
 REQUEST_SCHEMA = "normal-admission-request-v1"
+RECEPTION_REQUEST_SCHEMA = "normal-admission-request-v2"
+TERMINAL_REQUEST_SCHEMA = "normal-admission-request-v3"
+TERMINAL_SELECTION_POLICY = "failed-after-selected-range-v1"
 REPORT_SCHEMA = "normal-admission-report-v1"
-SPLITS = VALID_SPLITS | {"UNASSIGNED"}
+SPLITS = frozenset({"train", "validation", "test", "UNASSIGNED"})
 PAYLOAD_SCHEMAS = {
     "esp32-telemetry-v1": {"device_id", "sequence", "uptime_s"},
     "pico-bme280-v1": {"device_id", "seq", "uptime_ms", "temperature_c", "humidity_pct", "pressure_hpa"},
@@ -82,14 +85,41 @@ def load_request(path: Path) -> dict:
         request = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise CandidateQCError("invalid_request_json") from exc
-    _exact(request, {"schema_version", "runs", "final_snapshot", "device_specs", "slots"}, "request_fields")
-    _require(request["schema_version"] == REQUEST_SCHEMA, "request_schema_version")
+    _require(isinstance(request, dict), "request_fields")
+    schema = request.get("schema_version")
+    _require(schema in (REQUEST_SCHEMA, RECEPTION_REQUEST_SCHEMA, TERMINAL_REQUEST_SCHEMA), "request_schema_version")
+    terminal_review = schema == TERMINAL_REQUEST_SCHEMA
+    keys = {"schema_version", "runs", "final_snapshot", "device_specs", "slots"}
+    if schema != REQUEST_SCHEMA:
+        keys.add("reception_policy")
+    if terminal_review:
+        keys.add("terminal_source")
+    _exact(request, keys, "request_fields")
+    if schema == RECEPTION_REQUEST_SCHEMA:
+        _require(request["reception_policy"] == WIRE_JITTER_POLICY, "unknown_reception_policy")
+    if terminal_review:
+        _require(request["reception_policy"] in (STRICT_POLICY, WIRE_JITTER_POLICY), "unknown_reception_policy")
+        terminal = _exact(request["terminal_source"], {"policy", "capture_session_pk", "source_capture_group_id",
+                                                    "status", "ended_at"}, "terminal_source_fields")
+        _require(terminal["policy"] == TERMINAL_SELECTION_POLICY and terminal["status"] == "FAILED",
+                 "terminal_source_policy")
+        _require(type(terminal["capture_session_pk"]) is int and terminal["capture_session_pk"] > 0,
+                 "invalid_capture_pk")
+        _uuid(terminal["source_capture_group_id"])
+        _require(type(terminal["ended_at"]) is str and re.fullmatch(
+            r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?Z", terminal["ended_at"]),
+            "invalid_terminal_end")
+        _time(terminal["ended_at"])
+    reception_review = request.get("reception_policy", STRICT_POLICY) == WIRE_JITTER_POLICY
     for key in ("runs", "device_specs", "slots"):
         _require(isinstance(request[key], list) and request[key], f"request_{key}")
     for run in request["runs"]:
-        _exact(run, {"run_dir", "manifest_sha256"}, "run_fields")
+        _exact(run, {"run_dir", "manifest_sha256"} | ({"source_qc_sha256"} if reception_review else set()),
+               "run_fields")
         _relative(run["run_dir"], "unsafe_relative_path")
         _sha256(run["manifest_sha256"], "invalid_sha256")
+        if reception_review:
+            _sha256(run["source_qc_sha256"], "invalid_sha256")
     final = _exact(request["final_snapshot"], {"path", "sha256"}, "final_snapshot_fields")
     _relative(final["path"], "unsafe_relative_path")
     _sha256(final["sha256"], "invalid_sha256")
@@ -135,7 +165,7 @@ def _open_readonly(path: Path):
     return db
 
 
-def _range_rows(db, manifest):
+def _range_rows(db, manifest, *, full_capture_rows=False):
     """Rows of the selected interval that must not change between the candidate and final snapshot."""
     ids = manifest["included_device_ids"]
     marks = ",".join("?" for _ in ids)
@@ -151,8 +181,8 @@ def _range_rows(db, manifest):
     features = query(f"SELECT * FROM feature_logs WHERE device_id IN ({marks}) AND "
                      "julianday(window_start)>=julianday(?) AND julianday(window_end)<=julianday(?) ORDER BY id",
                      (*ids, *window))
-    segments = query("SELECT id, file_name, window_start, window_end, status, error_code "
-                     "FROM packet_capture_segments WHERE capture_session_id=? AND "
+    capture_columns = "*" if full_capture_rows else "id, file_name, window_start, window_end, status, error_code"
+    segments = query(f"SELECT {capture_columns} FROM packet_capture_segments WHERE capture_session_id=? AND "
                      "julianday(window_start)>=julianday(?) AND julianday(window_end)<=julianday(?) ORDER BY id",
                      (manifest["capture_session_pk"], *window))
     packets = query("SELECT f.* FROM packet_feature_logs f JOIN packet_capture_segments s "
@@ -169,6 +199,30 @@ def _digest(rows) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def validate_terminal_selection(terminal, whole, capture, bounds):
+    """Link a v3 request to disclosed terminal facts; never certifies normal behavior.
+
+    Admission supplies facts read from its hash-pinned immutable snapshot. The
+    Dataset loader only checks their recorded linkage, as for other admission facts.
+    """
+    _require(isinstance(whole, dict) and whole.get("session_status") == terminal["status"] == "FAILED"
+             and whole.get("whole_session_eligible") is False
+             and capture["capture_session_pk"] == terminal["capture_session_pk"]
+             and capture["source_capture_group_id"] == terminal["source_capture_group_id"], "terminal_source_link")
+    ended = _time(whole.get("session_ended_at"))
+    _require(ended == _time(terminal["ended_at"]) and bounds and all(right <= ended for _, right in bounds),
+             "terminal_source_end")
+    failures = whole.get("ineligible_segments")
+    _require(isinstance(failures, list) and failures, "terminal_source_requires_recorded_failure")
+    for item in failures:
+        _exact(item, {"segment_id", "window_start", "window_end", "status", "error_code"},
+               "terminal_failure_fields")
+        _require(type(item["segment_id"]) is int and item["segment_id"] > 0, "terminal_failure_id")
+        left, right = _time(item["window_start"]), _time(item["window_end"])
+        _require(left < right and not any(start < right and left < end for start, end in bounds),
+                 "terminal_failure_inside_selected_range")
+
+
 def review_admission(packages_dir: Path, request_path: Path, output_dir: Path) -> dict:
     report = {"schema_version": REPORT_SCHEMA, "status": "HOLD", "official_admission": "HOLD",
               "training_approved": False, "whole_capture_session_approved": False,
@@ -179,6 +233,11 @@ def review_admission(packages_dir: Path, request_path: Path, output_dir: Path) -
         request = load_request(request_path)
         _require("qc_profiles" in inspect.signature(export_normal_collection).parameters,
                  "qc_profile_api_unavailable")
+        reception_policy = request.get("reception_policy", STRICT_POLICY)
+        if reception_policy != STRICT_POLICY:
+            _require("reception_policy" in inspect.signature(export_normal_collection).parameters,
+                     "reception_policy_api_unavailable")
+        report["reception_policy"] = reception_policy
         destination = _new_output_dir(root, output_dir)
     except SAFE_ERRORS as exc:
         report["blockers"].append(f"preflight:{exc if isinstance(exc, CandidateQCError) else type(exc).__name__}")
@@ -195,13 +254,25 @@ def review_admission(packages_dir: Path, request_path: Path, output_dir: Path) -
         before = _tree(package)
         qc_profiles = {spec["device_id"]: spec["profile"] for spec in request["device_specs"]
                        if spec["device_id"] in manifest["included_device_ids"]}
-        qc = export_normal_collection(package, output_dir=destination / "qc" / f"run-{index:02d}",
-                                      qc_profiles=qc_profiles)
+        options = {"output_dir": destination / "qc" / f"run-{index:02d}", "qc_profiles": qc_profiles}
+        if reception_policy != STRICT_POLICY:
+            _require(manifest.get("qc_report") == "qc-report.json"
+                     and _hash(package / "qc-report.json") == entry["source_qc_sha256"], "source_qc_checksum")
+            options["reception_policy"] = reception_policy
+        qc = export_normal_collection(package, **options)
         _require(_tree(package) == before, "source_package_changed")
         manifests[manifest["run_id"]] = (package, manifest)
-        report["runs"].append({"run_id": manifest["run_id"], "run_dir": entry["run_dir"],
+        reviewed = {"run_id": manifest["run_id"], "run_dir": entry["run_dir"],
                                "candidate_qc": qc["status"], "hold_reasons": qc["hold_reasons"],
-                               "counts": qc["counts"], "qc_profiles": qc_profiles})
+                               "counts": qc["counts"], "qc_profiles": qc_profiles}
+        if reception_policy != STRICT_POLICY:
+            _require(qc.get("reception_policy") == reception_policy
+                     and qc.get("source_qc", {}).get("sha256") == entry["source_qc_sha256"],
+                     "source_reception_policy_link")
+            reviewed.update({key: qc.get(key) for key in
+                             ("reception_policy", "source_manifest_status", "source_qc", "reception_jitter")})
+            reviewed["derived_qc_sha256"] = _hash(options["output_dir"] / "qc-report.json")
+        report["runs"].append(reviewed)
         _require(qc["status"] == "PASS", f"candidate_qc_hold({manifest['run_id']})")
 
     for index, entry in enumerate(request["runs"], 1):
@@ -242,8 +313,10 @@ def review_admission(packages_dir: Path, request_path: Path, output_dir: Path) -
         with closing(_open_readonly(final)) as db:
             session = db.execute("SELECT * FROM packet_capture_sessions WHERE id=?",
                                  (first["capture_session_pk"],)).fetchone()
+            terminal = request.get("terminal_source")
             _require(session is not None and session["session_id"] == first["source_capture_group_id"]
-                     and session["status"] == "COMPLETED", "session_not_completed_or_mismatched")
+                     and (terminal is not None or session["status"] == "COMPLETED"),
+                     "session_not_completed_or_mismatched")
             policy = CapturePolicy(**first["capture_policy"])
             failures = []
             for row in db.execute("SELECT * FROM packet_capture_segments WHERE capture_session_id=? ORDER BY id",
@@ -260,8 +333,13 @@ def review_admission(packages_dir: Path, request_path: Path, output_dir: Path) -
             report["whole_session"] = {"session_status": session["status"],
                                        "whole_session_eligible": not failures, "ineligible_segments": failures}
             for run in runs:
-                final_rows[run["run_id"]] = _range_rows(db, run)
+                final_rows[run["run_id"]] = _range_rows(db, run, full_capture_rows=terminal is not None)
             _require(not inside, "session_failure_inside_selected_range")
+            if terminal is not None:
+                report["whole_session"].update(session_ended_at=session["ended_at"], whole_session_eligible=False)
+                validate_terminal_selection(terminal, report["whole_session"], report["capture_group"],
+                                            [(_boundary(run["start_utc"]), _boundary(run["end_utc"])) for run in runs])
+                report["terminal_source"] = dict(terminal)
         final_snapshot_unchanged()
 
     if runs:
@@ -270,7 +348,8 @@ def review_admission(packages_dir: Path, request_path: Path, output_dir: Path) -
     def consistency():
         for package, manifest in manifests.values():
             with closing(_open_readonly(_path(package, manifest["snapshot"]["path"]))) as db:
-                candidate = _digest(_range_rows(db, manifest))
+                candidate = _digest(_range_rows(db, manifest,
+                                                full_capture_rows=request["schema_version"] == TERMINAL_REQUEST_SCHEMA))
             final = _digest(final_rows[manifest["run_id"]])
             report["range_consistency"].append({"run_id": manifest["run_id"], "match": candidate == final})
             _require(candidate == final, f"range_rows_changed({manifest['run_id']})")

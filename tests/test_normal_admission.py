@@ -132,6 +132,70 @@ def test_failed_run_qc_holds_the_admission(case, package):
     assert any("candidate_qc_hold" in item for item in report["blockers"])
 
 
+def test_reception_review_request_preserves_v1_and_requires_explicit_policy_and_source_hash(case):
+    original = case.request()
+    assert admission.load_request(case.packages / "request.json") == original
+    request = {**original, "schema_version": "normal-admission-request-v2",
+               "reception_policy": "pico-p0-wire-jitter-v1",
+               "runs": [{**original["runs"][0], "source_qc_sha256": "c" * 64}]}
+    (case.packages / "request.json").write_text(json.dumps(request), encoding="utf-8")
+    assert admission.load_request(case.packages / "request.json") == request
+
+
+@pytest.mark.parametrize("change", ["unknown_policy", "missing_policy", "missing_source_hash",
+                                    "invalid_source_hash", "policy_on_v1"])
+def test_reception_review_request_rejects_implicit_or_invalid_evidence(case, change):
+    original = case.request()
+    request = {**original, "schema_version": "normal-admission-request-v2",
+               "reception_policy": "pico-p0-wire-jitter-v1",
+               "runs": [{**original["runs"][0], "source_qc_sha256": "c" * 64}]}
+    if change == "unknown_policy":
+        request["reception_policy"] = "allow_any_delay"
+    elif change == "missing_policy":
+        request.pop("reception_policy")
+    elif change == "missing_source_hash":
+        request["runs"][0].pop("source_qc_sha256")
+    elif change == "invalid_source_hash":
+        request["runs"][0]["source_qc_sha256"] = "c"
+    else:
+        request["schema_version"] = "normal-admission-request-v1"
+    (case.packages / "request.json").write_text(json.dumps(request), encoding="utf-8")
+    with pytest.raises(ValueError):
+        admission.load_request(case.packages / "request.json")
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_wire_reception_review_still_requires_real_completed_session_and_keeps_source_hold(case, package,
+                                                                                         complete):
+    base.wire_jitter_package(package)
+    case.final(complete=complete)
+    original = case.request()
+    case.request(schema_version="normal-admission-request-v2", reception_policy="pico-p0-wire-jitter-v1",
+                 runs=[{**original["runs"][0], "source_qc_sha256": digest(package / "qc-report.json")}])
+    before = tree_hashes(package)
+    report = case.review()
+    assert report["runs"][0]["candidate_qc"] == "PASS", report
+    assert report["reception_policy"] == "pico-p0-wire-jitter-v1"
+    assert report["runs"][0]["source_manifest_status"] == "HOLD"
+    assert report["runs"][0]["derived_qc_sha256"] == digest(case.out / "review/qc/run-01/qc-report.json")
+    assert report["runs"][0]["reception_jitter"]["physical_cause"] == "UNDETERMINED"
+    assert report["status"] == ("PASS" if complete else "HOLD"), report
+    if not complete:
+        assert any("session_not_completed_or_mismatched" in reason for reason in report["blockers"])
+    assert tree_hashes(package) == before
+
+
+def test_wire_reception_review_rejects_changed_original_qc_hash(case, package):
+    base.wire_jitter_package(package)
+    case.final()
+    original = case.request()
+    case.request(schema_version="normal-admission-request-v2", reception_policy="pico-p0-wire-jitter-v1",
+                 runs=[{**original["runs"][0], "source_qc_sha256": "f" * 64}])
+    report = case.review()
+    assert report["status"] == "HOLD"
+    assert any("source_qc_checksum" in reason for reason in report["blockers"])
+
+
 def _second_run(package, tmp_path, same_group, shift=40):
     clone = tmp_path / "candidate2"
     shutil.copytree(package, clone)
@@ -464,3 +528,144 @@ def test_cli_exit_codes(case, capsys):
     case.request()
     assert main([*argv, "--output-dir", str(case.out / "cli-hold")]) == 2
     assert "Blockers:" in capsys.readouterr().out
+
+
+TERMINAL_SCHEMA = "normal-admission-request-v3"
+TERMINAL_POLICY = "failed-after-selected-range-v1"
+
+
+def _terminal_request(case, package, *, wire=False):
+    if wire:
+        base.wire_jitter_package(package)
+    ended = utc(START + timedelta(seconds=320))
+    later = utc(START + timedelta(seconds=300))
+    case.final(sql=[("UPDATE packet_capture_sessions SET status='FAILED', ended_at=?", (ended,)),
+                    ("INSERT INTO packet_capture_segments(capture_session_id,file_name,capture_interface,"
+                     "window_start,window_end,status,error_code) VALUES(1,'later.pcap','eth0',?,?,'FAILED',"
+                     "'PARTIAL_CAPTURE')", (later, utc(START + timedelta(seconds=310))))])
+    original = case.request()
+    source = case.manifest()
+    runs = original["runs"]
+    if wire:
+        runs[0]["source_qc_sha256"] = digest(package / "qc-report.json")
+    return case.request(schema_version=TERMINAL_SCHEMA,
+                        reception_policy="pico-p0-wire-jitter-v1" if wire else "strict-v1", runs=runs,
+                        terminal_source={"policy": TERMINAL_POLICY, "capture_session_pk": source["capture_session_pk"],
+                                         "source_capture_group_id": source["source_capture_group_id"],
+                                         "status": "FAILED", "ended_at": ended})
+
+
+@pytest.mark.parametrize("wire", [False, True])
+def test_terminal_failed_v3_preserves_real_status_and_selected_source(case, package, wire):
+    request = _terminal_request(case, package, wire=wire)
+    before = tree_hashes(package)
+    final_hash = digest(case.packages / "final.db")
+    report = case.review()
+    assert report["status"] == "PASS", report
+    assert report["terminal_source"] == request["terminal_source"]
+    assert report["whole_session"]["session_status"] == "FAILED"
+    assert report["whole_session"]["session_ended_at"] == request["terminal_source"]["ended_at"]
+    assert report["whole_session"]["whole_session_eligible"] is False
+    assert len(report["whole_session"]["ineligible_segments"]) == 1
+    assert report["range_consistency"] == [{"run_id": case.manifest()["run_id"], "match": True}]
+    assert report["training_approved"] is False and report["whole_capture_session_approved"] is False
+    assert tree_hashes(package) == before and digest(case.packages / "final.db") == final_hash
+
+
+@pytest.mark.parametrize("change", ["running", "unknown", "completed", "missing_end", "early_end",
+    "changed_end", "wrong_session", "inside_failure", "selected_tamper", "missing_failure",
+    "missing_policy", "unknown_policy", "declared_completed", "declared_wrong_session", "old_schema"])
+def test_terminal_failed_v3_refuses_unproven_or_rewritten_termination(case, package, change):
+    request = _terminal_request(case, package)
+    final = case.packages / "final.db"
+    mutations = {
+        "running": "UPDATE packet_capture_sessions SET status='RUNNING'",
+        "completed": "UPDATE packet_capture_sessions SET status='COMPLETED'",
+        "missing_end": "UPDATE packet_capture_sessions SET ended_at=NULL",
+        "early_end": "UPDATE packet_capture_sessions SET ended_at='2026-10-04T00:00:10Z'",
+        "changed_end": "UPDATE packet_capture_sessions SET ended_at='2026-10-04T00:05:21Z'",
+        "wrong_session": "UPDATE packet_capture_sessions SET session_id='" + str(uuid4()) + "'",
+        "inside_failure": "UPDATE packet_capture_segments SET status='FAILED',error_code='PARTIAL_CAPTURE' WHERE id=1",
+        "selected_tamper": "UPDATE feature_logs SET max_payload_size=max_payload_size+1 WHERE rowid=1",
+        "missing_failure": "DELETE FROM packet_capture_segments WHERE file_name='later.pcap'",
+    }
+    if change in mutations:
+        with closing(sqlite3.connect(final)) as db:
+            db.execute(mutations[change])
+            db.commit()
+        request["final_snapshot"]["sha256"] = digest(final)
+        if change == "early_end":
+            request["terminal_source"]["ended_at"] = "2026-10-04T00:00:10Z"
+    elif change == "missing_policy":
+        request.pop("terminal_source")
+    elif change == "unknown_policy":
+        request["terminal_source"]["policy"] = "allow_any_failure"
+    elif change in ("declared_completed", "unknown"):
+        request["terminal_source"]["status"] = "COMPLETED" if change == "declared_completed" else "UNKNOWN"
+    elif change == "declared_wrong_session":
+        request["terminal_source"]["source_capture_group_id"] = str(uuid4())
+    else:
+        request["schema_version"] = "normal-admission-request-v1"
+    (case.packages / "request.json").write_text(json.dumps(request), encoding="utf-8")
+    before = tree_hashes(package)
+    report = case.review()
+    assert report["status"] == "HOLD" and report["blockers"], report
+    assert report["training_approved"] is False and tree_hashes(package) == before
+
+
+@pytest.mark.parametrize("wire", [False, True])
+def test_old_contracts_still_refuse_failed_terminal_source(case, package, wire):
+    request = _terminal_request(case, package, wire=wire)
+    request.pop("terminal_source")
+    if wire:
+        request["schema_version"] = "normal-admission-request-v2"
+    else:
+        request["schema_version"] = "normal-admission-request-v1"
+        request.pop("reception_policy")
+    (case.packages / "request.json").write_text(json.dumps(request), encoding="utf-8")
+    report = case.review()
+    assert report["status"] == "HOLD"
+    assert "final_snapshot:session_not_completed_or_mismatched" in report["blockers"]
+
+
+@pytest.mark.parametrize("change", ["missing_end", "non_utc_end", "invalid_end", "subsecond_overflow",
+    "invalid_pk", "bool_pk", "noncanonical_uuid", "extra_field", "nonobject"])
+def test_terminal_failed_request_requires_exact_typed_termination(case, package, change):
+    request = _terminal_request(case, package)
+    terminal = request["terminal_source"]
+    if change == "missing_end":
+        terminal.pop("ended_at")
+    elif change == "non_utc_end":
+        terminal["ended_at"] = "2026-10-04T00:05:20+00:00"
+    elif change == "invalid_end":
+        terminal["ended_at"] = "2026-99-04T00:05:20Z"
+    elif change == "subsecond_overflow":
+        terminal["ended_at"] = "2026-10-04T00:05:20.1234567Z"
+    elif change == "invalid_pk":
+        terminal["capture_session_pk"] = 0
+    elif change == "bool_pk":
+        terminal["capture_session_pk"] = True
+    elif change == "noncanonical_uuid":
+        terminal["source_capture_group_id"] = str(uuid4()).upper()
+    elif change == "extra_field":
+        terminal["approved"] = True
+    else:
+        request["terminal_source"] = None
+    (case.packages / "request.json").write_text(json.dumps(request), encoding="utf-8")
+    with pytest.raises(ValueError):
+        admission.load_request(case.packages / "request.json")
+
+
+
+def test_terminal_v3_rejects_changed_selected_capture_timing_even_when_still_eligible(case, package):
+    request = _terminal_request(case, package)
+    final = case.packages / "final.db"
+    with closing(sqlite3.connect(final)) as db:
+        db.execute("UPDATE packet_capture_segments SET start_delay_seconds=0.02 WHERE id=1")
+        db.commit()
+    request["final_snapshot"]["sha256"] = digest(final)
+    (case.packages / "request.json").write_text(json.dumps(request), encoding="utf-8")
+    report = case.review()
+    assert report["runs"][0]["candidate_qc"] == "PASS"
+    assert report["status"] == "HOLD", report
+    assert any("range_rows_changed" in reason for reason in report["blockers"])
