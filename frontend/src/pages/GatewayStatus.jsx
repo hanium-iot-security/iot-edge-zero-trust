@@ -413,48 +413,33 @@ function InterfaceCard({
 /* =========================================================
    Phase 9 - AI Runtime Helpers
 
-   Runtime 응답 필드가 불명확하면 UNKNOWN으로 표시합니다.
+   RuntimeStatusResponse의 관측 상태와 단계별 근거를 표시합니다.
    Desired 상태를 Actual 상태로 간주하지 않습니다.
 ========================================================= */
 
-function extractRuntimeItems(data) {
-  if (!data) return [];
+function extractRuntimeItems(data, now = Date.now()) {
+  if (!data || typeof data !== "object") return [];
 
-  if (Array.isArray(data)) return data;
+  const ageSeconds = (now - Date.parse(data.observed_at)) / 1000;
+  const freshness = data.freshness === "FRESH" &&
+    ageSeconds > data.max_age_seconds ? "STALE" : data.freshness;
+  const current = freshness === "FRESH";
+  const observation = {
+    name: "AI Runtime",
+    status: current ? data.status : "UNKNOWN",
+    last_observation_status: data.last_observation_status,
+    observed_at: data.observed_at,
+    error_code: data.error_code ?? data.reason_code,
+    freshness,
+  };
 
-  if (Array.isArray(data.items)) {
-    return data.items;
-  }
-
-  if (Array.isArray(data.runtimes)) {
-    return data.runtimes;
-  }
-
-  const result = [];
-
-  if (data.mqtt && typeof data.mqtt === "object") {
-    result.push({ runtime_name: "MQTT", ...data.mqtt });
-  }
-
-  if (data.packet && typeof data.packet === "object") {
-    result.push({ runtime_name: "Packet", ...data.packet });
-  }
-
-  if (data.mqtt_ai && typeof data.mqtt_ai === "object") {
-    result.push({ runtime_name: "MQTT", ...data.mqtt_ai });
-  }
-
-  if (data.packet_ai && typeof data.packet_ai === "object") {
-    result.push({ runtime_name: "Packet", ...data.packet_ai });
-  }
-
-  if (result.length) return result;
-
-  if (typeof data === "object") {
-    return [data];
-  }
-
-  return [];
+  return [observation, ...(data.stages ?? []).map((stage) => ({
+    ...stage,
+    status: current ? stage.status : "UNKNOWN",
+    last_observation_status: stage.status,
+    observed_at: stage.observed_at ?? data.observed_at,
+    freshness,
+  }))];
 }
 
 function runtimeTitle(item, index) {
@@ -472,24 +457,13 @@ function runtimeTitle(item, index) {
 
 function getRuntimeField(item, type) {
   if (type === "desired") {
-    return firstDefined(item, [
-      "desired_state",
-      "desired_status",
-      "desired_mode",
-      "configured_mode",
-      "requested_mode",
-    ]);
+    return typeof item.enabled === "boolean"
+      ? item.enabled ? "ENABLED" : "DISABLED"
+      : null;
   }
 
   if (type === "actual") {
-    return firstDefined(item, [
-      "actual_state",
-      "actual_status",
-      "actual_mode",
-      "effective_mode",
-      "runtime_state",
-      "runtime_status",
-    ]);
+    return item.status ?? "UNKNOWN";
   }
 
   return null;
@@ -533,24 +507,9 @@ function RuntimeCard({ item, index }) {
   const desired = getRuntimeField(item, "desired");
   const actual = getRuntimeField(item, "actual");
 
-  const model = firstDefined(item, [
-    "model_name",
-    "model_id",
-    "loaded_model",
-    "model",
-  ]);
-
-  const updatedAt = firstDefined(item, [
-    "updated_at",
-    "checked_at",
-    "last_heartbeat_at",
-  ]);
-
-  const error = firstDefined(item, [
-    "last_error",
-    "error",
-    "error_message",
-  ]);
+  const model = item.model_version;
+  const updatedAt = item.observed_at;
+  const error = item.error_code;
 
   return (
     <article className="ai-runtime-card">
@@ -584,6 +543,18 @@ function RuntimeCard({ item, index }) {
           <dd>{updatedAt ? formatKST(updatedAt) : "-"}</dd>
         </div>
 
+        <div>
+          <dt>Freshness</dt>
+          <dd>{displayValue(item.freshness)}</dd>
+        </div>
+
+        {item.freshness !== "FRESH" && (
+          <div>
+            <dt>Last Observation (과거 관측)</dt>
+            <dd>{displayValue(item.last_observation_status)}</dd>
+          </div>
+        )}
+
         {error != null && (
           <div className="ai-runtime-error">
             <dt>Last Error</dt>
@@ -593,6 +564,46 @@ function RuntimeCard({ item, index }) {
       </dl>
     </article>
   );
+}
+
+function CompletionCard({ item }) {
+  return (
+    <article className="ai-runtime-card">
+      <div className="ai-runtime-card-header">
+        <strong>{displayValue(item.detector_name)}</strong>
+        <StatusBadge
+          status="unknown"
+          label={`${item.evidence_status} / ${item.freshness}`}
+          size="small"
+        />
+      </div>
+      <dl className="ai-runtime-list">
+        <div><dt>Device</dt><dd>{displayValue(item.device_id)}</dd></div>
+        <div><dt>Completed Window</dt><dd>{formatKST(item.completed_window_end)}</dd></div>
+        <div><dt>Model</dt><dd>{displayValue(item.model_version)}</dd></div>
+        <div><dt>Inference / Input</dt><dd>{item.inference_count} / {item.input_count}</dd></div>
+        <div><dt>Normal / Anomaly</dt><dd>{item.normal_count} / {item.anomaly_count}</dd></div>
+        <div><dt>Excluded</dt><dd>{displayValue(item.exclusion_counts)}</dd></div>
+      </dl>
+    </article>
+  );
+}
+
+function extractCompletionItems(data, runtimeFreshness, now = Date.now()) {
+  return (data?.completions ?? []).map((item) => {
+    const ageSeconds = (now - Date.parse(item.observed_at)) / 1000;
+    const freshness = runtimeFreshness === "API_ERROR"
+      ? "API_ERROR"
+      : item.freshness === "FRESH" && ageSeconds > data.max_age_seconds
+        ? "STALE" : item.freshness;
+    const current = item.evidence_status === "CURRENT" &&
+      runtimeFreshness === "FRESH" && freshness === "FRESH";
+    return {
+      ...item,
+      evidence_status: current ? "CURRENT" : "HISTORICAL",
+      freshness,
+    };
+  });
 }
 
 /* =========================================================
@@ -616,35 +627,10 @@ function extractModels(data) {
 }
 
 function ModelCard({ model, index }) {
-  const name = firstDefined(model, [
-    "name",
-    "model_name",
-    "model_id",
-    "id",
-  ]);
-
-  const version = firstDefined(model, [
-    "version",
-    "model_version",
-  ]);
-
-  const framework = firstDefined(model, [
-    "framework",
-    "runtime",
-    "format",
-  ]);
-
-  const status = firstDefined(model, [
-    "status",
-    "state",
-    "load_status",
-  ]);
-
-  const detector = firstDefined(model, [
-    "detector_type",
-    "detector",
-    "pipeline",
-  ]);
+  const name = model.detector;
+  const version = model.configured_model_version;
+  const status = model.artifact_status;
+  const detector = model.detector;
 
   return (
     <article className="ai-model-card">
@@ -654,7 +640,7 @@ function ModelCard({ model, index }) {
         </strong>
 
         <StatusBadge
-          status={runtimeTheme(status)}
+          status={status === "INVALID" ? "danger" : "unknown"}
           label={status == null ? "상태 미제공" : displayValue(status)}
           size="small"
         />
@@ -672,10 +658,20 @@ function ModelCard({ model, index }) {
         </div>
 
         <div>
-          <dt>Framework</dt>
-          <dd>{displayValue(framework)}</dd>
+          <dt>Bundle SHA256</dt>
+          <dd>{displayValue(model.configured_bundle_sha256)}</dd>
         </div>
+
+        <div><dt>Runtime</dt><dd>{displayValue(model.runtime?.status)}</dd></div>
+        <div><dt>Runtime Reason</dt><dd>{displayValue(model.runtime?.reason_code)}</dd></div>
+        {model.error_code && (
+          <div className="ai-runtime-error"><dt>Error</dt><dd>{model.error_code}</dd></div>
+        )}
       </dl>
+      <details className="ai-runtime-raw">
+        <summary>모델 검증 근거</summary>
+        <pre>{JSON.stringify(model.checks, null, 2)}</pre>
+      </details>
     </article>
   );
 }
@@ -993,8 +989,15 @@ export default function GatewayStatus() {
       : "normal";
 
   const runtimeItems = useMemo(
-    () => extractRuntimeItems(runtimeData),
-    [runtimeData]
+    () => extractRuntimeItems(runtimeError
+      ? { ...runtimeData, freshness: "API_ERROR" }
+      : runtimeData, now),
+    [runtimeData, runtimeError, now]
+  );
+
+  const completionItems = useMemo(
+    () => extractCompletionItems(runtimeData, runtimeItems[0]?.freshness, now),
+    [runtimeData, runtimeItems, now]
   );
 
   const modelItems = useMemo(
@@ -1002,9 +1005,8 @@ export default function GatewayStatus() {
     [modelsData]
   );
 
-  const actualRuntimeKnown = runtimeItems.some(
-    (item) => getRuntimeField(item, "actual") != null
-  );
+  const actualRuntimeStatus = runtimeItems[0]?.status ?? "UNKNOWN";
+  const actualRuntimeKnown = actualRuntimeStatus !== "UNKNOWN";
 
   /* ---------------------------------------------------------
      Actions
@@ -1138,17 +1140,13 @@ export default function GatewayStatus() {
               <SummaryCard
                 title="Actual 상태 확인"
                 value={
-                  actualRuntimeKnown
-                    ? "필드 확인"
-                    : "UNKNOWN"
+                  actualRuntimeStatus
                 }
                 description={
-                  actualRuntimeKnown
-                    ? "Actual 상태 필드가 제공되었습니다."
-                    : "실제 실행 상태를 판단할 필드가 없습니다."
+                  `관측 신선도: ${runtimeItems[0]?.freshness ?? "MISSING"}`
                 }
                 status={
-                  actualRuntimeKnown ? "normal" : "warning"
+                  runtimeTheme(actualRuntimeStatus)
                 }
               />
 
@@ -1179,10 +1177,21 @@ export default function GatewayStatus() {
 
             {!actualRuntimeKnown && (
               <p className="ai-runtime-note">
-                Actual 필드가 없으므로 Runtime을 정상 실행 중이라고
-                판단할 수 없습니다. 정확한 필드명은 Swagger의
-                RuntimeStatusResponse 스키마와 대조해야 합니다.
+                최신 실행 상태를 확인할 수 없습니다. 마지막 관측과
+                추론 완료 근거는 현재 정상 실행을 보장하지 않습니다.
               </p>
+            )}
+
+            {completionItems.length > 0 && (
+              <>
+                <h3>최근 추론 완료 근거</h3>
+                <p className="ai-runtime-note">완료 기록과 현재 Runtime 상태는 별개입니다.</p>
+                <div className="ai-runtime-grid">
+                  {completionItems.map((item, index) => (
+                    <CompletionCard key={`${item.run_id}-${item.detector_name}-${index}`} item={item} />
+                  ))}
+                </div>
+              </>
             )}
 
             <details className="ai-runtime-raw">

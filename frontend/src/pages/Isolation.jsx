@@ -544,8 +544,9 @@ function Phase9ScopeExtension({ rule, adminKey }) {
   const ruleId = rule?.id;
 
   async function submit() {
-    if (lock.current || !ruleId) return;
+    if (lock.current || uncertain || !ruleId) return;
     setError("");
+    let dispatched = false;
     try {
       if (!adminKey.trim()) throw new Error("관리자 Key를 입력해 주세요.");
       if (!reason.trim()) throw new Error("차단 범위 확대 사유를 입력해 주세요.");
@@ -560,11 +561,13 @@ function Phase9ScopeExtension({ rule, adminKey }) {
       lock.current = true;
       setBusy(true);
       setResult(null);
+      dispatched = true;
       const value = await createFirewallScopeExtensionRequest(ruleId, payload, adminKey);
       setResult(unwrapApiItem(value));
     } catch (err) {
-      if (isUncertainCommandError(err)) setUncertain(true);
-      setError(`${err?.message || "요청 실패"}${isUncertainCommandError(err) ? " · 결과가 불확실하므로 자동 재요청하지 않습니다." : ""}`);
+      const uncertainRequest = dispatched && isUncertainCommandError(err);
+      if (uncertainRequest) setUncertain(true);
+      setError(`${err?.message || "요청 실패"}${uncertainRequest ? " · 결과가 불확실하므로 자동 재요청하지 않습니다." : ""}`);
     } finally {
       lock.current = false;
       setBusy(false);
@@ -594,7 +597,6 @@ function Phase9ScopeExtension({ rule, adminKey }) {
 function Phase9PacketPairRecovery({ adminKey, deviceId }) {
   const [requestText, setRequestText] = useState("");
   const [planId, setPlanId] = useState("");
-  const [verifyText, setVerifyText] = useState("");
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -602,11 +604,12 @@ function Phase9PacketPairRecovery({ adminKey, deviceId }) {
   const lock = useRef(false);
 
   async function run(kind) {
-    if (lock.current || uncertain) return;
+    if (lock.current || (kind !== "read" && uncertain)) return;
     setError("");
     if (!adminKey.trim()) { setError("관리자 Key를 입력해 주세요."); return; }
     lock.current = true;
     setBusy(true);
+    let dispatched = false;
     try {
       let response;
       if (kind === "create") {
@@ -614,16 +617,15 @@ function Phase9PacketPairRecovery({ adminKey, deviceId }) {
         if (payload.device_id && String(payload.device_id) !== String(deviceId)) {
           throw new Error("다른 기기의 device_id로 복구 Plan을 생성할 수 없습니다.");
         }
+        dispatched = true;
         response = await createPacketPairRecoveryPlan(payload, adminKey);
       } else {
         if (!planId.trim()) throw new Error("Plan ID를 입력해 주세요.");
         if (kind === "read") {
           response = await getPacketPairRecoveryPlan(planId.trim(), adminKey);
         } else {
-          const options = verifyText.trim()
-            ? { payload: parseAdminJson(verifyText, "Verify 요청 본문") }
-            : {};
-          response = await verifyPacketPairRecoveryPlan(planId.trim(), adminKey, options);
+          dispatched = true;
+          response = await verifyPacketPairRecoveryPlan(planId.trim(), adminKey);
         }
       }
       const value = unwrapApiItem(response);
@@ -631,8 +633,9 @@ function Phase9PacketPairRecovery({ adminKey, deviceId }) {
       const returnedId = value?.plan_id ?? value?.id;
       if (returnedId != null) setPlanId(String(returnedId));
     } catch (err) {
-      if (kind !== "read" && isUncertainCommandError(err)) setUncertain(true);
-      setError(`${err?.message || "요청 실패"}${kind !== "read" && isUncertainCommandError(err) ? " · 결과가 불확실하므로 자동 재시도하지 않습니다." : ""}`);
+      const uncertainRequest = kind !== "read" && dispatched && isUncertainCommandError(err);
+      if (uncertainRequest) setUncertain(true);
+      setError(`${err?.message || "요청 실패"}${uncertainRequest ? " · 결과가 불확실하므로 자동 재시도하지 않습니다." : ""}`);
     } finally {
       lock.current = false;
       setBusy(false);
@@ -648,7 +651,6 @@ function Phase9PacketPairRecovery({ adminKey, deviceId }) {
         <button type="button" className="button button-secondary" disabled={busy || uncertain || !adminKey.trim()} onClick={() => run("create")}>Plan 생성</button>
         <div className="filter-item"><label htmlFor="phase9-plan-id">Plan ID</label><input id="phase9-plan-id" value={planId} disabled={busy} onChange={(e) => setPlanId(e.target.value)} /></div>
         <button type="button" className="button button-secondary" disabled={busy || !planId.trim()} onClick={() => run("read")}>Plan 상태 재조회</button>
-        <div className="filter-item"><label htmlFor="phase9-verify-payload">Verify 본문 JSON (Swagger에서 요구하는 경우)</label><textarea id="phase9-verify-payload" rows={3} value={verifyText} disabled={busy || uncertain} onChange={(e) => setVerifyText(e.target.value)} placeholder="본문 불필요한 API라면 비워두세요." /></div>
         <button type="button" className="button button-secondary" disabled={busy || uncertain || !planId.trim()} onClick={() => run("verify")}>Plan Verify 요청</button>
       </div>
       {uncertain && <p className="phase9-uncertain">POST 결과가 불확실합니다. 서버에서 Plan/요청 상태를 확인한 후에만 다시 수행하세요.</p>}

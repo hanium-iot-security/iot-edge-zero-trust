@@ -810,7 +810,7 @@ function DeviceAiManagement({ deviceId, registration }) {
                   <StatusBadge
                     status="warning"
                     label={displayValue(
-                      warning.detector ?? warning.detector_type ?? "AI"
+                      warning.detector_name ?? "AI"
                     )}
                     size="small"
                   />
@@ -826,6 +826,10 @@ function DeviceAiManagement({ deviceId, registration }) {
 
                 <dl className="history-info">
                   <div>
+                    <dt>모델</dt>
+                    <dd>{displayValue(warning.model_version)}</dd>
+                  </div>
+                  <div>
                     <dt>횟수</dt>
                     <dd>{displayValue(
                       warning.count ?? warning.occurrence_count
@@ -834,28 +838,26 @@ function DeviceAiManagement({ deviceId, registration }) {
                   <div>
                     <dt>최초 시각</dt>
                     <dd>{formatKST(
-                      warning.first_seen_at ??
-                      warning.first_window_start
+                      warning.first_window ?? warning.bucket_start
                     )}</dd>
                   </div>
                   <div>
                     <dt>최근 시각</dt>
                     <dd>{formatKST(
-                      warning.last_seen_at ??
-                      warning.last_window_start
+                      warning.latest_window ?? warning.bucket_end
                     )}</dd>
                   </div>
                   <div>
                     <dt>상태</dt>
-                    <dd>{displayValue(warning.status)}</dd>
+                    <dd>{displayValue(warning.last_decision)} / {warning.closed ? "마감" : "진행 중"}</dd>
                   </div>
                   <div>
-                    <dt>Alerted</dt>
-                    <dd>{displayValue(warning.alerted)}</dd>
+                    <dt>통보 시각</dt>
+                    <dd>{formatKST(warning.notified_at)}</dd>
                   </div>
                   <div>
-                    <dt>Suppressed</dt>
-                    <dd>{displayValue(warning.suppressed)}</dd>
+                    <dt>억제 횟수</dt>
+                    <dd>{displayValue(warning.suppressed_count)}</dd>
                   </div>
                 </dl>
               </article>
@@ -948,7 +950,7 @@ export default function Devices() {
   const listControllerRef = useRef(null);
   const detailIdRef = useRef(0);
   const detailControllerRef = useRef(null);
-  const policyDraftDirty = useRef(false);
+  const policyDraftBaselineRef = useRef(null);
   const registrationLock = useRef(false);
   const policyLock = useRef(false);
 
@@ -1088,10 +1090,33 @@ export default function Devices() {
     selectedDevice, currentPolicy
   );
 
+  const applyPolicyResponse = useCallback((data, device, preserveDraft) => {
+    const nextDraft = draftFromPolicy(data.current, device);
+    const previousBaseline = policyDraftBaselineRef.current;
+    setPolicyInfo(data);
+
+    if (!preserveDraft || !previousBaseline) {
+      setPolicyDraft(nextDraft);
+    } else {
+      setPolicyDraft((current) => {
+        const next = { ...current };
+        Object.keys(nextDraft).forEach((key) => {
+          if (current[key] === previousBaseline[key]) {
+            next[key] = nextDraft[key];
+          }
+        });
+        return next;
+      });
+    }
+    policyDraftBaselineRef.current = nextDraft;
+  }, []);
+
   const refreshPolicy = useCallback(async (
     deviceId,
     preserveDraft = true
   ) => {
+    if (!deviceId) return null;
+    const id = ++detailIdRef.current;
     setPolicyLoading(true);
     setPolicyError("");
 
@@ -1100,6 +1125,7 @@ export default function Devices() {
         getDeviceDetail(deviceId),
         getDevicePolicy(deviceId),
       ]);
+      if (id !== detailIdRef.current) return null;
 
       const latestDevice = detailResult.status === "fulfilled"
         ? detailResult.value?.item ?? detailResult.value
@@ -1118,23 +1144,16 @@ export default function Devices() {
       }
 
       const data = normalizePolicy(policyResult.value);
-      setPolicyInfo(data);
-
-      if (!preserveDraft || !policyDraftDirty.current) {
-        setPolicyDraft(
-          draftFromPolicy(data.current, latestDevice)
-        );
-        policyDraftDirty.current = false;
-      }
-
+      applyPolicyResponse(data, latestDevice, preserveDraft);
       return data;
     } catch (err) {
+      if (id !== detailIdRef.current) return null;
       setPolicyError(err?.message || "Rule 정책 조회 실패");
       return null;
     } finally {
-      setPolicyLoading(false);
+      if (id === detailIdRef.current) setPolicyLoading(false);
     }
-  }, []);
+  }, [applyPolicyResponse]);
 
   async function openDetail(device) {
     if (!device?.device_id || policySaving) return;
@@ -1155,7 +1174,7 @@ export default function Devices() {
     setPolicyLoading(true);
     setPolicyError("");
     setPolicyDraft(EMPTY_DRAFT);
-    policyDraftDirty.current = false;
+    policyDraftBaselineRef.current = null;
     setPolicyKey("");
     setPolicyWriteError("");
     setPolicyMessage("");
@@ -1215,8 +1234,7 @@ export default function Devices() {
 
     if (rulePolicy.status === "fulfilled") {
       const data = normalizePolicy(rulePolicy.value);
-      setPolicyInfo(data);
-      setPolicyDraft(draftFromPolicy(data.current, latestDevice));
+      applyPolicyResponse(data, latestDevice, false);
     } else {
       setPolicyError(rulePolicy.reason?.message || "Rule 정책 조회 실패");
     }
@@ -1234,6 +1252,7 @@ export default function Devices() {
     setPolicyKey("");
     setPolicyInfo(EMPTY_POLICY);
     setPolicyDraft(EMPTY_DRAFT);
+    policyDraftBaselineRef.current = null;
     setPolicyWriteError("");
     setPolicyMessage("");
     setTrustHistory([]);
@@ -1244,7 +1263,6 @@ export default function Devices() {
   }
 
   function policyField(key, value) {
-    policyDraftDirty.current = true;
     setPolicyDraft((prev) => ({ ...prev, [key]: value }));
     setPolicyWriteError("");
     setPolicyMessage("");

@@ -405,7 +405,7 @@ function warningText(value) {
 }
 
 function warningTimestamp(item) {
-  return warningField(item, ["detected_at", "created_at", "observed_at", "timestamp"]);
+  return item?.latest_window ?? item?.bucket_start ?? null;
 }
 
 export default function Events() {
@@ -903,8 +903,8 @@ export default function Events() {
 
   const aiWarningColumns = [
     {
-      key: "detected_at",
-      header: "발생 시각",
+      key: "latest_window",
+      header: "최근 분석 시각",
       width: 180,
       render: (_value, warning) => formatKST(warningTimestamp(warning)),
     },
@@ -930,25 +930,32 @@ export default function Events() {
       ),
     },
     {
-      key: "severity",
-      header: "Severity",
+      key: "count",
+      header: "경고 횟수",
       width: 115,
-      render: (_value, warning) => {
-        const sev = warningField(warning, ["severity", "level"]);
-        return <StatusBadge status={getSeverityStatus(sev)} label={warningText(sev).toUpperCase()} size="small" />;
-      },
+      render: (_value, warning) => warningText(warning.count),
     },
     {
-      key: "model_name",
+      key: "model_version",
       header: "모델",
       width: 165,
-      render: (_value, warning) => warningText(warningField(warning, ["model_name", "model_id", "detector_type"])),
+      render: (_value, warning) => (
+        <div className="device-info">
+          <span>{warningText(warning.detector_name)}</span>
+          <small>{warningText(warning.model_version)}</small>
+        </div>
+      ),
     },
     {
-      key: "status",
+      key: "last_decision",
       header: "처리 상태",
       width: 125,
-      render: (_value, warning) => warningText(warningField(warning, ["status", "processing_status"])),
+      render: (_value, warning) => (
+        <div className="device-info">
+          <span>{warningText(warning.last_decision)}</span>
+          <small>{warning.closed ? "마감" : "진행 중"} / 억제 {warningText(warning.suppressed_count)}회</small>
+        </div>
+      ),
     },
   ];
 

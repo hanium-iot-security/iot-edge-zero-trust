@@ -327,6 +327,20 @@ function captureWindowField(item, ...keys) {
   return null;
 }
 
+const CAPTURE_OBSERVATION_THEMES = {
+  FAILED: "failed",
+  PROCESSED: "processed",
+  EMPTY: "captured",
+  PENDING: "pending",
+  MISSING: "missing",
+};
+
+function captureWindowObservation(item) {
+  const status = captureWindowField(item, "observation", "status", "capture_status", "segment_status");
+  const normalized = String(status ?? "UNKNOWN").toUpperCase();
+  return normalized === "READY" ? "PENDING" : normalized;
+}
+
 function captureWindowDisplay(value) {
   if (value === null || value === undefined || value === "") return "-";
   if (typeof value === "boolean") return value ? "예" : "아니요";
@@ -368,7 +382,6 @@ function availableCaptureSessions(features) {
 
 function PacketCaptureWindows({ featureRows = [] }) {
   const [items, setItems] = useState([]);
-  const [total, setTotal] = useState(null);
   const [offset, setOffset] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -399,7 +412,9 @@ function PacketCaptureWindows({ featureRows = [] }) {
       : Date.parse(fromISO) >= Date.parse(toISO)
         ? "종료 시각은 시작 시각보다 늦어야 합니다."
         : "";
-  const query = queryValidation ? null : { session_id: sessionInput.trim(), from: fromISO, to: toISO };
+  const query = useMemo(() => queryValidation ? null : {
+    session_id: sessionInput.trim(), from: fromISO, to: toISO,
+  }, [queryValidation, sessionInput, fromISO, toISO]);
   const queryKey = query ? `${query.session_id}|${query.from}|${query.to}` : "";
   const [lastUpdated, setLastUpdated] = useState("");
   const [filter, setFilter] = useState("");
@@ -416,14 +431,12 @@ function PacketCaptureWindows({ featureRows = [] }) {
     setLoading(true);
     try {
       const response = await getPacketCaptureWindows(
-        { ...query, limit: pageSize, offset },
+        query,
         { signal: controller.signal }
       );
       if (controller.signal.aborted || id !== requestIdRef.current) return;
       const normalized = captureWindowList(response);
       setItems(normalized.items);
-      const n = Number(normalized.total);
-      setTotal(normalized.total !== null && normalized.total !== undefined && Number.isFinite(n) ? n : null);
       setLastUpdated(new Date().toISOString());
       setError("");
     } catch (err) {
@@ -432,21 +445,20 @@ function PacketCaptureWindows({ featureRows = [] }) {
     } finally {
       if (id === requestIdRef.current) setLoading(false);
     }
-  }, [queryKey, offset]);
+  }, [query]);
 
   useEffect(() => {
     if (!queryKey) {
       controllerRef.current?.abort();
       setItems([]);
-      setTotal(null);
       setLastUpdated("");
       setError("");
       setLoading(false);
       return undefined;
     }
     // Session 및 기간이 바뀌었으면 이전 Session의 성공 값을 남기지 않습니다.
+    setOffset(0);
     setItems([]);
-    setTotal(null);
     setLastUpdated("");
     refresh();
     const timer = window.setInterval(refresh, 30000);
@@ -466,12 +478,17 @@ function PacketCaptureWindows({ featureRows = [] }) {
     }
   };
 
-  const visibleItems = useMemo(() => items.filter((item) => {
-    if (!filter) return true;
-    const status = captureWindowField(item, "status", "capture_status", "segment_status");
-    return String(status ?? "").toUpperCase() === filter;
+  // API는 조회 구간 전체를 반환하므로 상태 필터와 페이지 분할은 로컬에서 적용합니다.
+  const filteredItems = useMemo(() => items.filter((item) => {
+    return !filter || captureWindowObservation(item) === filter;
   }), [items, filter]);
-  const hasNext = total === null ? items.length === pageSize : offset + pageSize < total;
+  const visibleItems = filteredItems.slice(offset, offset + pageSize);
+  const total = filteredItems.length;
+  const hasNext = offset + pageSize < total;
+
+  useEffect(() => {
+    setOffset((value) => Math.min(value, Math.max(0, Math.ceil(total / pageSize) - 1) * pageSize));
+  }, [total]);
 
   return (
     <section className="panel packet-capture-panel">
@@ -521,20 +538,22 @@ function PacketCaptureWindows({ featureRows = [] }) {
       {queryValidation && <p className="command-note" role="status">조회 대기: {queryValidation} 서버로 잘못된 요청을 보내지 않습니다.</p>}
       <div className="packet-capture-toolbar">
         <label htmlFor="capture-window-status">표시 상태</label>
-        <select id="capture-window-status" value={filter} onChange={(event) => setFilter(event.target.value)}>
-          <option value="">전체 (현재 페이지)</option>
-          <option value="COMPLETED">COMPLETED</option>
+        <select id="capture-window-status" value={filter} onChange={(event) => { setFilter(event.target.value); setOffset(0); }}>
+          <option value="">전체 (조회 구간)</option>
+          <option value="PROCESSED">PROCESSED</option>
+          <option value="EMPTY">EMPTY</option>
+          <option value="MISSING">MISSING</option>
           <option value="FAILED">FAILED</option>
           <option value="PENDING">PENDING</option>
         </select>
-        <small>필터는 현재 조회 페이지에만 적용됩니다.</small>
+        <small>필터는 조회 구간 전체에 적용됩니다.</small>
       </div>
       {!queryKey ? null : loading && !lastUpdated ? (
         <p className="section-unavailable">Capture Window를 조회하는 중입니다.</p>
       ) : !lastUpdated ? (
         <EmptyState title="Capture Window 정보를 확인할 수 없습니다." compact />
       ) : visibleItems.length === 0 ? (
-        <EmptyState title="표시할 Capture Window가 없습니다." description="조회 결과가 없거나 현재 페이지 필터와 일치하지 않습니다." compact />
+        <EmptyState title="표시할 Capture Window가 없습니다." description="조회 결과가 없거나 상태 필터와 일치하지 않습니다." compact />
       ) : (
         <div className="table-scroll">
           <table className="packet-window-table">
@@ -542,8 +561,8 @@ function PacketCaptureWindows({ featureRows = [] }) {
               <th>Window / Session</th><th>시작</th><th>종료</th><th>상태</th><th>Coverage</th><th>분석 가능</th><th>제외·오류 사유</th>
             </tr></thead>
             <tbody>{visibleItems.map((item, index) => {
-              const id = captureWindowField(item, "id", "window_id", "capture_window_id", "capture_session_id", "session_id");
-              const status = captureWindowField(item, "status", "capture_status", "segment_status");
+              const id = captureWindowField(item, "segment_id", "id", "window_id", "capture_window_id", "capture_session_id", "session_id");
+              const status = captureWindowObservation(item);
               const coverage = captureWindowField(item, "coverage_ratio");
               const eligible = captureWindowField(item, "capture_eligible", "eligible");
               const reason = captureWindowField(item, "capture_exclusion_reason", "exclusion_reason", "segment_error_code", "error_code", "last_error");
@@ -552,7 +571,7 @@ function PacketCaptureWindows({ featureRows = [] }) {
                   <td className="packet-window-identifier">{captureWindowDisplay(id)}</td>
                   <td>{formatKST(captureWindowField(item, "window_start", "started_at", "start_at"))}</td>
                   <td>{formatKST(captureWindowField(item, "window_end", "ended_at", "end_at"))}</td>
-                  <td><StatusBadge status={String(status).toUpperCase() === "FAILED" ? "failed" : String(status).toUpperCase() === "COMPLETED" ? "normal" : "unknown"} label={captureWindowDisplay(status)} size="small" /></td>
+                  <td><StatusBadge status={CAPTURE_OBSERVATION_THEMES[status] ?? "unknown"} label={status} size="small" /></td>
                   <td>{formatPercent(coverage)}</td>
                   <td>{eligible === null ? "-" : eligible === true ? "가능" : eligible === false ? "제외" : captureWindowDisplay(eligible)}</td>
                   <td>{captureWindowDisplay(reason)}</td>
@@ -567,7 +586,7 @@ function PacketCaptureWindows({ featureRows = [] }) {
           <span>마지막 조회: {formatKST(lastUpdated)}</span>
           <div className="packet-capture-pagination">
             <button type="button" className="button button-secondary" disabled={loading || offset === 0} onClick={() => setOffset((n) => Math.max(0, n - pageSize))}>이전</button>
-            <span>시작 위치 {offset + 1} · 전체 {total === null ? "확인 불가" : formatNumber(total, 0)}건</span>
+            <span>시작 위치 {total ? offset + 1 : 0} · 전체 {formatNumber(total, 0)}건</span>
             <button type="button" className="button button-secondary" disabled={loading || !hasNext} onClick={() => setOffset((n) => n + pageSize)}>다음</button>
           </div>
         </div>

@@ -1388,7 +1388,6 @@ export function getPacketPairRecoveryPlan(
 
 export async function verifyPacketPairRecoveryPlan(
   planId,
-  payload,
   adminKey,
   options = {}
 ) {
@@ -1400,8 +1399,6 @@ export async function verifyPacketPairRecoveryPlan(
     "POST",
     `/recovery/packet-pair/${id}/verify`,
     {
-      // Swagger에서 body 필수 여부를 확인합니다.
-      data: payload,
       adminKey,
       signal: options.signal,
       timeout: options.timeout ?? 15000,
