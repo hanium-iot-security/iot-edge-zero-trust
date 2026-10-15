@@ -247,6 +247,125 @@ def rewrite_packets(root, evidence, mutate):
     evidence["pcaps"] = [seal(root, "transition.pcap", output.getvalue())]
 
 
+def timed_packets(root):
+    raw = io.BytesIO((root / "transition.pcap").read_bytes())
+    return [(stamp, dpkt.ethernet.Ethernet(packet)) for stamp, packet in dpkt.pcap.Reader(raw)]
+
+
+def reseal_packets(root, evidence, packets):
+    output = io.BytesIO()
+    writer = dpkt.pcap.Writer(output)
+    for stamp, packet in sorted(packets, key=lambda item: item[0]):
+        packet.data.sum = packet.data.data.sum = 0
+        packet.data.len = len(packet.data)
+        writer.writepkt(bytes(packet), stamp)
+    evidence["pcaps"] = [seal(root, "transition.pcap", output.getvalue())]
+
+
+@pytest.mark.parametrize("port", [3000, 3001])
+def test_disconnect_cannot_precede_later_publish_even_when_resealed(tmp_path, port):
+    evidence = make_evidence(tmp_path)
+    packets = timed_packets(tmp_path)
+    preceding = next(packet for _, packet in packets if packet.data.data.sport == port and packet.data.data.data)
+    disconnect_seq = preceding.data.data.seq + len(preceding.data.data.data)
+    disconnect_at = BASE.timestamp() + (2 if port == 3000 else 21.6)
+    for stamp, packet in packets:
+        tcp = packet.data.data
+        if tcp.sport == port and stamp > disconnect_at:
+            tcp.seq += 2
+    packets.append((disconnect_at, dpkt.ethernet.Ethernet(ethernet(
+        "192.168.0.8", "192.168.0.20", port, 1883, disconnect_seq, dpkt.tcp.TH_ACK, frame(0xe0)))))
+    reseal_packets(tmp_path, evidence, packets)
+    with pytest.raises(ValueError, match="transition_mqtt_after_disconnect"):
+        validate(tmp_path, evidence)
+
+
+def test_disconnect_cannot_precede_later_pingreq_even_when_resealed(tmp_path):
+    evidence = make_evidence(tmp_path)
+    packets = timed_packets(tmp_path)
+    last = [packet.data.data for _, packet in packets if packet.data.data.sport == 3001][-1]
+    seq = last.seq + len(last.data)
+    for seconds, payload in ((38.2, frame(0xe0)), (38.3, frame(0xc0))):
+        packets.append((BASE.timestamp()+seconds, dpkt.ethernet.Ethernet(ethernet(
+            "192.168.0.8", "192.168.0.20", 3001, 1883, seq, dpkt.tcp.TH_ACK, payload))))
+        seq += len(payload)
+    reseal_packets(tmp_path, evidence, packets)
+    with pytest.raises(ValueError, match="transition_mqtt_after_disconnect"):
+        validate(tmp_path, evidence)
+
+
+@pytest.mark.parametrize("port,seconds", [(3000, 19), (3001, 38.5)])
+def test_final_disconnect_remains_a_valid_shutdown(tmp_path, port, seconds):
+    evidence = make_evidence(tmp_path)
+    packets = timed_packets(tmp_path)
+    last = [packet.data.data for _, packet in packets if packet.data.data.sport == port][-1]
+    packets.append((BASE.timestamp()+seconds, dpkt.ethernet.Ethernet(ethernet(
+        "192.168.0.8", "192.168.0.20", port, 1883, last.seq+len(last.data), dpkt.tcp.TH_ACK, frame(0xe0)))))
+    reseal_packets(tmp_path, evidence, packets)
+    assert validate(tmp_path, evidence)["verified_transition"]["after_samples"] == 4
+
+
+@pytest.mark.parametrize("mutation", ["connect_before_synack", "handshake_after_mqtt"])
+def test_mqtt_cannot_precede_handshake_even_when_resealed(tmp_path, mutation):
+    evidence = make_evidence(tmp_path)
+    packets = timed_packets(tmp_path)
+    changed = []
+    for stamp, packet in packets:
+        tcp = packet.data.data
+        if mutation == "connect_before_synack" and tcp.sport == 3001 and tcp.data.startswith(b"\x10"):
+            stamp = BASE.timestamp()+21.15
+        elif mutation == "handshake_after_mqtt":
+            if tcp.sport == 3001 and tcp.flags & dpkt.tcp.TH_SYN:
+                stamp = BASE.timestamp()+22
+            elif tcp.dport == 3001 and tcp.flags & dpkt.tcp.TH_SYN:
+                stamp = BASE.timestamp()+22.1
+            elif tcp.sport == 3001 and not tcp.data:
+                stamp = BASE.timestamp()+22.2
+        changed.append((stamp, packet))
+    reseal_packets(tmp_path, evidence, changed)
+    with pytest.raises(ValueError, match="transition_tcp_handshake_chronology"):
+        validate(tmp_path, evidence)
+
+
+@pytest.mark.parametrize("mutation", ["sequence", "acknowledgment", "after_connect", "at_synack"])
+def test_later_telemetry_ack_cannot_complete_handshake_retroactively(tmp_path, mutation):
+    evidence = make_evidence(tmp_path)
+    changed = []
+    for stamp, packet in timed_packets(tmp_path):
+        tcp = packet.data.data
+        if tcp.sport == 3001 and tcp.flags == dpkt.tcp.TH_ACK and not tcp.data:
+            if mutation == "sequence":
+                tcp.seq += 1
+            elif mutation == "acknowledgment":
+                tcp.ack += 1
+            elif mutation == "after_connect":
+                stamp = BASE.timestamp()+21.45
+            else:
+                stamp = BASE.timestamp()+21.2
+        elif tcp.sport == 3001 and tcp.data.startswith(b"\x30"):
+            # A later, correctly acknowledging telemetry packet cannot establish
+            # the connection that the earlier CONNECT/CONNACK already used.
+            tcp.ack = 901
+        changed.append((stamp, packet))
+    reseal_packets(tmp_path, evidence, changed)
+    with pytest.raises(ValueError, match="transition_tcp_handshake_sequence"):
+        validate(tmp_path, evidence)
+
+
+def test_connect_may_piggyback_on_correct_final_handshake_ack(tmp_path):
+    evidence = make_evidence(tmp_path)
+    changed = []
+    for stamp, packet in timed_packets(tmp_path):
+        tcp = packet.data.data
+        if tcp.sport == 3001 and tcp.flags == dpkt.tcp.TH_ACK and not tcp.data:
+            continue
+        if tcp.sport == 3001 and tcp.data.startswith(b"\x10"):
+            tcp.ack = 901
+        changed.append((stamp, packet))
+    reseal_packets(tmp_path, evidence, changed)
+    assert validate(tmp_path, evidence)["verified_transition"]["after_samples"] == 4
+
+
 def test_tcp_stream_must_belong_to_observed_syn_sequence(tmp_path):
     evidence = make_evidence(tmp_path)
 

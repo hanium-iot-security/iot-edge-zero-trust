@@ -6,6 +6,7 @@ import csv
 import io
 import json
 from pathlib import Path
+import shutil
 import sqlite3
 
 import dpkt
@@ -177,6 +178,85 @@ def test_forged_csv_with_refreshed_outer_hashes_is_rejected(bounded):
         load_packet_if_dataset(result.output_path, result.manifest_path)
 
 
+@pytest.mark.parametrize("snapshot_kind", ["final", "candidate"])
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+@pytest.mark.parametrize("when", ["before", "during"])
+def test_bounded_snapshots_remain_standalone(bounded, monkeypatch, snapshot_kind, suffix, when):
+    from ai import packet_if_bounded as bounded_module
+    root = bounded.parent
+    spec = json.loads(bounded.read_text())
+    normal = json.loads((root / spec["normal_inputs"]["path"]).read_text())
+    group = normal["groups"][0]
+    request = json.loads((root / group["admission_request"]["path"]).read_text())
+    if snapshot_kind == "final":
+        snapshot = root / request["final_snapshot"]["path"]
+    else:
+        manifest_path = root / group["runs"][0]["manifest"]["path"]
+        manifest = json.loads(manifest_path.read_text())
+        snapshot = manifest_path.parent / manifest["snapshot"]["path"]
+    sidecar = Path(str(snapshot) + suffix)
+    if when == "before":
+        sidecar.write_bytes(b"")
+    else:
+        original = bounded_module._packet_rows
+
+        def create_sidecar(*args, **kwargs):
+            rows = original(*args, **kwargs)
+            sidecar.write_bytes(b"")
+            return rows
+
+        monkeypatch.setattr(bounded_module, "_packet_rows", create_sidecar)
+    with pytest.raises(ValueError, match="snapshot_not_standalone"):
+        build_bounded_packet_sources(bounded)
+
+
+def test_nested_normal_and_attack_provenance_resolves_from_v3_manifest(bounded, monkeypatch):
+    from ai import packet_if_dataset as dataset_module
+    root = bounded.parent
+    normal_root = root / "normal_inputs"
+    normal_root.mkdir()
+    for name in ("train", "calibration", "validation"):
+        shutil.copytree(root / name, normal_root / name)
+    shutil.copyfile(root / "normal.json", normal_root / "normal.json")
+    spec = json.loads(bounded.read_text())
+    spec["normal_inputs"] = ref(normal_root / "normal.json", root)
+    write(bounded, spec)
+    before = candidates.tree_hashes(root)
+    verified_runs = []
+    original = dataset_module.load_verified_run_manifest
+
+    def record_verified_run(path, **kwargs):
+        verified_runs.append(path)
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(dataset_module, "load_verified_run_manifest", record_verified_run)
+    result = export_bounded_packet_if_dataset(bounded, output_path=root / "packet.csv", manifest_path=root / "packet.json")
+    dataset = load_packet_if_dataset(result.output_path, result.manifest_path)
+    payload = json.loads(result.manifest_path.read_text())
+    for session in payload["sessions"]:
+        if session["traffic_label"] == "normal":
+            for key in ("admission_request", "admission_report"):
+                reference = session[key]
+                path = root / reference["path"]
+                assert path.is_file() and file_sha256(path) == reference["sha256"]
+                assert reference["path"].startswith("normal_inputs/")
+    inherited = next(item for item in dataset.manifest.sessions if item.traffic_label == "attack")
+    raw = next(item for item in payload["sessions"] if item["traffic_label"] == "attack")
+    source = json.loads((root / spec["attack_inputs"][0]["manifest"]["path"]).read_text())
+    original_attack = next(item for item in source["sessions"] if item["session_id"] == inherited.session_id)
+    assert inherited.run_manifest_ref is not None
+    assert inherited.run_manifest_ref.sha256 == original_attack["run_manifest_ref"]["sha256"]
+    assert inherited.run_manifest_ref.run_id == original_attack["run_manifest_ref"]["run_id"]
+    assert inherited.run_manifest_ref.relative_path.startswith("attacks/runs/")
+    assert root / inherited.run_manifest_ref.relative_path in verified_runs
+    assert raw["run_manifest_ref"] == inherited.run_manifest_ref.to_dict()
+    assert inherited.firmware_version == original_attack["firmware_version"]
+    assert inherited.payload_schema_version == original_attack["payload_schema_version"]
+    assert inherited.background_traffic_present == original_attack["background_traffic_present"]
+    assert inherited.collection_slot_id == original_attack["collection_slot_id"]
+    assert all(candidates.digest(root / path) == sha for path, sha in before.items())
+
+
 def test_failed_export_removes_only_new_outputs_and_never_overwrites(bounded):
     root = bounded.parent
     output, manifest_path = root / "packet.csv", root / "packet.json"
@@ -293,3 +373,83 @@ def test_transition_adapter_keeps_protocol_capture_and_dataset_checks_connected(
 
 def test_bounded_packet_dataset_has_explicit_version():
     assert PACKET_IF_DATASET_VERSION_V3 == "packet-if-dataset-v3"
+
+
+def test_two_transitions_in_one_capture_cannot_supply_different_roles(bounded):
+    root = bounded.parent
+    transition = transition_source(root)
+    evidence_path = root / transition["evidence"]["path"]
+    evidence = json.loads(evidence_path.read_text())
+    evidence["role"] = "calibration"
+    second = evidence_path.with_name("calibration-evidence.json")
+    write(second, evidence)
+    spec = json.loads(bounded.read_text())
+    spec["transitions"] = [transition, {**transition, "evidence": ref(second, root)}]
+    write(bounded, spec)
+    with pytest.raises(ValueError, match="split_crosses_capture_group"):
+        build_bounded_packet_sources(bounded)
+
+
+@pytest.mark.parametrize("mutation,code", [
+    ("disconnect_before_publish", "transition_mqtt_after_disconnect"),
+    ("handshake_after_mqtt", "transition_tcp_handshake_chronology"),
+])
+@pytest.mark.parametrize("entry_point", ["builder", "loader"])
+def test_resealed_invalid_transition_cannot_reach_bounded_dataset(bounded, mutation, code, entry_point):
+    root = bounded.parent
+    transition = transition_source(root)
+    spec = json.loads(bounded.read_text())
+    spec["transitions"] = [transition]
+    write(bounded, spec)
+    # Establish that the full, unmapped source actually exports and loads first.
+    result = export_bounded_packet_if_dataset(bounded, output_path=root / "packet.csv", manifest_path=root / "packet.json")
+    assert len(load_packet_if_dataset(result.output_path, result.manifest_path).train) == 10
+    for artifact in transition["capture_artifacts"]:
+        pcap = root / artifact["pcap_path"]
+        packets = [(stamp, dpkt.ethernet.Ethernet(packet))
+                   for stamp, packet in dpkt.pcap.Reader(io.BytesIO(pcap.read_bytes()))]
+        changed = []
+        for stamp, packet in packets:
+            tcp = packet.data.data
+            if mutation == "disconnect_before_publish":
+                if tcp.sport == 3001 and stamp > transitions.BASE.timestamp()+21.6:
+                    tcp.seq += 2
+            else:
+                if tcp.sport == 3001 and tcp.flags & dpkt.tcp.TH_SYN:
+                    stamp = transitions.BASE.timestamp()+22.5
+                elif tcp.dport == 3001 and tcp.flags & dpkt.tcp.TH_SYN:
+                    stamp = transitions.BASE.timestamp()+22.6
+                elif tcp.sport == 3001 and not tcp.data:
+                    stamp = transitions.BASE.timestamp()+22.7
+            changed.append((stamp, packet))
+        if mutation == "disconnect_before_publish":
+            connect = next((packet.data.data for _, packet in packets
+                            if packet.data.data.sport == 3001 and packet.data.data.data.startswith(b"\x10")), None)
+            if connect is not None:
+                changed.append((transitions.BASE.timestamp()+21.6, dpkt.ethernet.Ethernet(transitions.ethernet(
+                    "192.168.0.8", "192.168.0.20", 3001, 1883, connect.seq+len(connect.data),
+                    dpkt.tcp.TH_ACK, transitions.frame(0xe0)))))
+        output = io.BytesIO()
+        writer = dpkt.pcap.Writer(output)
+        for stamp, packet in sorted(changed, key=lambda item: item[0]):
+            packet.data.sum = packet.data.data.sum = 0
+            packet.data.len = len(packet.data)
+            writer.writepkt(bytes(packet), stamp)
+        pcap.write_bytes(output.getvalue())
+        artifact["pcap_sha256"] = file_sha256(pcap)
+    evidence_path = root / transition["evidence"]["path"]
+    evidence = json.loads(evidence_path.read_text())
+    evidence["pcaps"] = [{"path": item["pcap_path"], "sha256": item["pcap_sha256"]}
+                          for item in transition["capture_artifacts"]]
+    write(evidence_path, evidence)
+    transition["evidence"] = ref(evidence_path, root)
+    write(bounded, spec)
+    payload = json.loads(result.manifest_path.read_text())
+    payload["source_spec_ref"] = ref(bounded, root)
+    write(result.manifest_path, payload)
+    # Updating every outer reference must still reach actual TCP/MQTT validation.
+    with pytest.raises(ValueError, match=code):
+        if entry_point == "builder":
+            build_bounded_packet_sources(bounded, rerun_admission=True)
+        else:
+            load_packet_if_dataset(result.output_path, result.manifest_path)

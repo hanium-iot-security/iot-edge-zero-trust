@@ -294,7 +294,7 @@ def load_packet_if_manifest(
         sessions=sessions,
         db_snapshot_sha256=db_snapshot_sha256,
     )
-    if dataset_version == PACKET_IF_DATASET_VERSION_V2:
+    if dataset_version in {PACKET_IF_DATASET_VERSION_V2, PACKET_IF_DATASET_VERSION_V3}:
         _validate_run_manifest_references(path, manifest)
     return manifest
 
@@ -465,7 +465,8 @@ def _parse_session_spec(
         )
 
     status = _required_non_empty_string(payload, "status")
-    if status != "COMPLETED" and not (dataset_version == PACKET_IF_DATASET_VERSION_V3 and status == "FAILED"):
+    if status != "COMPLETED" and not (dataset_version == PACKET_IF_DATASET_VERSION_V3
+                                      and traffic_label == NORMAL_LABEL and status == "FAILED"):
         raise ValueError(
             f"packet dataset session must be COMPLETED: {session_id}"
         )
@@ -527,7 +528,9 @@ def _parse_session_spec(
             "included_device_ids": normalize_device_ids(payload.get("included_device_ids"), "included_device_ids"),
             "target_source_ip": normalize_optional_ipv4(payload.get("target_source_ip"), "target_source_ip"),
         }
-    if dataset_version == PACKET_IF_DATASET_VERSION_V2:
+    if dataset_version == PACKET_IF_DATASET_VERSION_V2 or (
+        dataset_version == PACKET_IF_DATASET_VERSION_V3 and traffic_label == ATTACK_LABEL
+    ):
         run_manifest_payload = payload.get("run_manifest_ref")
         if not isinstance(run_manifest_payload, dict):
             raise ValueError("run_manifest_ref must be a JSON object")
@@ -603,6 +606,9 @@ def _validate_manifest_sessions(
     if dataset_version == PACKET_IF_DATASET_VERSION_V2:
         _validate_phase5_manifest_sessions(sessions)
     elif dataset_version == PACKET_IF_DATASET_VERSION_V3:
+        attacks = tuple(spec for spec in sessions if spec.traffic_label == ATTACK_LABEL)
+        if attacks:
+            _validate_phase5_manifest_sessions(attacks)
         groups = {}
         for spec in sessions:
             previous = groups.setdefault(spec.source_capture_group_id, spec.split)
@@ -785,6 +791,8 @@ def _validate_run_manifest_references(
     for spec in manifest.sessions:
         reference = spec.run_manifest_ref
         if reference is None:
+            if manifest.dataset_version == PACKET_IF_DATASET_VERSION_V3 and spec.traffic_label == NORMAL_LABEL:
+                continue
             raise ValueError("run_manifest_ref is required for Dataset v2")
         run_manifest_path = (base_directory / reference.relative_path).resolve()
         if base_directory not in run_manifest_path.parents:

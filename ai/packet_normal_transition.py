@@ -266,8 +266,9 @@ def _connect(body):
 
 
 def _check_publish(frames, samples, topic, allow_connect):
-    observed = []
+    observed, closed = [], False
     for header, body, begin, finish in frames:
+        _require(not closed, "transition_mqtt_after_disconnect")
         if header == 0x10 and allow_connect:
             _connect(body)
         elif header == 0x30:
@@ -278,6 +279,7 @@ def _check_publish(frames, samples, topic, allow_connect):
             observed.append((body[2+length:], begin, finish))
         else:
             _require(header in (0xc0, 0xe0) and not body, "transition_unexpected_mqtt_control")
+            closed = header == 0xe0
     _require(len(observed) == len(samples), "transition_mqtt_publish_count")
     for (payload, _, finished), sample in zip(observed, samples):
         _require(payload == sample["raw"] and 0 <= sample["received_at"].timestamp()-finished <= 1,
@@ -324,15 +326,20 @@ def _protocol(files, evidence, device, start, end, operation, before, after):
               if tcp.flags & dpkt.tcp.TH_SYN and tcp.flags & dpkt.tcp.TH_ACK]
     _require(len(syn) == len(synack) == 1 and _time(operation["started_at"]).timestamp() <= syn[0][0]
              < synack[0][0] < after[0]["received_at"].timestamp(), "transition_tcp_handshake")
-    _require(any(synack[0][0] < stamp and tcp.flags & dpkt.tcp.TH_ACK and not tcp.flags & dpkt.tcp.TH_SYN
-                 for stamp, tcp in new["client"]), "transition_tcp_handshake")
     client_data = [(stamp, tcp) for stamp, tcp in new["client"] if tcp.data]
     server_data = [(stamp, tcp) for stamp, tcp in new["broker"] if tcp.data]
-    _require(client_data and server_data and synack[0][1].ack == (syn[0][1].seq+1) & 0xffffffff
-             and client_data[0][1].seq == (syn[0][1].seq+1) & 0xffffffff
-             and server_data[0][1].seq == (synack[0][1].seq+1) & 0xffffffff
-             and any(tcp.ack == (synack[0][1].seq+1) & 0xffffffff for stamp, tcp in new["client"]
-                     if stamp > synack[0][0] and tcp.flags & dpkt.tcp.TH_ACK),
+    client_sequence = (syn[0][1].seq+1) & 0xffffffff
+    server_sequence = (synack[0][1].seq+1) & 0xffffffff
+    _require(client_data and server_data and synack[0][1].ack == client_sequence
+             and client_data[0][1].seq == client_sequence and server_data[0][1].seq == server_sequence,
+             "transition_tcp_handshake_sequence")
+    first_application = min(client_data[0][0], server_data[0][0])
+    _require(synack[0][0] < first_application, "transition_tcp_handshake_chronology")
+    # CONNECT may carry the final ACK, but later telemetry cannot complete an
+    # earlier application exchange retroactively.
+    _require(any(synack[0][0] < stamp <= first_application and tcp.seq == client_sequence
+                 and tcp.ack == server_sequence and tcp.flags & dpkt.tcp.TH_ACK
+                 and not tcp.flags & dpkt.tcp.TH_SYN for stamp, tcp in new["client"]),
              "transition_tcp_handshake_sequence")
     _require(not any(tcp.flags & dpkt.tcp.TH_FIN and stamp < client_data[-1][0]
                      for direction in new.values() for stamp, tcp in direction), "transition_new_flow_closed_early")

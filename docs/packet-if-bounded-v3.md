@@ -30,6 +30,10 @@ All references are relative to their declared input root, without path escapes.
 `normal_inputs` is the existing `mqtt-if-candidate-dataset-v1` manifest. Its role
 bindings, request/report links, source QC and per-device firmware/payload evidence
 are reused. MQTT's feature-selection filter is not applied to Packet rows.
+The derived v3 manifest rebases its normal admission request/report references and
+inherited attack Run references to the v3 directory. Source documents, Run IDs,
+hashes and inherited firmware/payload fields remain unchanged. V3 loading also
+verifies the inherited attack's typed Run reference with the existing v2 checks.
 
 The capture-context JSON contains exactly `capture_filter` and `source_commits`.
 It is a separately retained historical context record, not inferred from traffic
@@ -52,9 +56,13 @@ are compared with the final DB. Selected failure, missing window, duplicate, IP
 mismatch, maintenance overlap or modified artifact rejects the input. Loader
 reconstructs expected rows and provenance without writing QC or modifying sources.
 Refreshing CSV/manifest hashes cannot hide changed feature values.
+Bounded snapshots may not have adjacent `-wal`, `-shm`, or `-journal` files,
+either before opening or when source reconstruction completes.
 
 Every normal train/calibration/evaluation role must exist. A trainable dataset also
 requires a separate verified v2 attack test source with the same Capture policy.
+Inherited attack sources must also share the original v2 normal-policy version;
+mixing different versions is rejected.
 No attack source means no successful trainable export. This checks input integrity,
 not the statistical adequacy of attack coverage. The previous deployed report's two
 attack rows do not establish broad attack detection.
@@ -95,6 +103,10 @@ support is a publish-only sender with exactly two relevant TCP flows. Unsupporte
 MQTT/control traffic, incomplete streams, RST on the new flow or unverified
 installation/runtime scope rejects eligibility. Missing proof remains missing;
 historical events may be retained only as development replay cases.
+The final client TCP ACK must establish the connection before application bytes
+(CONNECT may share that ACK packet). An MQTT DISCONNECT may terminate a stream;
+later client MQTT frames are rejected. These checks are repeated by the bounded
+builder and exported-dataset loader, including when outer hashes are resealed.
 
 These are consistency checks of supplied evidence, not cryptographic authentication
 of an operator's statement or a hardware attestation system. `training_approved`

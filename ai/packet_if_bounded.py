@@ -50,6 +50,16 @@ def _unchanged(inputs):
     _require(all(file_sha256(path) == sha for path, sha in inputs.files.items()), "source_changed_during_load")
 
 
+def _standalone_snapshot(path):
+    _require(not any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")),
+             "snapshot_not_standalone")
+
+
+def _rebase_reference(reference, source_root, output_root, *, path_key="path"):
+    path = _path(source_root, reference[path_key])
+    return {**reference, path_key: path.relative_to(output_root).as_posix()}
+
+
 def _policy(value):
     policy = CapturePolicy(**{key: value[key] for key in
                              ("version", "max_start_delay_seconds", "minimum_duration_seconds", "epsilon_seconds")})
@@ -194,6 +204,7 @@ def build_bounded_packet_sources(spec_path: Path, *, rerun_admission=False) -> B
 
         def open_snapshot(owner, reference):
             path = _pin(owner, reference)
+            _standalone_snapshot(path)
             if path not in snapshots:
                 snapshots[path] = stack.enter_context(closing(_open_readonly(path)))
             return snapshots[path]
@@ -245,7 +256,8 @@ def build_bounded_packet_sources(spec_path: Path, *, rerun_admission=False) -> B
                              _time(row["window_end"])) for row in selected), "selected_maintenance")
             rows.extend(selected)
             sessions.append(_session_payload(session, selections, selected, role, context,
-                            {"admission_request": group["admission_request"], "admission_report": group["admission_report"],
+                            {"admission_request": _rebase_reference(group["admission_request"], normal_inputs.root, inputs.root),
+                             "admission_report": _rebase_reference(group["admission_report"], normal_inputs.root, inputs.root),
                              "device_specs": request["device_specs"], "whole_session": report["whole_session"]}))
             sessions[-1]["source_snapshot_sha256"] = request["final_snapshot"]["sha256"]
 
@@ -319,7 +331,9 @@ def build_bounded_packet_sources(spec_path: Path, *, rerun_admission=False) -> B
             used_groups.update((group_id, session["session_id"]))
             _require(session["collection_slot_id"] not in used_slots, "duplicate_collection_slot")
             used_slots.add(session["collection_slot_id"])
-            sessions.append({**session, "inherited_attack": source})
+            run_reference = _rebase_reference(session["run_manifest_ref"], manifest_path.parent, inputs.root,
+                                             path_key="relative_path")
+            sessions.append({**session, "run_manifest_ref": run_reference, "inherited_attack": source})
         # Use CSV values, preserving the original lexical numeric representation.
         with data_path.open(newline="", encoding="utf-8") as handle:
             rows.extend(dict(row) for row in csv.DictReader(handle) if row["session_id"] in attack_ids)
@@ -327,6 +341,8 @@ def build_bounded_packet_sources(spec_path: Path, *, rerun_admission=False) -> B
     rows = [{column: row[column] for column in DATASET_REQUIRED_COLUMNS} for row in rows]
     rows.sort(key=lambda row: (str(row["session_id"]), str(row["window_start"]), int(row["packet_feature_log_id"])))
     _require(len({(row["session_id"], row["packet_feature_log_id"]) for row in rows}) == len(rows), "duplicate_source_row")
+    for path in snapshots:
+        _standalone_snapshot(path)
     _unchanged(inputs)
     _unchanged(normal_inputs)
     records = inputs.records() + [{"path": str(path), "sha256": sha} for path, sha in sorted(normal_inputs.files.items())]
