@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, } from "react";
-import { createFirewallReleaseRequest, executeRecovery, getDeviceDetail, getFirewallReleaseRequest, getFirewallRules, getIsolatedDevices, getIsolationHistory, getRecoveryHistory, recoveryPreflight, } from "../api/api";
+import { createFirewallReleaseRequest, createFirewallScopeExtensionRequest, createPacketPairRecoveryPlan, getPacketPairRecoveryPlan, verifyPacketPairRecoveryPlan, getFirewallRuntimeStatus, executeRecovery, getDeviceDetail, getFirewallReleaseRequest, getFirewallRules, getIsolatedDevices, getIsolationHistory, getRecoveryHistory, recoveryPreflight, } from "../api/api";
 import DataTable from "../components/DataTable";
 import DetailModal from "../components/DetailModal";
 import EmptyState from "../components/EmptyState";
@@ -146,6 +146,7 @@ function getIsolationActionLabel(action) {
         "-");
 }
 function getTrustStatus(score) {
+    if (score === null || score === undefined || score === "") return "unknown";
     const number = Number(score);
     if (!Number.isFinite(number)) {
         return "unknown";
@@ -282,6 +283,7 @@ function getPreflightTrustScore(preflight, device) {
         device
             ?.trust_score ??
         null;
+    if (value === null || value === undefined || value === "") return null;
     const number = Number(value);
     return Number.isFinite(number)
         ? number
@@ -448,6 +450,216 @@ function isUncertainCommandError(error) {
 /* =========================================================
    Page
    ========================================================= */
+/* =========================================================
+   Phase 9 - Firewall Runtime / Scope Extension / Packet Pair
+   Request bodies must match Swagger schema. The UI does not
+   invent extension ranges, plan actions, or successful status.
+   ========================================================= */
+function Phase9RuntimePanel() {
+  const [runtime, setRuntime] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [updatedAt, setUpdatedAt] = useState("");
+  const seq = useRef(0);
+
+  const refresh = useCallback(async (signal) => {
+    const id = ++seq.current;
+    setLoading(true);
+    try {
+      const response = await getFirewallRuntimeStatus({ signal });
+      if (signal?.aborted || id !== seq.current) return;
+      const value = unwrapApiItem(response);
+      if (value == null || typeof value !== "object") {
+        throw new Error("Firewall Runtime 응답 형식이 올바르지 않습니다.");
+      }
+      setRuntime(value);
+      setUpdatedAt(new Date().toISOString());
+      setError("");
+    } catch (err) {
+      if (!signal?.aborted && id === seq.current) {
+        setError(err?.message || "Firewall Runtime 조회에 실패했습니다.");
+      }
+    } finally {
+      if (id === seq.current) setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    refresh(controller.signal);
+    const timer = window.setInterval(() => refresh(controller.signal), POLLING_INTERVAL_MS);
+    return () => {
+      seq.current += 1;
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [refresh]);
+
+  return (
+    <section className="panel phase9-runtime-panel">
+      <div className="panel-header">
+        <div>
+          <h2>Firewall Runtime Status (Phase 9)</h2>
+          <p className="panel-description">DB Rule 상태는 실제 Firewall Runtime 검증을 대체하지 않습니다.</p>
+        </div>
+        <button type="button" className="button button-secondary" onClick={() => refresh()} disabled={loading}>
+          {loading ? "조회 중..." : "Runtime 새로고침"}
+        </button>
+      </div>
+      {error && <p className="inline-error" role="alert">{error}{runtime ? " · 이전 조회 데이터를 표시합니다." : ""}</p>}
+      {runtime ? (
+        <>
+          <p className="text-muted">최근 조회: {formatKST(updatedAt)} {error ? "(최신 상태 아님)" : ""}</p>
+          <details className="phase9-json-details" open>
+            <summary>Firewall Runtime 원본 응답</summary>
+            <pre>{JSON.stringify(runtime, null, 2)}</pre>
+          </details>
+        </>
+      ) : <p className="text-muted">{loading ? "Runtime 정보 조회 중..." : "Runtime 상태를 확인할 수 없습니다."}</p>}
+    </section>
+  );
+}
+
+function parseAdminJson(raw, label) {
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) throw new Error(`${label} JSON을 입력해 주세요.`);
+  let value;
+  try { value = JSON.parse(trimmed); }
+  catch { throw new Error(`${label} JSON 형식이 올바르지 않습니다.`); }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label}는 JSON 객체여야 합니다.`);
+  }
+  return value;
+}
+
+function Phase9ScopeExtension({ rule, adminKey }) {
+  const [payloadText, setPayloadText] = useState("");
+  const [reason, setReason] = useState("");
+  const [confirmId, setConfirmId] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [result, setResult] = useState(null);
+  const [uncertain, setUncertain] = useState(false);
+  const lock = useRef(false);
+  const ruleId = rule?.id;
+
+  async function submit() {
+    if (lock.current || uncertain || !ruleId) return;
+    setError("");
+    let dispatched = false;
+    try {
+      if (!adminKey.trim()) throw new Error("관리자 Key를 입력해 주세요.");
+      if (!reason.trim()) throw new Error("차단 범위 확대 사유를 입력해 주세요.");
+      if (confirmId.trim() !== String(ruleId)) throw new Error("확인용 Rule ID가 다릅니다.");
+      const payload = parseAdminJson(payloadText, "Scope Extension 요청 본문");
+      if (typeof payload.reason === "string" && payload.reason.trim() !== reason.trim()) {
+        throw new Error("입력한 사유와 요청 JSON의 reason이 다릅니다.");
+      }
+      if (payload.reason === undefined) {
+        throw new Error("Swagger 규격에 따라 reason을 포함한 JSON을 입력해 주세요.");
+      }
+      lock.current = true;
+      setBusy(true);
+      setResult(null);
+      dispatched = true;
+      const value = await createFirewallScopeExtensionRequest(ruleId, payload, adminKey);
+      setResult(unwrapApiItem(value));
+    } catch (err) {
+      const uncertainRequest = dispatched && isUncertainCommandError(err);
+      if (uncertainRequest) setUncertain(true);
+      setError(`${err?.message || "요청 실패"}${uncertainRequest ? " · 결과가 불확실하므로 자동 재요청하지 않습니다." : ""}`);
+    } finally {
+      lock.current = false;
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="detail-section phase9-admin-section">
+      <h3>Phase 9 · Firewall Scope Extension</h3>
+      <p className="text-muted">현재 Rule ID에 대해 관리자 승인형 범위 확대 요청을 보냅니다. 요청 자체를 실제 Firewall 적용으로 표시하지 않습니다. JSON 필드명·제약은 Swagger 스키마와 정확히 일치해야 합니다.</p>
+      {!ruleId ? <p className="inline-error">선택된 Source Rule ID가 없어 요청할 수 없습니다.</p> : (
+        <div className="recovery-form">
+          <div className="filter-item"><label>Source Rule ID</label><div className="phase9-readonly">{ruleId}</div></div>
+          <div className="filter-item"><label htmlFor="phase9-scope-reason">변경 사유 (JSON reason과 동일)</label><input id="phase9-scope-reason" value={reason} onChange={(e) => setReason(e.target.value)} disabled={busy || uncertain} /></div>
+          <div className="filter-item"><label htmlFor="phase9-scope-json">Scope Extension 요청 JSON (Swagger 스키마 기준)</label><textarea id="phase9-scope-json" rows={6} value={payloadText} onChange={(e) => setPayloadText(e.target.value)} disabled={busy || uncertain} placeholder={'{\n  "reason": "..."\n}'} /></div>
+          <div className="filter-item"><label htmlFor="phase9-scope-confirm">확인용 Rule ID 재입력</label><input id="phase9-scope-confirm" value={confirmId} onChange={(e) => setConfirmId(e.target.value)} disabled={busy || uncertain} /></div>
+          <button type="button" className="button button-danger" disabled={busy || uncertain || !adminKey.trim()} onClick={submit}>{busy ? "요청 중..." : "Scope Extension 요청"}</button>
+        </div>
+      )}
+      {uncertain && <p className="phase9-uncertain">결과 확인이 필요합니다. 서버의 변경 요청 상태를 직접 확인한 뒤 모달을 닫았다가 다시 열어 주세요.</p>}
+      {error && <p className="inline-error" role="alert">{error}</p>}
+      {result && <details className="phase9-json-details" open><summary>서버 요청 응답 (적용 완료 의미 아님)</summary><pre>{JSON.stringify(result, null, 2)}</pre></details>}
+    </section>
+  );
+}
+
+function Phase9PacketPairRecovery({ adminKey, deviceId }) {
+  const [requestText, setRequestText] = useState("");
+  const [planId, setPlanId] = useState("");
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [uncertain, setUncertain] = useState(false);
+  const lock = useRef(false);
+
+  async function run(kind) {
+    if (lock.current || (kind !== "read" && uncertain)) return;
+    setError("");
+    if (!adminKey.trim()) { setError("관리자 Key를 입력해 주세요."); return; }
+    lock.current = true;
+    setBusy(true);
+    let dispatched = false;
+    try {
+      let response;
+      if (kind === "create") {
+        const payload = parseAdminJson(requestText, "Packet Pair Plan 요청 본문");
+        if (payload.device_id && String(payload.device_id) !== String(deviceId)) {
+          throw new Error("다른 기기의 device_id로 복구 Plan을 생성할 수 없습니다.");
+        }
+        dispatched = true;
+        response = await createPacketPairRecoveryPlan(payload, adminKey);
+      } else {
+        if (!planId.trim()) throw new Error("Plan ID를 입력해 주세요.");
+        if (kind === "read") {
+          response = await getPacketPairRecoveryPlan(planId.trim(), adminKey);
+        } else {
+          dispatched = true;
+          response = await verifyPacketPairRecoveryPlan(planId.trim(), adminKey);
+        }
+      }
+      const value = unwrapApiItem(response);
+      setResult(value);
+      const returnedId = value?.plan_id ?? value?.id;
+      if (returnedId != null) setPlanId(String(returnedId));
+    } catch (err) {
+      const uncertainRequest = kind !== "read" && dispatched && isUncertainCommandError(err);
+      if (uncertainRequest) setUncertain(true);
+      setError(`${err?.message || "요청 실패"}${uncertainRequest ? " · 결과가 불확실하므로 자동 재시도하지 않습니다." : ""}`);
+    } finally {
+      lock.current = false;
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="detail-section phase9-admin-section">
+      <h3>Phase 9 · Packet Pair Recovery Plan</h3>
+      <p className="text-muted">기존 Baseline Recovery와 별도 API입니다. Plan 생성/조회/검증만 다루며 성공 응답을 실제 복구 완료로 간주하지 않습니다. 요청 JSON은 Swagger 명세에 맞춰 입력하세요.</p>
+      <div className="recovery-form">
+        <div className="filter-item"><label htmlFor="phase9-plan-create">Plan 생성 요청 JSON</label><textarea id="phase9-plan-create" rows={6} value={requestText} disabled={busy || uncertain} onChange={(e) => setRequestText(e.target.value)} placeholder="Swagger에 정의된 Plan 생성 요청 JSON" /></div>
+        <button type="button" className="button button-secondary" disabled={busy || uncertain || !adminKey.trim()} onClick={() => run("create")}>Plan 생성</button>
+        <div className="filter-item"><label htmlFor="phase9-plan-id">Plan ID</label><input id="phase9-plan-id" value={planId} disabled={busy} onChange={(e) => setPlanId(e.target.value)} /></div>
+        <button type="button" className="button button-secondary" disabled={busy || !planId.trim()} onClick={() => run("read")}>Plan 상태 재조회</button>
+        <button type="button" className="button button-secondary" disabled={busy || uncertain || !planId.trim()} onClick={() => run("verify")}>Plan Verify 요청</button>
+      </div>
+      {uncertain && <p className="phase9-uncertain">POST 결과가 불확실합니다. 서버에서 Plan/요청 상태를 확인한 후에만 다시 수행하세요.</p>}
+      {error && <p className="inline-error" role="alert">{error}</p>}
+      {result && <details className="phase9-json-details" open><summary>최근 서버 응답</summary><pre>{JSON.stringify(result, null, 2)}</pre></details>}
+    </section>
+  );
+}
+
 export default function Isolation() {
     const [history, setHistory,] = useState([]);
     const [isolatedDevices, setIsolatedDevices,] = useState([]);
@@ -1542,6 +1754,8 @@ export default function Isolation() {
           </div>
         </div>)}
 
+      <Phase9RuntimePanel />
+
       {!loading &&
             !error && (<section className="summary-card-grid" aria-label="격리 상태 요약">
             <SummaryCard title="현재 격리" value={formatNumber(isolationSummary.isolated)} description="Trust 상태가 isolated인 기기" status={isolationSummary.isolated >
@@ -2009,6 +2223,8 @@ export default function Isolation() {
                 </dl>
               </section>)}
 
+            <Phase9ScopeExtension key={`${selectedIsolatedDevice.device_id}-${selectedRule?.id ?? "none"}`} rule={selectedRule} adminKey={adminKey} />
+
             {/* ===============================================
                 Step 1 - Firewall Release
                 =============================================== */}
@@ -2457,6 +2673,8 @@ export default function Isolation() {
                   </dl>
                 </div>)}
             </section>
+
+            <Phase9PacketPairRecovery key={selectedIsolatedDevice.device_id} adminKey={adminKey} deviceId={selectedIsolatedDevice.device_id} />
 
             {/* ===============================================
                 Recovery History

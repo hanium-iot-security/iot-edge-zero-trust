@@ -262,19 +262,21 @@ test("saved pending policy resyncs 5120 to 6000 and next publish-count save reta
   const server = deviceServer(clock);
   const app = await componentHarness("Devices", server.api, clock);
   await openSensor(app);
-  await app.change("policy-admin-key", "test-admin");
-  await app.change("policy-payload-max", "6000");
-  await app.change("policy-reason", "raise payload limit");
-  await app.click("정책 변경 저장");
+  await app.change("rule-key", "test-admin");
+  await app.change("rule-payload_size_max", "6000");
+  await app.change("rule-reason", "raise payload limit");
+  await app.click("Rule 정책 변경 저장");
   assert.equal(server.writes.length, 1);
-  assert.equal(app.input("policy-payload-max").props.value, "5120");
-  assert.equal(app.input("policy-payload-max").props.disabled, true);
+  assert.equal(app.input("rule-key").props.value, "", "successful save clears the administrator key");
+  assert.equal(app.input("rule-payload_size_max").props.value, "5120");
+  assert.equal(app.input("rule-payload_size_max").props.disabled, true);
   await app.advance(10_750);
-  assert.equal(app.input("policy-payload-max").props.value, "6000");
-  assert.equal(app.input("policy-payload-max").props.disabled, false);
-  await app.change("policy-publish-max", "20");
-  await app.change("policy-reason", "raise publish count");
-  await app.click("정책 변경 저장");
+  assert.equal(app.input("rule-payload_size_max").props.value, "6000");
+  assert.equal(app.input("rule-payload_size_max").props.disabled, false);
+  await app.change("rule-key", "test-admin");
+  await app.change("rule-publish_count_max", "20");
+  await app.change("rule-reason", "raise publish count");
+  await app.click("Rule 정책 변경 저장");
   assert.equal(server.writes.length, 2);
   assert.equal(server.writes[1].payload.expected_revision, 2);
   assert.equal(server.writes[1].payload.policy.payload_size_max_bytes, 6000);
@@ -291,18 +293,18 @@ test("409 refresh and later scheduled callback preserve edited fields and update
   };
   const app = await componentHarness("Devices", server.api, clock);
   await openSensor(app);
-  await app.change("policy-admin-key", "test-admin");
-  await app.change("policy-payload-max", "6200");
-  await app.change("policy-publish-max", "21");
-  await app.change("policy-reason", "keep my draft");
-  await app.click("정책 변경 저장");
-  assert.equal(app.input("policy-payload-max").props.value, "6200");
-  assert.equal(app.input("policy-reason").props.value, "keep my draft");
+  await app.change("rule-key", "test-admin");
+  await app.change("rule-payload_size_max", "6200");
+  await app.change("rule-publish_count_max", "21");
+  await app.change("rule-reason", "keep my draft");
+  await app.click("Rule 정책 변경 저장");
+  assert.equal(app.input("rule-payload_size_max").props.value, "6200");
+  assert.equal(app.input("rule-reason").props.value, "keep my draft");
   await app.advance(10_750);
-  assert.equal(app.input("policy-payload-max").props.value, "6200");
-  assert.equal(app.input("policy-publish-max").props.value, "21");
-  assert.equal(app.input("policy-reason").props.value, "keep my draft");
-  assert.equal(app.input("policy-byte-max").props.value, "3100");
+  assert.equal(app.input("rule-payload_size_max").props.value, "6200");
+  assert.equal(app.input("rule-publish_count_max").props.value, "21");
+  assert.equal(app.input("rule-reason").props.value, "keep my draft");
+  assert.equal(app.input("rule-byte_rate_max").props.value, "3100");
   app.cleanup();
 });
 
@@ -313,18 +315,102 @@ for (const recovery of ["ErrorState retry", "manual policy refresh"]) {
     server.setPending({ ...policy(2, 6000), effective_from: new Date(clock.now + 10_000).toISOString() });
     const app = await componentHarness("Devices", server.api, clock);
     await openSensor(app);
+    await app.change("rule-key", "test-admin");
     server.failNextPolicy(new Error("temporary policy outage"));
     await app.advance(10_750);
     const error = app.find((node) => node.type === "ErrorState" && node.props.message === "temporary policy outage");
-    assert.equal(app.button("정책 변경 저장").props.disabled, true);
+    assert.equal(app.button("Rule 정책 변경 저장").props.disabled, true);
     if (recovery === "ErrorState retry") await app.act(() => error.props.onRetry());
     else await app.click("정책 새로고침");
     assert.equal(app.nodes().some((node) => node.type === "ErrorState" && node.props.message === "temporary policy outage"), false);
-    assert.equal(app.input("policy-payload-max").props.value, "6000");
-    assert.equal(app.button("정책 변경 저장").props.disabled, false);
+    assert.equal(app.input("rule-payload_size_max").props.value, "6000");
+    assert.equal(app.button("Rule 정책 변경 저장").props.disabled, false);
     app.cleanup();
   });
 }
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+async function openDevice(app, deviceId) {
+  const table = app.find((node) => node.type === "DataTable" && node.props.onRowClick);
+  await app.act(() => table.props.onRowClick(table.props.rows.find((row) => row.device_id === deviceId)));
+}
+
+function selectedDetail(app) {
+  return app.find((node) => node.type === "DetailModal" && node.props.open && node.props.title.endsWith("상세 상태"));
+}
+
+test("delayed policy refresh for device A cannot overwrite device B draft or next write", async () => {
+  const a = { ...sensor, device_id: "sensor_A" };
+  const b = { ...sensor, device_id: "sensor_B" };
+  const stale = deferred();
+  const writes = [];
+  let delayA = false;
+  const app = await componentHarness("Devices", {
+    getDevices: async () => ({ items: [a, b], total: 2 }),
+    getFirewallRules: async () => ({ items: [] }),
+    getDeviceDetail: async (id) => id === a.device_id ? a : b,
+    getTrustScoreHistory: async () => ({ items: [] }),
+    getDevicePolicy: async (id) => id === a.device_id && delayA
+      ? stale.promise
+      : { current: policy(1, id === a.device_id ? 5120 : 9100), latest_revision: 1 },
+    createDevicePolicyRevision: async (deviceId, payload) => { writes.push({ deviceId, payload }); },
+  });
+  await openDevice(app, a.device_id);
+  delayA = true;
+  await app.click("정책 새로고침");
+  await app.act(() => selectedDetail(app).props.onClose());
+  await openDevice(app, b.device_id);
+  stale.resolve({ current: policy(1, 5120), latest_revision: 1 });
+  await app.settle();
+  assert.equal(selectedDetail(app).props.title, "sensor_B 상세 상태");
+  assert.equal(app.input("rule-payload_size_max").props.value, "9100");
+  await app.change("rule-publish_count_max", "22");
+  await app.change("rule-key", "test-admin");
+  await app.change("rule-reason", "change device B publish count");
+  await app.click("Rule 정책 변경 저장");
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].deviceId, b.device_id);
+  assert.equal(writes[0].payload.policy.payload_size_max_bytes, 9100);
+  assert.equal(writes[0].payload.policy.publish_count_max, 22);
+  app.cleanup();
+});
+
+test("closed device A refresh error cannot clear device B loading state or show a stale error", async () => {
+  const a = { ...sensor, device_id: "sensor_A" };
+  const b = { ...sensor, device_id: "sensor_B" };
+  const stale = deferred();
+  const current = deferred();
+  let delayA = false;
+  const app = await componentHarness("Devices", {
+    getDevices: async () => ({ items: [a, b], total: 2 }),
+    getFirewallRules: async () => ({ items: [] }),
+    getDeviceDetail: async (id) => id === a.device_id ? a : b,
+    getTrustScoreHistory: async () => ({ items: [] }),
+    getDevicePolicy: async (id) => id === b.device_id ? current.promise
+      : delayA ? stale.promise : { current: policy(1), latest_revision: 1 },
+  });
+  await openDevice(app, a.device_id);
+  delayA = true;
+  await app.click("정책 새로고침");
+  await app.act(() => selectedDetail(app).props.onClose());
+  await openDevice(app, b.device_id);
+  stale.reject(new Error("old device A refresh failed"));
+  await app.settle();
+  assert.equal(app.nodes().some((node) => node.type === "ErrorState" && node.props.message === "old device A refresh failed"), false);
+  assert.equal(app.nodes().some((node) => node.type === "LoadingState" && node.props.title === "Rule 정책 조회 중"), true);
+  assert.equal(app.button("Rule 정책 변경 저장").props.disabled, true);
+  current.resolve({ current: policy(1, 9100), latest_revision: 1 });
+  await app.settle();
+  assert.equal(app.input("rule-payload_size_max").props.value, "9100");
+  assert.equal(app.button("Rule 정책 변경 저장").props.disabled, false);
+  app.cleanup();
+});
 
 function dashboardApi(gateway) {
   return {

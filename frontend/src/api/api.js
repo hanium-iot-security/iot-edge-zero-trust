@@ -1,4 +1,6 @@
+
 import axios from "axios";
+
 import {
   mockSummary,
   mockDevices,
@@ -13,25 +15,30 @@ import {
   mockFirewallRules,
   mockHealth,
 } from "../mockData";
-const API_BASE_URL =
+
+/* =========================================================
+   API Environment
+========================================================= */
+
+const API_BASE_URL = (
   import.meta.env.VITE_API_BASE_URL ||
-  "http://localhost:8000/api";
-const USE_MOCK =
-  import.meta.env.VITE_USE_MOCK === "true";
+  "http://127.0.0.1:8001/api"
+).replace(/\/+$/, "");
+
+const USE_MOCK = import.meta.env.VITE_USE_MOCK === "true";
 const IS_DEV = import.meta.env.DEV;
+
 if (IS_DEV) {
   console.log("[ENV CHECK]", {
     API_BASE_URL,
     USE_MOCK,
   });
 }
+
 /* =========================================================
    Common Helpers
-   ========================================================= */
-/**
- * undefined, null, 빈 문자열인 Query Parameter를 제거합니다.
- * false와 0은 유효한 값이므로 유지합니다.
- */
+========================================================= */
+
 function removeEmptyParams(params = {}) {
   return Object.fromEntries(
     Object.entries(params).filter(
@@ -42,251 +49,218 @@ function removeEmptyParams(params = {}) {
     )
   );
 }
-/**
- * 숫자형 Pagination 값을 안전하게 변환합니다.
- */
+
 function normalizePagination(
   params = {},
-  {
-    defaultLimit = 20,
-    defaultOffset = 0,
-  } = {}
+  { defaultLimit = 20, defaultOffset = 0 } = {}
 ) {
-  const parsedLimit = Number(
-    params.limit
-  );
-  const parsedOffset = Number(
-    params.offset
-  );
+  const parsedLimit = Number(params.limit);
+  const parsedOffset = Number(params.offset);
+
   return {
     limit:
-      Number.isFinite(
-        parsedLimit
-      ) && parsedLimit > 0
+      Number.isFinite(parsedLimit) && parsedLimit > 0
         ? parsedLimit
         : defaultLimit,
     offset:
-      Number.isFinite(
-        parsedOffset
-      ) && parsedOffset >= 0
+      Number.isFinite(parsedOffset) && parsedOffset >= 0
         ? parsedOffset
         : defaultOffset,
   };
 }
-/**
- * 배열을 API의 items/total 구조로 Pagination합니다.
- */
+
 function paginateMockItems(
   items,
   params = {},
   defaultLimit = 20
 ) {
-  const safeItems =
-    Array.isArray(items)
-      ? items
-      : [];
-  const {
-    limit,
-    offset,
-  } = normalizePagination(
-    params,
-    {
-      defaultLimit,
-    }
-  );
+  const safeItems = Array.isArray(items) ? items : [];
+
+  const { limit, offset } = normalizePagination(params, {
+    defaultLimit,
+  });
+
   return {
-    items: safeItems.slice(
-      offset,
-      offset + limit
-    ),
+    items: safeItems.slice(offset, offset + limit),
     total: safeItems.length,
   };
 }
-/**
- * Axios 오류를 화면에 표시할 안전한 메시지로 변환합니다.
- */
-function createApiErrorMessage(
-  error
-) {
-  if (axios.isCancel(error)) {
+
+function encodeId(id, label = "ID") {
+  if (id === undefined || id === null || String(id) === "") {
+    throw new Error(`${label}가 필요합니다.`);
+  }
+
+  return encodeURIComponent(String(id));
+}
+
+function requireAdminKey(adminKey) {
+  if (!String(adminKey ?? "").trim()) {
+    throw new Error("관리자 Key를 입력해 주세요.");
+  }
+}
+
+function requireReason(reason) {
+  const value = String(reason ?? "").trim();
+
+  if (!value) {
+    throw new Error("변경 사유를 입력해 주세요.");
+  }
+
+  return value;
+}
+
+function createApiErrorMessage(error) {
+  if (axios.isCancel(error) || error.name === "CanceledError") {
     return "요청이 취소되었습니다.";
   }
-  const status =
-    error.response?.status;
-  const detail =
-    error.response?.data?.detail;
-  if (
-    typeof detail === "string"
-  ) {
+
+  const status = error.response?.status;
+  const body = error.response?.data;
+  const detail = body?.detail;
+
+  if (typeof detail === "string") {
     return detail;
   }
-  if (
-    Array.isArray(detail)
-  ) {
-    const validationMessage =
-      detail
-        .map(
-          (item) =>
-            item?.msg
-        )
-        .filter(Boolean)
-        .join(", ");
-    if (validationMessage) {
-      return validationMessage;
-    }
+
+  if (Array.isArray(detail)) {
+    const message = detail
+      .map((item) => item?.msg)
+      .filter(Boolean)
+      .join(", ");
+
+    if (message) return message;
   }
-  if (
-    detail &&
-    typeof detail === "object" &&
-    !Array.isArray(detail)
-  ) {
-    const objectMessage = [
+
+  if (detail && typeof detail === "object") {
+    const message = [
       detail.message,
       detail.reason,
       detail.error,
       detail.detail,
     ].find(
       (value) =>
-        typeof value === "string" &&
-        value.trim()
+        typeof value === "string" && value.trim()
     );
-    if (objectMessage) {
-      return objectMessage.trim();
-    }
+
+    if (message) return message.trim();
   }
-  if (
-    error.code === "ERR_NETWORK" ||
-    !error.response
-  ) {
+
+  if (typeof body?.message === "string" && body.message.trim()) {
+    return body.message.trim();
+  }
+
+  if (error.code === "ERR_NETWORK" || !error.response) {
     return "백엔드 서버에 연결할 수 없습니다.";
   }
+
   if (status === 401) {
     return "관리자 인증에 실패했습니다.";
   }
+
+  if (status === 403) {
+    return "요청을 수행할 권한이 없습니다.";
+  }
+
   if (status === 404) {
     return "요청한 데이터를 찾을 수 없습니다.";
   }
+
   if (status === 409) {
     return "현재 상태에서는 요청을 수행할 수 없습니다.";
   }
+
   if (status === 422) {
     return "요청 조건을 확인해 주세요.";
   }
+
   if (status === 503) {
     return "관리자 기능을 사용할 수 없습니다.";
   }
-  if (
-    status &&
-    status >= 500
-  ) {
+
+  if (status >= 500) {
     return "서버에서 데이터를 처리하지 못했습니다.";
   }
+
   if (status) {
     return `API 요청에 실패했습니다. (${status})`;
   }
+
   return "API 요청에 실패했습니다.";
 }
+
+function toApiError(error) {
+  const apiError = new Error(createApiErrorMessage(error));
+
+  apiError.status = error.response?.status ?? null;
+  apiError.code = error.code ?? null;
+  apiError.responseData = error.response?.data ?? null;
+  apiError.isCanceled =
+    axios.isCancel(error) ||
+    error.name === "CanceledError";
+
+  return apiError;
+}
+
 /* =========================================================
    Common GET Request
-   ========================================================= */
-/**
- * 공통 GET 요청 함수
- */
+========================================================= */
+
 async function request(
   path,
   mockData,
   params = {},
   options = {}
 ) {
-  const validParams =
-    removeEmptyParams(params);
+  const validParams = removeEmptyParams(params);
+
   if (USE_MOCK) {
     if (IS_DEV) {
-      console.log(
-        "[MOCK]",
-        path,
-        validParams
-      );
+      console.log("[MOCK]", path, validParams);
     }
+
     return mockData;
   }
+
   try {
-    const response =
-      await axios.get(
-        `${API_BASE_URL}${path}`,
-        {
-          params:
-            validParams,
-          headers: {
-            Accept:
-              "application/json",
-          },
-          signal:
-            options.signal,
-        }
-      );
+    const response = await axios.get(
+      `${API_BASE_URL}${path}`,
+      {
+        params: validParams,
+        headers: {
+          Accept: "application/json",
+        },
+        signal: options.signal,
+        ...(options.timeout ? { timeout: options.timeout } : {}),
+      }
+    );
+
     if (IS_DEV) {
-      console.log(
-        "[API]",
-        path,
-        validParams,
-        response.data
-      );
+      console.log("[API]", path, validParams, response.data);
     }
+
     return response.data;
   } catch (error) {
-    const message =
-      createApiErrorMessage(
-        error
-      );
-    if (IS_DEV) {
-      console.error(
-        "[API ERROR]",
-        {
-          path,
-          params:
-            validParams,
-          status:
-            error.response
-              ?.status,
-          response:
-            error.response
-              ?.data,
-        }
-      );
+    if (IS_DEV && !axios.isCancel(error)) {
+      console.error("[API ERROR]", {
+        path,
+        params: validParams,
+        status: error.response?.status,
+        code: error.code,
+      });
     }
-    const apiError =
-      new Error(message);
-    apiError.status =
-      error.response?.status ??
-      null;
-    apiError.code =
-      error.code ??
-      null;
-    apiError.responseData =
-      error.response?.data ??
-      null;
-    apiError.isCanceled =
-      axios.isCancel(
-        error
-      ) ||
-      error.name ===
-      "CanceledError";
-    throw apiError;
+
+    throw toApiError(error);
   }
 }
+
 /* =========================================================
-   Phase 6-B Command Request
-   ========================================================= */
-/**
- * 관리자 Command용 공통 요청 함수
- *
- * Admin Key는 요청 시점에만
- * X-Recovery-Admin-Key Header로 전달합니다.
- *
- * Admin Key / Reason / Confirm은
- * Console에 출력하지 않습니다.
- */
+   Common Admin Command Request
+
+   Admin Key는 요청 헤더로만 전달합니다.
+   요청 Body, 인증키, 확인 문자열은 로그에 출력하지 않습니다.
+========================================================= */
+
 async function commandRequest(
   method,
   path,
@@ -299,132 +273,73 @@ async function commandRequest(
     mockData = undefined,
   } = {}
 ) {
-  const validParams =
-    removeEmptyParams(params);
+  const validParams = removeEmptyParams(params);
+
   if (USE_MOCK) {
     if (IS_DEV) {
-      console.log(
-        "[MOCK COMMAND]",
-        {
-          method,
-          path,
-          params:
-            validParams,
-        }
-      );
+      console.log("[MOCK COMMAND]", {
+        method,
+        path,
+        // 관리자 파라미터 내용은 기록하지 않습니다.
+      });
     }
-    /**
-     * Phase 6-B 계약:
-     * Mock 화면을 실제 Release / Recovery 성공 증적으로
-     * 사용하지 않습니다.
-     *
-     * 따라서 Mock에서는 호출자가 전달한 Fixture만 반환하고,
-     * 실제 성공 상태를 임의 생성하지 않습니다.
-     */
-    if (
-      mockData !== undefined
-    ) {
+
+    if (mockData !== undefined) {
       return mockData;
     }
+
     throw new Error(
       "Mock 모드에서는 실제 관리자 Write Command를 실행하지 않습니다."
     );
   }
+
   try {
-    const response =
-      await axios({
-        method,
-        url:
-          `${API_BASE_URL}${path}`,
-        data,
-        params:
-          validParams,
-        headers: {
-          Accept:
-            "application/json",
-          ...(data !==
-            undefined
-            ? {
-              "Content-Type":
-                "application/json",
-            }
-            : {}),
-          ...(adminKey
-            ? {
-              "X-Recovery-Admin-Key":
-                adminKey,
-            }
-            : {}),
-        },
-        signal,
-        ...(timeout ? { timeout } : {}),
-      });
-    /**
-     * Secret이나 Command Body를
-     * Console에 출력하지 않습니다.
-     */
+    const response = await axios({
+      method,
+      url: `${API_BASE_URL}${path}`,
+      data,
+      params: validParams,
+      headers: {
+        Accept: "application/json",
+        ...(data !== undefined
+          ? { "Content-Type": "application/json" }
+          : {}),
+        ...(adminKey
+          ? { "X-Recovery-Admin-Key": adminKey }
+          : {}),
+      },
+      signal,
+      ...(timeout ? { timeout } : {}),
+    });
+
     if (IS_DEV) {
-      console.log(
-        "[API COMMAND]",
-        {
-          method,
-          path,
-          status:
-            response.status,
-        }
-      );
+      console.log("[API COMMAND]", {
+        method,
+        path,
+        status: response.status,
+      });
     }
+
     return response.data;
   } catch (error) {
-    const message =
-      createApiErrorMessage(
-        error
-      );
-    /**
-     * Admin Key, Request Body,
-     * confirm 값은 Error Log에도 출력하지 않습니다.
-     */
-    if (IS_DEV) {
-      console.error(
-        "[API COMMAND ERROR]",
-        {
-          method,
-          path,
-          status:
-            error.response
-              ?.status,
-          response:
-            error.response
-              ?.data,
-        }
-      );
+    if (IS_DEV && !axios.isCancel(error)) {
+      console.error("[API COMMAND ERROR]", {
+        method,
+        path,
+        status: error.response?.status,
+        code: error.code,
+      });
     }
-    const apiError =
-      new Error(message);
-    apiError.status =
-      error.response?.status ??
-      null;
-    apiError.code =
-      error.code ??
-      null;
-    apiError.responseData =
-      error.response?.data ??
-      null;
-    apiError.isCanceled =
-      axios.isCancel(
-        error
-      ) ||
-      error.name ===
-      "CanceledError";
-    throw apiError;
+
+    throw toApiError(error);
   }
 }
+
 /* =========================================================
    Dashboard
-   ========================================================= */
-export function getSummary(
-  options = {}
-) {
+========================================================= */
+
+export function getSummary(options = {}) {
   return request(
     "/dashboard/summary",
     mockSummary,
@@ -432,90 +347,63 @@ export function getSummary(
     options
   );
 }
+
 /* =========================================================
    Devices
-   ========================================================= */
-export function getDevices(
-  params = {},
-  options = {}
-) {
+========================================================= */
+
+export function getDevices(params = {}, options = {}) {
   const queryParams = {
     limit: 20,
     offset: 0,
     ...params,
   };
-  let filteredItems =
-    Array.isArray(
-      mockDevices.items
-    )
-      ? [
-        ...mockDevices.items,
-      ]
-      : [];
-  if (
-    queryParams.status
-  ) {
-    filteredItems =
-      filteredItems.filter(
-        (device) =>
-          device.status ===
-          queryParams.status
-      );
-  }
-  if (
-    queryParams.device_id
-  ) {
-    filteredItems =
-      filteredItems.filter(
-        (device) =>
-          device.device_id ===
-          queryParams.device_id
-      );
-  }
-  const pagedMockData =
-    paginateMockItems(
-      filteredItems,
-      queryParams
+
+  let items = Array.isArray(mockDevices.items)
+    ? [...mockDevices.items]
+    : [];
+
+  if (queryParams.status) {
+    items = items.filter(
+      (item) => item.status === queryParams.status
     );
+  }
+
+  if (queryParams.device_id) {
+    items = items.filter(
+      (item) => item.device_id === queryParams.device_id
+    );
+  }
+
   return request(
     "/devices",
-    pagedMockData,
+    paginateMockItems(items, queryParams),
     queryParams,
     options
   );
 }
-export function getDeviceDetail(
-  deviceId,
-  options = {}
-) {
+
+export function getDeviceDetail(deviceId, options = {}) {
   if (!deviceId) {
     return Promise.reject(
-      new Error(
-        "조회할 Device ID가 필요합니다."
-      )
+      new Error("조회할 Device ID가 필요합니다.")
     );
   }
-  const encodedDeviceId =
-    encodeURIComponent(
-      deviceId
-    );
-  const mockDevice =
-    Array.isArray(
-      mockDevices.items
-    )
-      ? mockDevices.items.find(
-        (device) =>
-          device.device_id ===
-          deviceId
+
+  const mockDevice = Array.isArray(mockDevices.items)
+    ? mockDevices.items.find(
+        (item) => item.device_id === deviceId
       ) ?? null
-      : null;
+    : null;
+
   return request(
-    `/devices/${encodedDeviceId}`,
+    `/devices/${encodeId(deviceId, "Device ID")}`,
     mockDevice,
     {},
     options
   );
 }
+
 export async function createDevice(
   payload,
   adminKey,
@@ -524,75 +412,65 @@ export async function createDevice(
   if (!payload?.device_id) {
     throw new Error("Device ID가 필요합니다.");
   }
-  if (!String(adminKey ?? "").trim()) {
-    throw new Error("관리자 Key를 입력해 주세요.");
-  }
-  const response = await commandRequest(
-    "POST",
-    "/devices",
-    {
-      data: payload,
-      adminKey,
-      signal: options.signal,
-      timeout: options.timeout ?? 15_000,
-    }
-  );
-  return response;
+
+  requireAdminKey(adminKey);
+
+  return commandRequest("POST", "/devices", {
+    data: payload,
+    adminKey,
+    signal: options.signal,
+    timeout: options.timeout ?? 15000,
+  });
 }
-export function getDevicePolicy(
-  deviceId,
-  options = {}
-) {
+
+export function getDevicePolicy(deviceId, options = {}) {
   if (!deviceId) {
     return Promise.reject(
       new Error("정책을 조회할 Device ID가 필요합니다.")
     );
   }
-  const encodedDeviceId =
-    encodeURIComponent(deviceId);
+
   return request(
-    `/devices/${encodedDeviceId}/policy`,
+    `/devices/${encodeId(deviceId)}/policy`,
     null,
     {},
     options
   );
 }
+
 export async function createDevicePolicyRevision(
   deviceId,
   payload,
   adminKey,
   options = {}
 ) {
-  if (!deviceId) {
-    throw new Error("정책을 변경할 Device ID가 필요합니다.");
-  }
+  const id = encodeId(deviceId, "Device ID");
+
   if (
     payload?.expected_revision === null ||
     payload?.expected_revision === undefined ||
     payload?.expected_revision === ""
   ) {
-    throw new Error("현재 Policy Revision을 확인할 수 없습니다.");
+    throw new Error(
+      "현재 Policy Revision을 확인할 수 없습니다."
+    );
   }
-  if (!String(payload?.reason ?? "").trim()) {
-    throw new Error("정책 변경 사유를 입력해 주세요.");
-  }
-  if (!String(adminKey ?? "").trim()) {
-    throw new Error("관리자 Key를 입력해 주세요.");
-  }
-  const encodedDeviceId =
-    encodeURIComponent(deviceId);
-  const response = await commandRequest(
+
+  requireReason(payload?.reason);
+  requireAdminKey(adminKey);
+
+  return commandRequest(
     "POST",
-    `/devices/${encodedDeviceId}/policy-revisions`,
+    `/devices/${id}/policy-revisions`,
     {
       data: payload,
       adminKey,
       signal: options.signal,
-      timeout: options.timeout ?? 15_000,
+      timeout: options.timeout ?? 15000,
     }
   );
-  return response;
 }
+
 export function getIsolatedDevices(
   params = {},
   options = {}
@@ -605,9 +483,82 @@ export function getIsolatedDevices(
     options
   );
 }
+
 /* =========================================================
-   MQTT
-   ========================================================= */
+   Phase 9 - Device AI Policy
+
+   GET  /api/devices/{device_id}/ai-policy
+   POST /api/devices/{device_id}/ai-policy-revisions
+
+   Phase 9에서 허용하는 모드는 OFF / OBSERVE입니다.
+   변경은 즉시 적용되지 않을 수 있습니다.
+========================================================= */
+
+export function getDeviceAiPolicy(
+  deviceId,
+  options = {}
+) {
+  if (!deviceId) {
+    return Promise.reject(
+      new Error("AI 정책을 조회할 Device ID가 필요합니다.")
+    );
+  }
+
+  return request(
+    `/devices/${encodeId(deviceId)}/ai-policy`,
+    null,
+    {},
+    options
+  );
+}
+
+export async function createDeviceAiPolicyRevision(
+  deviceId,
+  payload,
+  adminKey,
+  options = {}
+) {
+  const id = encodeId(deviceId, "Device ID");
+
+  if (
+    typeof payload?.expected_revision !== "number" ||
+    !Number.isSafeInteger(payload.expected_revision) ||
+    payload.expected_revision < 1
+  ) {
+    throw new Error(
+      "올바른 AI Policy Revision을 입력해 주세요."
+    );
+  }
+
+  if (!["OFF", "OBSERVE"].includes(payload?.mode)) {
+    throw new Error(
+      "AI 모드는 OFF 또는 OBSERVE만 선택할 수 있습니다."
+    );
+  }
+
+  const reason = requireReason(payload?.reason);
+  requireAdminKey(adminKey);
+
+  return commandRequest(
+    "POST",
+    `/devices/${id}/ai-policy-revisions`,
+    {
+      data: {
+        expected_revision: payload.expected_revision,
+        mode: payload.mode,
+        reason,
+      },
+      adminKey,
+      signal: options.signal,
+      timeout: options.timeout ?? 15000,
+    }
+  );
+}
+
+/* =========================================================
+   MQTT Logs
+========================================================= */
+
 export function getMqttLogs(
   params = {},
   options = {}
@@ -617,22 +568,27 @@ export function getMqttLogs(
     offset: 0,
     ...params,
   };
-  const pagedMockData =
+
+  return request(
+    "/mqtt-logs",
     paginateMockItems(
       mockMqttLogs.items,
       queryParams,
       10
-    );
-  return request(
-    "/mqtt-logs",
-    pagedMockData,
+    ),
     queryParams,
     options
   );
 }
+
 /* =========================================================
    MQTT Feature Logs
-   ========================================================= */
+
+   Phase 9:
+   device_id, from, to, limit, offset를
+   Backend 계약에 맞춰 전달합니다.
+========================================================= */
+
 export function getFeatureLogs(
   params = {},
   options = {}
@@ -642,22 +598,23 @@ export function getFeatureLogs(
     offset: 0,
     ...params,
   };
-  const pagedMockData =
+
+  return request(
+    "/feature-logs",
     paginateMockItems(
       mockFeatureLogs.items,
       queryParams,
       10
-    );
-  return request(
-    "/feature-logs",
-    pagedMockData,
+    ),
     queryParams,
     options
   );
 }
+
 /* =========================================================
    Detection Events
-   ========================================================= */
+========================================================= */
+
 export function getEvents(
   params = {},
   options = {}
@@ -667,91 +624,91 @@ export function getEvents(
     offset: 0,
     ...params,
   };
-  let filteredItems =
-    Array.isArray(
-      mockEvents.items
-    )
-      ? [
-        ...mockEvents.items,
-      ]
-      : [];
-  if (
-    queryParams.device_id
-  ) {
-    filteredItems =
-      filteredItems.filter(
-        (event) =>
-          event.device_id ===
-          queryParams.device_id
-      );
-  }
-  if (
-    queryParams.event_type
-  ) {
-    filteredItems =
-      filteredItems.filter(
-        (event) =>
-          event.event_type ===
-          queryParams.event_type
-      );
-  }
-  if (
-    queryParams.incident_family
-  ) {
-    filteredItems =
-      filteredItems.filter(
-        (event) =>
-          event.incident_family ===
-          queryParams.incident_family
-      );
-  }
-  if (
-    queryParams.severity
-  ) {
-    filteredItems =
-      filteredItems.filter(
-        (event) =>
-          event.severity ===
-          queryParams.severity
-      );
-  }
-  if (
-    queryParams.applied_to_score !==
-    undefined
-  ) {
-    const appliedValue =
-      queryParams.applied_to_score ===
-      true ||
-      queryParams.applied_to_score ===
-      1 ||
-      queryParams.applied_to_score ===
-      "1" ||
-      queryParams.applied_to_score ===
-      "true";
-    filteredItems =
-      filteredItems.filter(
-        (event) =>
-          Boolean(
-            event.applied_to_score
-          ) ===
-          appliedValue
-      );
-  }
-  const pagedMockData =
-    paginateMockItems(
-      filteredItems,
-      queryParams
+
+  let items = Array.isArray(mockEvents.items)
+    ? [...mockEvents.items]
+    : [];
+
+  if (queryParams.device_id) {
+    items = items.filter(
+      (item) => item.device_id === queryParams.device_id
     );
+  }
+
+  if (queryParams.event_type) {
+    items = items.filter(
+      (item) => item.event_type === queryParams.event_type
+    );
+  }
+
+  if (queryParams.incident_family) {
+    items = items.filter(
+      (item) =>
+        item.incident_family === queryParams.incident_family
+    );
+  }
+
+  if (queryParams.severity) {
+    items = items.filter(
+      (item) => item.severity === queryParams.severity
+    );
+  }
+
+  if (queryParams.applied_to_score !== undefined) {
+    const appliedValue = [
+      true,
+      1,
+      "1",
+      "true",
+    ].includes(queryParams.applied_to_score);
+
+    items = items.filter(
+      (item) =>
+        Boolean(item.applied_to_score) === appliedValue
+    );
+  }
+
   return request(
     "/detection-events",
-    pagedMockData,
+    paginateMockItems(items, queryParams),
     queryParams,
     options
   );
 }
+
+/* =========================================================
+   Phase 9 - AI Warnings
+
+   GET /api/ai-warnings
+
+   Params:
+   device_id, from, to, limit, offset
+
+   AI 경고는 단독 Trust 감점이나 격리를 의미하지 않습니다.
+========================================================= */
+
+export function getAiWarnings(
+  params = {},
+  options = {}
+) {
+  const queryParams = {
+    limit: 20,
+    offset: 0,
+    ...params,
+  };
+
+  return request(
+    "/ai-warnings",
+    { items: [], total: 0 },
+    queryParams,
+    options
+  );
+}
+
 /* =========================================================
    Isolation History
-   ========================================================= */
+========================================================= */
+
 export function getIsolationHistory(
   params = {},
   options = {}
@@ -761,39 +718,29 @@ export function getIsolationHistory(
     offset: 0,
     ...params,
   };
-  let filteredItems =
-    Array.isArray(
-      mockIsolationHistory.items
-    )
-      ? [
-        ...mockIsolationHistory.items,
-      ]
-      : [];
-  if (
-    queryParams.device_id
-  ) {
-    filteredItems =
-      filteredItems.filter(
-        (item) =>
-          item.device_id ===
-          queryParams.device_id
-      );
-  }
-  const pagedMockData =
-    paginateMockItems(
-      filteredItems,
-      queryParams
+
+  let items = Array.isArray(mockIsolationHistory.items)
+    ? [...mockIsolationHistory.items]
+    : [];
+
+  if (queryParams.device_id) {
+    items = items.filter(
+      (item) => item.device_id === queryParams.device_id
     );
+  }
+
   return request(
     "/isolation/history",
-    pagedMockData,
+    paginateMockItems(items, queryParams),
     queryParams,
     options
   );
 }
+
 /* =========================================================
    Trust Score
-   ========================================================= */
+========================================================= */
+
 export function getTrustScoreSummary(
   params = {},
   options = {}
@@ -803,19 +750,19 @@ export function getTrustScoreSummary(
     offset: 0,
     ...params,
   };
-  const pagedMockData =
+
+  return request(
+    "/trust-score/summary",
     paginateMockItems(
       mockTrustScoreSummary.items,
       queryParams,
       100
-    );
-  return request(
-    "/trust-score/summary",
-    pagedMockData,
+    ),
     queryParams,
     options
   );
 }
+
 export function getTrustScoreCompensations(
   params = {},
   adminKey = "",
@@ -826,15 +773,14 @@ export function getTrustScoreCompensations(
     offset: 0,
     ...params,
   };
+
   return commandRequest(
     "GET",
     "/trust-score/compensations",
     {
-      params:
-        queryParams,
+      params: queryParams,
       adminKey,
-      signal:
-        options.signal,
+      signal: options.signal,
       mockData: {
         items: [],
         total: 0,
@@ -842,6 +788,7 @@ export function getTrustScoreCompensations(
     }
   );
 }
+
 export function getTrustScoreHistory(
   deviceId,
   params = {},
@@ -850,52 +797,48 @@ export function getTrustScoreHistory(
   if (!deviceId) {
     return Promise.reject(
       new Error(
-        "Trust Score 이력을 조회할 기기 ID가 필요합니다."
+        "Trust Score 이력을 조회할 Device ID가 필요합니다."
       )
     );
   }
-  const encodedDeviceId =
-    encodeURIComponent(
-      deviceId
-    );
+
   const queryParams = {
     limit: 20,
     offset: 0,
     ...params,
   };
-  const history =
-    mockTrustScoreHistories[
-    deviceId
-    ] || {
-      device_id:
-        deviceId,
-      current_score:
-        null,
-      items: [],
-      total: 0,
-    };
-  const pagedItems =
-    paginateMockItems(
-      history.items,
-      queryParams
-    );
-  const pagedMockData = {
-    ...history,
-    items:
-      pagedItems.items,
-    total:
-      pagedItems.total,
+
+  const history = mockTrustScoreHistories[deviceId] || {
+    device_id: deviceId,
+    current_score: null,
+    items: [],
+    total: 0,
   };
+
+  const pagedItems = paginateMockItems(
+    history.items,
+    queryParams
+  );
+
   return request(
-    `/trust-score/${encodedDeviceId}/history`,
-    pagedMockData,
+    `/trust-score/${encodeId(deviceId)}/history`,
+    {
+      ...history,
+      items: pagedItems.items,
+      total: pagedItems.total,
+    },
     queryParams,
     options
   );
 }
+
 /* =========================================================
    Packet Feature Logs
-   ========================================================= */
+
+   기존 API 유지
+   Phase 9 그래프에서 필터 및 기간 조회에 사용
+========================================================= */
+
 export function getPacketFeatureLogs(
   params = {},
   options = {}
@@ -905,71 +848,72 @@ export function getPacketFeatureLogs(
     offset: 0,
     ...params,
   };
-  let filteredItems =
-    Array.isArray(
-      mockPacketFeatureLogs.items
-    )
-      ? [
-        ...mockPacketFeatureLogs.items,
-      ]
-      : [];
-  if (
-    queryParams.direction
-  ) {
-    filteredItems =
-      filteredItems.filter(
-        (item) =>
-          item.direction ===
-          queryParams.direction
-      );
-  }
-  if (
-    queryParams.device_id
-  ) {
-    filteredItems =
-      filteredItems.filter(
-        (item) =>
-          item.device_id ===
-          queryParams.device_id
-      );
-  }
-  if (
-    queryParams.capture_eligible !==
-    undefined
-  ) {
-    const eligibleValue =
-      queryParams.capture_eligible ===
-      true ||
-      queryParams.capture_eligible ===
-      1 ||
-      queryParams.capture_eligible ===
-      "1" ||
-      queryParams.capture_eligible ===
-      "true";
-    filteredItems =
-      filteredItems.filter(
-        (item) =>
-          Boolean(
-            item.capture_eligible
-          ) ===
-          eligibleValue
-      );
-  }
-  const pagedMockData =
-    paginateMockItems(
-      filteredItems,
-      queryParams
+
+  let items = Array.isArray(mockPacketFeatureLogs.items)
+    ? [...mockPacketFeatureLogs.items]
+    : [];
+
+  if (queryParams.direction) {
+    items = items.filter(
+      (item) => item.direction === queryParams.direction
     );
+  }
+
+  if (queryParams.device_id) {
+    items = items.filter(
+      (item) => item.device_id === queryParams.device_id
+    );
+  }
+
+  if (queryParams.capture_eligible !== undefined) {
+    const eligibleValue = [
+      true,
+      1,
+      "1",
+      "true",
+    ].includes(queryParams.capture_eligible);
+
+    items = items.filter(
+      (item) =>
+        Boolean(item.capture_eligible) === eligibleValue
+    );
+  }
+
+  // capture_eligible는 현재 Backend 지원 여부를
+  // 확인한 뒤 화면에서 요청 파라미터로 전달해야 합니다.
   return request(
     "/packet-feature-logs",
-    pagedMockData,
+    paginateMockItems(items, queryParams),
     queryParams,
     options
   );
 }
+
+/* =========================================================
+   Phase 9 - Packet Capture Windows
+
+   GET /api/packet-capture-windows
+
+   Feature가 없는 구간의 Capture 상태를 확인합니다.
+   실제 지원 필터는 Swagger Schema와 대조해야 합니다.
+========================================================= */
+
+export function getPacketCaptureWindows(
+  params = {},
+  options = {}
+) {
+  return request(
+    "/packet-capture-windows",
+    { items: [], total: 0 },
+    params,
+    options
+  );
+}
+
 /* =========================================================
    Gateway Metrics
-   ========================================================= */
+========================================================= */
+
 export function getGatewayMetrics(
   params = {},
   options = {}
@@ -979,38 +923,67 @@ export function getGatewayMetrics(
     offset: 0,
     ...params,
   };
+
   const refreshedItems = (
-    mockGatewayMetrics.items ||
-    []
-  ).map(
-    (
-      item,
-      index
-    ) =>
-      index === 0
-        ? {
+    mockGatewayMetrics.items || []
+  ).map((item, index) =>
+    index === 0
+      ? {
           ...item,
-          collected_at:
-            new Date().toISOString(),
+          collected_at: new Date().toISOString(),
         }
-        : item
+      : item
   );
-  const pagedMockData =
+
+  return request(
+    "/gateway-metrics",
     paginateMockItems(
       refreshedItems,
       queryParams,
       1
-    );
-  return request(
-    "/gateway-metrics",
-    pagedMockData,
+    ),
     queryParams,
     options
   );
 }
+
+/* =========================================================
+   Phase 9 - Runtime Status
+
+   GET /api/runtime-status
+
+   설정값과 실제 실행 상태는 구분해야 합니다.
+   조회 실패를 정상 상태로 대체하지 않습니다.
+========================================================= */
+
+export function getRuntimeStatus(options = {}) {
+  return request(
+    "/runtime-status",
+    null,
+    {},
+    options
+  );
+}
+
+/* =========================================================
+   Phase 9 - Models
+
+   GET /api/models
+========================================================= */
+
+export function getModels(options = {}) {
+  return request(
+    "/models",
+    null,
+    {},
+    options
+  );
+}
+
 /* =========================================================
    Firewall Rules
-   ========================================================= */
+========================================================= */
+
 export function getFirewallRules(
   params = {},
   options = {}
@@ -1020,78 +993,105 @@ export function getFirewallRules(
     offset: 0,
     ...params,
   };
-  let filteredItems =
-    Array.isArray(
-      mockFirewallRules.items
-    )
-      ? [
-        ...mockFirewallRules.items,
-      ]
-      : [];
-  if (
-    queryParams.status
-  ) {
-    filteredItems =
-      filteredItems.filter(
-        (rule) =>
-          rule.status ===
-          queryParams.status
-      );
-  }
-  if (
-    queryParams.device_id
-  ) {
-    filteredItems =
-      filteredItems.filter(
-        (rule) =>
-          rule.device_id ===
-          queryParams.device_id
-      );
-  }
-  if (
-    queryParams.source_ip
-  ) {
-    filteredItems =
-      filteredItems.filter(
-        (rule) =>
-          rule.source_ip ===
-          queryParams.source_ip
-      );
-  }
-  const pagedMockData =
-    paginateMockItems(
-      filteredItems,
-      queryParams
+
+  let items = Array.isArray(mockFirewallRules.items)
+    ? [...mockFirewallRules.items]
+    : [];
+
+  if (queryParams.status) {
+    items = items.filter(
+      (item) => item.status === queryParams.status
     );
+  }
+
+  if (queryParams.device_id) {
+    items = items.filter(
+      (item) => item.device_id === queryParams.device_id
+    );
+  }
+
+  if (queryParams.source_ip) {
+    items = items.filter(
+      (item) => item.source_ip === queryParams.source_ip
+    );
+  }
+
   return request(
     "/firewall-rules",
-    pagedMockData,
+    paginateMockItems(items, queryParams),
     queryParams,
     options
   );
 }
+
 /* =========================================================
-   Phase 6-B Firewall Release Request
-   ========================================================= */
-/**
- * APPLIED Firewall Rule의 Release Request를 생성합니다.
- *
- * Backend는 Request만 저장하며
- * 실제 iptables Release는 Firewall Worker가 수행합니다.
- *
- * API 계약:
- *
- * POST /api/firewall-rules/{rule_id}/release-requests
- *
- * Body:
- * {
- *   reason,
- *   confirm
- * }
- *
- * confirm:
- * RELEASE-FIREWALL-RULE-{rule_id}
- */
+   Phase 9 - Firewall Runtime Status
+
+   GET /api/firewall-runtime-status
+========================================================= */
+
+export function getFirewallRuntimeStatus(
+  options = {}
+) {
+  return request(
+    "/firewall-runtime-status",
+    null,
+    {},
+    options
+  );
+}
+
+/* =========================================================
+   Phase 9 - Firewall Scope Extension
+
+   POST
+   /api/firewall-rules/{source_rule_id}/scope-extension-requests
+
+   관리자 명령의 정확한 Body Schema는
+   Swagger에서 확인해야 합니다.
+
+   이 함수는 payload를 임의 변경하지 않습니다.
+========================================================= */
+
+export async function createFirewallScopeExtensionRequest(
+  sourceRuleId,
+  payload,
+  adminKey,
+  options = {}
+) {
+  const id = encodeId(
+    sourceRuleId,
+    "Source Firewall Rule ID"
+  );
+
+  if (
+    !payload ||
+    typeof payload !== "object" ||
+    Array.isArray(payload)
+  ) {
+    throw new Error(
+      "차단 범위 확대 요청 데이터가 필요합니다."
+    );
+  }
+
+  requireAdminKey(adminKey);
+
+  return commandRequest(
+    "POST",
+    `/firewall-rules/${id}/scope-extension-requests`,
+    {
+      data: payload,
+      adminKey,
+      signal: options.signal,
+      timeout: options.timeout ?? 15000,
+    }
+  );
+}
+
+/* =========================================================
+   Firewall Release Request
+========================================================= */
+
 export async function createFirewallReleaseRequest(
   ruleId,
   {
@@ -1101,102 +1101,45 @@ export async function createFirewallReleaseRequest(
   },
   options = {}
 ) {
-  if (
-    ruleId === null ||
-    ruleId === undefined ||
-    ruleId === ""
-  ) {
-    throw new Error(
-      "Firewall Rule ID가 필요합니다."
-    );
-  }
-  const trimmedReason =
-    String(
-      reason ?? ""
-    ).trim();
+  const id = encodeId(ruleId, "Firewall Rule ID");
+
+  const trimmedReason = String(reason ?? "").trim();
+  const trimmedConfirmation =
+    String(confirmation ?? "").trim();
+
   if (!trimmedReason) {
     throw new Error(
       "Firewall 해제 사유를 입력해 주세요."
     );
   }
-  const trimmedConfirmation =
-    String(
-      confirmation ?? ""
-    ).trim();
-  if (
-    !trimmedConfirmation
-  ) {
-    throw new Error(
-      "Firewall 해제 확인 문구를 입력해 주세요."
-    );
-  }
+
   const expectedConfirmation =
     `RELEASE-FIREWALL-RULE-${ruleId}`;
-  if (
-    trimmedConfirmation !==
-    expectedConfirmation
-  ) {
+
+  if (trimmedConfirmation !== expectedConfirmation) {
     throw new Error(
       `확인 문구 ${expectedConfirmation}을 정확히 입력해 주세요.`
     );
   }
-  if (
-    !String(
-      adminKey ?? ""
-    ).trim()
-  ) {
-    throw new Error(
-      "관리자 Key를 입력해 주세요."
-    );
-  }
-  const encodedRuleId =
-    encodeURIComponent(
-      ruleId
-    );
-  const response =
-    await commandRequest(
-      "POST",
-      `/firewall-rules/${encodedRuleId}/release-requests`,
-      {
-        data: {
-          reason:
-            trimmedReason,
-          confirm:
-            trimmedConfirmation,
-        },
-        adminKey,
-        signal:
-          options.signal,
-      }
-    );
-  /**
-   * Backend 201 Response:
-   *
-   * {
-   *   item: {
-   *     id,
-   *     firewall_rule_id,
-   *     status,
-   *     ...
-   *   }
-   * }
-   *
-   * Frontend에서는 사용 편의를 위해
-   * item 객체만 반환합니다.
-   */
-  return (
-    response?.item ??
-    response
+
+  requireAdminKey(adminKey);
+
+  const response = await commandRequest(
+    "POST",
+    `/firewall-rules/${id}/release-requests`,
+    {
+      data: {
+        reason: trimmedReason,
+        confirm: trimmedConfirmation,
+      },
+      adminKey,
+      signal: options.signal,
+    }
   );
+
+  return response?.item ?? response;
 }
-/**
- * Firewall Release Request 상태 단건 조회
- *
- * 반환 status:
- * - PENDING
- * - SUCCEEDED
- * - FAILED
- */
+
 export function getFirewallReleaseRequest(
   requestId,
   adminKey = "",
@@ -1209,102 +1152,66 @@ export function getFirewallReleaseRequest(
       )
     );
   }
-  const encodedRequestId =
-    encodeURIComponent(
-      requestId
-    );
+
   return commandRequest(
     "GET",
-    `/firewall-release-requests/${encodedRequestId}`,
+    `/firewall-release-requests/${encodeId(requestId)}`,
     {
       adminKey,
-      signal:
-        options.signal,
+      signal: options.signal,
     }
   );
 }
+
 /* =========================================================
-   Phase 6-B Recovery
-   ========================================================= */
-/**
- * Recovery Preflight
- *
- * expected_trust_score는 Recovery 후 목표값 100이 아니라
- * 현재 Device의 Trust Score와 일치해야 합니다.
- *
- * 예:
- * 현재 esp32_02 trust_score = 25
- *
- * {
- *   device_id: "esp32_02",
- *   expected_trust_score: 25
- * }
- */
+   Recovery Preflight
+========================================================= */
+
 export function recoveryPreflight(
-  {
-    device_id,
-    expected_trust_score,
-  },
+  { device_id, expected_trust_score },
   adminKey,
   options = {}
 ) {
   if (!device_id) {
     return Promise.reject(
-      new Error(
-        "Recovery 대상 Device ID가 필요합니다."
-      )
+      new Error("Recovery 대상 Device ID가 필요합니다.")
     );
   }
-  const trustScore =
-    Number(
-      expected_trust_score
-    );
-  if (
-    !Number.isFinite(
-      trustScore
-    )
-  ) {
+
+  const trustScore = Number(expected_trust_score);
+
+  if (!Number.isFinite(trustScore)) {
     return Promise.reject(
       new Error(
         "현재 Trust Score를 확인할 수 없습니다."
       )
     );
   }
-  if (
-    !String(
-      adminKey ?? ""
-    ).trim()
-  ) {
+
+  if (!String(adminKey ?? "").trim()) {
     return Promise.reject(
-      new Error(
-        "관리자 Key를 입력해 주세요."
-      )
+      new Error("관리자 Key를 입력해 주세요.")
     );
   }
+
   return commandRequest(
     "POST",
     "/recovery/preflight",
     {
       data: {
         device_id,
-        expected_trust_score:
-          trustScore,
+        expected_trust_score: trustScore,
       },
       adminKey,
-      signal:
-        options.signal,
+      signal: options.signal,
     }
   );
 }
-/**
- * Recovery Execute
- *
- * confirm 값은 고정:
- * RESET-TO-NORMAL-100
- *
- * expected_trust_score 역시
- * Recovery 직전 현재 Trust Score입니다.
- */
+
+/* =========================================================
+   Recovery Execute
+========================================================= */
+
 export function executeRecovery(
   {
     device_id,
@@ -1317,92 +1224,64 @@ export function executeRecovery(
 ) {
   if (!device_id) {
     return Promise.reject(
-      new Error(
-        "Recovery 대상 Device ID가 필요합니다."
-      )
+      new Error("Recovery 대상 Device ID가 필요합니다.")
     );
   }
-  const trustScore =
-    Number(
-      expected_trust_score
-    );
-  if (
-    !Number.isFinite(
-      trustScore
-    )
-  ) {
+
+  const trustScore = Number(expected_trust_score);
+
+  if (!Number.isFinite(trustScore)) {
     return Promise.reject(
       new Error(
         "현재 Trust Score를 확인할 수 없습니다."
       )
     );
   }
-  const trimmedReason =
-    String(
-      reason ?? ""
-    ).trim();
+
+  const trimmedReason = String(reason ?? "").trim();
+
   if (!trimmedReason) {
     return Promise.reject(
-      new Error(
-        "Recovery 사유를 입력해 주세요."
-      )
+      new Error("Recovery 사유를 입력해 주세요.")
     );
   }
-  const trimmedConfirmation =
-    String(
-      confirmation ?? ""
-    ).trim();
-  const expectedConfirmation =
-    "RESET-TO-NORMAL-100";
-  if (
-    trimmedConfirmation !==
-    expectedConfirmation
-  ) {
+
+  const expectedConfirmation = "RESET-TO-NORMAL-100";
+
+  if (String(confirmation ?? "").trim() !== expectedConfirmation) {
     return Promise.reject(
       new Error(
         `${expectedConfirmation}을 정확히 입력해 주세요.`
       )
     );
   }
-  if (
-    !String(
-      adminKey ?? ""
-    ).trim()
-  ) {
+
+  if (!String(adminKey ?? "").trim()) {
     return Promise.reject(
-      new Error(
-        "관리자 Key를 입력해 주세요."
-      )
+      new Error("관리자 Key를 입력해 주세요.")
     );
   }
+
   return commandRequest(
     "POST",
     "/recovery/execute",
     {
       data: {
         device_id,
-        expected_trust_score:
-          trustScore,
-        reason:
-          trimmedReason,
-        confirm:
-          trimmedConfirmation,
+        expected_trust_score: trustScore,
+        reason: trimmedReason,
+        confirm: expectedConfirmation,
       },
       adminKey,
-      signal:
-        options.signal,
+      signal: options.signal,
     }
   );
 }
-/**
- * Recovery History
- *
- * Query:
- * - device_id
- * - result
- * - limit
- * - offset
- */
+
+/* =========================================================
+   Recovery History
+========================================================= */
+
 export function getRecoveryHistory(
   params = {},
   adminKey = "",
@@ -1414,14 +1293,11 @@ export function getRecoveryHistory(
     {
       params,
       adminKey,
-      signal:
-        options.signal,
+      signal: options.signal,
     }
   );
 }
-/**
- * Recovery History Detail
- */
+
 export function getRecoveryHistoryDetail(
   operationId,
   adminKey = "",
@@ -1434,26 +1310,107 @@ export function getRecoveryHistoryDetail(
       )
     );
   }
-  const encodedOperationId =
-    encodeURIComponent(
-      operationId
-    );
+
   return commandRequest(
     "GET",
-    `/recovery/history/${encodedOperationId}`,
+    `/recovery/history/${encodeId(operationId)}`,
     {
       adminKey,
-      signal:
-        options.signal,
+      signal: options.signal,
     }
   );
 }
+
 /* =========================================================
-   Health
-   ========================================================= */
-export function getHealth(
+   Phase 9 - Packet Pair Recovery
+
+   POST /api/recovery/packet-pair/plans
+   GET  /api/recovery/packet-pair/{plan_id}
+   POST /api/recovery/packet-pair/{plan_id}/verify
+
+   관리자 작업은 실제 적용/검증 범위를
+   Swagger 요청 스키마와 대조해야 합니다.
+
+   해당 함수는 API 호출 연결만 제공합니다.
+   응답 실패 시 자동 재시도하지 않습니다.
+========================================================= */
+
+export async function createPacketPairRecoveryPlan(
+  payload,
+  adminKey,
   options = {}
 ) {
+  if (
+    !payload ||
+    typeof payload !== "object" ||
+    Array.isArray(payload)
+  ) {
+    throw new Error(
+      "Packet Pair Recovery Plan 데이터가 필요합니다."
+    );
+  }
+
+  requireAdminKey(adminKey);
+
+  return commandRequest(
+    "POST",
+    "/recovery/packet-pair/plans",
+    {
+      data: payload,
+      adminKey,
+      signal: options.signal,
+      timeout: options.timeout ?? 15000,
+    }
+  );
+}
+
+export function getPacketPairRecoveryPlan(
+  planId,
+  adminKey = "",
+  options = {}
+) {
+  if (!planId) {
+    return Promise.reject(
+      new Error("Recovery Plan ID가 필요합니다.")
+    );
+  }
+
+  return commandRequest(
+    "GET",
+    `/recovery/packet-pair/${encodeId(planId)}`,
+    {
+      adminKey,
+      signal: options.signal,
+      timeout: options.timeout,
+    }
+  );
+}
+
+export async function verifyPacketPairRecoveryPlan(
+  planId,
+  adminKey,
+  options = {}
+) {
+  const id = encodeId(planId, "Recovery Plan ID");
+
+  requireAdminKey(adminKey);
+
+  return commandRequest(
+    "POST",
+    `/recovery/packet-pair/${id}/verify`,
+    {
+      adminKey,
+      signal: options.signal,
+      timeout: options.timeout ?? 15000,
+    }
+  );
+}
+
+/* =========================================================
+   Health
+========================================================= */
+
+export function getHealth(options = {}) {
   return request(
     "/health",
     mockHealth,
@@ -1461,6 +1418,11 @@ export function getHealth(
     options
   );
 }
+
+/* =========================================================
+   Exports
+========================================================= */
+
 export {
   API_BASE_URL,
   USE_MOCK,
