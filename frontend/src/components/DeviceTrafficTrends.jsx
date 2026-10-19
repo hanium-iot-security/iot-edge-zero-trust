@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import { assertTrafficRowsMatchQuery, featureTime } from "../utils/trafficQuery";
 import {
   CartesianGrid,
   Legend,
@@ -44,7 +46,7 @@ const kstInputToISO = (value) => {
 };
 const kstTime = (value) => {
   if (!value) return "-";
-  const d = new Date(value);
+  const d = new Date(featureTime(value));
   if (Number.isNaN(d.getTime())) return "-";
   return new Intl.DateTimeFormat("ko-KR", {
     timeZone: "Asia/Seoul",
@@ -58,7 +60,7 @@ const kstTime = (value) => {
 };
 const kstFull = (value) => {
   if (!value) return "-";
-  const d = new Date(value);
+  const d = new Date(featureTime(value));
   if (Number.isNaN(d.getTime())) return "-";
   return new Intl.DateTimeFormat("ko-KR", {
     timeZone: "Asia/Seoul",
@@ -109,6 +111,7 @@ async function loadPaged({ request, params, signal, label }) {
       break;
     }
 
+    assertTrafficRowsMatchQuery(result.items, params);
     pages += 1;
     if (result.totalKnown) total = result.total;
     else missingTotal = true;
@@ -142,8 +145,8 @@ async function loadPaged({ request, params, signal, label }) {
   // 데이터가 조회 중에 추가되면 offset 방식의 중복/누락 가능성이 있습니다.
   // snapshot_max_id API가 제공되지 않았으므로 '완전한 스냅샷'임을 보장하지 않습니다.
   const rows = [...byId.values()].sort((a, b) => {
-    const at = Date.parse(a?.window_start ?? "");
-    const bt = Date.parse(b?.window_start ?? "");
+    const at = featureTime(a?.window_start);
+    const bt = featureTime(b?.window_start);
     const order = (Number.isFinite(at) ? at : Infinity) - (Number.isFinite(bt) ? bt : Infinity);
     return order || String(a?.id ?? "").localeCompare(String(b?.id ?? ""), undefined, { numeric: true });
   });
@@ -184,8 +187,8 @@ function chartRows(rows, kind) {
   const plot = [];
   let last = null;
   for (const row of normalized) {
-    const currentTime = Date.parse(row.window_start ?? "");
-    const lastTime = Date.parse(last?.window_start ?? "");
+    const currentTime = featureTime(row.window_start);
+    const lastTime = featureTime(last?.window_start);
     const changedSession =
       kind === "packet" && last && isValue(sessionId(last)) && isValue(sessionId(row)) &&
       String(sessionId(last)) !== String(sessionId(row));
@@ -282,10 +285,12 @@ function CaptureEvidence({ data, loading, error, missingSession }) {
 }
 
 export default function DeviceTrafficTrends() {
+  const [searchParams] = useSearchParams();
+  const requestedDevice = searchParams.get("device_id") || "";
   const now = useMemo(() => new Date(), []);
   const [deviceOptions, setDeviceOptions] = useState([]);
   const [deviceError, setDeviceError] = useState("");
-  const [deviceId, setDeviceId] = useState("");
+  const [deviceId, setDeviceId] = useState(requestedDevice);
   const [tab, setTab] = useState("mqtt");
   const [direction, setDirection] = useState("INBOUND");
   const [fromInput, setFromInput] = useState(toKSTInput(new Date(now.getTime() - 60 * 60 * 1000)));
@@ -308,7 +313,7 @@ export default function DeviceTrafficTrends() {
         const ids = [...new Set(root.items.map((item) => item?.device_id).filter(Boolean))];
         if (controller.signal.aborted) return;
         setDeviceOptions(ids);
-        setDeviceId((current) => current || ids[0] || "");
+        setDeviceId((current) => ids.includes(current) ? current : ids[0] || "");
       } catch (err) {
         if (controller.signal.aborted) return;
         setDeviceError(err?.message || "기기 목록 조회 실패");
@@ -429,18 +434,18 @@ export default function DeviceTrafficTrends() {
     if (!result) return 0;
     let gaps = 0;
     for (let i = 1; i < result.rows.length; i += 1) {
-      const a = Date.parse(result.rows[i - 1].window_start ?? "");
-      const b = Date.parse(result.rows[i].window_start ?? "");
+      const a = featureTime(result.rows[i - 1].window_start);
+      const b = featureTime(result.rows[i].window_start);
       if (Number.isFinite(a) && Number.isFinite(b) && b - a > WINDOW_SECONDS * 1500) gaps += 1;
     }
     return gaps;
   }, [result]);
 
   return (
-    <section className="panel traffic-trends-panel" aria-label="Phase 9 기기별 MQTT Packet 통신 추이">
+    <section className="panel traffic-trends-panel" aria-label="기기별 MQTT Packet 통신 추이">
       <div className="panel-header">
         <div>
-          <h2>기기별 MQTT / Packet 통신 추이 (P9-07)</h2>
+          <h2>기기별 MQTT / Packet 통신 추이</h2>
           <p className="panel-description">기기 한 대와 고정 기간을 선택해 통신 추이를 조회합니다. 표시 시각은 KST입니다.</p>
         </div>
       </div>

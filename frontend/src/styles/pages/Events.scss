@@ -194,9 +194,9 @@
 
   /* ========================================
      PHASE 9 - AI WARNING PANEL
-     JSX: aria-label="Phase 9 AI 경고"
+     JSX: aria-label="AI 경고"
      ======================================== */
-  [aria-label="Phase 9 AI 경고"] {
+  [aria-label="AI 경고"] {
     min-width: 0;
 
     .panel-header {
@@ -293,7 +293,7 @@
       grid-template-columns: 1fr;
     }
 
-    [aria-label="Phase 9 AI 경고"] {
+    [aria-label="AI 경고"] {
       .panel-header {
         flex-direction: column;
         align-items: stretch;

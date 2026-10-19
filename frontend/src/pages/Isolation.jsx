@@ -499,7 +499,7 @@ function Phase9RuntimePanel() {
     <section className="panel phase9-runtime-panel">
       <div className="panel-header">
         <div>
-          <h2>Firewall Runtime Status (Phase 9)</h2>
+          <h2>Firewall Runtime Status </h2>
           <p className="panel-description">DB Rule 상태는 실제 Firewall Runtime 검증을 대체하지 않습니다.</p>
         </div>
         <button type="button" className="button button-secondary" onClick={() => refresh()} disabled={loading}>
@@ -576,7 +576,7 @@ function Phase9ScopeExtension({ rule, adminKey }) {
 
   return (
     <section className="detail-section phase9-admin-section">
-      <h3>Phase 9 · Firewall Scope Extension</h3>
+      <h3>Firewall Scope Extension</h3>
       <p className="text-muted">현재 Rule ID에 대해 관리자 승인형 범위 확대 요청을 보냅니다. 요청 자체를 실제 Firewall 적용으로 표시하지 않습니다. JSON 필드명·제약은 Swagger 스키마와 정확히 일치해야 합니다.</p>
       {!ruleId ? <p className="inline-error">선택된 Source Rule ID가 없어 요청할 수 없습니다.</p> : (
         <div className="recovery-form">
@@ -644,7 +644,7 @@ function Phase9PacketPairRecovery({ adminKey, deviceId }) {
 
   return (
     <section className="detail-section phase9-admin-section">
-      <h3>Phase 9 · Packet Pair Recovery Plan</h3>
+      <h3>Packet Pair Recovery Plan</h3>
       <p className="text-muted">기존 Baseline Recovery와 별도 API입니다. Plan 생성/조회/검증만 다루며 성공 응답을 실제 복구 완료로 간주하지 않습니다. 요청 JSON은 Swagger 명세에 맞춰 입력하세요.</p>
       <div className="recovery-form">
         <div className="filter-item"><label htmlFor="phase9-plan-create">Plan 생성 요청 JSON</label><textarea id="phase9-plan-create" rows={6} value={requestText} disabled={busy || uncertain} onChange={(e) => setRequestText(e.target.value)} placeholder="Swagger에 정의된 Plan 생성 요청 JSON" /></div>

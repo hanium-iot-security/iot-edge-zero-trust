@@ -29,7 +29,7 @@ export default function App() {
           <div className="sidebar-divider" />
 
           <p className="sidebar-section-title">Packet / Gateway</p>
-          <NavLink to="/packet-traffic">Packet Traffic</NavLink>
+          <NavLink to="/packet-traffic">통신 분석</NavLink>
           <NavLink to="/gateway-status">Gateway Status</NavLink>
         </aside>
 

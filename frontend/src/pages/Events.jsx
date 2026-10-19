@@ -1500,7 +1500,7 @@ export default function Events() {
       {/* =====================================================
           Phase 9 - AI Warning (Detection Event와 독립된 근거)
       ===================================================== */}
-      <section className="panel table-panel" aria-label="Phase 9 AI 경고">
+      <section className="panel table-panel" aria-label="AI 경고">
         <div className="panel-header">
           <div>
             <h2>AI 경고</h2>

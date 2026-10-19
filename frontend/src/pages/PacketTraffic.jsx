@@ -494,7 +494,7 @@ function PacketCaptureWindows({ featureRows = [] }) {
     <section className="panel packet-capture-panel">
       <div className="panel-header">
         <div>
-          <h2>Packet Capture Windows (Phase 9)</h2>
+          <h2>Packet Capture Windows</h2>
           <p className="panel-description">
             수집 Window의 상태와 Coverage를 표시합니다. Capture Gap은 AI 추론 실패와 다르며,
             Capture 품질 저하만으로 공격 또는 격리를 의미하지 않습니다.
@@ -509,88 +509,91 @@ function PacketCaptureWindows({ featureRows = [] }) {
           <div><strong>Capture Window 조회 실패</strong><p>{error} {lastUpdated ? "이전에 수신한 데이터를 표시합니다." : ""}</p></div>
         </div>
       )}
-      <div className="packet-capture-query-form">
-        <label className="filter-item" htmlFor="capture-session-input">
-          <span>Session ID (필수)</span>
-          <input
-            id="capture-session-input"
-            list="capture-session-suggestions"
-            value={sessionInput}
-            onChange={(event) => changeSession(event.target.value)}
-            placeholder="실제 capture_session_id"
-            autoComplete="off"
-          />
-          <datalist id="capture-session-suggestions">
-            {sessionOptions.map((option) => <option key={option.id} value={option.id} />)}
-          </datalist>
-        </label>
-        <label className="filter-item" htmlFor="capture-window-from">
-          <span>시작 (KST, 필수)</span>
-          <input id="capture-window-from" type="datetime-local" step="1" value={fromInput}
-            onChange={(event) => { setFromInput(event.target.value); setOffset(0); }} />
-        </label>
-        <label className="filter-item" htmlFor="capture-window-to">
-          <span>종료 (KST, 필수)</span>
-          <input id="capture-window-to" type="datetime-local" step="1" value={toInput}
-            onChange={(event) => { setToInput(event.target.value); setOffset(0); }} />
-        </label>
-      </div>
-      {queryValidation && <p className="command-note" role="status">조회 대기: {queryValidation} 서버로 잘못된 요청을 보내지 않습니다.</p>}
-      <div className="packet-capture-toolbar">
-        <label htmlFor="capture-window-status">표시 상태</label>
-        <select id="capture-window-status" value={filter} onChange={(event) => { setFilter(event.target.value); setOffset(0); }}>
-          <option value="">전체 (조회 구간)</option>
-          <option value="PROCESSED">PROCESSED</option>
-          <option value="EMPTY">EMPTY</option>
-          <option value="MISSING">MISSING</option>
-          <option value="FAILED">FAILED</option>
-          <option value="PENDING">PENDING</option>
-        </select>
-        <small>필터는 조회 구간 전체에 적용됩니다.</small>
-      </div>
-      {!queryKey ? null : loading && !lastUpdated ? (
-        <p className="section-unavailable">Capture Window를 조회하는 중입니다.</p>
-      ) : !lastUpdated ? (
-        <EmptyState title="Capture Window 정보를 확인할 수 없습니다." compact />
-      ) : visibleItems.length === 0 ? (
-        <EmptyState title="표시할 Capture Window가 없습니다." description="조회 결과가 없거나 상태 필터와 일치하지 않습니다." compact />
-      ) : (
-        <div className="table-scroll">
-          <table className="packet-window-table">
-            <thead><tr>
-              <th>Window / Session</th><th>시작</th><th>종료</th><th>상태</th><th>Coverage</th><th>분석 가능</th><th>제외·오류 사유</th>
-            </tr></thead>
-            <tbody>{visibleItems.map((item, index) => {
-              const id = captureWindowField(item, "segment_id", "id", "window_id", "capture_window_id", "capture_session_id", "session_id");
-              const status = captureWindowObservation(item);
-              const coverage = captureWindowField(item, "coverage_ratio");
-              const eligible = captureWindowField(item, "capture_eligible", "eligible");
-              const reason = captureWindowField(item, "capture_exclusion_reason", "exclusion_reason", "segment_error_code", "error_code", "last_error");
-              return (
-                <tr key={`${captureWindowDisplay(id)}-${offset + index}`}>
-                  <td className="packet-window-identifier">{captureWindowDisplay(id)}</td>
-                  <td>{formatKST(captureWindowField(item, "window_start", "started_at", "start_at"))}</td>
-                  <td>{formatKST(captureWindowField(item, "window_end", "ended_at", "end_at"))}</td>
-                  <td><StatusBadge status={CAPTURE_OBSERVATION_THEMES[status] ?? "unknown"} label={status} size="small" /></td>
-                  <td>{formatPercent(coverage)}</td>
-                  <td>{eligible === null ? "-" : eligible === true ? "가능" : eligible === false ? "제외" : captureWindowDisplay(eligible)}</td>
-                  <td>{captureWindowDisplay(reason)}</td>
-                </tr>
-              );
-            })}</tbody>
-          </table>
+      <details className="packet-capture-details">
+        <summary>수집 구간 상세 조회</summary>
+        <div className="packet-capture-query-form">
+          <label className="filter-item" htmlFor="capture-session-input">
+            <span>Session ID (필수)</span>
+            <input
+              id="capture-session-input"
+              list="capture-session-suggestions"
+              value={sessionInput}
+              onChange={(event) => changeSession(event.target.value)}
+              placeholder="실제 capture_session_id"
+              autoComplete="off"
+            />
+            <datalist id="capture-session-suggestions">
+              {sessionOptions.map((option) => <option key={option.id} value={option.id} />)}
+            </datalist>
+          </label>
+          <label className="filter-item" htmlFor="capture-window-from">
+            <span>시작 (KST, 필수)</span>
+            <input id="capture-window-from" type="datetime-local" step="1" value={fromInput}
+              onChange={(event) => { setFromInput(event.target.value); setOffset(0); }} />
+          </label>
+          <label className="filter-item" htmlFor="capture-window-to">
+            <span>종료 (KST, 필수)</span>
+            <input id="capture-window-to" type="datetime-local" step="1" value={toInput}
+              onChange={(event) => { setToInput(event.target.value); setOffset(0); }} />
+          </label>
         </div>
-      )}
-      {lastUpdated && (
-        <div className="packet-capture-footer">
-          <span>마지막 조회: {formatKST(lastUpdated)}</span>
-          <div className="packet-capture-pagination">
-            <button type="button" className="button button-secondary" disabled={loading || offset === 0} onClick={() => setOffset((n) => Math.max(0, n - pageSize))}>이전</button>
-            <span>시작 위치 {total ? offset + 1 : 0} · 전체 {formatNumber(total, 0)}건</span>
-            <button type="button" className="button button-secondary" disabled={loading || !hasNext} onClick={() => setOffset((n) => n + pageSize)}>다음</button>
+        {queryValidation && <p className="command-note" role="status">조회 대기: {queryValidation} 서버로 잘못된 요청을 보내지 않습니다.</p>}
+        <div className="packet-capture-toolbar">
+          <label htmlFor="capture-window-status">표시 상태</label>
+          <select id="capture-window-status" value={filter} onChange={(event) => { setFilter(event.target.value); setOffset(0); }}>
+            <option value="">전체 (조회 구간)</option>
+            <option value="PROCESSED">PROCESSED</option>
+            <option value="EMPTY">EMPTY</option>
+            <option value="MISSING">MISSING</option>
+            <option value="FAILED">FAILED</option>
+            <option value="PENDING">PENDING</option>
+          </select>
+          <small>필터는 조회 구간 전체에 적용됩니다.</small>
+        </div>
+        {!queryKey ? null : loading && !lastUpdated ? (
+          <p className="section-unavailable">Capture Window를 조회하는 중입니다.</p>
+        ) : !lastUpdated ? (
+          <EmptyState title="Capture Window 정보를 확인할 수 없습니다." compact />
+        ) : visibleItems.length === 0 ? (
+          <EmptyState title="표시할 Capture Window가 없습니다." description="조회 결과가 없거나 상태 필터와 일치하지 않습니다." compact />
+        ) : (
+          <div className="table-scroll">
+            <table className="packet-window-table">
+              <thead><tr>
+                <th>Window / Session</th><th>시작</th><th>종료</th><th>상태</th><th>Coverage</th><th>분석 가능</th><th>제외·오류 사유</th>
+              </tr></thead>
+              <tbody>{visibleItems.map((item, index) => {
+                const id = captureWindowField(item, "segment_id", "id", "window_id", "capture_window_id", "capture_session_id", "session_id");
+                const status = captureWindowObservation(item);
+                const coverage = captureWindowField(item, "coverage_ratio");
+                const eligible = captureWindowField(item, "capture_eligible", "eligible");
+                const reason = captureWindowField(item, "capture_exclusion_reason", "exclusion_reason", "segment_error_code", "error_code", "last_error");
+                return (
+                  <tr key={`${captureWindowDisplay(id)}-${offset + index}`}>
+                    <td className="packet-window-identifier">{captureWindowDisplay(id)}</td>
+                    <td>{formatKST(captureWindowField(item, "window_start", "started_at", "start_at"))}</td>
+                    <td>{formatKST(captureWindowField(item, "window_end", "ended_at", "end_at"))}</td>
+                    <td><StatusBadge status={CAPTURE_OBSERVATION_THEMES[status] ?? "unknown"} label={status} size="small" /></td>
+                    <td>{formatPercent(coverage)}</td>
+                    <td>{eligible === null ? "-" : eligible === true ? "가능" : eligible === false ? "제외" : captureWindowDisplay(eligible)}</td>
+                    <td>{captureWindowDisplay(reason)}</td>
+                  </tr>
+                );
+              })}</tbody>
+            </table>
           </div>
-        </div>
-      )}
+        )}
+        {lastUpdated && (
+          <div className="packet-capture-footer">
+            <span>마지막 조회: {formatKST(lastUpdated)}</span>
+            <div className="packet-capture-pagination">
+              <button type="button" className="button button-secondary" disabled={loading || offset === 0} onClick={() => setOffset((n) => Math.max(0, n - pageSize))}>이전</button>
+              <span>시작 위치 {total ? offset + 1 : 0} · 전체 {formatNumber(total, 0)}건</span>
+              <button type="button" className="button button-secondary" disabled={loading || !hasNext} onClick={() => setOffset((n) => n + pageSize)}>다음</button>
+            </div>
+          </div>
+        )}
+      </details>
     </section>
   );
 }
@@ -1592,7 +1595,7 @@ export default function PacketTraffic() {
 
       <PageHeader
 
-        title="Packet Traffic"
+        title="통신 분석"
 
         description="Raspberry Pi에서 수집한 Packet Feature와 실제 Capture 품질을 확인합니다."
 

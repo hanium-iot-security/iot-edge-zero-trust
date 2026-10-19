@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { Link } from "react-router-dom";
 
 import {
   createDevice,
@@ -581,7 +582,7 @@ function DeviceAiManagement({ deviceId, registration }) {
       <section className="detail-section">
         <div className="section-heading">
           <div>
-            <h3>AI 정책 관리 (Phase 9)</h3>
+            <h3>AI 정책 관리</h3>
             <p>
               기기별 MQTT/Packet 공통 AI 모드를 설정합니다.
               AI 경고만으로 Trust Score 감점이나 격리를 수행하지 않습니다.
@@ -674,7 +675,7 @@ function DeviceAiManagement({ deviceId, registration }) {
                   <option value="OBSERVE">OBSERVE</option>
                 </select>
                 <small className="help-text">
-                  OBSERVE는 관찰 모드입니다. ENFORCE는 Phase 9 범위 밖입니다.
+                  OBSERVE는 관찰 모드입니다. ENFORCE는 현재 지원하지 않습니다.
                 </small>
               </div>
 
@@ -1947,6 +1948,21 @@ export default function Devices() {
               ))}
             </section>
 
+            <section className="detail-section">
+              <div className="section-heading">
+                <div>
+                  <h3>통신 추이</h3>
+                  <p>기간별 MQTT·Packet 상세 그래프를 통신 분석에서 확인합니다.</p>
+                </div>
+                <Link
+                  className="button button-secondary"
+                  to={`/packet-traffic?device_id=${encodeURIComponent(selectedDevice.device_id)}`}
+                >
+                  이 기기의 통신 추이 보기
+                </Link>
+              </div>
+            </section>
+
             {/* Existing Rule Policy */}
             <section className="detail-section">
               <div className="section-heading">
@@ -2012,7 +2028,7 @@ export default function Devices() {
             <section className="detail-section">
               <h3>기기별 Rule 정책 변경</h3>
               <p className="text-muted">
-                Rule 정책과 Phase 9 AI 정책은 별개로 관리됩니다.
+                Rule 정책과 AI 정책은 별개로 관리됩니다.
               </p>
 
               <div className="policy-form-grid">

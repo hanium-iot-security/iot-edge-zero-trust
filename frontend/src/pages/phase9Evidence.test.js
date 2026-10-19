@@ -106,19 +106,6 @@ test("cached completion evidence expires with its snapshot and marks failed refr
   assert.equal(completion.freshness, "FRESH");
 });
 
-test("model cards show artifact validation and configured identity separately from runtime", async () => {
-  const { ModelCard } = await page("GatewayStatus", ["ModelCard"]);
-  const card = ModelCard({ model: {
-    detector: "mqtt_if", artifact_status: "INVALID", configured_model_version: "mqtt-v2",
-    configured_bundle_sha256: "a".repeat(64), error_code: "BUNDLE_HASH_MISMATCH",
-    checks: { bundle_sha256_verified: false, inference_verified: false },
-    runtime: { status: "UNKNOWN", reason_code: "RUNTIME_MODEL_EVIDENCE_NOT_AVAILABLE" },
-  }, index: 0 });
-  assert.ok([...nodes(card)].some((node) => node.type === "StatusBadge" && node.props.label === "INVALID"));
-  for (const value of ["mqtt-v2", "a".repeat(64), "BUNDLE_HASH_MISMATCH", "RUNTIME_MODEL_EVIDENCE_NOT_AVAILABLE"]) assert.ok(text(card).includes(value));
-  assert.ok(!text(card).includes("Framework"));
-});
-
 const warning = {
   id: 1, device_id: "pico_01", detector_name: "packet_if", event_type: "AI_PACKET_ANOMALY",
   model_version: "packet-v2", bucket_start: observedAt, bucket_end: "2026-10-15T07:10:00Z",

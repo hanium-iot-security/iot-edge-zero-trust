@@ -7,7 +7,6 @@ import {
   getPacketCaptureWindows,
   getEvents,
 
-  getFeatureLogs,
 
   getDevices,
 
@@ -27,25 +26,7 @@ import {
 
 } from "../api/api";
 
-import {
 
-  CartesianGrid,
-
-  Legend,
-
-  Line,
-
-  LineChart,
-
-  ResponsiveContainer,
-
-  Tooltip,
-
-  XAxis,
-
-  YAxis,
-
-} from "recharts";
 
 import DataTable from "../components/DataTable";
 
@@ -77,7 +58,6 @@ const SOURCE_KEYS = [
 
   "logs",
 
-  "features",
 
   "events",
 
@@ -180,40 +160,6 @@ function formatKST(dateString) {
     month: "2-digit",
 
     day: "2-digit",
-
-    hour: "2-digit",
-
-    minute: "2-digit",
-
-    second: "2-digit",
-
-    hour12: false,
-
-  }).format(date);
-
-}
-
-
-
-function formatChartTime(dateString) {
-
-  if (!dateString) {
-
-    return "-";
-
-  }
-
-  const date = new Date(dateString);
-
-  if (Number.isNaN(date.getTime())) {
-
-    return "-";
-
-  }
-
-  return new Intl.DateTimeFormat("ko-KR", {
-
-    timeZone: "Asia/Seoul",
 
     hour: "2-digit",
 
@@ -753,20 +699,6 @@ function getCaptureSummary(packetFeatures) {
 
 
 
-function getFeatureChartData(features) {
-
-  return features.map((item) => ({
-
-    ...item,
-
-    chart_time: formatChartTime(item.window_start),
-
-  }));
-
-}
-
-
-
 function formatResourceValue(value) {
 
   if (value === null || value === undefined || value === "") {
@@ -899,7 +831,6 @@ export default function Dashboard() {
 
   const [logs, setLogs] = useState([]);
 
-  const [features, setFeatures] = useState([]);
 
   const [events, setEvents] = useState([]);
 
@@ -999,16 +930,6 @@ export default function Dashboard() {
         label: "MQTT 로그",
 
         request: getMqttLogs({ limit: 5, offset: 0 }, options),
-
-      },
-
-      {
-
-        key: "features",
-
-        label: "MQTT Feature",
-
-        request: getFeatureLogs({ limit: 20, offset: 0 }, options),
 
       },
 
@@ -1137,12 +1058,6 @@ export default function Dashboard() {
           case "logs":
 
             setLogs(Array.isArray(data?.items) ? data.items : []);
-
-            break;
-
-          case "features":
-
-            setFeatures(Array.isArray(data?.items) ? data.items : []);
 
             break;
 
@@ -1468,16 +1383,6 @@ export default function Dashboard() {
   );
 
   const healthStatus = useMemo(() => getHealthStatus(health), [health]);
-
-  const featureChartData = useMemo(
-
-    () => getFeatureChartData(features),
-
-    [features]
-
-  );
-
-
 
   const deviceMap = useMemo(
 
@@ -2632,7 +2537,7 @@ export default function Dashboard() {
 
 
             {/* Phase 9: 새 API는 Trust/Firewall 운영 판정과 분리하여 표시 */}
-            <section className="panel" aria-label="Phase 9 AI 및 Packet 운영 상태">
+            <section className="panel" aria-label="AI 및 Packet 운영 상태">
               <div className="panel-header">
                 <div>
                   <h2>AI 분석 및 Packet Capture 현황</h2>
@@ -3311,180 +3216,6 @@ export default function Dashboard() {
                 <div className="section-unavailable">
 
                   {loading ? "Trust Score를 조회하는 중입니다." : "Trust Score를 확인할 수 없습니다."}
-
-                </div>
-
-              )}
-
-            </section>
-
-
-
-            <section className="panel">
-
-              <div className="panel-header">
-
-                <div>
-
-                  <h2>MQTT Feature Graph</h2>
-
-                  <p className="panel-description">
-
-                    10초 Window별 MQTT 발행량, Payload 크기, 메시지 간격을 표시합니다.
-
-                  </p>
-
-                </div>
-
-                <span className={`data-count ${!sourceHasSuccess("features") ? "unavailable" : ""}`}>
-
-                  {sourceHasSuccess("features")
-
-                    ? `${formatNumber(features.length)}개 Window`
-
-                    : "확인 불가"}
-
-                </span>
-
-              </div>
-
-              <SourceStateNotice state={sourceState.features} label="MQTT Feature" />
-
-              {!sourceHasSuccess("features") ? (
-
-                <div className="section-unavailable">
-
-                  {loading ? "그래프 데이터를 조회하는 중입니다." : "MQTT Feature를 확인할 수 없습니다."}
-
-                </div>
-
-              ) : features.length === 0 ? (
-
-                <EmptyState
-
-                  title="표시할 Feature Log가 없습니다."
-
-                  description="조회는 성공했지만 최근 MQTT Feature 데이터가 없습니다."
-
-                  compact
-
-                />
-
-              ) : (
-
-                <div className="chart-wrap">
-
-                  <ResponsiveContainer width="100%" height={360}>
-
-                    <LineChart
-
-                      data={featureChartData}
-
-                      margin={{ top: 10, right: 20, left: 0, bottom: 10 }}
-
-                    >
-
-                      <CartesianGrid strokeDasharray="3 3" />
-
-                      <XAxis dataKey="chart_time" minTickGap={25} />
-
-                      <YAxis />
-
-                      <Tooltip
-
-                        labelFormatter={(_, payload) =>
-
-                          formatKST(payload?.[0]?.payload?.window_start)
-
-                        }
-
-                      />
-
-                      <Legend />
-
-                      <Line
-
-                        type="monotone"
-
-                        dataKey="publish_count"
-
-                        stroke="#2563eb"
-
-                        strokeWidth={3}
-
-                        dot={false}
-
-                        name="Publish Count"
-
-                      />
-
-                      <Line
-
-                        type="monotone"
-
-                        dataKey="avg_payload_size"
-
-                        stroke="#16a34a"
-
-                        strokeWidth={2}
-
-                        dot={false}
-
-                        name="Avg Payload Size"
-
-                      />
-
-                      <Line
-
-                        type="monotone"
-
-                        dataKey="max_payload_size"
-
-                        stroke="#ef4444"
-
-                        strokeWidth={3}
-
-                        dot={false}
-
-                        name="Max Payload Size"
-
-                      />
-
-                      <Line
-
-                        type="monotone"
-
-                        dataKey="avg_message_interval"
-
-                        stroke="#9333ea"
-
-                        strokeWidth={2}
-
-                        dot={false}
-
-                        name="Avg Message Interval"
-
-                      />
-
-                      <Line
-
-                        type="monotone"
-
-                        dataKey="min_message_interval"
-
-                        stroke="#f97316"
-
-                        strokeWidth={2}
-
-                        dot={false}
-
-                        name="Min Message Interval"
-
-                      />
-
-                    </LineChart>
-
-                  </ResponsiveContainer>
 
                 </div>
 

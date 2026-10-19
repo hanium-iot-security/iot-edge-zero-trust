@@ -1,3 +1,188 @@
+.packet-page {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+
+  margin: 0 auto;
+
+
+  /* =========================================================
+     Table
+     ========================================================= */
+
+  .table-panel {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+
+    overflow: hidden;
+  }
+
+  .table-scroll {
+    display: block;
+
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+
+    overflow-x: auto;
+    overflow-y: hidden;
+
+    box-sizing: border-box;
+
+    -webkit-overflow-scrolling: touch;
+
+    > * {
+      max-width: none;
+    }
+  }
+
+
+  /* =========================================================
+     Table Cells
+     ========================================================= */
+
+  .truncate {
+    display: block;
+
+    max-width: 110px;
+
+    overflow: hidden;
+
+    font-family:
+      ui-monospace,
+      SFMono-Regular,
+      Menlo,
+      Consolas,
+      monospace;
+
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .device {
+    display: flex;
+
+    flex-direction: column;
+    align-items: flex-start;
+
+    gap: 5px;
+
+    small {
+      color: var(--color-slate-500);
+    }
+  }
+
+  .window {
+    display: flex;
+
+    min-width: 185px;
+
+    flex-direction: column;
+
+    gap: 3px;
+
+    white-space: nowrap;
+  }
+
+  .window-separator {
+    color: var(--color-slate-400);
+
+    font-size: 11px;
+  }
+
+  .metric-highlight {
+    color: var(--color-primary-dark);
+
+    font-weight: 800;
+  }
+
+
+  /* =========================================================
+     Packet Quality
+     ========================================================= */
+
+  .capture-quality {
+    display: flex;
+
+    flex-direction: column;
+
+    gap: 6px;
+  }
+
+  .coverage {
+    display: flex;
+
+    min-width: 90px;
+
+    flex-direction: column;
+
+    gap: 6px;
+  }
+
+  .coverage-bar {
+    width: 100%;
+    height: 6px;
+
+    overflow: hidden;
+
+    border-radius: var(--radius-pill);
+
+    background: var(--color-slate-200);
+  }
+
+  .coverage-fill {
+    height: 100%;
+
+    border-radius: inherit;
+
+    background: var(--color-primary);
+  }
+
+  .rate {
+    display: flex;
+
+    flex-direction: column;
+
+    gap: 4px;
+
+    small {
+      color: var(--color-slate-500);
+    }
+  }
+
+
+  /* =========================================================
+     Row State
+     ========================================================= */
+
+  .row-warning {
+    background: #fffbeb;
+
+    &:hover {
+      background: #fef3c7;
+    }
+  }
+
+  .row-danger {
+    background: #fef2f2;
+
+    &:hover {
+      background: #fee2e2;
+    }
+  }
+
+
+  /* =========================================================
+     Responsive
+     ========================================================= */
+
+  @media (max-width: 760px) {
+    .window {
+      min-width: 160px;
+    }
+  }
+}
 /* Phase 9: 필수 Session 및 기간 입력. 기존 PacketTraffic.scss 끝에 추가 */
 .packet-page {
   .packet-capture-query-form {
@@ -10,4 +195,29 @@
     .filter-item input { width: 100%; min-width: 0; max-width: 100%; box-sizing: border-box; }
   }
   @media (max-width: 920px) { .packet-capture-query-form { grid-template-columns: 1fr; } }
+}
+
+.packet-page {
+  .packet-capture-details > summary {
+    cursor: pointer;
+    color: var(--color-slate-700);
+    font-size: 13px;
+    font-weight: 700;
+    padding: 10px 0;
+  }
+  .packet-capture-toolbar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin: 14px 0;
+    font-size: 12px;
+    select {
+      padding: 8px 10px;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--color-slate-700);
+    }
+  }
 }

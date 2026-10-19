@@ -10,7 +10,6 @@ import {
 import {
   getGatewayMetrics,
   getRuntimeStatus,
-  getModels,
 } from "../api/api";
 
 import EmptyState from "../components/EmptyState";
@@ -607,76 +606,6 @@ function extractCompletionItems(data, runtimeFreshness, now = Date.now()) {
 }
 
 /* =========================================================
-   Phase 9 - Model Helpers
-========================================================= */
-
-function extractModels(data) {
-  if (Array.isArray(data)) {
-    return data;
-  }
-
-  if (Array.isArray(data?.items)) {
-    return data.items;
-  }
-
-  if (Array.isArray(data?.models)) {
-    return data.models;
-  }
-
-  return [];
-}
-
-function ModelCard({ model, index }) {
-  const name = model.detector;
-  const version = model.configured_model_version;
-  const status = model.artifact_status;
-  const detector = model.detector;
-
-  return (
-    <article className="ai-model-card">
-      <div className="ai-runtime-card-header">
-        <strong>
-          {displayValue(name ?? `Model ${index + 1}`)}
-        </strong>
-
-        <StatusBadge
-          status={status === "INVALID" ? "danger" : "unknown"}
-          label={status == null ? "상태 미제공" : displayValue(status)}
-          size="small"
-        />
-      </div>
-
-      <dl className="ai-runtime-list">
-        <div>
-          <dt>Version</dt>
-          <dd>{displayValue(version)}</dd>
-        </div>
-
-        <div>
-          <dt>Detector</dt>
-          <dd>{displayValue(detector)}</dd>
-        </div>
-
-        <div>
-          <dt>Bundle SHA256</dt>
-          <dd>{displayValue(model.configured_bundle_sha256)}</dd>
-        </div>
-
-        <div><dt>Runtime</dt><dd>{displayValue(model.runtime?.status)}</dd></div>
-        <div><dt>Runtime Reason</dt><dd>{displayValue(model.runtime?.reason_code)}</dd></div>
-        {model.error_code && (
-          <div className="ai-runtime-error"><dt>Error</dt><dd>{model.error_code}</dd></div>
-        )}
-      </dl>
-      <details className="ai-runtime-raw">
-        <summary>모델 검증 근거</summary>
-        <pre>{JSON.stringify(model.checks, null, 2)}</pre>
-      </details>
-    </article>
-  );
-}
-
-/* =========================================================
    Gateway Status Page
 ========================================================= */
 
@@ -695,19 +624,14 @@ export default function GatewayStatus() {
   const [runtimeError, setRuntimeError] = useState("");
   const [runtimeUpdatedAt, setRuntimeUpdatedAt] = useState("");
 
-  const [modelsData, setModelsData] = useState(null);
-  const [modelsLoading, setModelsLoading] = useState(true);
-  const [modelsError, setModelsError] = useState("");
 
   const [now, setNow] = useState(Date.now());
 
   const gatewayControllerRef = useRef(null);
   const runtimeControllerRef = useRef(null);
-  const modelsControllerRef = useRef(null);
 
   const gatewayRequestIdRef = useRef(0);
   const runtimeRequestIdRef = useRef(0);
-  const modelsRequestIdRef = useRef(0);
 
   const hasSuccessfulResponseRef = useRef(false);
 
@@ -830,65 +754,12 @@ export default function GatewayStatus() {
   }, []);
 
   /* ---------------------------------------------------------
-     Models API
-  --------------------------------------------------------- */
-
-  const loadModels = useCallback(async () => {
-    modelsControllerRef.current?.abort();
-
-    const controller = new AbortController();
-    modelsControllerRef.current = controller;
-
-    const requestId = ++modelsRequestIdRef.current;
-    setModelsLoading(true);
-
-    try {
-      const data = await getModels({
-        signal: controller.signal,
-      });
-
-      if (
-        controller.signal.aborted ||
-        requestId !== modelsRequestIdRef.current
-      ) {
-        return;
-      }
-
-      const root = normalizeApiRoot(data);
-
-      if (root === null || typeof root !== "object") {
-        throw new Error("Models API 응답 형식이 올바르지 않습니다.");
-      }
-
-      setModelsData(root);
-      setModelsError("");
-    } catch (err) {
-      if (
-        controller.signal.aborted ||
-        err?.isCanceled ||
-        requestId !== modelsRequestIdRef.current
-      ) {
-        return;
-      }
-
-      setModelsError(
-        err?.message || "AI 모델 목록을 불러오지 못했습니다."
-      );
-    } finally {
-      if (requestId === modelsRequestIdRef.current) {
-        setModelsLoading(false);
-      }
-    }
-  }, []);
-
-  /* ---------------------------------------------------------
      Polling and Cleanup
   --------------------------------------------------------- */
 
   useEffect(() => {
     loadGatewayMetrics();
     loadRuntimeStatus();
-    loadModels();
 
     const pollingTimer = window.setInterval(() => {
       loadGatewayMetrics();
@@ -900,16 +771,13 @@ export default function GatewayStatus() {
 
       gatewayRequestIdRef.current += 1;
       runtimeRequestIdRef.current += 1;
-      modelsRequestIdRef.current += 1;
 
       gatewayControllerRef.current?.abort();
       runtimeControllerRef.current?.abort();
-      modelsControllerRef.current?.abort();
     };
   }, [
     loadGatewayMetrics,
     loadRuntimeStatus,
-    loadModels,
   ]);
 
   useEffect(() => {
@@ -1000,11 +868,6 @@ export default function GatewayStatus() {
     [runtimeData, runtimeItems, now]
   );
 
-  const modelItems = useMemo(
-    () => extractModels(modelsData),
-    [modelsData]
-  );
-
   const actualRuntimeStatus = runtimeItems[0]?.status ?? "UNKNOWN";
   const actualRuntimeKnown = actualRuntimeStatus !== "UNKNOWN";
 
@@ -1015,7 +878,6 @@ export default function GatewayStatus() {
   function handleRefresh() {
     loadGatewayMetrics(true);
     loadRuntimeStatus();
-    loadModels();
   }
 
   /* ---------------------------------------------------------
@@ -1034,7 +896,7 @@ export default function GatewayStatus() {
         }
         onRefresh={handleRefresh}
         refreshing={
-          refreshing || runtimeLoading || modelsLoading
+          refreshing || runtimeLoading
         }
       />
 
@@ -1198,97 +1060,6 @@ export default function GatewayStatus() {
               <summary>Runtime 원본 응답 확인</summary>
               <pre>
                 {JSON.stringify(runtimeData, null, 2)}
-              </pre>
-            </details>
-          </>
-        )}
-      </section>
-
-      {/* =====================================================
-          Phase 9 - Model Information
-      ===================================================== */}
-
-      <section className="panel">
-        <div className="panel-header">
-          <div>
-            <h2>AI Models</h2>
-            <p className="panel-description">
-              등록 모델 메타데이터를 조회합니다.
-              목록 존재 여부는 실제 모델 적재 및 추론 성공과 다릅니다.
-            </p>
-          </div>
-
-          <button
-            type="button"
-            className="button button-ghost"
-            onClick={loadModels}
-            disabled={modelsLoading}
-          >
-            모델 새로고침
-          </button>
-        </div>
-
-        {modelsError && (
-          <div
-            className="page-warning-banner"
-            role="alert"
-          >
-            <div>
-              <strong>AI Models 조회 실패</strong>
-              <p>{modelsError}</p>
-            </div>
-          </div>
-        )}
-
-        {modelsLoading && !modelsData ? (
-          <LoadingState
-            title="AI 모델 정보를 불러오는 중입니다."
-            compact
-          />
-        ) : !modelsData ? (
-          <EmptyState
-            title="모델 정보를 확인할 수 없습니다."
-            compact
-          />
-        ) : modelItems.length === 0 ? (
-          <>
-            <EmptyState
-              title="표시할 모델이 없습니다."
-              description="등록된 모델이 없거나 응답 구조가 예상과 다를 수 있습니다."
-              compact
-            />
-
-            <details className="ai-runtime-raw">
-              <summary>Models 원본 응답 확인</summary>
-              <pre>
-                {JSON.stringify(modelsData, null, 2)}
-              </pre>
-            </details>
-          </>
-        ) : (
-          <>
-            <div className="ai-model-grid">
-              {modelItems.map((model, index) => (
-                <ModelCard
-                  key={
-                    String(
-                      firstDefined(model, [
-                        "id",
-                        "model_id",
-                        "name",
-                      ]) ?? index
-                    ) + index
-                  }
-                  model={model}
-                  index={index}
-                />
-              ))}
-            </div>
-
-            <details className="ai-runtime-raw">
-              <summary>Models 원본 응답 확인</summary>
-              <pre>
-                {JSON.stringify(modelsData, null, 2)}
               </pre>
             </details>
           </>
