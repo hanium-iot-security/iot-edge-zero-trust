@@ -45,6 +45,7 @@ import {
 } from "../utils/packetCaptureStatus";
 
 import DeviceTrafficTrends from "../components/DeviceTrafficTrends";
+import DateTimePicker from "../components/DateTimePicker";
 import "../styles/pages/PacketTraffic.scss"
 
 const DEFAULT_LIMIT = 20;
@@ -527,16 +528,16 @@ function PacketCaptureWindows({ featureRows = [] }) {
               {sessionOptions.map((option) => <option key={option.id} value={option.id} />)}
             </datalist>
           </label>
-          <label className="filter-item" htmlFor="capture-window-from">
-            <span>시작 (KST, 필수)</span>
-            <input id="capture-window-from" type="datetime-local" step="1" value={fromInput}
-              onChange={(event) => { setFromInput(event.target.value); setOffset(0); }} />
-          </label>
-          <label className="filter-item" htmlFor="capture-window-to">
-            <span>종료 (KST, 필수)</span>
-            <input id="capture-window-to" type="datetime-local" step="1" value={toInput}
-              onChange={(event) => { setToInput(event.target.value); setOffset(0); }} />
-          </label>
+          <div className="filter-item">
+            <label htmlFor="capture-window-from">시작 (KST, 필수)</label>
+            <DateTimePicker id="capture-window-from" label="수집 구간 시작 (KST)" withSeconds value={fromInput}
+              onChange={(value) => { setFromInput(value); setOffset(0); }} />
+          </div>
+          <div className="filter-item">
+            <label htmlFor="capture-window-to">종료 (KST, 필수)</label>
+            <DateTimePicker id="capture-window-to" label="수집 구간 종료 (KST)" withSeconds value={toInput}
+              onChange={(value) => { setToInput(value); setOffset(0); }} />
+          </div>
         </div>
         {queryValidation && <p className="command-note" role="status">조회 대기: {queryValidation} 서버로 잘못된 요청을 보내지 않습니다.</p>}
         <div className="packet-capture-toolbar">

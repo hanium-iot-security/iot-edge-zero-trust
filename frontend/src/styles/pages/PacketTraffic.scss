@@ -191,7 +191,7 @@
     gap: 12px;
     margin: 12px 0;
     .filter-item { min-width: 0; }
-    .filter-item span { display: block; margin-bottom: 6px; font-size: 12px; font-weight: 700; }
+    .filter-item > span, .filter-item > label { display: block; margin-bottom: 6px; font-size: 12px; font-weight: 700; }
     .filter-item input { width: 100%; min-width: 0; max-width: 100%; box-sizing: border-box; }
   }
   @media (max-width: 920px) { .packet-capture-query-form { grid-template-columns: 1fr; } }

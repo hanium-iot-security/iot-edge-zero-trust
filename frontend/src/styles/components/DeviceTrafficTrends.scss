@@ -31,6 +31,8 @@
       font: inherit;
     }
 
+    .traffic-date-field { display: flex; min-width: 0; flex-direction: column; gap: 6px; }
+
     .button { min-height: 38px; }
   }
 

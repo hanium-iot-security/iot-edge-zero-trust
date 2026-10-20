@@ -17,6 +17,7 @@ import {
   getPacketFeatureLogs,
   getPacketCaptureWindows,
 } from "../api/api";
+import DateTimePicker from "./DateTimePicker";
 import "../styles/components/DeviceTrafficTrends.scss";
 
 // Phase 9 P9-07: 한 기기와 고정 기간을 대상으로 한 조회. 서버 한 페이지는 최대 500건.
@@ -456,12 +457,14 @@ export default function DeviceTrafficTrends() {
             {deviceOptions.map((id) => <option key={id} value={id}>{id}</option>)}
           </select>
         </label>
-        <label>시작 (KST)
-          <input type="datetime-local" value={fromInput} onChange={(e) => setFromInput(e.target.value)} />
-        </label>
-        <label>종료 (KST)
-          <input type="datetime-local" value={toInput} onChange={(e) => setToInput(e.target.value)} />
-        </label>
+        <div className="traffic-date-field">
+          <label htmlFor="traffic-from">시작 (KST)</label>
+          <DateTimePicker id="traffic-from" label="시작 (KST)" value={fromInput} onChange={setFromInput} />
+        </div>
+        <div className="traffic-date-field">
+          <label htmlFor="traffic-to">종료 (KST)</label>
+          <DateTimePicker id="traffic-to" label="종료 (KST)" value={toInput} onChange={setToInput} />
+        </div>
         {tab === "packet" && (
           <label>통신 방향
             <select value={direction} onChange={(e) => setDirection(e.target.value)}>
