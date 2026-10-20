@@ -1603,13 +1603,13 @@ export default function Devices() {
           </section>
           <section className="summary-card-grid">
             <SummaryCard title="전체 기기" value={total} description="현재 필터 기준" />
-            <SummaryCard title="정상" value={summary.normal} status="normal" />
-            <SummaryCard title="주의" value={summary.warning} status="warning" />
-            <SummaryCard title="위험" value={summary.danger} status="danger" />
-            <SummaryCard title="격리" value={summary.isolated} status="isolated" />
-            <SummaryCard title="방화벽 적용" value={summary.firewallApplied} status="normal" />
-            <SummaryCard title="방화벽 대기" value={summary.firewallPending} status="warning" />
-            <SummaryCard title="방화벽 실패" value={summary.firewallFailed} status="danger" />
+            <SummaryCard title="정상" value={summary.normal} description="신뢰점수 80 이상" status="normal" />
+            <SummaryCard title="주의" value={summary.warning} description="신뢰점수 60~79" status="warning" />
+            <SummaryCard title="위험" value={summary.danger} description="신뢰점수 30~59" status="danger" />
+            <SummaryCard title="격리" value={summary.isolated} description="신뢰점수 30 미만" status="isolated" />
+            <SummaryCard title="방화벽 적용" value={summary.firewallApplied} description="실제 차단 규칙 적용" status="normal" />
+            <SummaryCard title="방화벽 대기" value={summary.firewallPending} description="차단 규칙 적용 대기" status="warning" />
+            <SummaryCard title="방화벽 실패" value={summary.firewallFailed} description="차단 규칙 적용 실패" status="danger" />
           </section>
         </>
       )}
