@@ -1,3 +1,4 @@
+import { uiLabel } from "../utils/uiText";
 import {
 
   useCallback,
@@ -206,7 +207,7 @@ function getAppliedStatus(event) {
 
       status: "degraded",
 
-      label: "Capture Gap 미반영",
+      label: "수집 공백 미반영",
 
     };
 
@@ -222,7 +223,7 @@ function getAppliedStatus(event) {
 
       status: "scored",
 
-      label: "Score 반영",
+      label: "점수 반영",
 
     };
 
@@ -244,7 +245,7 @@ function getProcessingReasonLabel(reason) {
 
     REPRESENTATIVE_RULE_EVENT:
 
-      "대표 Rule 이벤트",
+      "대표 규칙 이벤트",
 
     AI_SUPPORTING_EVIDENCE:
 
@@ -252,7 +253,7 @@ function getProcessingReasonLabel(reason) {
 
     CAPTURE_GAP_UNSCORED:
 
-      "Capture Gap으로 미반영",
+      "수집 공백으로 미반영",
 
     UNMAPPED_SUBJECT_IP:
 
@@ -264,11 +265,11 @@ function getProcessingReasonLabel(reason) {
 
     WINDOW_ALREADY_PROCESSED:
 
-      "이미 처리된 Window",
+      "이미 처리된 분석 구간",
 
     SCORE_CAP_APPLIED:
 
-      "Window 감점 상한 적용",
+      "분석 구간 감점 상한 적용",
 
   };
 
@@ -292,15 +293,15 @@ function getIncidentFamilyLabel(
 
   const labels = {
 
-    IDENTITY: "Identity",
+    IDENTITY: "기기 식별",
 
-    MESSAGE_POLICY: "Message Policy",
+    MESSAGE_POLICY: "메시지 정책",
 
-    FLOODING: "Flooding",
+    FLOODING: "트래픽 폭주",
 
-    NETWORK_POLICY: "Network Policy",
+    NETWORK_POLICY: "네트워크 정책",
 
-    SCAN: "Port Scan",
+    SCAN: "포트 스캔",
 
     AI_ONLY: "AI 단독 이상탐지",
 
@@ -536,7 +537,7 @@ export default function Events() {
       const data = await getEvents(params, { signal: controller.signal });
       if (controller.signal.aborted || eventsRequestRef.current.id !== requestId) return;
       if (!Array.isArray(data?.items)) {
-        throw new Error("Detection Events API 응답에 items 목록이 없습니다.");
+        throw new Error("탐지 Events API 응답에 items 목록이 없습니다.");
       }
       const parsedTotal = Number(data?.total);
       setEvents(data.items);
@@ -925,7 +926,7 @@ export default function Events() {
       width: 220,
       render: (_value, warning) => (
         <span className="event-name" title={warningText(warningField(warning, ["warning_type", "event_type", "type", "reason"]))}>
-          {warningText(warningField(warning, ["warning_type", "event_type", "type", "reason"]))}
+          {uiLabel(warningField(warning, ["warning_type", "event_type", "type", "reason"]))}
         </span>
       ),
     },
@@ -952,7 +953,7 @@ export default function Events() {
       width: 125,
       render: (_value, warning) => (
         <div className="device-info">
-          <span>{warningText(warning.last_decision)}</span>
+          <span>{uiLabel(warning.last_decision)}</span>
           <small>{warning.closed ? "마감" : "진행 중"} / 억제 {warningText(warning.suppressed_count)}회</small>
         </div>
       ),
@@ -965,7 +966,7 @@ export default function Events() {
 
       key: "detected_at",
 
-      header: "Detected At",
+      header: "탐지 시각",
 
       width: 180,
 
@@ -979,7 +980,7 @@ export default function Events() {
 
       key: "device_id",
 
-      header: "Device / Subject IP",
+      header: "기기 / 대상 IP",
 
       width: 170,
 
@@ -1013,7 +1014,7 @@ export default function Events() {
 
       key: "detector_type",
 
-      header: "Detector",
+      header: "탐지 방식",
 
       width: 100,
 
@@ -1051,7 +1052,7 @@ export default function Events() {
 
       key: "event_type",
 
-      header: "Event Type",
+      header: "탐지 유형",
 
       width: 210,
 
@@ -1065,7 +1066,7 @@ export default function Events() {
 
         >
 
-          {value || "-"}
+          {uiLabel(value || "-")}
 
         </span>
 
@@ -1077,7 +1078,7 @@ export default function Events() {
 
       key: "incident_family",
 
-      header: "Incident Family",
+      header: "사건 분류",
 
       width: 160,
 
@@ -1113,7 +1114,7 @@ export default function Events() {
 
       key: "severity",
 
-      header: "Severity",
+      header: "심각도",
 
       width: 100,
 
@@ -1149,7 +1150,7 @@ export default function Events() {
 
       key: "score_delta",
 
-      header: "Score Delta",
+      header: "정책상 점수 변화량",
 
       align: "right",
 
@@ -1183,7 +1184,7 @@ export default function Events() {
 
       key: "applied_to_score",
 
-      header: "Trust 반영",
+      header: "신뢰점수 반영",
 
       width: 150,
 
@@ -1267,9 +1268,9 @@ export default function Events() {
 
       <PageHeader
 
-        title="Detection Events"
+        title="탐지 이벤트"
 
-        description="Rule·AI 탐지 이벤트의 처리 근거와 Score 반영 여부를 확인하고, AI 경고를 별도로 조회합니다."
+        description="규칙·AI 탐지 이벤트의 처리 근거와 점수 반영 여부를 확인하고, AI 경고를 별도로 조회합니다."
 
         updatedAt={
 
@@ -1375,7 +1376,7 @@ export default function Events() {
 
             <SummaryCard
 
-              title="High"
+              title="높음"
 
               value={formatNumber(
 
@@ -1385,7 +1386,7 @@ export default function Events() {
 
               )}
 
-              description="현재 페이지 High Severity"
+              description="현재 페이지 심각도 높음"
 
               status={
 
@@ -1401,7 +1402,7 @@ export default function Events() {
 
             <SummaryCard
 
-              title="Rule 탐지"
+              title="규칙 탐지"
 
               value={formatNumber(
 
@@ -1411,7 +1412,7 @@ export default function Events() {
 
               )}
 
-              description="현재 페이지 Rule 기반 탐지"
+              description="현재 페이지 규칙 기반 탐지"
 
               status="rule"
 
@@ -1437,7 +1438,7 @@ export default function Events() {
 
             <SummaryCard
 
-              title="Trust 반영"
+              title="신뢰점수 반영"
 
               value={formatNumber(
 
@@ -1447,13 +1448,13 @@ export default function Events() {
 
               )}
 
-              description="현재 페이지에서 Score에 반영된 이벤트"
+              description="현재 페이지에서 점수에 반영된 이벤트"
 
             />
 
             <SummaryCard
 
-              title="Trust 미반영"
+              title="신뢰점수 미반영"
 
               value={formatNumber(
 
@@ -1479,7 +1480,7 @@ export default function Events() {
 
               )}
 
-              description="Capture Gap으로 Score 미반영"
+              description="수집 공백으로 점수 미반영"
 
               status={
 
@@ -1506,7 +1507,7 @@ export default function Events() {
             <h2>AI 경고</h2>
             <p className="panel-description">
               AI 이상징후 및 경고 기록입니다. AI 경고는 보조 근거이며,
-              경고 발생만으로 Trust Score 감점이나 자동 격리가 확정되지 않습니다.
+              경고 발생만으로 신뢰점수 감점이나 자동 격리가 확정되지 않습니다.
             </p>
           </div>
           <button
@@ -1548,7 +1549,7 @@ export default function Events() {
                 minWidth={970}
                 tableLabel="AI 경고 목록"
                 emptyTitle="표시할 AI 경고가 없습니다."
-                emptyDescription="현재 페이지에 조회된 AI 경고가 없습니다. AI Runtime 상태는 별도로 확인해야 합니다."
+                emptyDescription="현재 페이지에 조회된 AI 경고가 없습니다. AI 실행 상태는 별도로 확인해야 합니다."
                 onRowClick={setSelectedAiWarning}
               />
             </div>
@@ -1580,7 +1581,7 @@ export default function Events() {
 
             <p className="panel-description">
 
-              서버 Filter와 현재 페이지
+              서버 필터와 현재 페이지
 
               검색을 함께 사용할 수 있습니다.
 
@@ -1648,7 +1649,7 @@ export default function Events() {
 
             <label htmlFor="detector-filter">
 
-              Detector
+              탐지 방식
 
             </label>
 
@@ -1680,7 +1681,7 @@ export default function Events() {
 
               <option value="RULE">
 
-                RULE
+                규칙 기반
 
               </option>
 
@@ -1698,7 +1699,7 @@ export default function Events() {
 
             <label htmlFor="severity-filter">
 
-              Severity
+              심각도
 
             </label>
 
@@ -1730,19 +1731,19 @@ export default function Events() {
 
               <option value="high">
 
-                HIGH
+                높음
 
               </option>
 
               <option value="medium">
 
-                MEDIUM
+                보통
 
               </option>
 
               <option value="low">
 
-                LOW
+                낮음
 
               </option>
 
@@ -1754,7 +1755,7 @@ export default function Events() {
 
             <label htmlFor="incident-family-filter">
 
-              Incident Family
+              사건 분류
 
             </label>
 
@@ -1786,37 +1787,37 @@ export default function Events() {
 
               <option value="IDENTITY">
 
-                IDENTITY
+                기기 식별
 
               </option>
 
               <option value="MESSAGE_POLICY">
 
-                MESSAGE_POLICY
+                메시지 정책
 
               </option>
 
               <option value="FLOODING">
 
-                FLOODING
+                트래픽 폭주
 
               </option>
 
               <option value="NETWORK_POLICY">
 
-                NETWORK_POLICY
+                네트워크 정책
 
               </option>
 
               <option value="SCAN">
 
-                SCAN
+                포트 스캔
 
               </option>
 
               <option value="AI_ONLY">
 
-                AI_ONLY
+                AI 단독 이상징후
 
               </option>
 
@@ -1828,7 +1829,7 @@ export default function Events() {
 
             <label htmlFor="applied-filter">
 
-              Trust 반영
+              신뢰점수 반영
 
             </label>
 
@@ -1892,11 +1893,11 @@ export default function Events() {
 
             <p className="panel-description">
 
-              동일 Window의 Rule 이벤트와
+              동일 분석 구간의 규칙 이벤트와
 
               AI 이벤트는 서로 다른
 
-              Evidence로 저장될 수 있습니다.
+              근거로 저장될 수 있습니다.
 
             </p>
 
@@ -2082,7 +2083,7 @@ export default function Events() {
 
           selectedEvent
 
-            ? `Detection Event #${selectedEvent.id}`
+            ? `탐지 이벤트 #${selectedEvent.id}`
 
             : "Detection Event"
 
@@ -2092,7 +2093,7 @@ export default function Events() {
 
           selectedEvent
 
-            ? `${selectedEvent.event_type || "-"} · ${selectedEvent.device_id || selectedEvent.subject_ip || "미매핑 대상"}`
+            ? `${uiLabel(selectedEvent.event_type) || "-"} · ${selectedEvent.device_id || selectedEvent.subject_ip || "미매핑 대상"}`
 
             : undefined
 
@@ -2140,7 +2141,7 @@ export default function Events() {
 
                 <span>
 
-                  Score Delta
+                  정책상 점수 변화량
 
                 </span>
 
@@ -2160,7 +2161,7 @@ export default function Events() {
 
                 <span>
 
-                  Incident Family
+                  사건 분류
 
                 </span>
 
@@ -2180,7 +2181,7 @@ export default function Events() {
 
                 <span>
 
-                  Severity
+                  심각도
 
                 </span>
 
@@ -2209,7 +2210,7 @@ export default function Events() {
               </div>
 
               <div className="detail-item">
-                <span>Detector</span>
+                <span>탐지 방식</span>
                 <StatusBadge
                   status={getDetectorStatus(selectedEvent)}
                   label={selectedEvent.detector_type || "UNKNOWN"}
@@ -2220,7 +2221,7 @@ export default function Events() {
 
                 <span>
 
-                  Score 반영
+                  점수 반영
 
                 </span>
 
@@ -2254,7 +2255,7 @@ export default function Events() {
 
                 <span>
 
-                  Policy Version
+                  정책 버전
 
                 </span>
 
@@ -2280,7 +2281,7 @@ export default function Events() {
 
                   <dt>
 
-                    Processing Reason
+                    처리 사유
 
                   </dt>
 
@@ -2300,7 +2301,7 @@ export default function Events() {
 
                   <dt>
 
-                    Evidence Schema
+                    근거 형식 버전
 
                   </dt>
 
@@ -2318,7 +2319,7 @@ export default function Events() {
 
                   <dt>
 
-                    Dedupe Key
+                    중복 판별 키
 
                   </dt>
 
@@ -2336,7 +2337,7 @@ export default function Events() {
 
                   <dt>
 
-                    Detected At
+                    탐지 시각
 
                   </dt>
 
@@ -2356,7 +2357,7 @@ export default function Events() {
 
                   <dt>
 
-                    Processed At
+                    처리 시각
 
                   </dt>
 
@@ -2378,7 +2379,7 @@ export default function Events() {
 
             <section className="detail-section">
 
-              <h3>분석 Window</h3>
+              <h3>분석 구간</h3>
 
               <div className="window">
 
@@ -2448,9 +2449,9 @@ export default function Events() {
 
             <section className="detail-section">
 
-              <h3>Detection Evidence</h3>
+              <h3>탐지 근거</h3>
 
-              <JsonViewer
+              <JsonViewer translateKeys
 
                 data={selectedEvent.evidence}
 
@@ -2467,7 +2468,7 @@ export default function Events() {
       <DetailModal
         open={Boolean(selectedAiWarning)}
         title="AI 경고 상세"
-        description="AI 경고 원본과 분석 근거를 확인합니다. 실제 Trust Score 반영 여부는 탐지 이벤트 및 Score History에서 검증하세요."
+        description="AI 경고 원본과 분석 근거를 확인합니다. 실제 신뢰점수 반영 여부는 탐지 이벤트 및 신뢰점수 이력에서 검증하세요."
         size="large"
         onClose={() => setSelectedAiWarning(null)}
         footer={
@@ -2494,7 +2495,7 @@ export default function Events() {
             </section>
             <section className="detail-section">
               <h3>AI 경고 원본 응답</h3>
-              <JsonViewer data={selectedAiWarning} />
+              <JsonViewer translateKeys data={selectedAiWarning} />
             </section>
           </div>
         )}

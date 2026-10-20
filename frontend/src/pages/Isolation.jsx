@@ -1,3 +1,4 @@
+import { uiLabel } from "../utils/uiText";
 import { useCallback, useEffect, useMemo, useRef, useState, } from "react";
 import { createFirewallReleaseRequest, createFirewallScopeExtensionRequest, createPacketPairRecoveryPlan, getPacketPairRecoveryPlan, verifyPacketPairRecoveryPlan, getFirewallRuntimeStatus, executeRecovery, getDeviceDetail, getFirewallReleaseRequest, getFirewallRules, getIsolatedDevices, getIsolationHistory, getRecoveryHistory, recoveryPreflight, } from "../api/api";
 import DataTable from "../components/DataTable";
@@ -97,7 +98,7 @@ function getFirewallStatusLabel(status) {
         .toUpperCase();
     return (labels[normalized] ||
         status ||
-        "Firewall 기록 없음");
+        "방화벽 기록 없음");
 }
 function getFirewallReleaseConfirmation(ruleId) {
     if (ruleId === null ||
@@ -275,7 +276,7 @@ function getPreflightCanExecute(data) {
  * expected_trust_score는
  * Recovery 후 목표 Score 100이 아닙니다.
  *
- * Backend가 Preflight에서 비교하는 현재 Trust Score입니다.
+ * Backend가 Preflight에서 비교하는 현재 신뢰점수입니다.
  */
 function getPreflightTrustScore(preflight, device) {
     const value = preflight
@@ -310,16 +311,16 @@ function getRecoveryUiStatus(device, releaseRequest, preflight) {
         "PENDING") {
         return {
             status: "pending",
-            label: "Firewall 해제 처리 중",
-            description: "Firewall Worker가 Release Request를 처리하고 있습니다.",
+            label: "방화벽 해제 처리 중",
+            description: "방화벽 처리 서비스가 차단 해제 요청를 처리하고 있습니다.",
         };
     }
     if (releaseStatus ===
         "FAILED") {
         return {
             status: "failed",
-            label: "Firewall 해제 실패",
-            description: "Release Request가 실패했습니다. 실패 사유와 현재 Firewall Rule 상태를 확인해 주세요.",
+            label: "방화벽 해제 실패",
+            description: "차단 해제 요청이 실패했습니다. 실패 사유와 현재 방화벽 규칙 상태를 확인해 주세요.",
         };
     }
     if (firewallStatus ===
@@ -327,23 +328,23 @@ function getRecoveryUiStatus(device, releaseRequest, preflight) {
         return {
             status: "warning",
             label: "차단 해제 필요",
-            description: "현재 Firewall Rule이 APPLIED 상태입니다. 관리자 승인형 Release Request가 먼저 필요합니다.",
+            description: "현재 방화벽 규칙은 차단 적용 상태입니다. 관리자 승인형 차단 해제 요청이 먼저 필요합니다.",
         };
     }
     if (firewallStatus ===
         "PENDING") {
         return {
             status: "pending",
-            label: "Firewall 적용 대기",
-            description: "Firewall Rule 적용이 아직 완료되지 않았습니다.",
+            label: "방화벽 적용 대기",
+            description: "방화벽 규칙 적용이 아직 완료되지 않았습니다.",
         };
     }
     if (firewallStatus ===
         "FAILED") {
         return {
             status: "failed",
-            label: "Firewall 상태 확인 필요",
-            description: "Firewall Rule 상태가 FAILED입니다. 남은 차단을 정확한 Rule ID의 해제 요청으로 정리한 뒤 Recovery를 진행해 주세요.",
+            label: "방화벽 상태 확인 필요",
+            description: "방화벽 규칙 상태가 FAILED입니다. 남은 차단을 정확한 규칙 ID의 해제 요청으로 정리한 뒤 복구를 진행해 주세요.",
         };
     }
     if (firewallStatus !==
@@ -351,14 +352,14 @@ function getRecoveryUiStatus(device, releaseRequest, preflight) {
         return {
             status: "unknown",
             label: "확인 필요",
-            description: "Recovery 전 Firewall Rule 상태를 확인해야 합니다.",
+            description: "복구 전 방화벽 규칙 상태를 확인해야 합니다.",
         };
     }
     if (!preflight) {
         return {
             status: "pending",
-            label: "Preflight 필요",
-            description: "Firewall Rule이 REMOVED 상태입니다. Backend Preflight로 Runtime 상태와 나머지 안전 조건을 확인해 주세요.",
+            label: "사전 점검 필요",
+            description: "방화벽 규칙이 REMOVED 상태입니다. 백엔드 사전 점검로 실행 상태와 나머지 안전 조건을 확인해 주세요.",
         };
     }
     const runtimeStatus = getRuntimeReleaseStatus(preflight);
@@ -371,26 +372,26 @@ function getRecoveryUiStatus(device, releaseRequest, preflight) {
                 : "pending",
             label: runtimeStatus ===
                 "UNAVAILABLE"
-                ? "Runtime 검증 불가"
-                : "Runtime 검증 대기",
+                ? "실행 상태 검증 불가"
+                : "실행 상태 검증 대기",
             description: preflight
                 ?.failure_reason ||
-                "Runtime VERIFIED_RELEASED 상태가 확인되지 않았습니다.",
+                "실행 상태 VERIFIED_RELEASED 상태가 확인되지 않았습니다.",
         };
     }
     if (!getPreflightCanExecute(preflight)) {
         return {
             status: "warning",
-            label: "Preflight 차단",
+            label: "사전 점검 차단",
             description: preflight
                 ?.failure_reason ||
-                "Backend Preflight가 Recovery 실행을 허용하지 않았습니다.",
+                "백엔드 사전 점검이 복구 실행을 허용하지 않았습니다.",
         };
     }
     return {
         status: "eligible",
-        label: "Recovery 가능",
-        description: "Firewall REMOVED, Runtime VERIFIED_RELEASED 및 Backend Preflight 안전 조건을 통과했습니다.",
+        label: "복구 가능",
+        description: "방화벽 REMOVED, 실행 상태 VERIFIED_RELEASED 및 백엔드 사전 점검 안전 조건을 통과했습니다.",
     };
 }
 function unwrapApiItem(data) {
@@ -414,11 +415,11 @@ function validateCommandResponse(data, { deviceId = null, requestId = null, fire
         if (responseRequestId === null ||
             responseRequestId ===
                 undefined) {
-            throw new Error("Release Request ID가 없는 응답은 결과에 반영하지 않았습니다.");
+            throw new Error("차단 해제 요청 ID가 없는 응답은 결과에 반영하지 않았습니다.");
         }
         if (String(responseRequestId) !==
             String(requestId)) {
-            throw new Error("다른 Release Request 응답이 도착해 결과를 반영하지 않았습니다.");
+            throw new Error("다른 차단 해제 요청 응답이 도착해 결과를 반영하지 않았습니다.");
         }
     }
     if (firewallRuleId !== null &&
@@ -428,7 +429,7 @@ function validateCommandResponse(data, { deviceId = null, requestId = null, fire
         item.firewall_rule_id !== null &&
         String(item.firewall_rule_id) !==
             String(firewallRuleId)) {
-        throw new Error("다른 Firewall Rule의 응답이 도착해 결과를 반영하지 않았습니다.");
+        throw new Error("다른 방화벽 규칙의 응답이 도착해 결과를 반영하지 않았습니다.");
     }
     return item;
 }
@@ -470,14 +471,14 @@ function Phase9RuntimePanel() {
       if (signal?.aborted || id !== seq.current) return;
       const value = unwrapApiItem(response);
       if (value == null || typeof value !== "object") {
-        throw new Error("Firewall Runtime 응답 형식이 올바르지 않습니다.");
+        throw new Error("실제 방화벽 응답 형식이 올바르지 않습니다.");
       }
       setRuntime(value);
       setUpdatedAt(new Date().toISOString());
       setError("");
     } catch (err) {
       if (!signal?.aborted && id === seq.current) {
-        setError(err?.message || "Firewall Runtime 조회에 실패했습니다.");
+        setError(err?.message || "실제 방화벽 조회에 실패했습니다.");
       }
     } finally {
       if (id === seq.current) setLoading(false);
@@ -499,11 +500,11 @@ function Phase9RuntimePanel() {
     <section className="panel phase9-runtime-panel">
       <div className="panel-header">
         <div>
-          <h2>Firewall Runtime Status </h2>
-          <p className="panel-description">DB Rule 상태는 실제 Firewall Runtime 검증을 대체하지 않습니다.</p>
+          <h2>실제 방화벽 상태 </h2>
+          <p className="panel-description">DB 규칙 상태는 실제 방화벽 검증을 대체하지 않습니다.</p>
         </div>
         <button type="button" className="button button-secondary" onClick={() => refresh()} disabled={loading}>
-          {loading ? "조회 중..." : "Runtime 새로고침"}
+          {loading ? "조회 중..." : "실행 상태 새로고침"}
         </button>
       </div>
       {error && <p className="inline-error" role="alert">{error}{runtime ? " · 이전 조회 데이터를 표시합니다." : ""}</p>}
@@ -511,11 +512,11 @@ function Phase9RuntimePanel() {
         <>
           <p className="text-muted">최근 조회: {formatKST(updatedAt)} {error ? "(최신 상태 아님)" : ""}</p>
           <details className="phase9-json-details" open>
-            <summary>Firewall Runtime 원본 응답</summary>
+            <summary>실제 방화벽 원본 응답</summary>
             <pre>{JSON.stringify(runtime, null, 2)}</pre>
           </details>
         </>
-      ) : <p className="text-muted">{loading ? "Runtime 정보 조회 중..." : "Runtime 상태를 확인할 수 없습니다."}</p>}
+      ) : <p className="text-muted">{loading ? "실행 상태 정보 조회 중..." : "실행 상태를 확인할 수 없습니다."}</p>}
     </section>
   );
 }
@@ -548,15 +549,15 @@ function Phase9ScopeExtension({ rule, adminKey }) {
     setError("");
     let dispatched = false;
     try {
-      if (!adminKey.trim()) throw new Error("관리자 Key를 입력해 주세요.");
+      if (!adminKey.trim()) throw new Error("관리자 인증키를 입력해 주세요.");
       if (!reason.trim()) throw new Error("차단 범위 확대 사유를 입력해 주세요.");
-      if (confirmId.trim() !== String(ruleId)) throw new Error("확인용 Rule ID가 다릅니다.");
-      const payload = parseAdminJson(payloadText, "Scope Extension 요청 본문");
+      if (confirmId.trim() !== String(ruleId)) throw new Error("확인용 규칙 ID가 다릅니다.");
+      const payload = parseAdminJson(payloadText, "차단 범위 확대 요청 본문");
       if (typeof payload.reason === "string" && payload.reason.trim() !== reason.trim()) {
         throw new Error("입력한 사유와 요청 JSON의 reason이 다릅니다.");
       }
       if (payload.reason === undefined) {
-        throw new Error("Swagger 규격에 따라 reason을 포함한 JSON을 입력해 주세요.");
+        throw new Error("API 명세 규격에 따라 reason을 포함한 JSON을 입력해 주세요.");
       }
       lock.current = true;
       setBusy(true);
@@ -576,15 +577,15 @@ function Phase9ScopeExtension({ rule, adminKey }) {
 
   return (
     <section className="detail-section phase9-admin-section">
-      <h3>Firewall Scope Extension</h3>
-      <p className="text-muted">현재 Rule ID에 대해 관리자 승인형 범위 확대 요청을 보냅니다. 요청 자체를 실제 Firewall 적용으로 표시하지 않습니다. JSON 필드명·제약은 Swagger 스키마와 정확히 일치해야 합니다.</p>
-      {!ruleId ? <p className="inline-error">선택된 Source Rule ID가 없어 요청할 수 없습니다.</p> : (
+      <h3>차단 범위 확대 요청</h3>
+      <p className="text-muted">현재 규칙 ID에 대해 관리자 승인형 범위 확대 요청을 보냅니다. 요청 자체를 실제 방화벽 적용으로 표시하지 않습니다. JSON 필드명·제약은 API 명세 스키마와 정확히 일치해야 합니다.</p>
+      {!ruleId ? <p className="inline-error">선택된 Source 규칙 ID가 없어 요청할 수 없습니다.</p> : (
         <div className="recovery-form">
-          <div className="filter-item"><label>Source Rule ID</label><div className="phase9-readonly">{ruleId}</div></div>
+          <div className="filter-item"><label>대상 규칙 ID</label><div className="phase9-readonly">{ruleId}</div></div>
           <div className="filter-item"><label htmlFor="phase9-scope-reason">변경 사유 (JSON reason과 동일)</label><input id="phase9-scope-reason" value={reason} onChange={(e) => setReason(e.target.value)} disabled={busy || uncertain} /></div>
-          <div className="filter-item"><label htmlFor="phase9-scope-json">Scope Extension 요청 JSON (Swagger 스키마 기준)</label><textarea id="phase9-scope-json" rows={6} value={payloadText} onChange={(e) => setPayloadText(e.target.value)} disabled={busy || uncertain} placeholder={'{\n  "reason": "..."\n}'} /></div>
-          <div className="filter-item"><label htmlFor="phase9-scope-confirm">확인용 Rule ID 재입력</label><input id="phase9-scope-confirm" value={confirmId} onChange={(e) => setConfirmId(e.target.value)} disabled={busy || uncertain} /></div>
-          <button type="button" className="button button-danger" disabled={busy || uncertain || !adminKey.trim()} onClick={submit}>{busy ? "요청 중..." : "Scope Extension 요청"}</button>
+          <div className="filter-item"><label htmlFor="phase9-scope-json">차단 범위 확대 요청 JSON (API 명세 스키마 기준)</label><textarea id="phase9-scope-json" rows={6} value={payloadText} onChange={(e) => setPayloadText(e.target.value)} disabled={busy || uncertain} placeholder={'{\n  "reason": "..."\n}'} /></div>
+          <div className="filter-item"><label htmlFor="phase9-scope-confirm">확인용 규칙 ID 재입력</label><input id="phase9-scope-confirm" value={confirmId} onChange={(e) => setConfirmId(e.target.value)} disabled={busy || uncertain} /></div>
+          <button type="button" className="button button-danger" disabled={busy || uncertain || !adminKey.trim()} onClick={submit}>{busy ? "요청 중..." : "차단 범위 확대 요청"}</button>
         </div>
       )}
       {uncertain && <p className="phase9-uncertain">결과 확인이 필요합니다. 서버의 변경 요청 상태를 직접 확인한 뒤 모달을 닫았다가 다시 열어 주세요.</p>}
@@ -606,21 +607,21 @@ function Phase9PacketPairRecovery({ adminKey, deviceId }) {
   async function run(kind) {
     if (lock.current || (kind !== "read" && uncertain)) return;
     setError("");
-    if (!adminKey.trim()) { setError("관리자 Key를 입력해 주세요."); return; }
+    if (!adminKey.trim()) { setError("관리자 인증키를 입력해 주세요."); return; }
     lock.current = true;
     setBusy(true);
     let dispatched = false;
     try {
       let response;
       if (kind === "create") {
-        const payload = parseAdminJson(requestText, "Packet Pair Plan 요청 본문");
+        const payload = parseAdminJson(requestText, "Packet Pair 복구 계획 요청 본문");
         if (payload.device_id && String(payload.device_id) !== String(deviceId)) {
-          throw new Error("다른 기기의 device_id로 복구 Plan을 생성할 수 없습니다.");
+          throw new Error("다른 기기의 device_id로 복구 복구 계획을 생성할 수 없습니다.");
         }
         dispatched = true;
         response = await createPacketPairRecoveryPlan(payload, adminKey);
       } else {
-        if (!planId.trim()) throw new Error("Plan ID를 입력해 주세요.");
+        if (!planId.trim()) throw new Error("복구 계획 ID를 입력해 주세요.");
         if (kind === "read") {
           response = await getPacketPairRecoveryPlan(planId.trim(), adminKey);
         } else {
@@ -644,16 +645,16 @@ function Phase9PacketPairRecovery({ adminKey, deviceId }) {
 
   return (
     <section className="detail-section phase9-admin-section">
-      <h3>Packet Pair Recovery Plan</h3>
-      <p className="text-muted">기존 Baseline Recovery와 별도 API입니다. Plan 생성/조회/검증만 다루며 성공 응답을 실제 복구 완료로 간주하지 않습니다. 요청 JSON은 Swagger 명세에 맞춰 입력하세요.</p>
+      <h3>패킷 처리 복구 계획</h3>
+      <p className="text-muted">기존 신뢰 상태 복구와 별도 API입니다. 복구 계획 생성/조회/검증만 다루며 성공 응답을 실제 복구 완료로 간주하지 않습니다. 요청 JSON은 API 명세에 맞춰 입력하세요.</p>
       <div className="recovery-form">
-        <div className="filter-item"><label htmlFor="phase9-plan-create">Plan 생성 요청 JSON</label><textarea id="phase9-plan-create" rows={6} value={requestText} disabled={busy || uncertain} onChange={(e) => setRequestText(e.target.value)} placeholder="Swagger에 정의된 Plan 생성 요청 JSON" /></div>
-        <button type="button" className="button button-secondary" disabled={busy || uncertain || !adminKey.trim()} onClick={() => run("create")}>Plan 생성</button>
-        <div className="filter-item"><label htmlFor="phase9-plan-id">Plan ID</label><input id="phase9-plan-id" value={planId} disabled={busy} onChange={(e) => setPlanId(e.target.value)} /></div>
-        <button type="button" className="button button-secondary" disabled={busy || !planId.trim()} onClick={() => run("read")}>Plan 상태 재조회</button>
-        <button type="button" className="button button-secondary" disabled={busy || uncertain || !planId.trim()} onClick={() => run("verify")}>Plan Verify 요청</button>
+        <div className="filter-item"><label htmlFor="phase9-plan-create">복구 계획 생성 요청 JSON</label><textarea id="phase9-plan-create" rows={6} value={requestText} disabled={busy || uncertain} onChange={(e) => setRequestText(e.target.value)} placeholder="API 명세에 정의된 복구 계획 생성 요청 JSON" /></div>
+        <button type="button" className="button button-secondary" disabled={busy || uncertain || !adminKey.trim()} onClick={() => run("create")}>복구 계획 생성</button>
+        <div className="filter-item"><label htmlFor="phase9-plan-id">복구 계획 ID</label><input id="phase9-plan-id" value={planId} disabled={busy} onChange={(e) => setPlanId(e.target.value)} /></div>
+        <button type="button" className="button button-secondary" disabled={busy || !planId.trim()} onClick={() => run("read")}>복구 계획 다시 조회</button>
+        <button type="button" className="button button-secondary" disabled={busy || uncertain || !planId.trim()} onClick={() => run("verify")}>복구 계획 검증 요청</button>
       </div>
-      {uncertain && <p className="phase9-uncertain">POST 결과가 불확실합니다. 서버에서 Plan/요청 상태를 확인한 후에만 다시 수행하세요.</p>}
+      {uncertain && <p className="phase9-uncertain">POST 결과가 불확실합니다. 서버에서 복구 계획/요청 상태를 확인한 후에만 다시 수행하세요.</p>}
       {error && <p className="inline-error" role="alert">{error}</p>}
       {result && <details className="phase9-json-details" open><summary>최근 서버 응답</summary><pre>{JSON.stringify(result, null, 2)}</pre></details>}
     </section>
@@ -955,7 +956,7 @@ export default function Isolation() {
                 }
                 setReleaseError(err instanceof Error
                     ? err.message
-                    : "Firewall 해제 요청 상태를 확인하지 못했습니다.");
+                    : "방화벽 해제 요청 상태를 확인하지 못했습니다.");
             }
         };
         poll();
@@ -1205,7 +1206,7 @@ export default function Isolation() {
                     ? "checked"
                     : "failed",
                 message: anyVerified
-                    ? "서버 상태를 다시 조회했습니다. 현재 Trust·Firewall 상태를 확인한 뒤 창을 닫고 다시 열어 다음 작업을 진행해 주세요."
+                    ? "서버 상태를 다시 조회했습니다. 현재 신뢰점수·방화벽 상태를 확인한 뒤 창을 닫고 다시 열어 다음 작업을 진행해 주세요."
                     : "서버 상태 재조회에도 실패했습니다. 결과를 단정하지 말고 잠시 후 다시 확인해 주세요.",
             });
         }
@@ -1257,7 +1258,7 @@ export default function Isolation() {
                 String(item.device_id) !==
                     String(deviceId));
             if (mismatchedItem) {
-                throw new Error("다른 기기의 Recovery History 응답이 포함되어 결과를 반영하지 않았습니다.");
+                throw new Error("다른 기기의 복구 이력 응답이 포함되어 결과를 반영하지 않았습니다.");
             }
             setRecoveryHistory(items);
         }
@@ -1269,7 +1270,7 @@ export default function Isolation() {
             setRecoveryHistory([]);
             setRecoveryHistoryError(err instanceof Error
                 ? err.message
-                : "Recovery History를 불러오지 못했습니다.");
+                : "복구 이력를 불러오지 못했습니다.");
         }
         finally {
             if (generation ===
@@ -1315,16 +1316,16 @@ export default function Isolation() {
             return;
         }
         if (!rule?.id) {
-            setReleaseError("해제할 Firewall Rule ID를 확인할 수 없습니다.");
+            setReleaseError("해제할 방화벽 규칙 ID를 확인할 수 없습니다.");
             return;
         }
         if (!canReleaseFirewallRule(rule)) {
-            setReleaseError("APPLIED 또는 FAILED 상태의 Firewall Rule만 해제 요청할 수 있습니다.");
+            setReleaseError("APPLIED 또는 FAILED 상태의 방화벽 규칙만 해제 요청할 수 있습니다.");
             return;
         }
         const reason = releaseReason.trim();
         if (!reason) {
-            setReleaseError("Firewall 해제 사유를 입력해 주세요.");
+            setReleaseError("방화벽 해제 사유를 입력해 주세요.");
             return;
         }
         const expectedConfirmation = getFirewallReleaseConfirmation(rule.id);
@@ -1334,7 +1335,7 @@ export default function Isolation() {
             return;
         }
         if (!adminKey.trim()) {
-            setReleaseError("관리자 Key를 입력해 주세요.");
+            setReleaseError("관리자 인증키를 입력해 주세요.");
             return;
         }
         const targetDeviceId = device.device_id;
@@ -1370,10 +1371,10 @@ export default function Isolation() {
             }
             const message = err instanceof Error
                 ? err.message
-                : "Firewall 해제 요청에 실패했습니다.";
+                : "방화벽 해제 요청에 실패했습니다.";
             if (isUncertainCommandError(err)) {
                 setReleaseError(`${message} 요청이 서버에 전달되었을 가능성이 있어 결과를 단정하지 않습니다.`);
-                await verifyRecoveryTargetState(targetDeviceId, "Firewall 해제 요청의 응답이 불명확하여 서버 상태를 다시 확인하고 있습니다.");
+                await verifyRecoveryTargetState(targetDeviceId, "방화벽 해제 요청의 응답이 불명확하여 서버 상태를 다시 확인하고 있습니다.");
             }
             else {
                 setReleaseError(message);
@@ -1395,18 +1396,18 @@ export default function Isolation() {
             return;
         }
         if (!adminKey.trim()) {
-            setPreflightError("관리자 Key를 입력해 주세요.");
+            setPreflightError("관리자 인증키를 입력해 주세요.");
             return;
         }
         const currentTrustScore = Number(device.trust_score);
         if (!Number.isFinite(currentTrustScore)) {
-            setPreflightError("현재 Trust Score를 확인할 수 없습니다.");
+            setPreflightError("현재 신뢰점수를 확인할 수 없습니다.");
             return;
         }
         if (String(device.firewall_status ||
             "").toUpperCase() !==
             "REMOVED") {
-            setPreflightError("Firewall Rule이 REMOVED 상태가 된 뒤 Preflight를 실행할 수 있습니다.");
+            setPreflightError("방화벽 규칙이 제거 상태로 기록된 뒤 사전 점검를 실행할 수 있습니다.");
             return;
         }
         const targetDeviceId = device.device_id;
@@ -1422,7 +1423,7 @@ export default function Isolation() {
                 device_id: targetDeviceId,
                 /*
                  * 중요:
-                 * 100이 아니라 현재 Trust Score입니다.
+                 * 100이 아니라 현재 신뢰점수입니다.
                  */
                 expected_trust_score: currentTrustScore,
             }, adminKey);
@@ -1442,7 +1443,7 @@ export default function Isolation() {
             }
             setPreflightError(err instanceof Error
                 ? err.message
-                : "Recovery Preflight에 실패했습니다.");
+                : "복구 사전 점검에 실패했습니다.");
         }
         finally {
             if (generation ===
@@ -1461,23 +1462,23 @@ export default function Isolation() {
         }
         if (!preflight ||
             !getPreflightCanExecute(preflight)) {
-            setRecoveryError("먼저 Recovery Preflight를 통과해야 합니다.");
+            setRecoveryError("먼저 복구 사전 점검를 통과해야 합니다.");
             return;
         }
         const runtimeStatus = getRuntimeReleaseStatus(preflight);
         if (runtimeStatus !==
             "VERIFIED_RELEASED") {
-            setRecoveryError("Runtime VERIFIED_RELEASED 상태가 확인되지 않았습니다.");
+            setRecoveryError("실행 상태 VERIFIED_RELEASED 상태가 확인되지 않았습니다.");
             return;
         }
         const currentTrustScore = getPreflightTrustScore(preflight, device);
         if (currentTrustScore === null) {
-            setRecoveryError("Recovery 직전 Trust Score를 확인할 수 없습니다.");
+            setRecoveryError("복구 직전 신뢰점수를 확인할 수 없습니다.");
             return;
         }
         const reason = recoveryReason.trim();
         if (!reason) {
-            setRecoveryError("Recovery 사유를 입력해 주세요.");
+            setRecoveryError("복구 사유를 입력해 주세요.");
             return;
         }
         if (recoveryConfirmation.trim() !==
@@ -1486,7 +1487,7 @@ export default function Isolation() {
             return;
         }
         if (!adminKey.trim()) {
-            setRecoveryError("관리자 Key를 입력해 주세요.");
+            setRecoveryError("관리자 인증키를 입력해 주세요.");
             return;
         }
         const targetDeviceId = device.device_id;
@@ -1519,10 +1520,10 @@ export default function Isolation() {
             }
             const message = err instanceof Error
                 ? err.message
-                : "Recovery 실행에 실패했습니다.";
+                : "복구 실행에 실패했습니다.";
             if (isUncertainCommandError(err)) {
                 setRecoveryError(`${message} 서버에서 실행되었을 가능성이 있어 성공/실패를 단정하지 않습니다.`);
-                await verifyRecoveryTargetState(targetDeviceId, "Recovery 응답이 불명확하여 현재 Device·Firewall 상태를 다시 확인하고 있습니다.");
+                await verifyRecoveryTargetState(targetDeviceId, "복구 응답이 불명확하여 현재 기기·방화벽 상태를 다시 확인하고 있습니다.");
             }
             else {
                 setRecoveryError(message);
@@ -1541,7 +1542,7 @@ export default function Isolation() {
     const isolatedDeviceColumns = [
         {
             key: "device_id",
-            header: "Device",
+            header: "기기",
             width: 150,
             render: (value) => (<strong className="device-id" title={value ||
                     ""}>
@@ -1551,14 +1552,14 @@ export default function Isolation() {
         },
         {
             key: "ip_address",
-            header: "IP Address",
+            header: "IP 주소",
             width: 140,
             render: (value) => value ||
                 "-",
         },
         {
             key: "status",
-            header: "Trust 상태",
+            header: "신뢰 상태",
             width: 120,
             render: (value, device) => {
                 const status = String(value ||
@@ -1568,7 +1569,7 @@ export default function Isolation() {
         },
         {
             key: "trust_score",
-            header: "Trust Score",
+            header: "신뢰점수",
             align: "center",
             width: 120,
             render: (value) => {
@@ -1582,7 +1583,7 @@ export default function Isolation() {
         },
         {
             key: "firewall_status",
-            header: "Firewall 상태",
+            header: "방화벽 상태",
             width: 140,
             render: (value) => (<StatusBadge status={getFirewallStatusTheme(value)} label={getFirewallStatusLabel(value)} size="small"/>),
         },
@@ -1613,7 +1614,7 @@ export default function Isolation() {
         },
         {
             key: "device_id",
-            header: "Device",
+            header: "기기",
             width: 150,
             render: (value) => (<strong className="device-id" title={value ||
                     ""}>
@@ -1623,19 +1624,19 @@ export default function Isolation() {
         },
         {
             key: "action",
-            header: "격리 Action",
+            header: "격리 동작",
             width: 120,
             render: (value) => (<StatusBadge status={getIsolationActionStatus(value)} label={getIsolationActionLabel(value)} size="small"/>),
         },
         {
             key: "firewall_status",
-            header: "Firewall 상태",
+            header: "방화벽 상태",
             width: 140,
             render: (value) => (<StatusBadge status={getFirewallStatusTheme(value)} label={getFirewallStatusLabel(value)} size="small"/>),
         },
         {
             key: "reason",
-            header: "Reason",
+            header: "사유",
             width: 280,
             render: (value) => (<span className="description" title={value ||
                     ""}>
@@ -1645,7 +1646,7 @@ export default function Isolation() {
         },
         {
             key: "previous_score",
-            header: "이전 Score",
+            header: "이전 점수",
             align: "right",
             width: 100,
             render: (value, item) => formatNumber(value ??
@@ -1654,7 +1655,7 @@ export default function Isolation() {
         },
         {
             key: "new_score",
-            header: "변경 Score",
+            header: "변경 후 점수",
             align: "right",
             width: 100,
             render: (value, item) => formatNumber(value ??
@@ -1663,7 +1664,7 @@ export default function Isolation() {
         },
         {
             key: "trust_score_history_id",
-            header: "Trust History",
+            header: "신뢰점수 이력",
             align: "right",
             width: 120,
             render: (value) => value ??
@@ -1671,7 +1672,7 @@ export default function Isolation() {
         },
         {
             key: "trigger_event_id",
-            header: "Trigger Event",
+            header: "판단 근거 이벤트",
             align: "right",
             width: 120,
             render: (value) => value ??
@@ -1679,7 +1680,7 @@ export default function Isolation() {
         },
         {
             key: "created_at",
-            header: "Created At",
+            header: "기록 시각",
             width: 180,
             render: (value) => formatKST(value),
         },
@@ -1726,7 +1727,7 @@ export default function Isolation() {
        Render
        ========================================================= */
     return (<div className="isolation-page">
-      <PageHeader title="Isolation" description="Trust Score 기반 격리 판단과 실제 Firewall 차단 적용 상태를 함께 확인합니다." updatedAt={lastUpdated
+      <PageHeader title="격리·복구" description="신뢰점수 기반 격리 판단과 실제 방화벽 차단 적용 상태를 함께 확인합니다." updatedAt={lastUpdated
             ? formatKST(lastUpdated)
             : undefined} onRefresh={handleRefresh} refreshing={refreshing}/>
 
@@ -1758,24 +1759,24 @@ export default function Isolation() {
 
       {!loading &&
             !error && (<section className="summary-card-grid" aria-label="격리 상태 요약">
-            <SummaryCard title="현재 격리" value={formatNumber(isolationSummary.isolated)} description="Trust 상태가 isolated인 기기" status={isolationSummary.isolated >
+            <SummaryCard title="현재 격리" value={formatNumber(isolationSummary.isolated)} description="신뢰 상태가 isolated인 기기" status={isolationSummary.isolated >
                 0
                 ? "isolated"
                 : "default"}/>
 
-            <SummaryCard title="Firewall 적용" value={formatNumber(isolationSummary.applied)} description="실제 네트워크 차단 완료" status="normal"/>
+            <SummaryCard title="방화벽 적용" value={formatNumber(isolationSummary.applied)} description="실제 네트워크 차단 완료" status="normal"/>
 
             <SummaryCard title="적용 대기" value={formatNumber(isolationSummary.pending)} description="격리 결정 후 차단 적용 대기" status={isolationSummary.pending >
                 0
                 ? "warning"
                 : "default"}/>
 
-            <SummaryCard title="Firewall 실패" value={formatNumber(isolationSummary.failed)} description="차단 규칙 적용 실패" status={isolationSummary.failed >
+            <SummaryCard title="방화벽 실패" value={formatNumber(isolationSummary.failed)} description="차단 규칙 적용 실패" status={isolationSummary.failed >
                 0
                 ? "danger"
                 : "default"}/>
 
-            <SummaryCard title="Firewall 미확인" value={formatNumber(isolationSummary.missing)} description="연결된 Firewall Rule 없음" status={isolationSummary.missing >
+            <SummaryCard title="방화벽 미확인" value={formatNumber(isolationSummary.missing)} description="연결된 방화벽 규칙 없음" status={isolationSummary.missing >
                 0
                 ? "warning"
                 : "default"}/>
@@ -1795,7 +1796,7 @@ export default function Isolation() {
             </h2>
 
             <p className="panel-description">
-              행을 선택하면 Trust, Firewall 상태와 Recovery 준비 상태를 확인할 수 있습니다.
+              행을 선택하면 신뢰점수, 방화벽 상태와 복구 준비 상태를 확인할 수 있습니다.
             </p>
           </div>
 
@@ -1811,7 +1812,7 @@ export default function Isolation() {
                 0} error={isolatedDevices.length ===
             0
             ? error
-            : ""} onRetry={handleRefresh} rowKey="device_id" minWidth={1000} tableLabel="현재 격리된 기기" emptyTitle="현재 격리된 기기가 없습니다." emptyDescription="Trust Score가 격리 기준 아래로 내려간 기기가 없습니다." rowClassName={(device) => {
+            : ""} onRetry={handleRefresh} rowKey="device_id" minWidth={1000} tableLabel="현재 격리된 기기" emptyTitle="현재 격리된 기기가 없습니다." emptyDescription="신뢰점수가 격리 기준 아래로 내려간 기기가 없습니다." rowClassName={(device) => {
             if (device.firewall_status ===
                 "FAILED") {
                 return "row-danger";
@@ -1838,7 +1839,7 @@ export default function Isolation() {
             </h2>
 
             <p className="panel-description">
-              행을 선택하면 격리·해제 판단과 연결된 Trust Score History 및 Trigger Event를 확인할 수 있습니다.
+              행을 선택하면 격리·해제 판단과 연결된 신뢰점수 이력 및 판단 근거 이벤트를 확인할 수 있습니다.
             </p>
           </div>
 
@@ -1862,7 +1863,7 @@ export default function Isolation() {
 
           <div className="filter-item">
             <label htmlFor="isolation-action-filter">
-              격리 Action
+              격리 동작
             </label>
 
             <select id="isolation-action-filter" value={actionFilter} onChange={(event) => {
@@ -1885,7 +1886,7 @@ export default function Isolation() {
 
           <div className="filter-item">
             <label htmlFor="firewall-status-filter">
-              Firewall 상태
+              방화벽 상태
             </label>
 
             <select id="firewall-status-filter" value={firewallFilter} onChange={(event) => {
@@ -1921,7 +1922,7 @@ export default function Isolation() {
             history.length >
                 0 &&
             filteredHistory.length ===
-                0 ? (<EmptyState title="검색 조건에 맞는 격리 이력이 없습니다." description="다른 Device ID, 사유 또는 Trigger Event ID를 검색해 주세요." actionLabel="검색 초기화" onAction={() => setSearchText("")}/>) : (<div className="table-scroll">
+                0 ? (<EmptyState title="검색 조건에 맞는 격리 이력이 없습니다." description="다른 기기 ID, 사유 또는 Trigger Event ID를 검색해 주세요." actionLabel="검색 초기화" onAction={() => setSearchText("")}/>) : (<div className="table-scroll">
             <DataTable columns={isolationHistoryColumns} rows={filteredHistory} loading={loading} error={error} onRetry={handleRefresh} rowKey="id" minWidth={1450} tableLabel="격리 이력" emptyTitle="표시할 격리 이력이 없습니다." emptyDescription="아직 격리 또는 격리 해제 기록이 생성되지 않았습니다." rowClassName={(item) => {
                 if (item.firewall_status ===
                     "FAILED") {
@@ -1946,16 +1947,16 @@ export default function Isolation() {
             ===================================================== */}
 
       <DetailModal open={Boolean(selectedIsolatedDevice)} title={selectedIsolatedDevice
-            ? `${selectedIsolatedDevice.device_id} Recovery`
-            : "Recovery"} description="Firewall Release → Runtime Verify → Preflight → Recovery 순서로 안전하게 정상 상태를 복구합니다." onClose={closeRecoveryDetail} closeDisabled={isRecoveryModalLocked} size="large" footer={<>
+            ? `${selectedIsolatedDevice.device_id} 복구`
+            : "Recovery"} description="차단 해제 요청 → 실제 차단 해제 확인 → 복구 사전 점검 → 정상 상태 복구 순서로 안전하게 정상 상태를 복구합니다." onClose={closeRecoveryDetail} closeDisabled={isRecoveryModalLocked} size="large" footer={<>
             <button type="button" className="button button-ghost" onClick={closeRecoveryDetail} disabled={isRecoveryModalLocked}>
               닫기
             </button>
 
             <button type="button" className="button" onClick={handleExecuteRecovery} disabled={!canRunRecovery}>
               {recoveryExecuting
-                ? "Recovery 실행 중..."
-                : "Recovery 실행"}
+                ? "복구 실행 중..."
+                : "복구 실행"}
             </button>
           </>}>
         {selectedIsolatedDevice && (<div className="detail">
@@ -1966,7 +1967,7 @@ export default function Isolation() {
             <section className="detail-grid">
               <div className="detail-item">
                 <span>
-                  Device ID
+                  기기 ID
                 </span>
 
                 <strong>
@@ -1976,7 +1977,7 @@ export default function Isolation() {
 
               <div className="detail-item">
                 <span>
-                  IP Address
+                  IP 주소
                 </span>
 
                 <strong>
@@ -1987,7 +1988,7 @@ export default function Isolation() {
 
               <div className="detail-item">
                 <span>
-                  현재 Trust Score
+                  현재 신뢰점수
                 </span>
 
                 <strong>
@@ -1997,7 +1998,7 @@ export default function Isolation() {
 
               <div className="detail-item">
                 <span>
-                  Trust 상태
+                  신뢰 상태
                 </span>
 
                 <StatusBadge status={selectedIsolatedDevice.status ||
@@ -2007,7 +2008,7 @@ export default function Isolation() {
 
               <div className="detail-item">
                 <span>
-                  Firewall 상태
+                  방화벽 상태
                 </span>
 
                 <StatusBadge status={getFirewallStatusTheme(selectedIsolatedDevice.firewall_status)} label={getFirewallStatusLabel(selectedIsolatedDevice.firewall_status)}/>
@@ -2036,16 +2037,16 @@ export default function Isolation() {
               <div className="recovery-form">
                 <div className="filter-item">
                   <label htmlFor="recovery-admin-key">
-                    Admin Key
+                    관리자 인증키
                   </label>
 
                   <input id="recovery-admin-key" type="password" autoComplete="off" value={adminKey} disabled={isRecoveryModalLocked ||
                 isReleasePolling} onChange={(event) => setAdminKey(event
                 .target
-                .value)} placeholder="관리자 Key 입력"/>
+                .value)} placeholder="관리자 인증키 입력"/>
 
                   <small className="help-text">
-                    Admin Key는 이 Modal의 React 메모리에만 보관되며 닫기 또는 새로고침 시 폐기됩니다.
+                    관리자 인증키는 현재 창에서만 사용하며 닫거나 새로고침하면 지워집니다.
                   </small>
                 </div>
               </div>
@@ -2057,7 +2058,7 @@ export default function Isolation() {
 
             <section className="detail-section">
               <h3>
-                Recovery 준비 상태
+                복구 준비 상태
               </h3>
 
               <div className="detail-list">
@@ -2072,9 +2073,7 @@ export default function Isolation() {
                 </div>
 
                 <div>
-                  <dt>
-                    Release Request
-                  </dt>
+                  <dt>차단 해제 요청</dt>
 
                   <dd>
                     {releaseRequestStatus ? (<StatusBadge status={getReleaseRequestTheme(releaseRequestStatus)} label={getReleaseRequestLabel(releaseRequestStatus)}/>) : ("-")}
@@ -2082,9 +2081,7 @@ export default function Isolation() {
                 </div>
 
                 <div>
-                  <dt>
-                    Preflight
-                  </dt>
+                  <dt>사전 점검</dt>
 
                   <dd>
                     {preflightLoading
@@ -2100,7 +2097,7 @@ export default function Isolation() {
 
                 <div>
                   <dt>
-                    Runtime
+                    실제 실행 상태
                   </dt>
 
                   <dd>
@@ -2113,7 +2110,7 @@ export default function Isolation() {
 
                 <div>
                   <dt>
-                    검증 Trust Score
+                    검증 신뢰점수
                   </dt>
 
                   <dd>
@@ -2150,13 +2147,13 @@ export default function Isolation() {
 
             {selectedRule && (<section className="detail-section">
                 <h3>
-                  현재 Firewall Rule
+                  현재 방화벽 규칙
                 </h3>
 
                 <dl className="detail-list">
                   <div>
                     <dt>
-                      Rule ID
+                      규칙 ID
                     </dt>
 
                     <dd>
@@ -2167,7 +2164,7 @@ export default function Isolation() {
 
                   <div>
                     <dt>
-                      Source IP
+                      출발지 IP
                     </dt>
 
                     <dd>
@@ -2180,7 +2177,7 @@ export default function Isolation() {
 
                   <div>
                     <dt>
-                      Action
+                      동작
                     </dt>
 
                     <dd>
@@ -2191,7 +2188,7 @@ export default function Isolation() {
 
                   <div>
                     <dt>
-                      Status
+                      상태
                     </dt>
 
                     <dd>
@@ -2201,7 +2198,7 @@ export default function Isolation() {
 
                   <div>
                     <dt>
-                      Retry Count
+                      재시도 횟수
                     </dt>
 
                     <dd>
@@ -2212,7 +2209,7 @@ export default function Isolation() {
 
                   <div>
                     <dt>
-                      Last Error
+                      마지막 오류
                     </dt>
 
                     <dd className="break-word">
@@ -2231,29 +2228,29 @@ export default function Isolation() {
 
             <section className="detail-section">
               <h3>
-                1. Firewall 해제 요청
+                1. 방화벽 해제 요청
               </h3>
 
               <p className="text-muted">
-                APPLIED 또는 FAILED Firewall Rule의 정확한 ID로 해제를 요청합니다. 실제 차단 해제는 Firewall Worker가 수행합니다. 다른 범위의 규칙이 남아 있으면 이어서 해당 규칙의 해제가 필요합니다.
+                적용 중이거나 적용에 실패한 방화벽 규칙의 정확한 ID로 해제를 요청합니다. 실제 차단 해제는 방화벽 처리 서비스가 수행합니다. 다른 범위의 규칙이 남아 있으면 이어서 해당 규칙의 해제가 필요합니다.
               </p>
 
               <div className="recovery-form">
                 <div className="filter-item">
                   <label htmlFor="firewall-release-reason">
-                    Reason
+                    사유
                   </label>
 
                   <textarea id="firewall-release-reason" value={releaseReason} onChange={(event) => setReleaseReason(event
                 .target
-                .value)} placeholder="Firewall 해제 사유" disabled={isRecoveryModalLocked ||
+                .value)} placeholder="방화벽 해제 사유" disabled={isRecoveryModalLocked ||
                 isReleasePolling ||
                 hasUncertainOutcome}/>
                 </div>
 
                 <div className="filter-item">
                   <label htmlFor="firewall-release-confirmation">
-                    Rule-bound Confirmation
+                    대상 규칙 확인 문구
                   </label>
 
                   <input id="firewall-release-confirmation" type="text" value={releaseConfirmation} onChange={(event) => setReleaseConfirmation(event
@@ -2278,8 +2275,8 @@ export default function Isolation() {
                 ? "해제 요청 중..."
                 : releaseRequestStatus ===
                     "PENDING"
-                    ? "Firewall Worker 처리 중..."
-                    : "Firewall 해제 요청"}
+                    ? "방화벽 처리 서비스 처리 중..."
+                    : "방화벽 해제 요청"}
                 </button>
               </div>
 
@@ -2290,7 +2287,7 @@ export default function Isolation() {
               {releaseRequest && (<dl className="detail-list result-list">
                   <div>
                     <dt>
-                      Request ID
+                      요청 ID
                     </dt>
 
                     <dd className="break-word">
@@ -2301,7 +2298,7 @@ export default function Isolation() {
 
                   <div>
                     <dt>
-                      Status
+                      상태
                     </dt>
 
                     <dd>
@@ -2311,7 +2308,7 @@ export default function Isolation() {
 
                   <div>
                     <dt>
-                      Requested By
+                      요청자
                     </dt>
 
                     <dd>
@@ -2322,7 +2319,7 @@ export default function Isolation() {
 
                   <div>
                     <dt>
-                      Requested At
+                      요청 시각
                     </dt>
 
                     <dd>
@@ -2332,7 +2329,7 @@ export default function Isolation() {
 
                   <div>
                     <dt>
-                      Processed At
+                      처리 시각
                     </dt>
 
                     <dd>
@@ -2342,7 +2339,7 @@ export default function Isolation() {
 
                   <div>
                     <dt>
-                      Last Error
+                      마지막 오류
                     </dt>
 
                     <dd className="break-word">
@@ -2353,7 +2350,7 @@ export default function Isolation() {
                 </dl>)}
 
               {isReleasePolling && (<p className="command-note">
-                  Release Request는 서버에서 계속 처리됩니다. 이 창을 닫아도 서버 작업이 취소된 것으로 간주하지 않습니다.
+                  차단 해제 요청는 서버에서 계속 처리됩니다. 이 창을 닫아도 서버 작업이 취소된 것으로 간주하지 않습니다.
                 </p>)}
             </section>
 
@@ -2363,11 +2360,11 @@ export default function Isolation() {
 
             <section className="detail-section">
               <h3>
-                2. Recovery Preflight
+                2. 복구 사전 점검
               </h3>
 
               <p className="text-muted">
-                Firewall Rule이 REMOVED 상태가 된 뒤 Backend가 Runtime Firewall, 미처리 Detection, Release Request 및 Backup 경로를 다시 검사합니다.
+                방화벽 규칙이 제거 상태로 기록된 뒤 백엔드가 실제 방화벽, 미처리 탐지, 차단 해제 요청 및 백업 경로를 다시 검사합니다.
               </p>
 
               <div className="action-row">
@@ -2376,8 +2373,8 @@ export default function Isolation() {
                 currentSelectedFirewallStatus !==
                     "REMOVED"}>
                   {preflightLoading
-                ? "Preflight 확인 중..."
-                : "Preflight 실행"}
+                ? "사전 점검 확인 중..."
+                : "사전 점검 실행"}
                 </button>
               </div>
 
@@ -2389,41 +2386,41 @@ export default function Isolation() {
                   <dl className="detail-list result-list">
                     <div>
                       <dt>
-                        Result
+                        결과
                       </dt>
 
                       <dd>
-                        {preflight.result ||
-                    "-"}
+                        {uiLabel(preflight.result ||
+                    "-")}
                       </dd>
                     </div>
 
                     <div>
                       <dt>
-                        can_execute
+                        복구 실행 가능 여부
                       </dt>
 
                       <dd>
                         {getPreflightCanExecute(preflight)
-                    ? "true"
-                    : "false"}
+                    ? "가능"
+                    : "불가"}
                       </dd>
                     </div>
 
                     <div>
                       <dt>
-                        Current Status
+                        현재 상태
                       </dt>
 
                       <dd>
-                        {preflight.current_status ||
-                    "-"}
+                        {uiLabel(preflight.current_status ||
+                    "-")}
                       </dd>
                     </div>
 
                     <div>
                       <dt>
-                        Current Trust Score
+                        현재 신뢰점수
                       </dt>
 
                       <dd>
@@ -2433,18 +2430,18 @@ export default function Isolation() {
 
                     <div>
                       <dt>
-                        Runtime
+                        실제 실행 상태
                       </dt>
 
                       <dd>
-                        {getRuntimeReleaseStatus(preflight) ||
-                    "-"}
+                        {uiLabel(getRuntimeReleaseStatus(preflight) ||
+                    "-")}
                       </dd>
                     </div>
 
                     <div>
                       <dt>
-                        Runtime Rule Count
+                        실제 방화벽 규칙 수
                       </dt>
 
                       <dd>
@@ -2457,7 +2454,7 @@ export default function Isolation() {
 
                     <div>
                       <dt>
-                        Active Firewall Rules
+                        활성 규칙 기록 수
                       </dt>
 
                       <dd>
@@ -2470,7 +2467,7 @@ export default function Isolation() {
 
                     <div>
                       <dt>
-                        Release Requests
+                        차단 해제 요청 수
                       </dt>
 
                       <dd>
@@ -2483,7 +2480,7 @@ export default function Isolation() {
 
                     <div>
                       <dt>
-                        Unprocessed Detection
+                        미처리 탐지 건수
                       </dt>
 
                       <dd>
@@ -2494,7 +2491,7 @@ export default function Isolation() {
 
                     <div>
                       <dt>
-                        Backup Check
+                        백업 확인
                       </dt>
 
                       <dd>
@@ -2502,12 +2499,12 @@ export default function Isolation() {
                     ?.backup_check
                     ?.available ===
                     true
-                    ? "AVAILABLE"
+                    ? "사용 가능"
                     : preflight
                         ?.backup_check
                         ?.available ===
                         false
-                        ? "UNAVAILABLE"
+                        ? "사용 불가"
                         : "-"}
                       </dd>
                     </div>
@@ -2516,12 +2513,12 @@ export default function Isolation() {
                   {!getPreflightCanExecute(preflight) && (<div className="page-warning-banner">
                         <div>
                           <strong>
-                            Recovery 실행 불가
+                            복구 실행 불가
                           </strong>
 
                           <p>
                             {preflight.failure_reason ||
-                        "Backend Preflight 안전 조건을 통과하지 못했습니다."}
+                        "백엔드 사전 점검 안전 조건을 통과하지 못했습니다."}
                           </p>
 
                           {preflight.failure_code && (<p>
@@ -2541,27 +2538,27 @@ export default function Isolation() {
 
             <section className="detail-section">
               <h3>
-                3. Recovery 승인 및 실행
+                3. 복구 승인 및 실행
               </h3>
 
               <p className="text-muted">
-                Preflight가 PASS이고 Runtime이 VERIFIED_RELEASED인 경우에만 Baseline Recovery를 실행할 수 있습니다.
+                사전 점검을 통과하고 실제 방화벽 차단 해제가 확인된 경우에만 신뢰 상태 복구를 실행할 수 있습니다.
               </p>
 
               <div className="recovery-form">
                 <div className="filter-item">
                   <label htmlFor="recovery-reason">
-                    Reason
+                    사유
                   </label>
 
                   <textarea id="recovery-reason" value={recoveryReason} onChange={(event) => setRecoveryReason(event
                 .target
-                .value)} placeholder="Recovery 수행 사유" disabled={!canRunRecovery}/>
+                .value)} placeholder="복구 수행 사유" disabled={!canRunRecovery}/>
                 </div>
 
                 <div className="filter-item">
                   <label htmlFor="recovery-confirmation">
-                    Confirmation
+                    확인 문구
                   </label>
 
                   <input id="recovery-confirmation" type="text" value={recoveryConfirmation} onChange={(event) => setRecoveryConfirmation(event
@@ -2585,14 +2582,14 @@ export default function Isolation() {
                   <strong>
                     {getRecoveryResult(recoveryResult) ===
                     "SUCCESS"
-                    ? "Recovery 완료"
+                    ? "복구 완료"
                     : `Recovery ${getRecoveryResult(recoveryResult)}`}
                   </strong>
 
                   <dl className="detail-list">
                     <div>
                       <dt>
-                        Operation ID
+                        작업 ID
                       </dt>
 
                       <dd className="break-word">
@@ -2603,23 +2600,23 @@ export default function Isolation() {
 
                     <div>
                       <dt>
-                        Result
+                        결과
                       </dt>
 
                       <dd>
-                        {recoveryResult.result ||
-                    "-"}
+                        {uiLabel(recoveryResult.result ||
+                    "-")}
                       </dd>
                     </div>
 
                     <div>
                       <dt>
-                        Before
+                        복구 전
                       </dt>
 
                       <dd>
-                        {recoveryResult.before_status ||
-                    "-"}
+                        {uiLabel(recoveryResult.before_status ||
+                    "-")}
                         {" / "}
                         {formatNumber(recoveryResult.before_trust_score)}
                       </dd>
@@ -2627,12 +2624,12 @@ export default function Isolation() {
 
                     <div>
                       <dt>
-                        After
+                        복구 후
                       </dt>
 
                       <dd>
-                        {recoveryResult.after_status ||
-                    "-"}
+                        {uiLabel(recoveryResult.after_status ||
+                    "-")}
                         {" / "}
                         {formatNumber(recoveryResult.after_trust_score)}
                       </dd>
@@ -2640,18 +2637,18 @@ export default function Isolation() {
 
                     <div>
                       <dt>
-                        Firewall Release
+                        방화벽 차단 해제
                       </dt>
 
                       <dd>
-                        {recoveryResult.firewall_release_status ||
-                    "-"}
+                        {uiLabel(recoveryResult.firewall_release_status ||
+                    "-")}
                       </dd>
                     </div>
 
                     <div>
                       <dt>
-                        Backup Reference
+                        백업 위치
                       </dt>
 
                       <dd className="break-word">
@@ -2662,7 +2659,7 @@ export default function Isolation() {
 
                     <div>
                       <dt>
-                        Backup SHA256
+                        백업 SHA256
                       </dt>
 
                       <dd className="break-word">
@@ -2682,16 +2679,16 @@ export default function Isolation() {
 
             <section className="detail-section">
               <h3>
-                Recovery History
+                복구 이력
               </h3>
 
               {recoveryHistoryLoading ? (<p className="text-muted">
-                  Recovery History를 불러오는 중입니다.
+                  복구 이력를 불러오는 중입니다.
                 </p>) : recoveryHistoryError ? (<p className="inline-error" role="alert">
                   {recoveryHistoryError}
                 </p>) : recoveryHistory.length ===
                 0 ? (<p className="text-muted">
-                  표시할 Recovery History가 없습니다.
+                  표시할 복구 이력이 없습니다.
                 </p>) : (<div className="history-list">
                   {recoveryHistory.map((item, index) => (<article className="history-item" key={item.operation_id ??
                         item.id ??
@@ -2725,7 +2722,7 @@ export default function Isolation() {
       <DetailModal open={Boolean(selectedHistory)} title={selectedHistory
             ? `격리 이력 #${selectedHistory.id}`
             : "격리 이력 상세"} description={selectedHistory
-            ? `${selectedHistory.device_id || "Device 없음"} · ${getIsolationActionLabel(selectedHistory.action)}`
+            ? `${selectedHistory.device_id || "기기 없음"} · ${getIsolationActionLabel(selectedHistory.action)}`
             : undefined} onClose={closeHistoryDetail} size="large" footer={<button type="button" className="button button-secondary" onClick={closeHistoryDetail}>
             닫기
           </button>}>
@@ -2733,7 +2730,7 @@ export default function Isolation() {
             <section className="detail-grid">
               <div className="detail-item">
                 <span>
-                  Device
+                  기기
                 </span>
 
                 <strong>
@@ -2744,7 +2741,7 @@ export default function Isolation() {
 
               <div className="detail-item">
                 <span>
-                  격리 Action
+                  격리 동작
                 </span>
 
                 <StatusBadge status={getIsolationActionStatus(selectedHistory.action)} label={getIsolationActionLabel(selectedHistory.action)}/>
@@ -2752,7 +2749,7 @@ export default function Isolation() {
 
               <div className="detail-item">
                 <span>
-                  Firewall 상태
+                  방화벽 상태
                 </span>
 
                 <StatusBadge status={getFirewallStatusTheme(selectedHistory.firewall_status)} label={getFirewallStatusLabel(selectedHistory.firewall_status)}/>
@@ -2760,7 +2757,7 @@ export default function Isolation() {
 
               <div className="detail-item">
                 <span>
-                  이전 Score
+                  이전 점수
                 </span>
 
                 <strong>
@@ -2771,7 +2768,7 @@ export default function Isolation() {
 
               <div className="detail-item">
                 <span>
-                  변경 Score
+                  변경 후 점수
                 </span>
 
                 <strong>
@@ -2782,7 +2779,7 @@ export default function Isolation() {
 
               <div className="detail-item">
                 <span>
-                  Created At
+                  기록 시각
                 </span>
 
                 <strong>
@@ -2799,7 +2796,7 @@ export default function Isolation() {
               <dl className="detail-list">
                 <div>
                   <dt>
-                    Reason
+                    사유
                   </dt>
 
                   <dd className="break-word">
@@ -2810,7 +2807,7 @@ export default function Isolation() {
 
                 <div>
                   <dt>
-                    Trust History ID
+                    신뢰점수 이력 ID
                   </dt>
 
                   <dd>
@@ -2821,7 +2818,7 @@ export default function Isolation() {
 
                 <div>
                   <dt>
-                    Trigger Event ID
+                    판단 근거 이벤트 ID
                   </dt>
 
                   <dd>
@@ -2834,13 +2831,13 @@ export default function Isolation() {
 
             <section className="detail-section">
               <h3>
-                Firewall Rule
+                방화벽 규칙
               </h3>
 
               {selectedHistory.firewall_rule ? (<dl className="detail-list">
                   <div>
                     <dt>
-                      Rule ID
+                      규칙 ID
                     </dt>
 
                     <dd>
@@ -2851,7 +2848,7 @@ export default function Isolation() {
 
                   <div>
                     <dt>
-                      Source IP
+                      출발지 IP
                     </dt>
 
                     <dd>
@@ -2864,7 +2861,7 @@ export default function Isolation() {
 
                   <div>
                     <dt>
-                      Action
+                      동작
                     </dt>
 
                     <dd>
@@ -2875,7 +2872,7 @@ export default function Isolation() {
 
                   <div>
                     <dt>
-                      Retry Count
+                      재시도 횟수
                     </dt>
 
                     <dd>
@@ -2886,7 +2883,7 @@ export default function Isolation() {
 
                   <div>
                     <dt>
-                      Last Error
+                      마지막 오류
                     </dt>
 
                     <dd className="break-word">
@@ -2894,7 +2891,7 @@ export default function Isolation() {
                     "-"}
                     </dd>
                   </div>
-                </dl>) : (<EmptyState title="연결된 Firewall Rule이 없습니다." description="이 격리 이력의 Trigger Event ID와 일치하는 Firewall Rule이 없습니다. 다른 Device의 Rule을 임의로 연결하지 않습니다." compact/>)}
+                </dl>) : (<EmptyState title="연결된 방화벽 규칙이 없습니다." description="이 격리 이력의 Trigger Event ID와 일치하는 방화벽 규칙이 없습니다. 다른 기기의 규칙을 임의로 연결하지 않습니다." compact/>)}
             </section>
           </div>)}
       </DetailModal>

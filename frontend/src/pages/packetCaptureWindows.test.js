@@ -1,3 +1,4 @@
+import * as uiText from "../utils/uiText.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -45,7 +46,7 @@ async function captureHarness(response) {
     },
   };
   const scope = {
-    ...hooks, AbortController, console,
+    ...hooks, ...uiText, AbortController, console,
     StatusBadge: "StatusBadge", EmptyState: "EmptyState",
     window: { setInterval: () => 1, clearInterval() {} },
     getPacketCaptureWindows: async (query) => { calls.push(query); return response; },

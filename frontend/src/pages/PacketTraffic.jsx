@@ -1,3 +1,4 @@
+import { uiLabel } from "../utils/uiText";
 import {
 
   useCallback,
@@ -316,7 +317,7 @@ function captureWindowList(response) {
   if (Array.isArray(root)) return { items: root, total: root.length };
   if (Array.isArray(root?.items)) return { items: root.items, total: root.total };
   if (Array.isArray(root?.windows)) return { items: root.windows, total: root.total };
-  throw new Error("Capture Window 응답 형식을 확인할 수 없습니다.");
+  throw new Error("수집 구간 응답 형식을 확인할 수 없습니다.");
 }
 
 function captureWindowField(item, ...keys) {
@@ -406,7 +407,7 @@ function PacketCaptureWindows({ featureRows = [] }) {
   const fromISO = captureKstToISO(fromInput);
   const toISO = captureKstToISO(toInput);
   const queryValidation = !sessionInput.trim()
-    ? "실제 Session ID가 필요합니다. 아래 Packet Feature 목록에서 자동으로 가져오거나 팀원에게 전달받아 입력해 주세요."
+    ? "실제 수집 세션 ID가 필요합니다. 아래 패킷 분석 지표 목록에서 자동으로 가져오거나 팀원에게 전달받아 입력해 주세요."
     : !fromISO || !toISO
       ? "조회 시작·종료 시각(KST)을 모두 입력해 주세요."
       : Date.parse(fromISO) >= Date.parse(toISO)
@@ -441,7 +442,7 @@ function PacketCaptureWindows({ featureRows = [] }) {
       setError("");
     } catch (err) {
       if (controller.signal.aborted || err?.isCanceled || id !== requestIdRef.current) return;
-      setError(err?.message || "Capture Window 조회에 실패했습니다.");
+      setError(err?.message || "수집 구간 조회에 실패했습니다.");
     } finally {
       if (id === requestIdRef.current) setLoading(false);
     }
@@ -494,26 +495,26 @@ function PacketCaptureWindows({ featureRows = [] }) {
     <section className="panel packet-capture-panel">
       <div className="panel-header">
         <div>
-          <h2>Packet Capture Windows</h2>
+          <h2>패킷 수집 구간</h2>
           <p className="panel-description">
-            수집 Window의 상태와 Coverage를 표시합니다. Capture Gap은 AI 추론 실패와 다르며,
-            Capture 품질 저하만으로 공격 또는 격리를 의미하지 않습니다.
+            수집 구간의 상태와 수집 시간 충족률를 표시합니다. 수집 공백은 AI 추론 실패와 다르며,
+            수집 품질 저하만으로 공격 또는 격리를 의미하지 않습니다.
           </p>
         </div>
         <button type="button" className="button button-ghost" onClick={refresh} disabled={loading || !queryKey}>
-          Capture 새로고침
+          수집 상태 새로고침
         </button>
       </div>
       {error && (
         <div className="page-warning-banner" role="alert">
-          <div><strong>Capture Window 조회 실패</strong><p>{error} {lastUpdated ? "이전에 수신한 데이터를 표시합니다." : ""}</p></div>
+          <div><strong>수집 구간 조회 실패</strong><p>{error} {lastUpdated ? "이전에 수신한 데이터를 표시합니다." : ""}</p></div>
         </div>
       )}
       <details className="packet-capture-details">
         <summary>수집 구간 상세 조회</summary>
         <div className="packet-capture-query-form">
           <label className="filter-item" htmlFor="capture-session-input">
-            <span>Session ID (필수)</span>
+            <span>수집 세션 ID (필수)</span>
             <input
               id="capture-session-input"
               list="capture-session-suggestions"
@@ -542,25 +543,25 @@ function PacketCaptureWindows({ featureRows = [] }) {
           <label htmlFor="capture-window-status">표시 상태</label>
           <select id="capture-window-status" value={filter} onChange={(event) => { setFilter(event.target.value); setOffset(0); }}>
             <option value="">전체 (조회 구간)</option>
-            <option value="PROCESSED">PROCESSED</option>
-            <option value="EMPTY">EMPTY</option>
-            <option value="MISSING">MISSING</option>
-            <option value="FAILED">FAILED</option>
-            <option value="PENDING">PENDING</option>
+            <option value="PROCESSED">수집 처리 완료</option>
+            <option value="EMPTY">패킷 없음</option>
+            <option value="MISSING">수집 자료 누락</option>
+            <option value="FAILED">수집 실패</option>
+            <option value="PENDING">처리 대기</option>
           </select>
           <small>필터는 조회 구간 전체에 적용됩니다.</small>
         </div>
         {!queryKey ? null : loading && !lastUpdated ? (
-          <p className="section-unavailable">Capture Window를 조회하는 중입니다.</p>
+          <p className="section-unavailable">수집 구간을 조회하는 중입니다.</p>
         ) : !lastUpdated ? (
-          <EmptyState title="Capture Window 정보를 확인할 수 없습니다." compact />
+          <EmptyState title="수집 구간 정보를 확인할 수 없습니다." compact />
         ) : visibleItems.length === 0 ? (
-          <EmptyState title="표시할 Capture Window가 없습니다." description="조회 결과가 없거나 상태 필터와 일치하지 않습니다." compact />
+          <EmptyState title="표시할 수집 구간이 없습니다." description="조회 결과가 없거나 상태 필터와 일치하지 않습니다." compact />
         ) : (
           <div className="table-scroll">
             <table className="packet-window-table">
               <thead><tr>
-                <th>Window / Session</th><th>시작</th><th>종료</th><th>상태</th><th>Coverage</th><th>분석 가능</th><th>제외·오류 사유</th>
+                <th>분석 구간 / 수집 세션</th><th>시작</th><th>종료</th><th>상태</th><th>수집 시간 충족률</th><th>분석 가능</th><th>제외·오류 사유</th>
               </tr></thead>
               <tbody>{visibleItems.map((item, index) => {
                 const id = captureWindowField(item, "segment_id", "id", "window_id", "capture_window_id", "capture_session_id", "session_id");
@@ -576,7 +577,7 @@ function PacketCaptureWindows({ featureRows = [] }) {
                     <td><StatusBadge status={CAPTURE_OBSERVATION_THEMES[status] ?? "unknown"} label={status} size="small" /></td>
                     <td>{formatPercent(coverage)}</td>
                     <td>{eligible === null ? "-" : eligible === true ? "가능" : eligible === false ? "제외" : captureWindowDisplay(eligible)}</td>
-                    <td>{captureWindowDisplay(reason)}</td>
+                    <td>{uiLabel(reason)}</td>
                   </tr>
                 );
               })}</tbody>
@@ -670,7 +671,7 @@ export default function PacketTraffic() {
         { signal: controller.signal }
       );
       if (controller.signal.aborted || requestId !== featureRequestIdRef.current) return;
-      if (!Array.isArray(data?.items)) throw new Error("Packet Feature 응답 형식을 확인할 수 없습니다.");
+      if (!Array.isArray(data?.items)) throw new Error("패킷 분석 지표 응답 형식을 확인할 수 없습니다.");
       const items = data.items;
       setPacketFeatures(items);
       const responseTotal = Number(data.total);
@@ -682,7 +683,7 @@ export default function PacketTraffic() {
     } catch (err) {
       if (controller.signal.aborted || err?.isCanceled || requestId !== featureRequestIdRef.current) return;
       if (IS_DEV) console.error("Packet feature load failed:", err);
-      const message = err instanceof Error ? err.message : "Packet Traffic 데이터를 불러오지 못했습니다.";
+      const message = err instanceof Error ? err.message : "패킷 통신 데이터를 불러오지 못했습니다.";
       if (hasDataRef.current) setPollWarning(message);
       else setError(message);
     } finally {
@@ -1017,7 +1018,7 @@ export default function PacketTraffic() {
 
       key: "capture_session_id",
 
-      header: "Session",
+      header: "수집 세션",
 
       width: 120,
 
@@ -1055,7 +1056,7 @@ export default function PacketTraffic() {
 
       key: "capture_segment_id",
 
-      header: "Segment",
+      header: "수집 구간",
 
       align: "right",
 
@@ -1071,7 +1072,7 @@ export default function PacketTraffic() {
 
       key: "device_id",
 
-      header: "Device",
+      header: "기기",
 
       width: 130,
 
@@ -1125,7 +1126,7 @@ export default function PacketTraffic() {
 
       key: "peer_ip",
 
-      header: "Peer IP",
+      header: "상대 IP",
 
       width: 130,
 
@@ -1135,7 +1136,7 @@ export default function PacketTraffic() {
 
       key: "direction",
 
-      header: "Direction",
+      header: "통신 방향",
 
       width: 110,
 
@@ -1157,7 +1158,7 @@ export default function PacketTraffic() {
 
       key: "window_start",
 
-      header: "분석 Window",
+      header: "분석 구간",
 
       width: 210,
 
@@ -1201,7 +1202,7 @@ export default function PacketTraffic() {
 
       key: "packet_count",
 
-      header: "Packets",
+      header: "패킷 수",
 
       align: "right",
 
@@ -1217,7 +1218,7 @@ export default function PacketTraffic() {
 
       key: "total_bytes",
 
-      header: "Total Bytes",
+      header: "총 전송량",
 
       align: "right",
 
@@ -1233,7 +1234,7 @@ export default function PacketTraffic() {
 
       key: "nominal_packets_per_second",
 
-      header: "명목 PPS",
+      header: <span className="rate-column-heading">PPS<small>10초 기준</small></span>,
 
       align: "right",
 
@@ -1257,7 +1258,7 @@ export default function PacketTraffic() {
 
       key: "effective_packets_per_second",
 
-      header: "실제 PPS",
+      header: <span className="rate-column-heading">PPS<small>수집시간 기준</small></span>,
 
       align: "right",
 
@@ -1299,7 +1300,7 @@ export default function PacketTraffic() {
 
       key: "nominal_bytes_per_second",
 
-      header: "명목 BPS",
+      header: <span className="rate-column-heading">BPS<small>10초 기준</small></span>,
 
       align: "right",
 
@@ -1323,7 +1324,7 @@ export default function PacketTraffic() {
 
       key: "effective_bytes_per_second",
 
-      header: "실제 BPS",
+      header: <span className="rate-column-heading">BPS<small>수집시간 기준</small></span>,
 
       align: "right",
 
@@ -1365,7 +1366,7 @@ export default function PacketTraffic() {
 
       key: "captured_duration_seconds",
 
-      header: "Capture 시간",
+      header: "실제 수집시간",
 
       align: "right",
 
@@ -1381,7 +1382,7 @@ export default function PacketTraffic() {
 
       key: "coverage_ratio",
 
-      header: "Coverage",
+      header: "수집 시간 충족률",
 
       align: "right",
 
@@ -1597,7 +1598,7 @@ export default function PacketTraffic() {
 
         title="통신 분석"
 
-        description="Raspberry Pi에서 수집한 Packet Feature와 실제 Capture 품질을 확인합니다."
+        description="Raspberry Pi에서 수집한 패킷 분석 지표와 실제 수집 품질을 확인합니다."
 
         updatedAt={
 
@@ -1701,13 +1702,13 @@ export default function PacketTraffic() {
 
             className="summary-card-grid"
 
-            aria-label="Packet Traffic 요약"
+            aria-label="패킷 통신 요약"
 
           >
 
             <SummaryCard
 
-              title="전체 Feature"
+              title="전체 분석 지표"
 
               value={formatNumber(
 
@@ -1717,7 +1718,7 @@ export default function PacketTraffic() {
 
               )}
 
-              description="조회 조건에 해당하는 전체 Window"
+              description="조회 조건에 해당하는 전체 분석 구간"
 
             />
 
@@ -1733,7 +1734,7 @@ export default function PacketTraffic() {
 
               )}
 
-              description="현재 페이지의 Capture 품질 통과 Window"
+              description="현재 페이지의 수집 품질 통과 분석 구간"
 
               status="normal"
 
@@ -1751,7 +1752,7 @@ export default function PacketTraffic() {
 
               )}
 
-              description="현재 페이지의 분석 제외 Window"
+              description="현재 페이지에서 분석이 제외된 구간"
 
               status={
 
@@ -1779,7 +1780,7 @@ export default function PacketTraffic() {
 
               )}
 
-              description="현재 페이지의 Segment 실패 Window"
+              description="현재 페이지에서 수집에 실패한 구간"
 
               status={
 
@@ -1807,7 +1808,7 @@ export default function PacketTraffic() {
 
               )}
 
-              description="현재 페이지 고유 Device"
+              description="현재 페이지 고유 기기"
 
             />
 
@@ -1823,7 +1824,7 @@ export default function PacketTraffic() {
 
               )}
 
-              description="Device와 연결되지 않은 고유 IP"
+              description="기기와 연결되지 않은 고유 IP"
 
               status={
 
@@ -1861,7 +1862,7 @@ export default function PacketTraffic() {
 
               }
 
-              description="실제 Capture Duration 기준"
+              description="실제 수집시간 기준"
 
             />
 
@@ -1885,7 +1886,7 @@ export default function PacketTraffic() {
 
             <p className="panel-description">
 
-              Direction은 전체 조회에 적용되고,
+              통신 방향은 전체 조회에 적용되고,
 
               검색어와 분석 상태는 현재 페이지 결과에 적용됩니다.
 
@@ -1921,7 +1922,7 @@ export default function PacketTraffic() {
 
             <label htmlFor="packet-search">
 
-              기기·IP·Session 검색
+              기기·IP·수집 세션 검색
 
             </label>
 
@@ -1931,7 +1932,7 @@ export default function PacketTraffic() {
 
               type="search"
 
-              placeholder="device_id, peer_ip, session_id"
+              placeholder="기기 ID, 상대 IP, 수집 세션 ID"
 
               value={searchText}
 
@@ -1953,7 +1954,7 @@ export default function PacketTraffic() {
 
             <label htmlFor="direction-filter">
 
-              Direction
+              통신 방향
 
             </label>
 
@@ -1983,13 +1984,13 @@ export default function PacketTraffic() {
 
               <option value="INBOUND">
 
-                INBOUND
+                기기 → Pi
 
               </option>
 
               <option value="OUTBOUND">
 
-                OUTBOUND
+                Pi → 기기
 
               </option>
 
@@ -2001,7 +2002,7 @@ export default function PacketTraffic() {
 
             <label htmlFor="capture-status-filter">
 
-              Capture 분석 상태
+              수집 분석 상태
 
             </label>
 
@@ -2057,17 +2058,13 @@ export default function PacketTraffic() {
 
             <h2>
 
-              Packet Feature 목록
+              패킷 분석 지표 목록
 
             </h2>
 
             <p className="panel-description">
 
-              명목 Rate는 10초 Window
-
-              기준이며, 실제 Rate는
-
-              Capture Duration 기준입니다.
+              전송률은 10초 기준과 실제 수집시간 기준을 구분해 표시합니다.
 
             </p>
 
@@ -2103,7 +2100,7 @@ export default function PacketTraffic() {
 
             title="검색 조건에 맞는 데이터가 없습니다."
 
-            description="현재 페이지에서 다른 기기 ID, IP 또는 Session ID를 검색해 주세요."
+            description="현재 페이지에서 다른 기기 ID, IP 또는 수집 세션 ID를 검색해 주세요."
 
             actionLabel="검색 초기화"
 
@@ -2131,11 +2128,11 @@ export default function PacketTraffic() {
 
               minWidth={2500}
 
-              tableLabel="Packet Feature 목록"
+              tableLabel="패킷 분석 지표 목록"
 
-              emptyTitle="표시할 Packet Feature가 없습니다."
+              emptyTitle="표시할 패킷 분석 지표가 없습니다."
 
-              emptyDescription="Packet Capture와 Feature Extractor가 정상적으로 실행 중인지 확인해 주세요."
+              emptyDescription="패킷 수집과 특징 추출 서비스가 정상적으로 실행 중인지 확인해 주세요."
 
               rowClassName={(item) => {
 

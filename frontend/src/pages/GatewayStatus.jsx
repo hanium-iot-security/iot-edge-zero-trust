@@ -1,3 +1,4 @@
+import { uiLabel } from "../utils/uiText";
 
 import {
   useCallback,
@@ -194,16 +195,16 @@ function getGatewayStatus(
 function gatewayDescription(status) {
   const descriptions = {
     ONLINE:
-      "최근 수집 주기 내에 Gateway Metric이 수신되었습니다.",
+      "최근 수집 주기 내에 게이트웨이 지표이 수신되었습니다.",
     STALE:
       "마지막 Metric 수집 이후 허용 시간이 지났습니다.",
     NO_DATA:
-      "API 요청은 성공했지만 저장된 Gateway Metric이 없습니다.",
+      "API 요청은 성공했지만 저장된 게이트웨이 지표이 없습니다.",
     API_ERROR:
-      "Gateway Metrics API에 연결할 수 없습니다.",
+      "게이트웨이 지표 API에 연결할 수 없습니다.",
   };
 
-  return descriptions[status] || "Gateway 상태 확인 불가";
+  return descriptions[status] || "게이트웨이 상태 확인 불가";
 }
 
 function gatewayTheme(status) {
@@ -260,7 +261,7 @@ function getInterfaceStatus(data) {
     return {
       status: "missing",
       label: "미인식",
-      description: "Interface 정보가 응답에 없습니다.",
+      description: "인터페이스 정보가 응답에 없습니다.",
     };
   }
 
@@ -268,7 +269,7 @@ function getInterfaceStatus(data) {
     return {
       status: "missing",
       label: "미인식",
-      description: "운영체제에서 Interface를 찾지 못했습니다.",
+      description: "운영체제에서 인터페이스를 찾지 못했습니다.",
     };
   }
 
@@ -276,7 +277,7 @@ function getInterfaceStatus(data) {
     return {
       status: "down",
       label: "DOWN",
-      description: "Interface는 존재하지만 비활성 상태입니다.",
+      description: "인터페이스는 존재하지만 비활성 상태입니다.",
     };
   }
 
@@ -284,14 +285,14 @@ function getInterfaceStatus(data) {
     return {
       status: "connected",
       label: "연결됨",
-      description: "Interface가 활성화되어 있습니다.",
+      description: "인터페이스가 활성화되어 있습니다.",
     };
   }
 
   return {
     status: "unknown",
     label: "상태 미확인",
-    description: "Interface 상태 필드가 충분하지 않습니다.",
+    description: "인터페이스 상태 필드가 충분하지 않습니다.",
   };
 }
 
@@ -349,7 +350,7 @@ function InterfaceCard({
 
       <div className="interface-details">
         <div className="metric-item">
-          <span>IP Address</span>
+          <span>IP 주소</span>
           <strong>
             {interfaceData?.ip_address || "-"}
           </strong>
@@ -400,7 +401,7 @@ function InterfaceCard({
           (rxRate == null || txRate == null) && (
             <StatusBadge
               status="degraded"
-              label="Rate 계산 불가"
+              label="전송률 계산 불가"
               size="small"
             />
           )}
@@ -516,47 +517,47 @@ function RuntimeCard({ item, index }) {
         <strong>{runtimeTitle(item, index)}</strong>
         <StatusBadge
           status={runtimeTheme(actual)}
-          label={actual == null ? "UNKNOWN" : displayValue(actual)}
+          label={actual == null ? "UNKNOWN" : uiLabel(actual)}
           size="small"
         />
       </div>
 
       <dl className="ai-runtime-list">
         <div>
-          <dt>Desired</dt>
-          <dd>{displayValue(desired)}</dd>
+          <dt>실행 설정</dt>
+          <dd>{uiLabel(desired)}</dd>
         </div>
 
         <div>
-          <dt>Actual</dt>
-          <dd>{displayValue(actual)}</dd>
+          <dt>실제 관측 상태</dt>
+          <dd>{uiLabel(actual)}</dd>
         </div>
 
         <div>
-          <dt>Model</dt>
+          <dt>모델</dt>
           <dd>{displayValue(model)}</dd>
         </div>
 
         <div>
-          <dt>Updated At</dt>
+          <dt>관측 시각</dt>
           <dd>{updatedAt ? formatKST(updatedAt) : "-"}</dd>
         </div>
 
         <div>
-          <dt>Freshness</dt>
-          <dd>{displayValue(item.freshness)}</dd>
+          <dt>관측 정보 최신 여부</dt>
+          <dd>{uiLabel(item.freshness)}</dd>
         </div>
 
         {item.freshness !== "FRESH" && (
           <div>
-            <dt>Last Observation (과거 관측)</dt>
-            <dd>{displayValue(item.last_observation_status)}</dd>
+            <dt>마지막 관측 상태</dt>
+            <dd>{uiLabel(item.last_observation_status)}</dd>
           </div>
         )}
 
         {error != null && (
           <div className="ai-runtime-error">
-            <dt>Last Error</dt>
+            <dt>마지막 오류</dt>
             <dd>{displayValue(error)}</dd>
           </div>
         )}
@@ -572,17 +573,17 @@ function CompletionCard({ item }) {
         <strong>{displayValue(item.detector_name)}</strong>
         <StatusBadge
           status="unknown"
-          label={`${item.evidence_status} / ${item.freshness}`}
+          label={`${uiLabel(item.evidence_status)} / ${uiLabel(item.freshness)}`}
           size="small"
         />
       </div>
       <dl className="ai-runtime-list">
-        <div><dt>Device</dt><dd>{displayValue(item.device_id)}</dd></div>
-        <div><dt>Completed Window</dt><dd>{formatKST(item.completed_window_end)}</dd></div>
-        <div><dt>Model</dt><dd>{displayValue(item.model_version)}</dd></div>
-        <div><dt>Inference / Input</dt><dd>{item.inference_count} / {item.input_count}</dd></div>
-        <div><dt>Normal / Anomaly</dt><dd>{item.normal_count} / {item.anomaly_count}</dd></div>
-        <div><dt>Excluded</dt><dd>{displayValue(item.exclusion_counts)}</dd></div>
+        <div><dt>기기</dt><dd>{displayValue(item.device_id)}</dd></div>
+        <div><dt>마지막 분석 완료 구간</dt><dd>{formatKST(item.completed_window_end)}</dd></div>
+        <div><dt>모델</dt><dd>{displayValue(item.model_version)}</dd></div>
+        <div><dt>추론 횟수 / 입력 수</dt><dd>{item.inference_count} / {item.input_count}</dd></div>
+        <div><dt>정상 / 이상 판정 수</dt><dd>{item.normal_count} / {item.anomaly_count}</dd></div>
+        <div><dt>분석 제외</dt><dd>{displayValue(item.exclusion_counts)}</dd></div>
       </dl>
     </article>
   );
@@ -664,7 +665,7 @@ export default function GatewayStatus() {
 
       if (!Array.isArray(data?.items)) {
         throw new Error(
-          "Gateway Metrics 응답 형식을 확인할 수 없습니다."
+          "게이트웨이 지표 응답 형식을 확인할 수 없습니다."
         );
       }
 
@@ -685,7 +686,7 @@ export default function GatewayStatus() {
       }
 
       const message =
-        err?.message || "Gateway Metrics를 불러오지 못했습니다.";
+        err?.message || "게이트웨이 지표를 불러오지 못했습니다.";
 
       if (hasSuccessfulResponseRef.current) {
         setPollWarning(message);
@@ -728,7 +729,7 @@ export default function GatewayStatus() {
       const root = normalizeApiRoot(data);
 
       if (root === null || typeof root !== "object") {
-        throw new Error("AI Runtime 응답 형식이 올바르지 않습니다.");
+        throw new Error("AI 실행 상태 응답 형식이 올바르지 않습니다.");
       }
 
       setRuntimeData(root);
@@ -744,7 +745,7 @@ export default function GatewayStatus() {
       }
 
       setRuntimeError(
-        err?.message || "AI Runtime 상태 조회에 실패했습니다."
+        err?.message || "AI 실행 상태 조회에 실패했습니다."
       );
     } finally {
       if (requestId === runtimeRequestIdRef.current) {
@@ -815,14 +816,14 @@ export default function GatewayStatus() {
         key: "internal_lan",
         title: "내부 LAN",
         description:
-          "IoT 내부 네트워크와 연결되는 기본 Interface입니다.",
+          "IoT 내부 네트워크와 연결되는 기본 인터페이스입니다.",
         data: internalLan,
       },
       {
         key: "usb_lan",
         title: "USB LAN",
         description:
-          "외부 또는 보조 네트워크와 연결되는 USB Interface입니다.",
+          "외부 또는 보조 네트워크와 연결되는 USB 인터페이스입니다.",
         data: usbLan,
       },
     ],
@@ -887,8 +888,8 @@ export default function GatewayStatus() {
   return (
     <div className="gateway-page">
       <PageHeader
-        title="Gateway Status"
-        description="Raspberry Pi Gateway 자원, 네트워크 Interface 및 AI Runtime의 실제 상태를 확인합니다."
+        title="게이트웨이 상태"
+        description="Raspberry Pi 게이트웨이 자원, 네트워크 인터페이스 및 AI 실행 상태의 실제 상태를 확인합니다."
         updatedAt={
           lastSuccessfulFetchAt
             ? formatKST(lastSuccessfulFetchAt)
@@ -906,7 +907,7 @@ export default function GatewayStatus() {
           role="alert"
         >
           <div>
-            <strong>Gateway Metrics 갱신 실패</strong>
+            <strong>게이트웨이 지표 갱신 실패</strong>
             <p>
               {pollWarning} 이전에 수신한 Metric을 계속 표시합니다.
             </p>
@@ -935,7 +936,7 @@ export default function GatewayStatus() {
       <section className="panel">
         <div className="panel-header">
           <div>
-            <h2>AI Runtime Status</h2>
+            <h2>AI 실행 상태</h2>
             <p className="panel-description">
               Desired 설정과 Actual 실행 상태를 구분합니다.
               AI 정책이 OBSERVE라고 해서 추론 엔진의 실행이
@@ -949,7 +950,7 @@ export default function GatewayStatus() {
             onClick={loadRuntimeStatus}
             disabled={runtimeLoading}
           >
-            Runtime 새로고침
+            실행 상태 새로고침
           </button>
         </div>
 
@@ -959,7 +960,7 @@ export default function GatewayStatus() {
             role="alert"
           >
             <div>
-              <strong>AI Runtime 조회 실패</strong>
+              <strong>AI 실행 상태 조회 실패</strong>
               <p>
                 {runtimeError}
                 {runtimeData
@@ -972,13 +973,13 @@ export default function GatewayStatus() {
 
         {runtimeLoading && !runtimeData ? (
           <LoadingState
-            title="AI Runtime 상태를 확인하는 중입니다."
+            title="AI 실행 상태를 확인하는 중입니다."
             compact
           />
         ) : !runtimeData ? (
           <EmptyState
-            title="AI Runtime 상태를 확인할 수 없습니다."
-            description="Runtime API 연결 및 서비스 상태를 확인해 주세요."
+            title="AI 실행 상태를 확인할 수 없습니다."
+            description="실행 상태 조회 API 연결 및 서비스 상태를 확인해 주세요."
             compact
           />
         ) : (
@@ -992,7 +993,7 @@ export default function GatewayStatus() {
                 description={
                   runtimeError
                     ? "최근 갱신에 실패했습니다."
-                    : "Runtime 상태 API 응답을 수신했습니다."
+                    : "실행 상태 API 응답을 수신했습니다."
                 }
                 status={
                   runtimeError ? "danger" : "normal"
@@ -1047,7 +1048,7 @@ export default function GatewayStatus() {
             {completionItems.length > 0 && (
               <>
                 <h3>최근 추론 완료 근거</h3>
-                <p className="ai-runtime-note">완료 기록과 현재 Runtime 상태는 별개입니다.</p>
+                <p className="ai-runtime-note">완료 기록과 현재 실행 상태는 별개입니다.</p>
                 <div className="ai-runtime-grid">
                   {completionItems.map((item, index) => (
                     <CompletionCard key={`${item.run_id}-${item.detector_name}-${index}`} item={item} />
@@ -1057,7 +1058,7 @@ export default function GatewayStatus() {
             )}
 
             <details className="ai-runtime-raw">
-              <summary>Runtime 원본 응답 확인</summary>
+              <summary>실행 상태 원본 응답 확인</summary>
               <pre>
                 {JSON.stringify(runtimeData, null, 2)}
               </pre>
@@ -1072,12 +1073,12 @@ export default function GatewayStatus() {
 
       {loading && !hasSuccessfulResponseRef.current ? (
         <LoadingState
-          title="Gateway Metrics를 불러오는 중입니다."
-          description="Raspberry Pi 시스템 상태와 Interface 정보를 확인하고 있습니다."
+          title="게이트웨이 지표를 불러오는 중입니다."
+          description="Raspberry Pi 시스템 상태와 인터페이스 정보를 확인하고 있습니다."
         />
       ) : error && !hasSuccessfulResponseRef.current ? (
         <ErrorState
-          title="Gateway API에 연결할 수 없습니다."
+          title="게이트웨이 API에 연결할 수 없습니다."
           message={error}
           onRetry={handleRefresh}
         />
@@ -1085,7 +1086,7 @@ export default function GatewayStatus() {
         <>
           <section className="summary-card-grid">
             <SummaryCard
-              title="Gateway 상태"
+              title="게이트웨이 상태"
               value="NO DATA"
               description="API 응답에 저장된 Metric이 없습니다."
               status="unknown"
@@ -1093,8 +1094,8 @@ export default function GatewayStatus() {
           </section>
 
           <EmptyState
-            title="수집된 Gateway Metrics가 없습니다."
-            description="Gateway Metrics Collector와 DB 저장 상태를 확인해 주세요."
+            title="수집된 게이트웨이 지표가 없습니다."
+            description="게이트웨이 지표 수집 서비스와 DB 저장 상태를 확인해 주세요."
             actionLabel="다시 조회"
             onAction={handleRefresh}
           />
@@ -1103,10 +1104,10 @@ export default function GatewayStatus() {
         <>
           <section
             className="summary-card-grid"
-            aria-label="Gateway 상태 요약"
+            aria-label="게이트웨이 상태 요약"
           >
             <SummaryCard
-              title="Gateway 상태"
+              title="게이트웨이 상태"
               value={gatewayStatus}
               description={gatewayDescription(gatewayStatus)}
               status={gatewayTheme(gatewayStatus)}
@@ -1130,10 +1131,10 @@ export default function GatewayStatus() {
             />
 
             <SummaryCard
-              title="연결된 Interface"
+              title="연결된 인터페이스"
               value={interfaceSummary.connected}
               description={[
-                `DOWN ${interfaceSummary.down}`,
+                `비활성 ${interfaceSummary.down}`,
                 `미인식 ${interfaceSummary.missing}`,
                 interfaceSummary.unknown > 0
                   ? `미확인 ${interfaceSummary.unknown}`
@@ -1167,7 +1168,7 @@ export default function GatewayStatus() {
 
             <div className="overview-detail">
               <div>
-                <span>Metric ID</span>
+                <span>수집 지표 ID</span>
                 <strong>
                   {formatInteger(latestMetric.id)}
                 </strong>
@@ -1187,8 +1188,8 @@ export default function GatewayStatus() {
               <div>
                 <h2>시스템 자원</h2>
                 <p>
-                  Raspberry Pi의 CPU, Memory, Disk,
-                  Temperature 사용 상태입니다.
+                  Raspberry Pi의 CPU, 메모리, 저장공간,
+                  온도 사용 상태입니다.
                 </p>
               </div>
             </div>
@@ -1208,7 +1209,7 @@ export default function GatewayStatus() {
               />
 
               <MetricCard
-                label="Memory"
+                label="메모리"
                 value={formatResourceValue(
                   latestMetric.memory_percent
                 )}
@@ -1217,11 +1218,11 @@ export default function GatewayStatus() {
                 status={resourceStatus(
                   latestMetric.memory_percent
                 )}
-                description="현재 Memory 사용률"
+                description="현재 메모리 사용률"
               />
 
               <MetricCard
-                label="Disk"
+                label="저장공간"
                 value={formatResourceValue(
                   latestMetric.disk_percent
                 )}
@@ -1238,7 +1239,7 @@ export default function GatewayStatus() {
               />
 
               <MetricCard
-                label="Temperature"
+                label="온도"
                 value={formatResourceValue(
                   latestMetric.temperature_c
                 )}
@@ -1254,9 +1255,9 @@ export default function GatewayStatus() {
           <section className="panel">
             <div className="panel-header">
               <div>
-                <h2>Network Interface</h2>
+                <h2>네트워크 인터페이스</h2>
                 <p className="panel-description">
-                  운영 Interface인 internal_lan(eth0)과
+                  운영 인터페이스인 internal_lan(eth0)과
                   usb_lan(eth1)의 상태를 확인합니다.
                 </p>
               </div>
@@ -1270,7 +1271,7 @@ export default function GatewayStatus() {
 
                 <StatusBadge
                   status="down"
-                  label={`DOWN ${interfaceSummary.down}`}
+                  label={`비활성 ${interfaceSummary.down}`}
                   size="small"
                 />
 

@@ -1,3 +1,4 @@
+import { uiLabel } from "../utils/uiText";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -521,7 +522,7 @@ function getFirewallStatusLabel(status) {
 
   const normalized = String(status || "").toUpperCase();
 
-  return labels[normalized] || status || "Firewall 기록 없음";
+  return labels[normalized] || status || "방화벽 기록 없음";
 
 }
 
@@ -947,7 +948,7 @@ export default function Dashboard() {
 
         key: "trustScores",
 
-        label: "Trust Score",
+        label: "신뢰점수",
 
         request: getTrustScoreSummary({ limit: 10, offset: 0 }, options),
 
@@ -957,7 +958,7 @@ export default function Dashboard() {
 
         key: "gateway",
 
-        label: "Gateway Metric",
+        label: "게이트웨이 지표",
 
         request: getGatewayMetrics({ limit: 1, offset: 0 }, options),
 
@@ -967,7 +968,7 @@ export default function Dashboard() {
 
         key: "packetFeatures",
 
-        label: "Packet Feature",
+        label: "패킷 분석 지표",
 
         request: getPacketFeatureLogs({ limit: 20, offset: 0 }, options),
 
@@ -977,15 +978,15 @@ export default function Dashboard() {
 
         key: "firewall",
 
-        label: "Firewall Rule",
+        label: "방화벽 규칙",
 
         request: getFirewallRules({ limit: 100, offset: 0 }, options),
 
       },
 
-      { key: "health", label: "API Health", request: getHealth(options) },
+      { key: "health", label: "API 연결 상태", request: getHealth(options) },
       { key: "aiWarnings", label: "AI 경고", request: getAiWarnings({ limit: 10, offset: 0 }, options) },
-      { key: "runtime", label: "AI Runtime", request: getRuntimeStatus(options) },
+      { key: "runtime", label: "AI 실행 상태", request: getRuntimeStatus(options) },
 
     ];
 
@@ -1101,7 +1102,7 @@ export default function Dashboard() {
             setAiWarnings(data.items);
             break;
           case "runtime":
-            if (!data || typeof data !== "object") throw new Error("Runtime 응답 형식 오류");
+            if (!data || typeof data !== "object") throw new Error("실행 상태 응답 형식 오류");
             setRuntime(data?.item ?? data);
             break;
 
@@ -1135,7 +1136,7 @@ export default function Dashboard() {
         setCaptureWindows([]);
         stateUpdates.captureWindows = {
           status: "skipped",
-          error: "Session ID와 분석 기간이 없어 조회를 보류했습니다.",
+          error: "수집 세션 ID와 분석 기간이 없어 조회를 보류했습니다.",
           lastSuccessAt: "",
         };
       } else {
@@ -1152,7 +1153,7 @@ export default function Dashboard() {
           const captureData = await getPacketCaptureWindows(captureQuery, options);
           if (requestId !== requestIdRef.current || controller.signal.aborted) return;
           if (!Array.isArray(captureData?.items)) {
-            throw new Error("Capture Window 응답 형식 오류");
+            throw new Error("수집 구간 응답 형식 오류");
           }
           setCaptureWindows(captureData.items);
           successCount += 1;
@@ -1163,7 +1164,7 @@ export default function Dashboard() {
           if (controller.signal.aborted || captureError?.isCanceled) return;
           const message = captureError instanceof Error
             ? captureError.message
-            : "Capture Window 조회 실패";
+            : "수집 구간 조회 실패";
           warnings.push(`Packet Capture Window: ${message}`);
           stateUpdates.captureWindows = {
             status: "error", error: message,
@@ -1200,7 +1201,7 @@ export default function Dashboard() {
 
       if (successCount === 0) {
 
-        throw new Error("모든 Dashboard API 요청에 실패했습니다.");
+        throw new Error("모든 종합 현황 API 요청에 실패했습니다.");
 
       }
 
@@ -1590,7 +1591,7 @@ export default function Dashboard() {
 
       key: "device_id",
 
-      header: "Device",
+      header: "기기",
 
       width: 150,
 
@@ -1642,7 +1643,7 @@ export default function Dashboard() {
 
       key: "trust_score",
 
-      header: "Trust Score",
+      header: "신뢰점수",
 
       align: "right",
 
@@ -1694,7 +1695,7 @@ export default function Dashboard() {
 
       key: "status",
 
-      header: "Trust 상태",
+      header: "신뢰 상태",
 
       width: 110,
 
@@ -1724,7 +1725,7 @@ export default function Dashboard() {
 
       key: "firewall_status",
 
-      header: "Firewall",
+      header: "방화벽",
 
       width: 140,
 
@@ -1748,7 +1749,7 @@ export default function Dashboard() {
 
       key: "last_seen_at",
 
-      header: "Last Seen",
+      header: "마지막 수신 시각",
 
       width: 180,
 
@@ -1766,7 +1767,7 @@ export default function Dashboard() {
 
       key: "device_id",
 
-      header: "Device",
+      header: "기기",
 
       width: 130,
 
@@ -1778,7 +1779,7 @@ export default function Dashboard() {
 
       key: "detector_type",
 
-      header: "Detector",
+      header: "탐지 방식",
 
       width: 100,
 
@@ -1802,7 +1803,7 @@ export default function Dashboard() {
 
       key: "event_type",
 
-      header: "Event",
+      header: "탐지 유형",
 
       width: 210,
 
@@ -1810,7 +1811,7 @@ export default function Dashboard() {
 
         <span className="event-name" title={value || ""}>
 
-          {value || "-"}
+          {uiLabel(value || "-")}
 
         </span>
 
@@ -1822,7 +1823,7 @@ export default function Dashboard() {
 
       key: "severity",
 
-      header: "Severity",
+      header: "심각도",
 
       width: 100,
 
@@ -1846,7 +1847,7 @@ export default function Dashboard() {
 
       key: "score_delta",
 
-      header: "Delta",
+      header: "정책상 점수 변화량",
 
       align: "right",
 
@@ -1868,7 +1869,7 @@ export default function Dashboard() {
 
       key: "applied_to_score",
 
-      header: "Trust 반영",
+      header: "신뢰점수 반영",
 
       width: 120,
 
@@ -1922,7 +1923,7 @@ export default function Dashboard() {
 
       key: "detected_at",
 
-      header: "Detected At",
+      header: "탐지 시각",
 
       width: 180,
 
@@ -1940,7 +1941,7 @@ export default function Dashboard() {
 
       key: "device_id",
 
-      header: "Device",
+      header: "기기",
 
       width: 130,
 
@@ -1952,7 +1953,7 @@ export default function Dashboard() {
 
       key: "topic",
 
-      header: "Topic",
+      header: "토픽",
 
       width: 260,
 
@@ -1972,7 +1973,7 @@ export default function Dashboard() {
 
       key: "payload_size",
 
-      header: "Payload",
+      header: "메시지 내용",
 
       align: "right",
 
@@ -2010,7 +2011,7 @@ export default function Dashboard() {
 
       key: "is_topic_valid",
 
-      header: "Topic",
+      header: "토픽",
 
       width: 90,
 
@@ -2034,7 +2035,7 @@ export default function Dashboard() {
 
       key: "received_at",
 
-      header: "Received At",
+      header: "수신 시각",
 
       width: 180,
 
@@ -2054,9 +2055,9 @@ export default function Dashboard() {
 
         <PageHeader
 
-          title="Dashboard"
+          title="종합 현황"
 
-          description="IoT Gateway, 등록 상태, Trust Score, Detection, Firewall 상태를 한눈에 확인합니다."
+          description="IoT 게이트웨이, 등록 상태, 신뢰점수, 탐지, 방화벽 상태를 한눈에 확인합니다."
 
           updatedAt={lastUpdated ? formatKST(lastUpdated) : undefined}
 
@@ -2074,7 +2075,7 @@ export default function Dashboard() {
 
             <div>
 
-              <strong>일부 Dashboard 데이터 갱신 실패</strong>
+              <strong>일부 종합 현황 데이터 갱신 실패</strong>
 
               <p>실패한 항목은 0으로 바꾸지 않고, 이전 성공 데이터가 있으면 그대로 유지합니다.</p>
 
@@ -2126,7 +2127,7 @@ export default function Dashboard() {
 
               <div>
 
-                <strong>Dashboard를 불러오지 못했습니다.</strong>
+                <strong>종합 현황를 불러오지 못했습니다.</strong>
 
                 <p>{error}</p>
 
@@ -2190,7 +2191,7 @@ export default function Dashboard() {
 
                 unavailable={registrationPendingValue === null}
 
-                description="PENDING · 자동 대응 미적용"
+                description="등록 대기 · 자동 대응 미적용"
 
                 status={
 
@@ -2224,7 +2225,7 @@ export default function Dashboard() {
 
                 unavailable={registrationActiveValue === null}
 
-                description="ACTIVE · 자동 대응 적용 대상"
+                description="등록 활성 · 자동 대응 적용 대상"
 
                 status="normal"
 
@@ -2250,7 +2251,7 @@ export default function Dashboard() {
 
                 unavailable={registrationDisabledValue === null}
 
-                description="DISABLED · 새 자동 대응 중지"
+                description="관리 비활성 · 새 자동 대응 중지"
 
                 updatedAt={sourceUpdatedAt("devices")}
 
@@ -2274,7 +2275,7 @@ export default function Dashboard() {
 
                 unavailable={registrationUnknownValue === null}
 
-                description="정책 migration/backfill 또는 상태 확인 필요"
+                description="등록 정책 정보 확인 필요"
 
                 status={
 
@@ -2300,7 +2301,7 @@ export default function Dashboard() {
 
                 unavailable={!sourceHasSuccess("summary") || !hasFiniteNumber(summary?.normal_devices)}
 
-                description="Trust Score 80 이상"
+                description="신뢰점수 80 이상"
 
                 status="normal"
 
@@ -2318,7 +2319,7 @@ export default function Dashboard() {
 
                 unavailable={!sourceHasSuccess("summary") || !hasFiniteNumber(summary?.warning_devices)}
 
-                description="Trust Score 60~79"
+                description="신뢰점수 60~79"
 
                 status="warning"
 
@@ -2336,7 +2337,7 @@ export default function Dashboard() {
 
                 unavailable={!sourceHasSuccess("summary") || !hasFiniteNumber(summary?.danger_devices)}
 
-                description="Trust Score 30~59"
+                description="신뢰점수 30~59"
 
                 status="danger"
 
@@ -2354,7 +2355,7 @@ export default function Dashboard() {
 
                 unavailable={!sourceHasSuccess("summary") || !hasFiniteNumber(summary?.isolated_devices)}
 
-                description="Trust Score 30 미만"
+                description="신뢰점수 30 미만"
 
                 status="isolated"
 
@@ -2366,7 +2367,7 @@ export default function Dashboard() {
 
               <SummaryCard
 
-                title="Firewall 적용"
+                title="방화벽 적용"
 
                 value={
 
@@ -2408,7 +2409,7 @@ export default function Dashboard() {
 
               <SummaryCard
 
-                title="Firewall 대기"
+                title="방화벽 대기"
 
                 value={
 
@@ -2458,7 +2459,7 @@ export default function Dashboard() {
 
               <SummaryCard
 
-                title="Firewall 실패"
+                title="방화벽 실패"
 
                 value={
 
@@ -2522,11 +2523,11 @@ export default function Dashboard() {
 
             <div className="registration-state-guide" role="note">
 
-              <strong>등록 상태와 Trust 상태는 별개입니다.</strong>
+              <strong>등록 상태와 신뢰 상태는 별개입니다.</strong>
 
               <span>
 
-                PENDING의 초기 Trust Score 100은 보안 검증 완료를 의미하지 않으며,
+                등록 대기 상태의 초기 신뢰점수 100은 보안 검증 완료를 의미하지 않으며,
 
                 자동 감점·차단은 적용되지 않습니다.
 
@@ -2540,10 +2541,10 @@ export default function Dashboard() {
             <section className="panel" aria-label="AI 및 Packet 운영 상태">
               <div className="panel-header">
                 <div>
-                  <h2>AI 분석 및 Packet Capture 현황</h2>
+                  <h2>AI 분석 및 패킷 수집 현황</h2>
                   <p className="panel-description">
                     AI 경고는 보조 관찰 결과이며 단독으로 감점이나 격리를 의미하지 않습니다.
-                    모델 설정과 실제 Runtime 실행 상태도 별개입니다.
+                    모델 설정과 실제 실행 상태도 별개입니다.
                   </p>
                 </div>
               </div>
@@ -2558,7 +2559,7 @@ export default function Dashboard() {
                   updatedAt={sourceUpdatedAt("aiWarnings")}
                 />
                 <SummaryCard
-                  title="AI Runtime API"
+                  title="AI 실행 상태 조회"
                   value={!sourceHasSuccess("runtime") ? null : "조회됨"}
                   unavailable={!sourceHasSuccess("runtime")}
                   description="API 조회 성공은 추론 실행 확인이 아닙니다"
@@ -2566,34 +2567,34 @@ export default function Dashboard() {
                   updatedAt={sourceUpdatedAt("runtime")}
                 />
                 <SummaryCard
-                  title="Capture Window (선택 Session)"
+                  title="수집 구간 (선택 수집 세션)"
                   value={sourceHasSuccess("captureWindows") ? formatNumber(captureWindows.length) : null}
                   unavailable={!sourceHasSuccess("captureWindows")}
-                  description="최근 Packet Feature의 단일 Session · 최대 20건 · 전체 수집 건수 아님"
+                  description="최근 패킷 분석 지표의 단일 수집 세션 · 최대 20건 · 전체 수집 건수 아님"
                   stale={sourceIsStale("captureWindows")}
                   updatedAt={sourceUpdatedAt("captureWindows")}
                 />
               </div>
               <SourceStateNotice state={sourceState.aiWarnings} label="AI 경고" />
-              <SourceStateNotice state={sourceState.runtime} label="AI Runtime" />
+              <SourceStateNotice state={sourceState.runtime} label="AI 실행 상태" />
               <SourceStateNotice state={sourceState.captureWindows} label="Capture Window" />
               {sourceState.captureWindows?.status === "skipped" && (
                 <p className="text-muted" role="status" style={{ marginTop: 10 }}>
-                  Capture Window 조회 대기: 최근 Packet Feature에 실제 Session ID와
-                  Window 기간이 없습니다. 오류를 만들지 않도록 서버 요청을 보류했습니다.
-                  실제 Session이 있으면 Packet Traffic 페이지에서도 확인할 수 있습니다.
+                  수집 구간 조회 대기: 최근 패킷 분석 지표에 실제 수집 세션 ID와
+                  분석 구간 기간이 없습니다. 오류를 만들지 않도록 서버 요청을 보류했습니다.
+                  실제 수집 세션이 있으면 패킷 통신 페이지에서도 확인할 수 있습니다.
                 </p>
               )}
               {captureContext && (
                 <p className="text-muted" style={{ marginTop: 10 }}>
-                  조회 범위: Session {captureContext.session_id} · {formatKST(captureContext.from)}
+                  조회 범위: 수집 세션 {captureContext.session_id} · {formatKST(captureContext.from)}
                   {" ~ "}{formatKST(captureContext.to)} (KST).
-                  최근 Packet Feature 페이지의 일부 구간만 다루며 전체 통계가 아닙니다.
+                  최근 패킷 분석 지표 페이지의 일부 구간만 다루며 전체 통계가 아닙니다.
                 </p>
               )}
               <div className="health-grid" style={{ marginTop: 12 }}>
                 <div className="health-item">
-                  <span>Runtime 원본 상태 (설정/실행 구분 확인용)</span>
+                  <span>실행 상태 원본 상태 (설정·실행 확인용)</span>
                   <strong style={{ overflowWrap: "anywhere", whiteSpace: "pre-wrap" }}>
                     {sourceHasSuccess("runtime")
                       ? JSON.stringify(runtime, null, 2)
@@ -2623,11 +2624,11 @@ export default function Dashboard() {
 
                   <div>
 
-                    <h2>Gateway 상태</h2>
+                    <h2>게이트웨이 상태</h2>
 
                     <p className="panel-description">
 
-                      Raspberry Pi의 마지막 Metric 수집 상태입니다.
+                      Raspberry Pi의 마지막 지표 수집 상태입니다.
 
                     </p>
 
@@ -2669,7 +2670,7 @@ export default function Dashboard() {
 
 
 
-                <SourceStateNotice state={sourceState.gateway} label="Gateway Metric" />
+                <SourceStateNotice state={sourceState.gateway} label="게이트웨이 지표" />
 
 
 
@@ -2701,7 +2702,7 @@ export default function Dashboard() {
 
                       <MetricCard
 
-                        label="Memory"
+                        label="메모리"
 
                         value={formatResourceValue(gatewayMetric.memory_percent)}
 
@@ -2711,7 +2712,7 @@ export default function Dashboard() {
 
                         status={getResourceStatus(gatewayMetric.memory_percent)}
 
-                        description="현재 Memory 사용률"
+                        description="현재 메모리 사용률"
 
                         updatedAt={sourceUpdatedAt("gateway")}
 
@@ -2721,7 +2722,7 @@ export default function Dashboard() {
 
                       <MetricCard
 
-                        label="Disk"
+                        label="저장공간"
 
                         value={formatResourceValue(gatewayMetric.disk_percent)}
 
@@ -2731,7 +2732,7 @@ export default function Dashboard() {
 
                         status={getResourceStatus(gatewayMetric.disk_percent)}
 
-                        description="현재 Disk 사용률"
+                        description="현재 저장공간 사용률"
 
                         updatedAt={sourceUpdatedAt("gateway")}
 
@@ -2741,7 +2742,7 @@ export default function Dashboard() {
 
                       <MetricCard
 
-                        label="Temperature"
+                        label="온도"
 
                         value={formatResourceValue(gatewayMetric.temperature_c)}
 
@@ -2771,9 +2772,9 @@ export default function Dashboard() {
 
                   <EmptyState
 
-                    title="Gateway Metric이 없습니다."
+                    title="게이트웨이 지표이 없습니다."
 
-                    description="조회는 성공했지만 최근 Gateway Metric 데이터가 없습니다."
+                    description="조회는 성공했지만 최근 게이트웨이 지표 데이터가 없습니다."
 
                     compact
 
@@ -2783,7 +2784,7 @@ export default function Dashboard() {
 
                   <div className="section-unavailable">
 
-                    {loading ? "Gateway Metric을 조회하는 중입니다." : "Gateway Metric을 확인할 수 없습니다."}
+                    {loading ? "게이트웨이 지표을 조회하는 중입니다." : "게이트웨이 지표을 확인할 수 없습니다."}
 
                   </div>
 
@@ -2799,11 +2800,11 @@ export default function Dashboard() {
 
                   <div>
 
-                    <h2>Packet Capture</h2>
+                    <h2>패킷 수집 상태</h2>
 
                     <p className="panel-description">
 
-                      최근 Packet Feature의 Capture 품질입니다.
+                      최근 패킷 분석 지표의 수집 품질입니다.
 
                     </p>
 
@@ -2857,7 +2858,7 @@ export default function Dashboard() {
 
                   state={sourceState.packetFeatures}
 
-                  label="Packet Feature"
+                  label="패킷 분석 지표"
 
                 />
 
@@ -2881,7 +2882,7 @@ export default function Dashboard() {
 
                     unavailable={!sourceHasSuccess("packetFeatures")}
 
-                    description="Capture 품질 통과"
+                    description="수집 품질 통과"
 
                     status="normal"
 
@@ -2907,7 +2908,7 @@ export default function Dashboard() {
 
                     unavailable={!sourceHasSuccess("packetFeatures")}
 
-                    description="Coverage 또는 Timing 문제"
+                    description="수집 시간 충족률 또는 수집 시간 정보 문제"
 
                     status={
 
@@ -2941,7 +2942,7 @@ export default function Dashboard() {
 
                     unavailable={!sourceHasSuccess("packetFeatures")}
 
-                    description="Segment 처리 실패"
+                    description="수집 구간 처리 실패"
 
                     status={
 
@@ -2961,7 +2962,7 @@ export default function Dashboard() {
 
                   <SummaryCard
 
-                    title="평균 Coverage"
+                    title="평균 수집 시간 충족률"
 
                     value={
 
@@ -2979,7 +2980,7 @@ export default function Dashboard() {
 
                     unavailable={!sourceHasSuccess("packetFeatures")}
 
-                    description="최근 Packet Window"
+                    description="최근 패킷 분석 구간"
 
                     updatedAt={sourceUpdatedAt("packetFeatures")}
 
@@ -3001,11 +3002,11 @@ export default function Dashboard() {
 
                 <div>
 
-                  <h2>API Health</h2>
+                  <h2>API 연결 상태</h2>
 
                   <p className="panel-description">
 
-                    Backend API와 Database 연결 상태를 확인합니다.
+                    백엔드 API와 데이터베이스 연결 상태를 확인합니다.
 
                   </p>
 
@@ -3047,7 +3048,7 @@ export default function Dashboard() {
 
 
 
-              <SourceStateNotice state={sourceState.health} label="API Health" />
+              <SourceStateNotice state={sourceState.health} label="API 연결 상태" />
 
 
 
@@ -3057,7 +3058,7 @@ export default function Dashboard() {
 
                   <div className="health-item">
 
-                    <span>API Status</span>
+                    <span>API 상태</span>
 
                     <strong>{getHealthDisplayLabel(health.status)}</strong>
 
@@ -3065,7 +3066,7 @@ export default function Dashboard() {
 
                   <div className="health-item">
 
-                    <span>Database</span>
+                    <span>데이터베이스</span>
 
                     <strong>{getHealthDisplayLabel(health.database)}</strong>
 
@@ -3073,7 +3074,7 @@ export default function Dashboard() {
 
                   <div className="health-item">
 
-                    <span>DB Connection</span>
+                    <span>DB 연결</span>
 
                     <StatusBadge
 
@@ -3089,7 +3090,7 @@ export default function Dashboard() {
 
                   <div className="health-item">
 
-                    <span>Server Time</span>
+                    <span>서버 시각</span>
 
                     <strong>{formatKST(health.server_time)}</strong>
 
@@ -3141,11 +3142,11 @@ export default function Dashboard() {
 
                 <div>
 
-                  <h2>Trust Score Summary</h2>
+                  <h2>기기별 신뢰점수</h2>
 
                   <p className="panel-description">
 
-                    Device별 등록 상태와 현재 Trust·Firewall 상태를 분리해 표시합니다.
+                    기기별 등록 상태와 현재 신뢰점수·방화벽 상태를 분리해 표시합니다.
 
                   </p>
 
@@ -3163,7 +3164,7 @@ export default function Dashboard() {
 
               </div>
 
-              <SourceStateNotice state={sourceState.trustScores} label="Trust Score" />
+              <SourceStateNotice state={sourceState.trustScores} label="신뢰점수" />
 
               {sourceHasSuccess("trustScores") ? (
 
@@ -3181,11 +3182,11 @@ export default function Dashboard() {
 
                     minWidth={1020}
 
-                    tableLabel="등록 상태 및 Trust Score 요약"
+                    tableLabel="등록 상태 및 신뢰점수 요약"
 
-                    emptyTitle="표시할 Trust Score 데이터가 없습니다."
+                    emptyTitle="표시할 신뢰점수 데이터가 없습니다."
 
-                    emptyDescription="조회는 성공했지만 현재 Trust Score 데이터가 없습니다."
+                    emptyDescription="조회는 성공했지만 현재 신뢰점수 데이터가 없습니다."
 
                     rowClassName={(item) => {
 
@@ -3215,7 +3216,7 @@ export default function Dashboard() {
 
                 <div className="section-unavailable">
 
-                  {loading ? "Trust Score를 조회하는 중입니다." : "Trust Score를 확인할 수 없습니다."}
+                  {loading ? "신뢰점수를 조회하는 중입니다." : "신뢰점수를 확인할 수 없습니다."}
 
                 </div>
 
@@ -3235,7 +3236,7 @@ export default function Dashboard() {
 
                   <p className="panel-description">
 
-                    Rule 및 AI 탐지 결과와 Trust Score 반영 여부를 표시합니다.
+                    규칙 및 AI 탐지 결과와 신뢰점수 반영 여부를 표시합니다.
 
                   </p>
 
@@ -3329,7 +3330,7 @@ export default function Dashboard() {
 
                   <p className="panel-description">
 
-                    최근 수신한 Topic과 Payload 유효성입니다.
+                    최근 수신한 토픽과 메시지 내용 유효성입니다.
 
                   </p>
 

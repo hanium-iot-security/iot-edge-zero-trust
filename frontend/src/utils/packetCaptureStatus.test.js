@@ -35,18 +35,18 @@ test("capture eligibility maps to dashboard status and label", () => {
 
 
 test("common capture policy exclusion reasons have Korean labels", () => {
-  assert.equal(getExclusionLabel("missing_timing_metadata"), "Timing 정보 없음");
+  assert.equal(getExclusionLabel("missing_timing_metadata"), "수집 시간 정보 없음");
   assert.equal(
     getExclusionLabel("captured_duration_below_policy"),
-    "Capture 시간 부족",
+    "수집시간 부족",
   );
   assert.equal(
     getExclusionLabel("status_not_eligible:READY"),
-    "분석 불가 상태 (READY)",
+    "분석 불가 상태 (준비 완료)",
   );
   assert.equal(
     getExclusionLabel("error_code_present:LATE_CAPTURE"),
-    "수집 오류 (LATE_CAPTURE)",
+    "수집 오류 (수집 시작 지연)",
   );
 });
 

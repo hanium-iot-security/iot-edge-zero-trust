@@ -1,3 +1,4 @@
+import * as uiText from "../utils/uiText.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -18,6 +19,7 @@ async function page(name, exports, states = {}) {
   const scope = {
     ...Object.fromEntries(importedNames.map((name) => [name, name])),
     ...mqttTimestamp,
+    ...uiText,
     useState: (initial) => [Object.hasOwn(states, state) ? states[state++] : (state++, typeof initial === "function" ? initial() : initial), () => {}],
     useRef: (initial) => ({ current: initial }),
     useMemo: (callback) => callback(),
@@ -57,7 +59,7 @@ test("runtime cards preserve actual failure and stage evidence, not policy guess
   const card = subject.RuntimeCard({ item: stage, index: 1 });
   assert.match(text(card), /packet-v2/);
   assert.match(text(card), /MODEL_LOAD_FAILED/);
-  assert.ok([...nodes(card)].some((node) => node.type === "StatusBadge" && node.props.label === "FAILED"));
+  assert.ok([...nodes(card)].some((node) => node.type === "StatusBadge" && node.props.label === "실패"));
 });
 
 test("stale and expired observations do not advertise current runtime execution", async () => {
@@ -77,7 +79,7 @@ test("completion evidence retains its historical identity and inference counts",
     normal_count: 1, anomaly_count: 1, exclusion_counts: { CAPTURE_GAP: 1 },
   } });
   const badge = [...nodes(card)].find((node) => node.type === "StatusBadge");
-  assert.equal(badge.props.label, "HISTORICAL / STALE");
+  assert.equal(badge.props.label, "과거 관측 / 정보 갱신 지연");
   assert.notEqual(badge.props.status, "normal");
   for (const value of ["pico_01", "packet-v1", "2 / 3", "CAPTURE_GAP"]) assert.ok(text(card).includes(value));
 });
@@ -119,12 +121,24 @@ test("warning table renders published window, model and decision fields", async 
   const table = [...nodes(Events())].find((node) => node.type === "DataTable" && node.props.tableLabel === "AI 경고 목록");
   assert.ok(table);
   const cells = table.props.columns.map((column) => column.render?.(warning[column.key], warning));
-  for (const value of ["packet_if", "packet-v2", "SUPPRESSED", "2"]) assert.ok(text(cells).includes(value));
+  for (const value of ["packet_if", "packet-v2", "중복 알림 생략", "2"]) assert.ok(text(cells).includes(value));
   assert.ok(!table.props.columns.some((column) => column.key === "severity"));
 });
 
 test("device warning cards show first/latest windows and notification evidence", async () => {
   const { DeviceAiManagement } = await page("Devices", ["DeviceAiManagement"], { 1: false, 10: [warning], 13: false });
   const card = DeviceAiManagement({ deviceId: "pico_01", registration: "ACTIVE" });
-  for (const value of ["SUPPRESSED", "packet-v2", "16:00:00", "16:00:20", "16:00:30", "2"]) assert.ok(text(card).includes(value), `missing ${value}`);
+  for (const value of ["중복 알림 생략", "packet-v2", "16:00:00", "16:00:20", "16:00:30", "2"]) assert.ok(text(card).includes(value), `missing ${value}`);
+});
+
+
+test("display localization preserves identifiers that happen to match status words", async () => {
+  for (const name of ["Devices", "GatewayStatus"]) {
+    const subject = await page(name, ["displayValue"]);
+    for (const value of ["OFF", "PENDING", "RAW_MODEL_01"]) {
+      assert.equal(subject.displayValue(value), value);
+    }
+  }
+  const events = await page("Events", ["warningText"]);
+  assert.equal(events.warningText("PENDING"), "PENDING");
 });

@@ -216,7 +216,7 @@ function MetricsChart({ data, lines, title, unit, isPacket }) {
           <YAxis tick={{ fontSize: 11 }} width={55} />
           <Tooltip
             labelFormatter={(_label, payload) =>
-              payload?.[0]?.payload?.__gap ? "미수집/Session 변경" : kstFull(payload?.[0]?.payload?.window_start)
+              payload?.[0]?.payload?.__gap ? "미수집/수집 세션 변경" : kstFull(payload?.[0]?.payload?.window_start)
             }
             formatter={(value, name) => [formatNumber(value), name]}
           />
@@ -238,7 +238,7 @@ function MetricsChart({ data, lines, title, unit, isPacket }) {
       </ResponsiveContainer>
       {isPacket && (
         <small className="traffic-trends-help">
-          실제 Capture Duration 기준 Rate입니다. 10초로 나눈 명목 Rate나 Packet IF 입력값으로 해석하지 않습니다.
+          실제 수집시간 기준 전송률입니다. 10초로 나눈 명목 전송률나 패킷 AI 입력값으로 해석하지 않습니다.
         </small>
       )}
     </div>
@@ -261,15 +261,15 @@ function CaptureEvidence({ data, loading, error, missingSession }) {
   }, [list]);
   return (
     <div className="traffic-trends-evidence">
-      <strong>Capture 근거 (최근 메타 조회)</strong>
+      <strong>수집 근거 (최근 메타 조회)</strong>
       {loading ? (
-        <p>Capture 근거 조회 중...</p>
+        <p>수집 근거 조회 중...</p>
       ) : missingSession ? (
-        <p role="status">Capture 메타 조회 보류: 실제 session_id를 확인할 수 없습니다. Feature 부재를 정상 수집으로 해석하지 않습니다.</p>
+        <p role="status">수집 상태 정보 조회 보류: 실제 session_id를 확인할 수 없습니다. 분석 지표 부재를 정상 수집으로 해석하지 않습니다.</p>
       ) : error ? (
         <p role="status">Capture 메타 조회 실패: {error}. Feature 그래프만 표시하며 누락 원인은 확인할 수 없습니다.</p>
       ) : !data ? (
-        <p role="status">Capture 근거를 아직 조회하지 않았습니다.</p>
+        <p role="status">수집 근거를 아직 조회하지 않았습니다.</p>
       ) : (
         <p>
           수신 {list.length}건 · COMPLETED {found.completed} · EMPTY {found.empty} · FAILED {found.failed} · 대기 {found.pending} · 기타 {found.other}
@@ -278,7 +278,7 @@ function CaptureEvidence({ data, loading, error, missingSession }) {
       )}
       <small>
         이 통계는 메타 조회 결과에 한정되며, 선택 기기의 무통신 증거가 아닙니다.
-        Feature 미수집 구간은 원인을 특정할 수 없으면 미상으로 표시하고 0으로 채우지 않습니다.
+        분석 지표 미수집 구간은 원인을 특정할 수 없으면 미상으로 표시하고 0으로 채우지 않습니다.
       </small>
     </div>
   );
@@ -463,10 +463,10 @@ export default function DeviceTrafficTrends() {
           <input type="datetime-local" value={toInput} onChange={(e) => setToInput(e.target.value)} />
         </label>
         {tab === "packet" && (
-          <label>Direction
+          <label>통신 방향
             <select value={direction} onChange={(e) => setDirection(e.target.value)}>
-              <option value="INBOUND">INBOUND (기기 → Pi)</option>
-              <option value="OUTBOUND">OUTBOUND (Pi → 기기)</option>
+              <option value="INBOUND">기기 → Pi</option>
+              <option value="OUTBOUND">Pi → 기기</option>
             </select>
           </label>
         )}
@@ -495,36 +495,36 @@ export default function DeviceTrafficTrends() {
             </p>
           )}
           <p className="traffic-trends-qualification">
-            from/to는 고정하고 ID 중복을 제거한 후 Window 시각순으로 표시했습니다.
+            from/to는 고정하고 ID 중복을 제거한 후 분석 구간 시각순으로 표시했습니다.
             다만 백엔드 snapshot_max_id가 제공되지 않은 offset 조회이므로 조회 중 데이터 추가 시 완전한 스냅샷을 보장하지 않습니다.
           </p>
           {result.rows.length === 0 ? (
-            <div className="traffic-trends-empty">Feature 행이 없습니다. 무통신이나 정상 상태로 단정할 수 없습니다.</div>
+            <div className="traffic-trends-empty">분석 지표 행이 없습니다. 무통신이나 정상 상태로 단정할 수 없습니다.</div>
           ) : result.kind === "mqtt" ? (
             <div className="traffic-trends-charts">
-              <MetricsChart data={chart} title="MQTT 메시지 발행 수" unit="messages / 10s" lines={[{ key: "publish_count", label: "발행 수", color: "#2563eb" }]} />
-              <MetricsChart data={chart} title="MQTT Payload 크기" unit="bytes (B)" lines={[
+              <MetricsChart data={chart} title="MQTT 메시지 발행 수" unit="건 / 10초" lines={[{ key: "publish_count", label: "발행 수", color: "#2563eb" }]} />
+              <MetricsChart data={chart} title="MQTT 메시지 크기" unit="B" lines={[
                 { key: "avg_payload_size", label: "평균", color: "#16a34a" },
                 { key: "max_payload_size", label: "최대", color: "#ef4444" },
               ]} />
-              <MetricsChart data={chart} title="MQTT 메시지 간격" unit="seconds (s)" lines={[
+              <MetricsChart data={chart} title="MQTT 메시지 간격" unit="초 (s)" lines={[
                 { key: "avg_message_interval", label: "평균", color: "#9333ea" },
                 { key: "min_message_interval", label: "최소", color: "#f97316" },
               ]} />
-              <p className="traffic-trends-qualification">메시지 1건 Window의 간격 5.0초는 기존 대체값 계약이며 실측 간격으로 해석하지 않습니다.</p>
+              <p className="traffic-trends-qualification">메시지 1건 분석 구간의 간격 5.0초는 기존 대체값 계약이며 실측 간격으로 해석하지 않습니다.</p>
             </div>
           ) : (
             <div className="traffic-trends-charts">
-              <MetricsChart isPacket data={chart} title="Packet 실제 Rate" unit="packets / second (pps)" lines={[{ key: "packets_per_second", label: "실제 PPS", color: "#2563eb" }]} />
-              <MetricsChart isPacket data={chart} title="Packet 실제 Byte Rate" unit="bytes / second (B/s)" lines={[{ key: "bytes_per_second", label: "실제 B/s", color: "#16a34a" }]} />
-              <p className="traffic-trends-qualification">분석 제외·FAILED·품질 미확인 Window는 수치를 연결하지 않습니다. Session 변화와 10초 초과 공백도 선을 끊습니다.</p>
+              <MetricsChart isPacket data={chart} title="실제 초당 패킷 수" unit="pps" lines={[{ key: "packets_per_second", label: "실제 PPS", color: "#2563eb" }]} />
+              <MetricsChart isPacket data={chart} title="실제 초당 전송량" unit="B/s" lines={[{ key: "bytes_per_second", label: "실제 B/s", color: "#16a34a" }]} />
+              <p className="traffic-trends-qualification">분석 제외·FAILED·품질 미확인 분석 구간는 수치를 연결하지 않습니다. 수집 세션 변화와 10초 초과 공백도 선을 끊습니다.</p>
             </div>
           )}
           {result.kind === "packet" && (
             <>
               {captureSessions.length > 1 && (
                 <label className="traffic-trends-session-selector">
-                  Capture 근거를 조회할 Session
+                  수집 근거를 조회할 수집 세션
                   <select value={captureSession} onChange={(event) => setPreferredSession(event.target.value)}>
                     {captureSessions.map((value) => <option key={value} value={value}>{value}</option>)}
                   </select>

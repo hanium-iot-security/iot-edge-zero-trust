@@ -4,6 +4,7 @@ import {
   Route,
   NavLink,
 } from "react-router-dom";
+import NavigationIcon from "./components/NavigationIcon";
 import Dashboard from "./pages/Dashboard";
 import Devices from "./pages/Devices";
 import Logs from "./pages/Logs";
@@ -20,17 +21,17 @@ export default function App() {
         <aside className="sidebar">
           <h2>IoT Zero Trust</h2>
 
-          <NavLink to="/">Dashboard</NavLink>
-          <NavLink to="/devices">Devices</NavLink>
-          <NavLink to="/logs">MQTT Logs</NavLink>
-          <NavLink to="/events">Detection Events</NavLink>
-          <NavLink to="/isolation">Isolation</NavLink>
+          <NavLink to="/"><NavigationIcon name="overview" /><span>종합 현황</span></NavLink>
+          <NavLink to="/devices"><NavigationIcon name="devices" /><span>기기 관리</span></NavLink>
+          <NavLink to="/logs"><NavigationIcon name="logs" /><span>MQTT 수신 로그</span></NavLink>
+          <NavLink to="/events"><NavigationIcon name="events" /><span>탐지 이벤트</span></NavLink>
+          <NavLink to="/isolation"><NavigationIcon name="isolation" /><span>격리·복구</span></NavLink>
 
           <div className="sidebar-divider" />
 
-          <p className="sidebar-section-title">Packet / Gateway</p>
-          <NavLink to="/packet-traffic">통신 분석</NavLink>
-          <NavLink to="/gateway-status">Gateway Status</NavLink>
+          <p className="sidebar-section-title">통신·게이트웨이</p>
+          <NavLink to="/packet-traffic"><NavigationIcon name="traffic" /><span>통신 분석</span></NavLink>
+          <NavLink to="/gateway-status"><NavigationIcon name="gateway" /><span>게이트웨이 상태</span></NavLink>
         </aside>
 
         <main className="content">

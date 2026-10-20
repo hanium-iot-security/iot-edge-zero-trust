@@ -1,3 +1,4 @@
+import { uiLabel } from "../utils/uiText";
 import "../styles/components/StatusBadge.scss";
 
 const STATUS_LABELS = {
@@ -106,7 +107,7 @@ export default function StatusBadge({
         />
       )}
 
-      <span>{displayLabel}</span>
+      <span>{uiLabel(displayLabel)}</span>
     </span>
   );
 }

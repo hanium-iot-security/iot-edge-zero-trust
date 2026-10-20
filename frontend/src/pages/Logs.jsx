@@ -1,3 +1,4 @@
+import { uiLabel } from "../utils/uiText";
 import {
   useCallback,
   useEffect,
@@ -471,7 +472,7 @@ export default function Logs() {
   },
   {
     key: "device_id",
-    header: "Device",
+    header: "기기",
     width: 150,
     render: (value) => (
       <strong
@@ -484,7 +485,7 @@ export default function Logs() {
   },
   {
     key: "topic",
-    header: "Topic",
+    header: "토픽",
     width: 280,
     render: (value) => (
       <span
@@ -497,7 +498,7 @@ export default function Logs() {
   },
   {
     key: "payload",
-    header: "Payload",
+    header: "메시지 내용",
     width: 320,
     render: (value) => (
       <span
@@ -514,7 +515,7 @@ export default function Logs() {
   },
   {
     key: "payload_size",
-    header: "Size",
+    header: "크기",
     align: "right",
     width: 130,
     render: (value) => (
@@ -544,8 +545,8 @@ export default function Logs() {
         }
         label={
           normalizeBoolean(value)
-            ? "Valid"
-            : "Invalid"
+            ? "정상"
+            : "오류"
         }
         size="small"
       />
@@ -553,7 +554,7 @@ export default function Logs() {
   },
   {
     key: "is_topic_valid",
-    header: "Topic Valid",
+    header: "토픽 검사",
     width: 120,
     render: (value) => (
       <StatusBadge
@@ -564,8 +565,8 @@ export default function Logs() {
         }
         label={
           normalizeBoolean(value)
-            ? "Valid"
-            : "Invalid"
+            ? "정상"
+            : "오류"
         }
         size="small"
       />
@@ -573,7 +574,7 @@ export default function Logs() {
   },
   {
     key: "error_message",
-    header: "Error",
+    header: "오류 내용",
     width: 260,
     render: (value) => (
       <span
@@ -584,13 +585,13 @@ export default function Logs() {
         }
         title={value || ""}
       >
-        {value || "-"}
+        {uiLabel(value || "-")}
       </span>
     ),
   },
   {
     key: "received_at",
-    header: "Received At",
+    header: "수신 시각",
     width: 190,
     render: (value) =>
       formatMqttLogTimestamp(value),
@@ -600,8 +601,8 @@ export default function Logs() {
   return (
     <div className="logs-page">
       <PageHeader
-        title="MQTT Logs"
-        description="수신된 MQTT Topic과 Payload, JSON 및 Topic 유효성 검사 결과를 확인합니다."
+        title="MQTT 수신 로그"
+        description="수신된 MQTT 토픽과 메시지 내용, JSON 및 토픽 유효성 검사 결과를 확인합니다."
         updatedAt={
           lastUpdated
             ? formatKST(
@@ -667,7 +668,7 @@ export default function Logs() {
               value={formatNumber(
                 logSummary.jsonValidCount
               )}
-              description="현재 페이지 JSON Valid"
+              description="현재 페이지 JSON 정상"
               status="normal"
             />
 
@@ -676,7 +677,7 @@ export default function Logs() {
               value={formatNumber(
                 logSummary.jsonInvalidCount
               )}
-              description="현재 페이지 JSON Invalid"
+              description="현재 페이지 JSON 오류"
               status={
                 logSummary.jsonInvalidCount >
                   0
@@ -686,20 +687,20 @@ export default function Logs() {
             />
 
             <SummaryCard
-              title="Topic 정상"
+              title="토픽 정상"
               value={formatNumber(
                 logSummary.topicValidCount
               )}
-              description="현재 페이지 Topic Valid"
+              description="현재 페이지 토픽 정상"
               status="normal"
             />
 
             <SummaryCard
-              title="Topic 오류"
+              title="토픽 오류"
               value={formatNumber(
                 logSummary.topicInvalidCount
               )}
-              description="현재 페이지 Topic Invalid"
+              description="현재 페이지 토픽 오류"
               status={
                 logSummary.topicInvalidCount >
                   0
@@ -709,11 +710,11 @@ export default function Logs() {
             />
 
             <SummaryCard
-              title="대용량 Payload"
+              title="대용량 메시지"
               value={formatNumber(
                 logSummary.largePayloadCount
               )}
-              description="Payload가 5KB를 초과한 로그"
+              description="메시지 내용가 5KB를 초과한 로그"
               status={
                 logSummary.largePayloadCount >
                   0
@@ -723,11 +724,11 @@ export default function Logs() {
             />
 
             <SummaryCard
-              title="미매핑 Device"
+              title="미매핑 기기"
               value={formatNumber(
                 logSummary.unknownDeviceCount
               )}
-              description="Device ID를 확인하지 못한 로그"
+              description="기기 ID를 확인하지 못한 로그"
               status={
                 logSummary.unknownDeviceCount >
                   0
@@ -771,7 +772,7 @@ export default function Logs() {
             <input
               id="mqtt-log-search"
               type="search"
-              placeholder="Device, Topic, Payload, Error"
+              placeholder="기기, 토픽, 메시지 내용, 오류"
               value={searchText}
               onChange={(event) => {
                 setSearchText(
@@ -800,18 +801,18 @@ export default function Logs() {
               </option>
 
               <option value="valid">
-                Valid
+                정상
               </option>
 
               <option value="invalid">
-                Invalid
+                오류
               </option>
             </select>
           </div>
 
           <div className="filter-item">
             <label htmlFor="topic-validity-filter">
-              Topic 유효성
+              토픽 유효성
             </label>
 
             <select
@@ -828,11 +829,11 @@ export default function Logs() {
               </option>
 
               <option value="valid">
-                Valid
+                정상
               </option>
 
               <option value="invalid">
-                Invalid
+                오류
               </option>
             </select>
           </div>
@@ -845,7 +846,7 @@ export default function Logs() {
             <h2>MQTT 로그 목록</h2>
 
             <p className="panel-description">
-              Payload는 표에서 일부만
+              메시지 내용는 표에서 일부만
               표시하고 상세 모달에서 전체
               내용을 확인합니다.
             </p>
@@ -866,7 +867,7 @@ export default function Logs() {
           filteredLogs.length === 0 ? (
           <EmptyState
             title="검색 조건에 맞는 MQTT 로그가 없습니다."
-            description="다른 Device ID, Topic 또는 Payload를 검색해 주세요."
+            description="다른 기기 ID, 토픽 또는 메시지 내용를 검색해 주세요."
             actionLabel="검색 초기화"
             onAction={() =>
               setSearchText("")
@@ -884,7 +885,7 @@ export default function Logs() {
               minWidth={1550}
               tableLabel="MQTT 로그 목록"
               emptyTitle="표시할 MQTT 로그가 없습니다."
-              emptyDescription="MQTT Subscriber가 실행 중이고 메시지를 정상적으로 수신하는지 확인해 주세요."
+              emptyDescription="MQTT 수신 서비스가 실행 중이고 메시지를 정상적으로 수신하는지 확인해 주세요."
               rowClassName={(log) => {
                 if (
                   !normalizeBoolean(
@@ -933,12 +934,12 @@ export default function Logs() {
         open={Boolean(selectedLog)}
         title={
           selectedLog
-            ? `MQTT Log #${selectedLog.id}`
-            : "MQTT Log 상세"
+            ? `MQTT 로그 #${selectedLog.id}`
+            : "MQTT 로그 상세"
         }
         description={
           selectedLog
-            ? `${selectedLog.device_id || "미매핑 Device"} · ${selectedLog.topic || "Topic 없음"}`
+            ? `${selectedLog.device_id || "미매핑 기기"} · ${selectedLog.topic || "토픽 없음"}`
             : undefined
         }
         onClose={() =>
@@ -961,7 +962,7 @@ export default function Logs() {
           <div className="detail">
             <section className="detail-grid">
               <div className="detail-item">
-                <span>Device</span>
+                <span>기기</span>
 
                 <strong>
                   {selectedLog.device_id ||
@@ -970,7 +971,7 @@ export default function Logs() {
               </div>
 
               <div className="detail-item">
-                <span>Payload Size</span>
+                <span>메시지 크기</span>
 
                 <strong>
                   {selectedLog.payload_size ===
@@ -999,14 +1000,14 @@ export default function Logs() {
                     normalizeBoolean(
                       selectedLog.is_json_valid
                     )
-                      ? "Valid"
-                      : "Invalid"
+                      ? "정상"
+                      : "오류"
                   }
                 />
               </div>
 
               <div className="detail-item">
-                <span>Topic 검사</span>
+                <span>토픽 검사</span>
 
                 <StatusBadge
                   status={
@@ -1020,14 +1021,14 @@ export default function Logs() {
                     normalizeBoolean(
                       selectedLog.is_topic_valid
                     )
-                      ? "Valid"
-                      : "Invalid"
+                      ? "정상"
+                      : "오류"
                   }
                 />
               </div>
 
               <div className="detail-item">
-                <span>Received At</span>
+                <span>수신 시각</span>
 
                 <strong>
                   {formatMqttLogTimestamp(
@@ -1038,7 +1039,7 @@ export default function Logs() {
             </section>
 
             <section className="detail-section">
-              <h3>Topic</h3>
+              <h3>토픽</h3>
 
               <p className="break-word topic-detail">
                 {selectedLog.topic || "-"}
@@ -1050,7 +1051,7 @@ export default function Logs() {
 
               {selectedLog.error_message ? (
                 <div className="error-box">
-                  {selectedLog.error_message}
+                  {uiLabel(selectedLog.error_message)}
                 </div>
               ) : (
                 <p className="text-muted">
@@ -1060,7 +1061,7 @@ export default function Logs() {
             </section>
 
             <section className="detail-section">
-              <h3>Payload</h3>
+              <h3>메시지 내용</h3>
 
               {parsePayload(
                 selectedLog.payload
