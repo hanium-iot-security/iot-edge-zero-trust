@@ -1,3 +1,4 @@
+import { uiLabel } from "../utils/uiText";
 
 import {
   useCallback,
@@ -6,6 +7,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { Link } from "react-router-dom";
 
 import {
   createDevice,
@@ -29,7 +31,6 @@ import LoadingState from "../components/LoadingState";
 import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
 import StatusBadge from "../components/StatusBadge";
-import SummaryCard from "../components/SummaryCard";
 
 import { getCurrentFirewallRuleMap } from "../utils/firewallRuleSelection";
 import {
@@ -176,7 +177,7 @@ function firewallLabel(status) {
     APPLIED: "차단 적용",
     FAILED: "적용 실패",
     REMOVED: "차단 해제",
-  }[String(status || "").toUpperCase()] || "Firewall 기록 없음";
+  }[String(status || "").toUpperCase()] || "방화벽 기록 없음";
 }
 
 function firewallTheme(status) {
@@ -306,11 +307,11 @@ function availableRegistrationStates(state) {
 function validatePolicyValues(form) {
   const errors = [];
   const fields = [
-    ["expected_publish_interval", "Expected Publish Interval", false],
-    ["publish_count_max", "Publish Count Max", true],
-    ["payload_size_max", "Payload Size Max", true],
-    ["packet_rate_max", "Packet Rate Max", false],
-    ["byte_rate_max", "Byte Rate Max", false],
+    ["expected_publish_interval", "예상 메시지 전송 간격", false],
+    ["publish_count_max", "최대 메시지 수", true],
+    ["payload_size_max", "최대 메시지 크기", true],
+    ["packet_rate_max", "최대 초당 패킷 수", false],
+    ["byte_rate_max", "최대 초당 전송량", false],
   ];
 
   for (const [key, label, integer] of fields) {
@@ -521,7 +522,7 @@ function DeviceAiManagement({ deviceId, registration }) {
       return;
     }
     if (!reason.trim() || !adminKey.trim()) {
-      setWriteError("변경 사유와 관리자 Key를 모두 입력해 주세요.");
+      setWriteError("변경 사유와 관리자 인증키를 모두 입력해 주세요.");
       return;
     }
 
@@ -559,7 +560,7 @@ function DeviceAiManagement({ deviceId, registration }) {
       }
     } catch (err) {
       if (err?.status === 409) {
-        setWriteError("Revision 충돌입니다. 최신 AI 정책을 재조회했습니다.");
+        setWriteError("정책 버전 충돌입니다. 최신 AI 정책을 재조회했습니다.");
         await refreshPolicy();
       } else if (uncertainError(err)) {
         setNeedsVerification(true);
@@ -581,10 +582,10 @@ function DeviceAiManagement({ deviceId, registration }) {
       <section className="detail-section">
         <div className="section-heading">
           <div>
-            <h3>AI 정책 관리 (Phase 9)</h3>
+            <h3>AI 정책 관리</h3>
             <p>
               기기별 MQTT/Packet 공통 AI 모드를 설정합니다.
-              AI 경고만으로 Trust Score 감점이나 격리를 수행하지 않습니다.
+              AI 경고만으로 신뢰점수 감점이나 격리를 수행하지 않습니다.
             </p>
           </div>
           <button
@@ -622,11 +623,11 @@ function DeviceAiManagement({ deviceId, registration }) {
                 </div>
                 {current ? (
                   <dl className="policy-list">
-                    <div><dt>Mode</dt><dd>{displayValue(current.mode)}</dd></div>
-                    <div><dt>Revision</dt><dd>{displayValue(current.revision)}</dd></div>
-                    <div><dt>Effective From</dt><dd>{formatKST(effectiveFrom(current))}</dd></div>
-                    <div><dt>Reason</dt><dd>{displayValue(current.reason)}</dd></div>
-                    <div><dt>Created By</dt><dd>{displayValue(current.created_by)}</dd></div>
+                    <div><dt>동작 모드</dt><dd>{uiLabel(current.mode)}</dd></div>
+                    <div><dt>정책 버전</dt><dd>{displayValue(current.revision)}</dd></div>
+                    <div><dt>적용 시작 시각</dt><dd>{formatKST(effectiveFrom(current))}</dd></div>
+                    <div><dt>사유</dt><dd>{displayValue(current.reason)}</dd></div>
+                    <div><dt>등록자</dt><dd>{displayValue(current.created_by)}</dd></div>
                   </dl>
                 ) : (
                   <p className="text-muted">현재 정책을 확인할 수 없습니다.</p>
@@ -644,10 +645,10 @@ function DeviceAiManagement({ deviceId, registration }) {
                 </div>
                 {pending ? (
                   <dl className="policy-list">
-                    <div><dt>Mode</dt><dd>{displayValue(pending.mode)}</dd></div>
-                    <div><dt>Revision</dt><dd>{displayValue(pending.revision)}</dd></div>
-                    <div><dt>Effective From</dt><dd>{formatKST(effectiveFrom(pending))}</dd></div>
-                    <div><dt>Reason</dt><dd>{displayValue(pending.reason)}</dd></div>
+                    <div><dt>동작 모드</dt><dd>{uiLabel(pending.mode)}</dd></div>
+                    <div><dt>정책 버전</dt><dd>{displayValue(pending.revision)}</dd></div>
+                    <div><dt>적용 시작 시각</dt><dd>{formatKST(effectiveFrom(pending))}</dd></div>
+                    <div><dt>사유</dt><dd>{displayValue(pending.reason)}</dd></div>
                   </dl>
                 ) : (
                   <p className="text-muted">적용 예정 AI 정책이 없습니다.</p>
@@ -658,7 +659,7 @@ function DeviceAiManagement({ deviceId, registration }) {
             <h3>AI 모드 변경</h3>
             <div className="policy-form-grid">
               <div className="filter-item">
-                <label htmlFor="ai-mode">AI Mode</label>
+                <label htmlFor="ai-mode">AI 모드</label>
                 <select
                   id="ai-mode"
                   value={mode}
@@ -670,16 +671,16 @@ function DeviceAiManagement({ deviceId, registration }) {
                   disabled={saving || !current || Boolean(pending)}
                 >
                   <option value="">선택</option>
-                  <option value="OFF">OFF</option>
-                  <option value="OBSERVE">OBSERVE</option>
+                  <option value="OFF">사용 안 함</option>
+                  <option value="OBSERVE">관찰 모드</option>
                 </select>
                 <small className="help-text">
-                  OBSERVE는 관찰 모드입니다. ENFORCE는 Phase 9 범위 밖입니다.
+                  관찰 모드는 경고를 기록합니다. 자동 대응 모드는 현재 지원하지 않습니다.
                 </small>
               </div>
 
               <div className="filter-item">
-                <label>현재 Revision</label>
+                <label>현재 정책 버전</label>
                 <div className="readonly-value">
                   {revision ?? "-"}
                 </div>
@@ -697,7 +698,7 @@ function DeviceAiManagement({ deviceId, registration }) {
               </div>
 
               <div className="filter-item full-width">
-                <label htmlFor="ai-admin-key">Admin Key</label>
+                <label htmlFor="ai-admin-key">관리자 인증키</label>
                 <input
                   id="ai-admin-key"
                   type="password"
@@ -705,10 +706,10 @@ function DeviceAiManagement({ deviceId, registration }) {
                   value={adminKey}
                   onChange={(e) => setAdminKey(e.target.value)}
                   disabled={saving}
-                  placeholder="관리자 Key 입력"
+                  placeholder="관리자 인증키 입력"
                 />
                 <small className="help-text">
-                  인증키는 컴포넌트 메모리에만 보관하고 서버 요청 헤더로 전달합니다.
+                  인증키는 현재 창에서만 사용하며 창을 닫으면 지워집니다.
                 </small>
               </div>
             </div>
@@ -771,7 +772,7 @@ function DeviceAiManagement({ deviceId, registration }) {
             <h3>AI 반복 경고</h3>
             <p>
               기기별 AI 관찰 결과입니다.
-              Trust 감점 및 Firewall 격리 상태와 별개로 표시합니다.
+              신뢰점수 감점 및 방화벽 격리 상태와 별개로 표시합니다.
             </p>
           </div>
           <button
@@ -815,7 +816,7 @@ function DeviceAiManagement({ deviceId, registration }) {
                     size="small"
                   />
                   <strong>
-                    {displayValue(
+                    {uiLabel(
                       warning.event_type ??
                       warning.warning_type ??
                       warning.status ??
@@ -849,7 +850,7 @@ function DeviceAiManagement({ deviceId, registration }) {
                   </div>
                   <div>
                     <dt>상태</dt>
-                    <dd>{displayValue(warning.last_decision)} / {warning.closed ? "마감" : "진행 중"}</dd>
+                    <dd>{uiLabel(warning.last_decision)} / {warning.closed ? "마감" : "진행 중"}</dd>
                   </div>
                   <div>
                     <dt>통보 시각</dt>
@@ -1148,7 +1149,7 @@ export default function Devices() {
       return data;
     } catch (err) {
       if (id !== detailIdRef.current) return null;
-      setPolicyError(err?.message || "Rule 정책 조회 실패");
+      setPolicyError(err?.message || "규칙 정책 조회 실패");
       return null;
     } finally {
       if (id === detailIdRef.current) setPolicyLoading(false);
@@ -1218,7 +1219,7 @@ export default function Devices() {
       };
     } else {
       setDetailError((prev) =>
-        prev || firewall.reason?.message || "Firewall 조회 실패"
+        prev || firewall.reason?.message || "방화벽 조회 실패"
       );
     }
 
@@ -1236,7 +1237,7 @@ export default function Devices() {
       const data = normalizePolicy(rulePolicy.value);
       applyPolicyResponse(data, latestDevice, false);
     } else {
-      setPolicyError(rulePolicy.reason?.message || "Rule 정책 조회 실패");
+      setPolicyError(rulePolicy.reason?.message || "규칙 정책 조회 실패");
     }
 
     setDetailLoading(false);
@@ -1273,19 +1274,19 @@ export default function Devices() {
 
     const errors = validatePolicyValues(registration);
     if (!/^[A-Za-z0-9._-]{1,64}$/.test(registration.device_id.trim())) {
-      errors.push("Device ID는 64자 이하의 영문, 숫자, ., _, -만 가능합니다.");
+      errors.push("기기 ID는 64자 이하의 영문, 숫자, ., _, -만 가능합니다.");
     }
     if (!isPrivateIPv4(registration.ip_address)) {
       errors.push("고정 IP는 RFC1918 사설 IPv4여야 합니다.");
     }
     if (!DEVICE_TYPES.includes(registration.device_type)) {
-      errors.push("Device Type을 확인해 주세요.");
+      errors.push("기기 유형을 확인해 주세요.");
     }
     if (!registration.mqtt_principal.trim()) {
-      errors.push("MQTT Principal이 필요합니다.");
+      errors.push("MQTT 인증 계정이 필요합니다.");
     }
     if (!registration.reason.trim() || !registrationKey.trim()) {
-      errors.push("등록 사유와 관리자 Key가 필요합니다.");
+      errors.push("등록 사유와 관리자 인증키가 필요합니다.");
     }
 
     if (errors.length) {
@@ -1359,9 +1360,9 @@ export default function Devices() {
       errors.push("등록 상태가 필요합니다.");
     }
     if (!policyDraft.reason.trim() || !policyKey.trim()) {
-      errors.push("변경 사유와 관리자 Key가 필요합니다.");
+      errors.push("변경 사유와 관리자 인증키가 필요합니다.");
     }
-    if (revision === null) errors.push("현재 Revision이 없습니다.");
+    if (revision === null) errors.push("현재 정책 버전이 없습니다.");
     if (pendingPolicy) errors.push("적용 예정 정책이 존재합니다.");
 
     if (errors.length) {
@@ -1399,14 +1400,14 @@ export default function Devices() {
       setPolicyVerify(!checked);
       setPolicyMessage(
         checked
-          ? "Rule 정책 변경 요청을 저장하고 서버에서 재조회했습니다."
+          ? "규칙 정책 변경 요청을 저장하고 서버에서 재조회했습니다."
           : "변경 응답은 받았지만 서버 재조회에 실패했습니다."
       );
       setPolicyKey("");
       await loadData(true);
     } catch (err) {
       if (err?.status === 409) {
-        setPolicyWriteError("Revision 충돌입니다. 서버 정책을 다시 조회했습니다.");
+        setPolicyWriteError("정책 버전 충돌입니다. 서버 정책을 다시 조회했습니다.");
         await refreshPolicy(deviceId, true);
       } else if (uncertainError(err)) {
         setPolicyVerify(true);
@@ -1415,7 +1416,7 @@ export default function Devices() {
         );
         await refreshPolicy(deviceId, true);
       } else {
-        setPolicyWriteError(err?.message || "Rule 정책 변경 실패");
+        setPolicyWriteError(err?.message || "규칙 정책 변경 실패");
       }
     } finally {
       policyLock.current = false;
@@ -1441,7 +1442,7 @@ export default function Devices() {
   const columns = [
     {
       key: "device_id",
-      header: "Device ID",
+      header: "기기 ID",
       width: 150,
       render: (value) => (
         <strong className="device-id" title={value || ""}>
@@ -1451,7 +1452,7 @@ export default function Devices() {
     },
     {
       key: "ip_address",
-      header: "IP Address",
+      header: "IP 주소",
       width: 140,
       render: (value) => value || "-",
     },
@@ -1475,7 +1476,7 @@ export default function Devices() {
     },
     {
       key: "status",
-      header: "Trust 상태",
+      header: "신뢰 상태",
       width: 120,
       render: (value, device) => {
         const status = value || getTrustStatus(device.trust_score);
@@ -1490,7 +1491,7 @@ export default function Devices() {
     },
     {
       key: "trust_score",
-      header: "Trust Score",
+      header: "신뢰점수",
       align: "right",
       width: 120,
       render: (value) => (
@@ -1511,7 +1512,7 @@ export default function Devices() {
     },
     {
       key: "firewall_status",
-      header: "Firewall 상태",
+      header: "방화벽 상태",
       width: 140,
       render: (value) => (
         <StatusBadge
@@ -1544,8 +1545,8 @@ export default function Devices() {
   return (
     <div className="devices-page">
       <PageHeader
-        title="Devices"
-        description="기기 등록, Rule 정책, AI 관찰 정책, Trust Score 및 Firewall 상태를 분리해 관리합니다."
+        title="기기 관리"
+        description="기기 등록, 규칙 정책, AI 관찰 정책, 신뢰점수 및 방화벽 상태를 분리해 관리합니다."
         updatedAt={lastUpdated ? formatKST(lastUpdated) : undefined}
         onRefresh={() => loadData(true)}
         refreshing={refreshing}
@@ -1553,10 +1554,10 @@ export default function Devices() {
 
       <section className="device-admin-bar">
         <div>
-          <strong>Device Administration</strong>
+          <strong>기기 등록·관리</strong>
           <p>
-            신규 기기는 PENDING으로 등록됩니다.
-            AI OBSERVE 경고는 단독으로 자동 감점·격리를 실행하지 않습니다.
+            신규 기기는 등록 대기 상태로 등록됩니다.
+            AI 관찰 모드 경고는 단독으로 자동 감점·격리를 실행하지 않습니다.
           </p>
         </div>
         <button
@@ -1593,22 +1594,91 @@ export default function Devices() {
 
       {!loading && !error && rows.length > 0 && (
         <>
-          <section className="summary-card-grid">
-            <SummaryCard title="등록 준비" value={summary.registrationPending} description="PENDING" status="warning" />
-            <SummaryCard title="등록 활성" value={summary.registrationActive} description="ACTIVE" status="normal" />
-            <SummaryCard title="관리 비활성" value={summary.registrationDisabled} description="DISABLED" />
-            <SummaryCard title="상태 확인 불가" value={summary.registrationUnknown} description="Migration/backfill 확인" />
+          <section className="device-state-summary" aria-label="기기 등록·신뢰·방화벽 요약">
+            <dl>
+              <div className="device-state-row">
+                <dt>기기·등록</dt>
+                <dd>
+                  <div className="device-state-value">
+                    <span className="device-state-label">전체 기기</span>
+                    <strong>{total}</strong>
+                    <small>신뢰 상태 필터 기준 전체 건수</small>
+                  </div>
+                  <div className="device-state-value">
+                    <span className="device-state-label is-warning">등록 준비</span>
+                    <strong>{summary.registrationPending}</strong>
+                    <small>자동 대응 미적용</small>
+                  </div>
+                  <div className="device-state-value">
+                    <span className="device-state-label is-normal">등록 활성</span>
+                    <strong>{summary.registrationActive}</strong>
+                    <small>자동 대응 적용 대상</small>
+                  </div>
+                  <div className="device-state-value">
+                    <span className="device-state-label is-unknown">관리 비활성</span>
+                    <strong>{summary.registrationDisabled}</strong>
+                    <small>새 자동 대응 중지</small>
+                  </div>
+                </dd>
+              </div>
+              <div className="device-state-row">
+                <dt>신뢰 상태</dt>
+                <dd>
+                  <div className="device-state-value">
+                    <StatusBadge status="normal" label="정상" title="신뢰점수 80 이상" />
+                    <strong>{summary.normal}</strong>
+                    <small>신뢰점수 80 이상</small>
+                  </div>
+                  <div className="device-state-value">
+                    <StatusBadge status="warning" label="주의" title="신뢰점수 60~79" />
+                    <strong>{summary.warning}</strong>
+                    <small>신뢰점수 60~79</small>
+                  </div>
+                  <div className="device-state-value">
+                    <StatusBadge status="danger" label="위험" title="신뢰점수 30~59" />
+                    <strong>{summary.danger}</strong>
+                    <small>신뢰점수 30~59</small>
+                  </div>
+                  <div className="device-state-value">
+                    <StatusBadge status="isolated" label="격리" title="신뢰점수 30 미만" />
+                    <strong>{summary.isolated}</strong>
+                    <small>신뢰점수 30 미만</small>
+                  </div>
+                </dd>
+              </div>
+              <div className="device-state-row">
+                <dt>방화벽</dt>
+                <dd>
+                  <div className="device-state-value">
+                    <StatusBadge status="applied" label="적용" title="실제 차단 규칙 적용" />
+                    <strong>{summary.firewallApplied}</strong>
+                    <small>실제 차단 규칙 적용</small>
+                  </div>
+                  <div className="device-state-value">
+                    <StatusBadge status="pending" label="대기" title="차단 규칙 적용 대기" />
+                    <strong>{summary.firewallPending}</strong>
+                    <small>차단 규칙 적용 대기</small>
+                  </div>
+                  <div className="device-state-value">
+                    <StatusBadge status="failed" label="실패" title="차단 규칙 적용 실패" />
+                    <strong>{summary.firewallFailed}</strong>
+                    <small>차단 규칙 적용 실패</small>
+                  </div>
+                </dd>
+              </div>
+            </dl>
+            <p className="device-summary-note">
+              전체 기기는 신뢰 상태 필터 기준 전체 건수입니다. 나머지 요약은 현재 페이지 기준이며, 검색어는 목록에만 적용됩니다.
+            </p>
           </section>
-          <section className="summary-card-grid">
-            <SummaryCard title="전체 기기" value={total} description="현재 필터 기준" />
-            <SummaryCard title="정상" value={summary.normal} status="normal" />
-            <SummaryCard title="주의" value={summary.warning} status="warning" />
-            <SummaryCard title="위험" value={summary.danger} status="danger" />
-            <SummaryCard title="격리" value={summary.isolated} status="isolated" />
-            <SummaryCard title="Firewall 적용" value={summary.firewallApplied} status="normal" />
-            <SummaryCard title="Firewall 대기" value={summary.firewallPending} status="warning" />
-            <SummaryCard title="Firewall 실패" value={summary.firewallFailed} status="danger" />
-          </section>
+          {summary.registrationUnknown > 0 && (
+            <div className="page-warning-banner" role="alert">
+              <div>
+                <strong>등록 상태 확인 불가 {summary.registrationUnknown}대</strong>
+                <p>등록 정책 정보를 확인할 수 없습니다. 기기 상세에서 조회 상태를 확인해 주세요.</p>
+              </div>
+            </div>
+          )}
         </>
       )}
 
@@ -1617,7 +1687,7 @@ export default function Devices() {
           <div>
             <h2>조회 조건</h2>
             <p className="panel-description">
-              Trust 상태는 서버 필터, 검색어는 현재 페이지에 적용됩니다.
+              신뢰 상태는 서버 필터, 검색어는 현재 페이지에 적용됩니다.
             </p>
           </div>
           <button
@@ -1644,7 +1714,7 @@ export default function Devices() {
             />
           </div>
           <div className="filter-item">
-            <label htmlFor="device-status">Trust 상태</label>
+            <label htmlFor="device-status">신뢰 상태</label>
             <select
               id="device-status"
               value={statusFilter}
@@ -1669,7 +1739,7 @@ export default function Devices() {
           <div>
             <h2>등록 기기 목록</h2>
             <p className="panel-description">
-              행을 선택하면 Rule/AI 정책 및 보안 상태를 확인합니다.
+              행을 선택하면 규칙/AI 정책 및 보안 상태를 확인합니다.
             </p>
           </div>
           <span className="data-count">{filteredRows.length}건 표시</span>
@@ -1722,7 +1792,7 @@ export default function Devices() {
       <DetailModal
         open={registrationOpen}
         title="신규 기기 등록"
-        description="Application 등록만 수행하며 Broker 계정·비밀번호는 생성하지 않습니다."
+        description="대시보드에 기기 정보만 등록합니다. MQTT 브로커 계정과 비밀번호는 별도로 설정해야 합니다."
         size="large"
         onClose={() => {
           if (registrationSaving) return;
@@ -1751,7 +1821,7 @@ export default function Devices() {
               onClick={saveRegistration}
               disabled={registrationSaving || registrationVerify}
             >
-              {registrationSaving ? "등록 중..." : "PENDING으로 등록"}
+              {registrationSaving ? "등록 중..." : "등록 대기 상태로 추가"}
             </button>
           </>
         }
@@ -1761,9 +1831,9 @@ export default function Devices() {
             <h3>기기 정보</h3>
             <div className="admin-form">
               {[
-                ["device_id", "Device ID", "pico_01"],
+                ["device_id", "기기 ID", "pico_01"],
                 ["ip_address", "고정 IP", "192.168.0.50"],
-                ["mqtt_principal", "MQTT Principal", "pico_01"],
+                ["mqtt_principal", "MQTT 인증 계정", "pico_01"],
                 ["reason", "등록 사유", "신규 센서 등록"],
               ].map(([key, label, placeholder]) => (
                 <div
@@ -1782,7 +1852,7 @@ export default function Devices() {
               ))}
 
               <div className="filter-item">
-                <label htmlFor="reg-type">Device Type</label>
+                <label htmlFor="reg-type">기기 유형</label>
                 <select
                   id="reg-type"
                   value={registration.device_type}
@@ -1790,13 +1860,13 @@ export default function Devices() {
                   disabled={registrationSaving}
                 >
                   {DEVICE_TYPES.map((type) => (
-                    <option key={type}>{type}</option>
+                    <option key={type} value={type}>{uiLabel(type)}</option>
                   ))}
                 </select>
               </div>
 
               <div className="filter-item">
-                <label>자동 산출 Topic</label>
+                <label>자동 산출 토픽</label>
                 <div className="readonly-value">
                   {registration.device_id
                     ? `iot/${registration.device_id}/sensor`
@@ -1807,14 +1877,14 @@ export default function Devices() {
           </section>
 
           <section className="detail-section">
-            <h3>기본 Rule 정책</h3>
+            <h3>기본 규칙 정책</h3>
             <div className="policy-form-grid">
               {[
-                ["expected_publish_interval", "Expected Publish Interval", "seconds", "0.1"],
-                ["publish_count_max", "Publish Count Max", "messages / 10s", "1"],
-                ["payload_size_max", "Payload Size Max", "bytes", "1"],
-                ["packet_rate_max", "Packet Rate Max", "packets/s", "0.1"],
-                ["byte_rate_max", "Byte Rate Max", "bytes/s", "0.1"],
+                ["expected_publish_interval", "예상 메시지 전송 간격", "초", "0.1"],
+                ["publish_count_max", "최대 메시지 수", "건 / 10초", "1"],
+                ["payload_size_max", "최대 메시지 크기", "B", "1"],
+                ["packet_rate_max", "최대 초당 패킷 수", "pps", "0.1"],
+                ["byte_rate_max", "최대 초당 전송량", "B/s", "0.1"],
               ].map(([key, label, unit, step]) => (
                 <div className="filter-item" key={key}>
                   <label htmlFor={`reg-${key}`}>{label}</label>
@@ -1838,7 +1908,7 @@ export default function Devices() {
           <section className="detail-section">
             <h3>관리자 인증</h3>
             <div className="filter-item">
-              <label htmlFor="register-admin">Admin Key</label>
+              <label htmlFor="register-admin">관리자 인증키</label>
               <input
                 id="register-admin"
                 type="password"
@@ -1846,7 +1916,7 @@ export default function Devices() {
                 value={registrationKey}
                 onChange={(e) => setRegistrationKey(e.target.value)}
                 disabled={registrationSaving}
-                placeholder="관리자 Key"
+                placeholder="관리자 인증키"
               />
             </div>
 
@@ -1877,7 +1947,7 @@ export default function Devices() {
           ? `${selectedDevice.device_id} 상세 상태`
           : "기기 상세 상태"}
         description={selectedDevice
-          ? `${selectedDevice.ip_address || "IP 없음"} · Rule/AI/Trust/Firewall`
+          ? `${selectedDevice.ip_address || "IP 없음"} · 규칙/AI/신뢰점수/방화벽`
           : undefined}
         onClose={closeDetail}
         closeDisabled={policySaving}
@@ -1904,7 +1974,7 @@ export default function Devices() {
                 policyVerify
               }
             >
-              {policySaving ? "Rule 정책 저장 중..." : "Rule 정책 변경 저장"}
+              {policySaving ? "규칙 정책 저장 중..." : "규칙 정책 변경 저장"}
             </button>
           </>
         }
@@ -1925,19 +1995,19 @@ export default function Devices() {
 
             <section className="detail-grid">
               {[
-                ["Device ID", selectedDevice.device_id],
-                ["IP Address", selectedDevice.ip_address],
-                ["Device Type", selectedDevice.device_type],
-                ["MQTT Principal", selectedDevice.mqtt_principal],
-                ["Topic", selectedDevice.mqtt_topic ??
+                ["기기 ID", selectedDevice.device_id],
+                ["IP 주소", selectedDevice.ip_address],
+                ["기기 유형", selectedDevice.device_type],
+                ["MQTT 인증 계정", selectedDevice.mqtt_principal],
+                ["토픽", selectedDevice.mqtt_topic ??
                   `iot/${selectedDevice.device_id}/sensor`],
                 ["등록 상태", registrationLabel(currentRegistration)],
-                ["Trust 상태", trustLabel(
+                ["신뢰 상태", trustLabel(
                   selectedDevice.status ??
                   getTrustStatus(selectedDevice.trust_score)
                 )],
-                ["Trust Score", formatNumber(selectedDevice.trust_score)],
-                ["Firewall 상태", firewallLabel(selectedDevice.firewall_status)],
+                ["신뢰점수", formatNumber(selectedDevice.trust_score)],
+                ["방화벽 상태", firewallLabel(selectedDevice.firewall_status)],
                 ["마지막 통신", formatKST(selectedDevice.last_seen_at)],
               ].map(([label, value]) => (
                 <div className="detail-item" key={label}>
@@ -1947,11 +2017,26 @@ export default function Devices() {
               ))}
             </section>
 
+            <section className="detail-section">
+              <div className="section-heading">
+                <div>
+                  <h3>통신 추이</h3>
+                  <p>기간별 MQTT·Packet 상세 그래프를 통신 분석에서 확인합니다.</p>
+                </div>
+                <Link
+                  className="button button-secondary"
+                  to={`/packet-traffic?device_id=${encodeURIComponent(selectedDevice.device_id)}`}
+                >
+                  이 기기의 통신 추이 보기
+                </Link>
+              </div>
+            </section>
+
             {/* Existing Rule Policy */}
             <section className="detail-section">
               <div className="section-heading">
                 <div>
-                  <h3>현재 / 적용 예정 Rule 정책</h3>
+                  <h3>현재 / 적용 예정 규칙 정책</h3>
                   <p>서버 재조회 기준으로 효력 적용 여부를 판단합니다.</p>
                 </div>
                 <button
@@ -1965,10 +2050,10 @@ export default function Devices() {
               </div>
 
               {policyLoading ? (
-                <LoadingState title="Rule 정책 조회 중" compact />
+                <LoadingState title="규칙 정책 조회 중" compact />
               ) : policyError ? (
                 <ErrorState
-                  title="Rule 정책 조회 실패"
+                  title="규칙 정책 조회 실패"
                   message={policyError}
                   onRetry={() => refreshPolicy(selectedDevice.device_id, true)}
                   compact
@@ -1990,15 +2075,15 @@ export default function Devices() {
                       </div>
                       {revision ? (
                         <dl className="policy-list">
-                          <div><dt>Revision</dt><dd>{displayValue(revision.revision)}</dd></div>
-                          <div><dt>Registration</dt><dd>{registrationLabel(registrationState(selectedDevice, revision))}</dd></div>
-                          <div><dt>Profile</dt><dd>{displayValue(policyPayload(revision).policy_profile)}</dd></div>
-                          <div><dt>Expected Interval</dt><dd>{formatNumber(policyValue(revision, "expected_publish_interval"), 2)} s</dd></div>
-                          <div><dt>Publish Count Max</dt><dd>{formatNumber(policyValue(revision, "publish_count_max"))} / 10s</dd></div>
-                          <div><dt>Payload Size Max</dt><dd>{formatNumber(policyValue(revision, "payload_size_max"))} B</dd></div>
-                          <div><dt>Packet Rate Max</dt><dd>{formatNumber(policyValue(revision, "packet_rate_max"), 2)} pps</dd></div>
-                          <div><dt>Byte Rate Max</dt><dd>{formatNumber(policyValue(revision, "byte_rate_max"), 2)} B/s</dd></div>
-                          <div><dt>Effective From</dt><dd>{formatKST(effectiveFrom(revision))}</dd></div>
+                          <div><dt>정책 버전</dt><dd>{displayValue(revision.revision)}</dd></div>
+                          <div><dt>등록 상태</dt><dd>{registrationLabel(registrationState(selectedDevice, revision))}</dd></div>
+                          <div><dt>정책 프로필</dt><dd>{displayValue(policyPayload(revision).policy_profile)}</dd></div>
+                          <div><dt>예상 전송 간격</dt><dd>{formatNumber(policyValue(revision, "expected_publish_interval"), 2)} s</dd></div>
+                          <div><dt>최대 메시지 수</dt><dd>{formatNumber(policyValue(revision, "publish_count_max"))} / 10s</dd></div>
+                          <div><dt>최대 메시지 크기</dt><dd>{formatNumber(policyValue(revision, "payload_size_max"))} B</dd></div>
+                          <div><dt>최대 초당 패킷 수</dt><dd>{formatNumber(policyValue(revision, "packet_rate_max"), 2)} pps</dd></div>
+                          <div><dt>최대 초당 전송량</dt><dd>{formatNumber(policyValue(revision, "byte_rate_max"), 2)} B/s</dd></div>
+                          <div><dt>적용 시작 시각</dt><dd>{formatKST(effectiveFrom(revision))}</dd></div>
                         </dl>
                       ) : (
                         <p className="text-muted">정책 정보가 없습니다.</p>
@@ -2010,9 +2095,9 @@ export default function Devices() {
             </section>
 
             <section className="detail-section">
-              <h3>기기별 Rule 정책 변경</h3>
+              <h3>기기별 규칙 정책 변경</h3>
               <p className="text-muted">
-                Rule 정책과 Phase 9 AI 정책은 별개로 관리됩니다.
+                규칙 정책과 AI 정책은 별개로 관리됩니다.
               </p>
 
               <div className="policy-form-grid">
@@ -2037,11 +2122,11 @@ export default function Devices() {
                 </div>
 
                 {[
-                  ["expected_publish_interval", "Expected Publish Interval", "seconds", "0.1"],
-                  ["publish_count_max", "Publish Count Max", "messages / 10s", "1"],
-                  ["payload_size_max", "Payload Size Max", "bytes", "1"],
-                  ["packet_rate_max", "Packet Rate Max", "packets/s", "0.1"],
-                  ["byte_rate_max", "Byte Rate Max", "bytes/s", "0.1"],
+                  ["expected_publish_interval", "예상 메시지 전송 간격", "초", "0.1"],
+                  ["publish_count_max", "최대 메시지 수", "건 / 10초", "1"],
+                  ["payload_size_max", "최대 메시지 크기", "B", "1"],
+                  ["packet_rate_max", "최대 초당 패킷 수", "pps", "0.1"],
+                  ["byte_rate_max", "최대 초당 전송량", "B/s", "0.1"],
                 ].map(([key, label, unit, step]) => (
                   <div className="filter-item" key={key}>
                     <label htmlFor={`rule-${key}`}>{label}</label>
@@ -2067,12 +2152,12 @@ export default function Devices() {
                     value={policyDraft.reason}
                     onChange={(e) => policyField("reason", e.target.value)}
                     disabled={policySaving || Boolean(pendingPolicy)}
-                    placeholder="Rule 정책 변경 사유"
+                    placeholder="규칙 정책 변경 사유"
                   />
                 </div>
 
                 <div className="filter-item full-width">
-                  <label htmlFor="rule-key">Admin Key</label>
+                  <label htmlFor="rule-key">관리자 인증키</label>
                   <input
                     id="rule-key"
                     type="password"
@@ -2080,14 +2165,14 @@ export default function Devices() {
                     value={policyKey}
                     onChange={(e) => setPolicyKey(e.target.value)}
                     disabled={policySaving}
-                    placeholder="관리자 Key"
+                    placeholder="관리자 인증키"
                   />
                 </div>
               </div>
 
               {pendingPolicy && (
                 <div className="verification-box verification-checking">
-                  적용 예정 Rule 정책이 있어 새 변경이 제한됩니다.
+                  적용 예정 규칙 정책이 있어 새 변경이 제한됩니다.
                 </div>
               )}
               {policyWriteError && (
@@ -2099,7 +2184,7 @@ export default function Devices() {
                     ? "verification-box verification-checking"
                     : "verification-box verification-checked"
                 }>
-                  <strong>{policyVerify ? "결과 확인 필요" : "Rule 정책 결과"}</strong>
+                  <strong>{policyVerify ? "결과 확인 필요" : "규칙 정책 결과"}</strong>
                   <p>{policyMessage}</p>
                 </div>
               )}
@@ -2115,25 +2200,25 @@ export default function Devices() {
             {/* Firewall */}
             {selectedDevice.firewall_rule && (
               <section className="detail-section">
-                <h3>Firewall Rule</h3>
+                <h3>방화벽 규칙</h3>
                 <dl className="detail-list">
                   <div>
-                    <dt>Source IP</dt>
+                    <dt>출발지 IP</dt>
                     <dd>{displayValue(selectedDevice.firewall_rule.source_ip)}</dd>
                   </div>
                   <FirewallTrafficFields
                     rule={selectedDevice.firewall_rule}
                   />
                   <div>
-                    <dt>Action</dt>
+                    <dt>동작</dt>
                     <dd>{displayValue(selectedDevice.firewall_rule.action)}</dd>
                   </div>
                   <div>
-                    <dt>Retry Count</dt>
+                    <dt>재시도 횟수</dt>
                     <dd>{displayValue(selectedDevice.firewall_rule.retry_count)}</dd>
                   </div>
                   <div>
-                    <dt>Last Error</dt>
+                    <dt>마지막 오류</dt>
                     <dd className="break-word">
                       {displayValue(selectedDevice.firewall_rule.last_error)}
                     </dd>
@@ -2142,12 +2227,12 @@ export default function Devices() {
               </section>
             )}
 
-            {/* Trust Score History */}
+            {/* 신뢰점수 이력 */}
             <section className="detail-section">
               <div className="section-heading">
                 <div>
-                  <h3>Trust Score 이력</h3>
-                  <p>서버가 계산한 실제 Score 변화값을 표시합니다.</p>
+                  <h3>신뢰점수 이력</h3>
+                  <p>서버가 계산한 실제 점수 변화값을 표시합니다.</p>
                 </div>
               </div>
 
@@ -2161,7 +2246,7 @@ export default function Devices() {
                 />
               ) : trustHistory.length === 0 ? (
                 <EmptyState
-                  title="Trust Score 변화 이력이 없습니다."
+                  title="신뢰점수 변화 이력이 없습니다."
                   compact
                 />
               ) : (
@@ -2188,10 +2273,10 @@ export default function Devices() {
                         <span>{formatKST(history.analysis_window_end)}</span>
                       </div>
                       <dl className="history-info">
-                        <div><dt>계산 Delta</dt><dd>{formatDelta(history.calculated_delta)}</dd></div>
-                        <div><dt>상한 적용 Delta</dt><dd>{formatDelta(history.capped_delta)}</dd></div>
-                        <div><dt>대표 Event</dt><dd>{Array.isArray(history.representative_event_ids) ? history.representative_event_ids.join(", ") : "-"}</dd></div>
-                        <div><dt>Policy</dt><dd>{history.policy_version || "-"}</dd></div>
+                        <div><dt>계산된 점수 변화량</dt><dd>{formatDelta(history.calculated_delta)}</dd></div>
+                        <div><dt>상한 적용 후 변화량</dt><dd>{formatDelta(history.capped_delta)}</dd></div>
+                        <div><dt>대표 이벤트</dt><dd>{Array.isArray(history.representative_event_ids) ? history.representative_event_ids.join(", ") : "-"}</dd></div>
+                        <div><dt>정책</dt><dd>{history.policy_version || "-"}</dd></div>
                       </dl>
                     </article>
                   ))}

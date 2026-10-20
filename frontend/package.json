@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "oxlint",
-    "test": "node --test src/utils/mqttTimestamp.test.js src/utils/packetCaptureStatus.test.js src/utils/firewallTrafficFields.test.js src/pages/devicePolicyPolling.test.js src/pages/packetCaptureWindows.test.js src/pages/phase9Recovery.test.js src/pages/phase9Evidence.test.js",
+    "test": "node --test src/components/DateTimePicker.test.js src/utils/mqttTimestamp.test.js src/utils/packetCaptureStatus.test.js src/utils/firewallTrafficFields.test.js src/utils/trafficQuery.test.js src/pages/devicePolicyPolling.test.js src/pages/packetCaptureWindows.test.js src/pages/phase9Recovery.test.js src/pages/phase9Evidence.test.js",
     "preview": "vite preview"
   },
   "dependencies": {

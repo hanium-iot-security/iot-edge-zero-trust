@@ -1,3 +1,4 @@
+import { evidenceLabel } from "../utils/uiText";
 import "../styles/components/JsonViewer.scss";
 
 function formatValue(value) {
@@ -23,18 +24,9 @@ function formatValue(value) {
   return String(value);
 }
 
-function formatKey(key) {
-  return String(key)
-    .replaceAll("_", " ")
-    .replace(
-      /\b\w/g,
-      (letter) =>
-        letter.toUpperCase()
-    );
-}
-
 export default function JsonViewer({
   data,
+  translateKeys = false,
 }) {
   if (
     !data ||
@@ -55,7 +47,7 @@ export default function JsonViewer({
             className="json-row"
             key={key}
           >
-            <dt>{formatKey(key)}</dt>
+            <dt>{translateKeys ? evidenceLabel(key) : key}</dt>
 
             <dd>
               {typeof value ===

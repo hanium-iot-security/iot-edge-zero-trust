@@ -1,3 +1,4 @@
+import * as uiText from "../utils/uiText.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -45,8 +46,8 @@ async function captureHarness(response) {
     },
   };
   const scope = {
-    ...hooks, AbortController, console,
-    StatusBadge: "StatusBadge", EmptyState: "EmptyState",
+    ...hooks, ...uiText, AbortController, console,
+    StatusBadge: "StatusBadge", EmptyState: "EmptyState", DateTimePicker: "DateTimePicker",
     window: { setInterval: () => 1, clearInterval() {} },
     getPacketCaptureWindows: async (query) => { calls.push(query); return response; },
     jsx: (type, props, ...children) => ({ type, props: props || {}, children }),
@@ -68,7 +69,10 @@ async function captureHarness(response) {
   return {
     calls, nodes, text,
     rows: () => nodes().filter((node) => node.type === "tbody").flatMap((node) => [...walk(node.children)].filter((child) => child.type === "tr")),
-    change: (id, value) => act(() => find((node) => node.props.id === id).props.onChange({ target: { value } })),
+    change: (id, value) => act(() => {
+      const node = find((node) => node.props.id === id);
+      node.props.onChange(node.type === "DateTimePicker" ? value : { target: { value } });
+    }),
     click: (label) => act(() => { const button = find((node) => node.type === "button" && text(node) === label); assert.equal(Boolean(button.props.disabled), false); return button.props.onClick(); }),
   };
 }
@@ -129,4 +133,13 @@ test("filter changes reset pagination and filter the complete bounded interval",
   await app.change("capture-window-status", "PENDING");
   assert.deepEqual(identifiers(app), ["12"]);
   assert.equal(app.calls.length, 1);
+});
+
+
+test("date picker midnight values retain KST offset and second precision in the API query", async () => {
+  const app = await captureHarness({ items: windows(), total: 12 });
+  await app.change("capture-window-from", "2026-10-15T00:00:37");
+  assert.equal(app.calls.at(-1).from, "2026-10-14T15:00:37.000Z");
+  await app.change("capture-window-to", "2026-10-15T12:00:59");
+  assert.equal(app.calls.at(-1).to, "2026-10-15T03:00:59.000Z");
 });

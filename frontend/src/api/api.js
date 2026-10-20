@@ -120,6 +120,9 @@ function createApiErrorMessage(error) {
   const detail = body?.detail;
 
   if (typeof detail === "string") {
+    if (status === 404 && detail.trim() === "Not Found") {
+      return "요청한 API 또는 자료를 찾을 수 없습니다. 서버 API 버전을 확인해 주세요. (404)";
+    }
     return detail;
   }
 

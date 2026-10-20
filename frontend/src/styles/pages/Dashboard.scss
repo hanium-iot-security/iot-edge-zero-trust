@@ -156,24 +156,6 @@
   }
 
   /* ========================================
-     CHART
-     ======================================== */
-
-  .chart-wrap {
-    width: 100%;
-    min-width: 0;
-    overflow: hidden;
-  }
-
-  .chart-loading {
-    display: flex;
-    min-height: 320px;
-    align-items: center;
-    justify-content: center;
-    color: var(--color-slate-500);
-  }
-
-  /* ========================================
      TABLE
      ======================================== */
 
@@ -316,7 +298,7 @@
      AI WARNINGS / RUNTIME / CAPTURE WINDOW
      ======================================== */
 
-  [aria-label="Phase 9 AI 및 Packet 운영 상태"] {
+  [aria-label="AI 및 Packet 운영 상태"] {
     min-width: 0;
 
     .panel-header {
@@ -468,7 +450,7 @@
       grid-template-columns: 1fr;
     }
 
-    [aria-label="Phase 9 AI 및 Packet 운영 상태"] {
+    [aria-label="AI 및 Packet 운영 상태"] {
       .health-grid {
         grid-template-columns: 1fr;
       }
@@ -496,7 +478,7 @@
       justify-content: flex-start;
     }
 
-    [aria-label="Phase 9 AI 및 Packet 운영 상태"] {
+    [aria-label="AI 및 Packet 운영 상태"] {
       .health-item {
         padding: 12px;
 

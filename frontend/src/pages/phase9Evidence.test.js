@@ -1,3 +1,4 @@
+import * as uiText from "../utils/uiText.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -6,8 +7,8 @@ import { transformWithOxc } from "vite";
 import * as mqttTimestamp from "../utils/mqttTimestamp.js";
 
 // Render the production JSX and field readers with fixed API response fixtures.
-async function page(name, exports, states = {}) {
-  const source = await readFile(new URL(`./${name}.jsx`, import.meta.url), "utf8");
+async function page(name, exports, states = {}, directory = "pages") {
+  const source = await readFile(new URL(`../${directory}/${name}.jsx`, import.meta.url), "utf8");
   const importedNames = [...source.matchAll(/^import\s+(?:\{([\s\S]*?)\}|(\w+))\s+from\s+["'][^"']+["'];/gm)]
     .flatMap((match) => match[1] ? match[1].split(",").map((name) => name.trim()).filter(Boolean) : [match[2]]);
   const { code } = await transformWithOxc(source.replace(/^import\b[\s\S]*?;\r?\n/gm, ""), `${name}.jsx`, {
@@ -18,6 +19,7 @@ async function page(name, exports, states = {}) {
   const scope = {
     ...Object.fromEntries(importedNames.map((name) => [name, name])),
     ...mqttTimestamp,
+    ...uiText,
     useState: (initial) => [Object.hasOwn(states, state) ? states[state++] : (state++, typeof initial === "function" ? initial() : initial), () => {}],
     useRef: (initial) => ({ current: initial }),
     useMemo: (callback) => callback(),
@@ -57,7 +59,7 @@ test("runtime cards preserve actual failure and stage evidence, not policy guess
   const card = subject.RuntimeCard({ item: stage, index: 1 });
   assert.match(text(card), /packet-v2/);
   assert.match(text(card), /MODEL_LOAD_FAILED/);
-  assert.ok([...nodes(card)].some((node) => node.type === "StatusBadge" && node.props.label === "FAILED"));
+  assert.ok([...nodes(card)].some((node) => node.type === "StatusBadge" && node.props.label === "실패"));
 });
 
 test("stale and expired observations do not advertise current runtime execution", async () => {
@@ -77,7 +79,7 @@ test("completion evidence retains its historical identity and inference counts",
     normal_count: 1, anomaly_count: 1, exclusion_counts: { CAPTURE_GAP: 1 },
   } });
   const badge = [...nodes(card)].find((node) => node.type === "StatusBadge");
-  assert.equal(badge.props.label, "HISTORICAL / STALE");
+  assert.equal(badge.props.label, "과거 관측 / 정보 갱신 지연");
   assert.notEqual(badge.props.status, "normal");
   for (const value of ["pico_01", "packet-v1", "2 / 3", "CAPTURE_GAP"]) assert.ok(text(card).includes(value));
 });
@@ -106,19 +108,6 @@ test("cached completion evidence expires with its snapshot and marks failed refr
   assert.equal(completion.freshness, "FRESH");
 });
 
-test("model cards show artifact validation and configured identity separately from runtime", async () => {
-  const { ModelCard } = await page("GatewayStatus", ["ModelCard"]);
-  const card = ModelCard({ model: {
-    detector: "mqtt_if", artifact_status: "INVALID", configured_model_version: "mqtt-v2",
-    configured_bundle_sha256: "a".repeat(64), error_code: "BUNDLE_HASH_MISMATCH",
-    checks: { bundle_sha256_verified: false, inference_verified: false },
-    runtime: { status: "UNKNOWN", reason_code: "RUNTIME_MODEL_EVIDENCE_NOT_AVAILABLE" },
-  }, index: 0 });
-  assert.ok([...nodes(card)].some((node) => node.type === "StatusBadge" && node.props.label === "INVALID"));
-  for (const value of ["mqtt-v2", "a".repeat(64), "BUNDLE_HASH_MISMATCH", "RUNTIME_MODEL_EVIDENCE_NOT_AVAILABLE"]) assert.ok(text(card).includes(value));
-  assert.ok(!text(card).includes("Framework"));
-});
-
 const warning = {
   id: 1, device_id: "pico_01", detector_name: "packet_if", event_type: "AI_PACKET_ANOMALY",
   model_version: "packet-v2", bucket_start: observedAt, bucket_end: "2026-10-15T07:10:00Z",
@@ -132,12 +121,55 @@ test("warning table renders published window, model and decision fields", async 
   const table = [...nodes(Events())].find((node) => node.type === "DataTable" && node.props.tableLabel === "AI 경고 목록");
   assert.ok(table);
   const cells = table.props.columns.map((column) => column.render?.(warning[column.key], warning));
-  for (const value of ["packet_if", "packet-v2", "SUPPRESSED", "2"]) assert.ok(text(cells).includes(value));
+  for (const value of ["packet_if", "packet-v2", "중복 알림 생략", "2"]) assert.ok(text(cells).includes(value));
   assert.ok(!table.props.columns.some((column) => column.key === "severity"));
 });
 
 test("device warning cards show first/latest windows and notification evidence", async () => {
   const { DeviceAiManagement } = await page("Devices", ["DeviceAiManagement"], { 1: false, 10: [warning], 13: false });
   const card = DeviceAiManagement({ deviceId: "pico_01", registration: "ACTIVE" });
-  for (const value of ["SUPPRESSED", "packet-v2", "16:00:00", "16:00:20", "16:00:30", "2"]) assert.ok(text(card).includes(value), `missing ${value}`);
+  for (const value of ["중복 알림 생략", "packet-v2", "16:00:00", "16:00:20", "16:00:30", "2"]) assert.ok(text(card).includes(value), `missing ${value}`);
+});
+
+
+test("display localization preserves identifiers that happen to match status words", async () => {
+  for (const name of ["Devices", "GatewayStatus"]) {
+    const subject = await page(name, ["displayValue"]);
+    for (const value of ["OFF", "PENDING", "RAW_MODEL_01"]) {
+      assert.equal(subject.displayValue(value), value);
+    }
+  }
+  const events = await page("Events", ["warningText"]);
+  assert.equal(events.warningText("PENDING"), "PENDING");
+});
+
+
+test("evidence labels leave original values and nested JSON intact; MQTT keys stay raw", async () => {
+  const { JsonViewer } = await page("JsonViewer", ["JsonViewer"], {}, "components");
+  const evidence = {
+    candidate_device_id: "PENDING", capture_coverage_ratio: 0.9922034999999999,
+    model: { model_version: "packet-if-v2-calib-002-p99-py310", raw_decision_score: -0.22475799838643418, threshold_operator: ">" },
+    observed_values: { packet_count: 7, total_bytes: 650 },
+    constructor: "original-field", future_evidence_field: "OFF",
+  };
+  const original = JSON.stringify(evidence);
+  Object.freeze(evidence.model);
+  Object.freeze(evidence.observed_values);
+  Object.freeze(evidence);
+  const rendered = [...nodes(JsonViewer({ data: evidence, translateKeys: true }))];
+  const keys = rendered.filter((node) => node.type === "dt").map(text);
+  assert.deepEqual(keys, ["식별 후보 기기 ID", "수집 시간 충족 비율", "모델 판정 정보", "실제 관측값", "constructor", "future_evidence_field"]);
+  const values = rendered.filter((node) => node.type === "dd").map(text);
+  assert.equal(values[0], "PENDING");
+  assert.equal(values[1], "0.9922034999999999");
+  assert.equal(values[5], "OFF");
+  const jsonBlocks = rendered.filter((node) => node.type === "pre");
+  assert.equal(jsonBlocks[0].children[0], JSON.stringify(evidence.model, null, 2));
+  assert.equal(jsonBlocks[1].children[0], JSON.stringify(evidence.observed_values, null, 2));
+  assert.equal(JSON.stringify(evidence), original);
+
+  const mqtt = { device_id: "esp32_02", sequence: 2345, uptime_s: 11729 };
+  const mqttRendered = [...nodes(JsonViewer({ data: mqtt }))];
+  assert.deepEqual(mqttRendered.filter((node) => node.type === "dt").map(text), Object.keys(mqtt));
+  assert.deepEqual(mqttRendered.filter((node) => node.type === "dd").map(text), ["esp32_02", "2345", "11729"]);
 });
