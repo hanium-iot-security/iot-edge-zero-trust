@@ -1754,17 +1754,7 @@ export default function PacketTraffic() {
 
               description="현재 페이지에서 분석이 제외된 구간"
 
-              status={
-
-                pageSummary.excludedCount >
-
-                  0
-
-                  ? "warning"
-
-                  : "default"
-
-              }
+              status="warning"
 
             />
 
@@ -1782,17 +1772,7 @@ export default function PacketTraffic() {
 
               description="현재 페이지에서 수집에 실패한 구간"
 
-              status={
-
-                pageSummary.failedCount >
-
-                  0
-
-                  ? "danger"
-
-                  : "default"
-
-              }
+              status="danger"
 
             />
 
@@ -1826,17 +1806,7 @@ export default function PacketTraffic() {
 
               description="기기와 연결되지 않은 고유 IP"
 
-              status={
-
-                pageSummary.unmappedIpCount >
-
-                  0
-
-                  ? "warning"
-
-                  : "default"
-
-              }
+              status="unknown"
 
             />
 

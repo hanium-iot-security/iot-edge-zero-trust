@@ -2193,15 +2193,7 @@ export default function Dashboard() {
 
                 description="등록 대기 · 자동 대응 미적용"
 
-                status={
-
-                  registrationPendingValue !== null && registrationPendingValue > 0
-
-                    ? "warning"
-
-                    : "default"
-
-                }
+                status="warning"
 
                 updatedAt={sourceUpdatedAt("devices")}
 
@@ -2238,6 +2230,8 @@ export default function Dashboard() {
               <SummaryCard
 
                 title="관리 비활성"
+
+                status="unknown"
 
                 value={
 
@@ -2277,15 +2271,7 @@ export default function Dashboard() {
 
                 description="등록 정책 정보 확인 필요"
 
-                status={
-
-                  registrationUnknownValue !== null && registrationUnknownValue > 0
-
-                    ? "warning"
-
-                    : "default"
-
-                }
+                status="unknown"
 
                 updatedAt={sourceUpdatedAt("devices")}
 
@@ -2425,15 +2411,7 @@ export default function Dashboard() {
 
                 description="차단 규칙 적용 대기"
 
-                status={
-
-                  firewallPendingCard.value !== null && firewallPendingCard.value > 0
-
-                    ? "warning"
-
-                    : "default"
-
-                }
+                status="warning"
 
                 updatedAt={
 
@@ -2475,15 +2453,7 @@ export default function Dashboard() {
 
                 description="차단 규칙 적용 실패"
 
-                status={
-
-                  firewallFailedCard.value !== null && firewallFailedCard.value > 0
-
-                    ? "danger"
-
-                    : "default"
-
-                }
+                status="danger"
 
                 updatedAt={
 
@@ -2554,7 +2524,7 @@ export default function Dashboard() {
                   value={sourceHasSuccess("aiWarnings") ? formatNumber(aiWarnings.length) : null}
                   unavailable={!sourceHasSuccess("aiWarnings")}
                   description="최근 최대 10건 · 전체 누적 건수 아님"
-                  status={aiWarnings.length > 0 ? "warning" : "default"}
+                  status="ai"
                   stale={sourceIsStale("aiWarnings")}
                   updatedAt={sourceUpdatedAt("aiWarnings")}
                 />
@@ -2910,15 +2880,7 @@ export default function Dashboard() {
 
                     description="수집 시간 충족률 또는 수집 시간 정보 문제"
 
-                    status={
-
-                      sourceHasSuccess("packetFeatures") && captureSummary.excluded > 0
-
-                        ? "warning"
-
-                        : "default"
-
-                    }
+                    status="warning"
 
                     updatedAt={sourceUpdatedAt("packetFeatures")}
 
@@ -2944,15 +2906,7 @@ export default function Dashboard() {
 
                     description="수집 구간 처리 실패"
 
-                    status={
-
-                      sourceHasSuccess("packetFeatures") && captureSummary.failed > 0
-
-                        ? "danger"
-
-                        : "default"
-
-                    }
+                    status="danger"
 
                     updatedAt={sourceUpdatedAt("packetFeatures")}
 

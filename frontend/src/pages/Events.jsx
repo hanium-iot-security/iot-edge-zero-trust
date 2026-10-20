@@ -1388,15 +1388,7 @@ export default function Events() {
 
               description="현재 페이지 심각도 높음"
 
-              status={
-
-                eventSummary.highSeverityCount > 0
-
-                  ? "danger"
-
-                  : "default"
-
-              }
+              status="danger"
 
             />
 
@@ -1456,6 +1448,8 @@ export default function Events() {
 
               title="신뢰점수 미반영"
 
+              status="unknown"
+
               value={formatNumber(
 
                 eventSummary.unappliedCount,
@@ -1482,15 +1476,7 @@ export default function Events() {
 
               description="수집 공백으로 점수 미반영"
 
-              status={
-
-                eventSummary.captureGapCount > 0
-
-                  ? "warning"
-
-                  : "default"
-
-              }
+              status="warning"
 
             />
 

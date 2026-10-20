@@ -1599,7 +1599,7 @@ export default function Devices() {
             <SummaryCard title="전체 기기" value={total} description="신뢰 상태 필터 기준 전체 건수" />
             <SummaryCard title="등록 준비" value={summary.registrationPending} description="자동 대응 미적용" status="warning" />
             <SummaryCard title="등록 활성" value={summary.registrationActive} description="자동 대응 적용 대상" status="normal" />
-            <SummaryCard title="관리 비활성" value={summary.registrationDisabled} description="새 자동 대응 중지" />
+            <SummaryCard title="관리 비활성" value={summary.registrationDisabled} description="새 자동 대응 중지" status="unknown" />
           </section>
           <section className="device-state-summary" aria-label="현재 페이지 기기 상태 요약">
             <dl>

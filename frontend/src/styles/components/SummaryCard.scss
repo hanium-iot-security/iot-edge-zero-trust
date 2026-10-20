@@ -64,6 +64,10 @@
     background: var(--color-purple);
   }
 
+  &.status-unknown::before {
+    background: var(--color-slate-400);
+  }
+
   &.status-unavailable {
     border-style: dashed;
     background: var(--color-slate-50);

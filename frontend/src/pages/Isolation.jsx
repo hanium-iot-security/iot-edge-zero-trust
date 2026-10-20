@@ -1759,27 +1759,15 @@ export default function Isolation() {
 
       {!loading &&
             !error && (<section className="summary-card-grid" aria-label="격리 상태 요약">
-            <SummaryCard title="현재 격리" value={formatNumber(isolationSummary.isolated)} description="신뢰 상태가 isolated인 기기" status={isolationSummary.isolated >
-                0
-                ? "isolated"
-                : "default"}/>
+            <SummaryCard title="현재 격리" value={formatNumber(isolationSummary.isolated)} description="신뢰 상태가 isolated인 기기" status="isolated"/>
 
             <SummaryCard title="방화벽 적용" value={formatNumber(isolationSummary.applied)} description="실제 네트워크 차단 완료" status="normal"/>
 
-            <SummaryCard title="적용 대기" value={formatNumber(isolationSummary.pending)} description="격리 결정 후 차단 적용 대기" status={isolationSummary.pending >
-                0
-                ? "warning"
-                : "default"}/>
+            <SummaryCard title="적용 대기" value={formatNumber(isolationSummary.pending)} description="격리 결정 후 차단 적용 대기" status="warning"/>
 
-            <SummaryCard title="방화벽 실패" value={formatNumber(isolationSummary.failed)} description="차단 규칙 적용 실패" status={isolationSummary.failed >
-                0
-                ? "danger"
-                : "default"}/>
+            <SummaryCard title="방화벽 실패" value={formatNumber(isolationSummary.failed)} description="차단 규칙 적용 실패" status="danger"/>
 
-            <SummaryCard title="방화벽 미확인" value={formatNumber(isolationSummary.missing)} description="연결된 방화벽 규칙 없음" status={isolationSummary.missing >
-                0
-                ? "warning"
-                : "default"}/>
+            <SummaryCard title="방화벽 미확인" value={formatNumber(isolationSummary.missing)} description="연결된 방화벽 규칙 없음" status="unknown"/>
 
             <SummaryCard title="전체 격리 이력" value={formatNumber(total)} description="현재 조회 조건의 전체 기록"/>
           </section>)}

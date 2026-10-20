@@ -678,12 +678,7 @@ export default function Logs() {
                 logSummary.jsonInvalidCount
               )}
               description="현재 페이지 JSON 오류"
-              status={
-                logSummary.jsonInvalidCount >
-                  0
-                  ? "danger"
-                  : "default"
-              }
+              status="danger"
             />
 
             <SummaryCard
@@ -701,12 +696,7 @@ export default function Logs() {
                 logSummary.topicInvalidCount
               )}
               description="현재 페이지 토픽 오류"
-              status={
-                logSummary.topicInvalidCount >
-                  0
-                  ? "warning"
-                  : "default"
-              }
+              status="danger"
             />
 
             <SummaryCard
@@ -715,12 +705,7 @@ export default function Logs() {
                 logSummary.largePayloadCount
               )}
               description="메시지 내용가 5KB를 초과한 로그"
-              status={
-                logSummary.largePayloadCount >
-                  0
-                  ? "danger"
-                  : "default"
-              }
+              status="danger"
             />
 
             <SummaryCard
@@ -729,12 +714,7 @@ export default function Logs() {
                 logSummary.unknownDeviceCount
               )}
               description="기기 ID를 확인하지 못한 로그"
-              status={
-                logSummary.unknownDeviceCount >
-                  0
-                  ? "warning"
-                  : "default"
-              }
+              status="unknown"
             />
           </section>
         )}
