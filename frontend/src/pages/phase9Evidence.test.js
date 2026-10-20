@@ -7,8 +7,8 @@ import { transformWithOxc } from "vite";
 import * as mqttTimestamp from "../utils/mqttTimestamp.js";
 
 // Render the production JSX and field readers with fixed API response fixtures.
-async function page(name, exports, states = {}) {
-  const source = await readFile(new URL(`./${name}.jsx`, import.meta.url), "utf8");
+async function page(name, exports, states = {}, directory = "pages") {
+  const source = await readFile(new URL(`../${directory}/${name}.jsx`, import.meta.url), "utf8");
   const importedNames = [...source.matchAll(/^import\s+(?:\{([\s\S]*?)\}|(\w+))\s+from\s+["'][^"']+["'];/gm)]
     .flatMap((match) => match[1] ? match[1].split(",").map((name) => name.trim()).filter(Boolean) : [match[2]]);
   const { code } = await transformWithOxc(source.replace(/^import\b[\s\S]*?;\r?\n/gm, ""), `${name}.jsx`, {
@@ -141,4 +141,35 @@ test("display localization preserves identifiers that happen to match status wor
   }
   const events = await page("Events", ["warningText"]);
   assert.equal(events.warningText("PENDING"), "PENDING");
+});
+
+
+test("evidence labels leave original values and nested JSON intact; MQTT keys stay raw", async () => {
+  const { JsonViewer } = await page("JsonViewer", ["JsonViewer"], {}, "components");
+  const evidence = {
+    candidate_device_id: "PENDING", capture_coverage_ratio: 0.9922034999999999,
+    model: { model_version: "packet-if-v2-calib-002-p99-py310", raw_decision_score: -0.22475799838643418, threshold_operator: ">" },
+    observed_values: { packet_count: 7, total_bytes: 650 },
+    constructor: "original-field", future_evidence_field: "OFF",
+  };
+  const original = JSON.stringify(evidence);
+  Object.freeze(evidence.model);
+  Object.freeze(evidence.observed_values);
+  Object.freeze(evidence);
+  const rendered = [...nodes(JsonViewer({ data: evidence, translateKeys: true }))];
+  const keys = rendered.filter((node) => node.type === "dt").map(text);
+  assert.deepEqual(keys, ["식별 후보 기기 ID", "수집 시간 충족 비율", "모델 판정 정보", "실제 관측값", "constructor", "future_evidence_field"]);
+  const values = rendered.filter((node) => node.type === "dd").map(text);
+  assert.equal(values[0], "PENDING");
+  assert.equal(values[1], "0.9922034999999999");
+  assert.equal(values[5], "OFF");
+  const jsonBlocks = rendered.filter((node) => node.type === "pre");
+  assert.equal(jsonBlocks[0].children[0], JSON.stringify(evidence.model, null, 2));
+  assert.equal(jsonBlocks[1].children[0], JSON.stringify(evidence.observed_values, null, 2));
+  assert.equal(JSON.stringify(evidence), original);
+
+  const mqtt = { device_id: "esp32_02", sequence: 2345, uptime_s: 11729 };
+  const mqttRendered = [...nodes(JsonViewer({ data: mqtt }))];
+  assert.deepEqual(mqttRendered.filter((node) => node.type === "dt").map(text), Object.keys(mqtt));
+  assert.deepEqual(mqttRendered.filter((node) => node.type === "dd").map(text), ["esp32_02", "2345", "11729"]);
 });

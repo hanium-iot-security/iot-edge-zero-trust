@@ -34,6 +34,13 @@ export function uiLabel(value) {
 
 const evidenceLabels = {
   source_type: "원본 자료 유형", source_id: "원본 자료 ID", device_id: "기기 ID",
+  candidate_device_id: "식별 후보 기기 ID", capture_coverage_ratio: "수집 시간 충족 비율",
+  capture_policy: "수집 품질 기준", capture_segment_id: "수집 구간 ID",
+  capture_session_id: "수집 세션 ID", cycle_range_start: "탐지 처리 범위 시작",
+  cycle_cutoff: "탐지 처리 범위 종료", model: "모델 판정 정보",
+  normalization: "입력값 보정 방식", normalized_values: "보정 입력값",
+  observed_values: "실제 관측값", trust_decision: "신뢰점수 반영 근거",
+  policy_version: "적용 정책 버전",
   detector_name: "탐지기", event_type: "탐지 유형", model_version: "모델 버전",
   raw_decision_function: "모델 원점수", anomaly_score: "이상 점수", threshold: "판정 기준값",
   comparison_operator: "판정 연산자", captured_duration_seconds: "실제 수집시간(초)",
@@ -50,5 +57,5 @@ const evidenceLabels = {
 };
 
 export function evidenceLabel(key) {
-  return evidenceLabels[key] ?? key;
+  return Object.hasOwn(evidenceLabels, key) ? evidenceLabels[key] : key;
 }

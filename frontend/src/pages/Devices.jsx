@@ -31,7 +31,6 @@ import LoadingState from "../components/LoadingState";
 import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
 import StatusBadge from "../components/StatusBadge";
-import SummaryCard from "../components/SummaryCard";
 
 import { getCurrentFirewallRuleMap } from "../utils/firewallRuleSelection";
 import {
@@ -1595,34 +1594,81 @@ export default function Devices() {
 
       {!loading && !error && rows.length > 0 && (
         <>
-          <section className="summary-card-grid device-registration-summary" aria-label="기기 등록 요약">
-            <SummaryCard title="전체 기기" value={total} description="신뢰 상태 필터 기준 전체 건수" />
-            <SummaryCard title="등록 준비" value={summary.registrationPending} description="자동 대응 미적용" status="warning" />
-            <SummaryCard title="등록 활성" value={summary.registrationActive} description="자동 대응 적용 대상" status="normal" />
-            <SummaryCard title="관리 비활성" value={summary.registrationDisabled} description="새 자동 대응 중지" status="unknown" />
-          </section>
-          <section className="device-state-summary" aria-label="현재 페이지 기기 상태 요약">
+          <section className="device-state-summary" aria-label="기기 등록·신뢰·방화벽 요약">
             <dl>
+              <div className="device-state-row">
+                <dt>기기·등록</dt>
+                <dd>
+                  <div className="device-state-value">
+                    <span className="device-state-label">전체 기기</span>
+                    <strong>{total}</strong>
+                    <small>신뢰 상태 필터 기준 전체 건수</small>
+                  </div>
+                  <div className="device-state-value">
+                    <span className="device-state-label is-warning">등록 준비</span>
+                    <strong>{summary.registrationPending}</strong>
+                    <small>자동 대응 미적용</small>
+                  </div>
+                  <div className="device-state-value">
+                    <span className="device-state-label is-normal">등록 활성</span>
+                    <strong>{summary.registrationActive}</strong>
+                    <small>자동 대응 적용 대상</small>
+                  </div>
+                  <div className="device-state-value">
+                    <span className="device-state-label is-unknown">관리 비활성</span>
+                    <strong>{summary.registrationDisabled}</strong>
+                    <small>새 자동 대응 중지</small>
+                  </div>
+                </dd>
+              </div>
               <div className="device-state-row">
                 <dt>신뢰 상태</dt>
                 <dd>
-                  <StatusBadge status="normal" label={`정상 ${summary.normal}`} title="신뢰점수 80 이상" />
-                  <StatusBadge status="warning" label={`주의 ${summary.warning}`} title="신뢰점수 60~79" />
-                  <StatusBadge status="danger" label={`위험 ${summary.danger}`} title="신뢰점수 30~59" />
-                  <StatusBadge status="isolated" label={`격리 ${summary.isolated}`} title="신뢰점수 30 미만" />
+                  <div className="device-state-value">
+                    <StatusBadge status="normal" label="정상" title="신뢰점수 80 이상" />
+                    <strong>{summary.normal}</strong>
+                    <small>신뢰점수 80 이상</small>
+                  </div>
+                  <div className="device-state-value">
+                    <StatusBadge status="warning" label="주의" title="신뢰점수 60~79" />
+                    <strong>{summary.warning}</strong>
+                    <small>신뢰점수 60~79</small>
+                  </div>
+                  <div className="device-state-value">
+                    <StatusBadge status="danger" label="위험" title="신뢰점수 30~59" />
+                    <strong>{summary.danger}</strong>
+                    <small>신뢰점수 30~59</small>
+                  </div>
+                  <div className="device-state-value">
+                    <StatusBadge status="isolated" label="격리" title="신뢰점수 30 미만" />
+                    <strong>{summary.isolated}</strong>
+                    <small>신뢰점수 30 미만</small>
+                  </div>
                 </dd>
               </div>
               <div className="device-state-row">
                 <dt>방화벽</dt>
                 <dd>
-                  <StatusBadge status="applied" label={`적용 ${summary.firewallApplied}`} title="실제 차단 규칙 적용" />
-                  <StatusBadge status="pending" label={`대기 ${summary.firewallPending}`} title="차단 규칙 적용 대기" />
-                  <StatusBadge status="failed" label={`실패 ${summary.firewallFailed}`} title="차단 규칙 적용 실패" />
+                  <div className="device-state-value">
+                    <StatusBadge status="applied" label="적용" title="실제 차단 규칙 적용" />
+                    <strong>{summary.firewallApplied}</strong>
+                    <small>실제 차단 규칙 적용</small>
+                  </div>
+                  <div className="device-state-value">
+                    <StatusBadge status="pending" label="대기" title="차단 규칙 적용 대기" />
+                    <strong>{summary.firewallPending}</strong>
+                    <small>차단 규칙 적용 대기</small>
+                  </div>
+                  <div className="device-state-value">
+                    <StatusBadge status="failed" label="실패" title="차단 규칙 적용 실패" />
+                    <strong>{summary.firewallFailed}</strong>
+                    <small>차단 규칙 적용 실패</small>
+                  </div>
                 </dd>
               </div>
             </dl>
             <p className="device-summary-note">
-              등록·신뢰·방화벽 요약은 현재 페이지 기준이며, 검색어는 목록에만 적용됩니다.
+              전체 기기는 신뢰 상태 필터 기준 전체 건수입니다. 나머지 요약은 현재 페이지 기준이며, 검색어는 목록에만 적용됩니다.
             </p>
           </section>
           {summary.registrationUnknown > 0 && (
