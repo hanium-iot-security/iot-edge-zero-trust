@@ -60,6 +60,7 @@ const DOT_STATUSES = new Set([
 
   "pending",
   "applied",
+  "failed",
   "removed",
 
   "down",

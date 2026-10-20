@@ -1595,22 +1595,44 @@ export default function Devices() {
 
       {!loading && !error && rows.length > 0 && (
         <>
-          <section className="summary-card-grid">
-            <SummaryCard title="등록 준비" value={summary.registrationPending} description="등록 대기" status="warning" />
-            <SummaryCard title="등록 활성" value={summary.registrationActive} description="등록 활성" status="normal" />
-            <SummaryCard title="관리 비활성" value={summary.registrationDisabled} description="관리 비활성" />
-            <SummaryCard title="상태 확인 불가" value={summary.registrationUnknown} description="등록 정책 정보 확인 필요" />
+          <section className="summary-card-grid device-registration-summary" aria-label="기기 등록 요약">
+            <SummaryCard title="전체 기기" value={total} description="신뢰 상태 필터 기준 전체 건수" />
+            <SummaryCard title="등록 준비" value={summary.registrationPending} description="자동 대응 미적용" status="warning" />
+            <SummaryCard title="등록 활성" value={summary.registrationActive} description="자동 대응 적용 대상" status="normal" />
+            <SummaryCard title="관리 비활성" value={summary.registrationDisabled} description="새 자동 대응 중지" />
           </section>
-          <section className="summary-card-grid">
-            <SummaryCard title="전체 기기" value={total} description="현재 필터 기준" />
-            <SummaryCard title="정상" value={summary.normal} description="신뢰점수 80 이상" status="normal" />
-            <SummaryCard title="주의" value={summary.warning} description="신뢰점수 60~79" status="warning" />
-            <SummaryCard title="위험" value={summary.danger} description="신뢰점수 30~59" status="danger" />
-            <SummaryCard title="격리" value={summary.isolated} description="신뢰점수 30 미만" status="isolated" />
-            <SummaryCard title="방화벽 적용" value={summary.firewallApplied} description="실제 차단 규칙 적용" status="normal" />
-            <SummaryCard title="방화벽 대기" value={summary.firewallPending} description="차단 규칙 적용 대기" status="warning" />
-            <SummaryCard title="방화벽 실패" value={summary.firewallFailed} description="차단 규칙 적용 실패" status="danger" />
+          <section className="device-state-summary" aria-label="현재 페이지 기기 상태 요약">
+            <dl>
+              <div className="device-state-row">
+                <dt>신뢰 상태</dt>
+                <dd>
+                  <StatusBadge status="normal" label={`정상 ${summary.normal}`} title="신뢰점수 80 이상" />
+                  <StatusBadge status="warning" label={`주의 ${summary.warning}`} title="신뢰점수 60~79" />
+                  <StatusBadge status="danger" label={`위험 ${summary.danger}`} title="신뢰점수 30~59" />
+                  <StatusBadge status="isolated" label={`격리 ${summary.isolated}`} title="신뢰점수 30 미만" />
+                </dd>
+              </div>
+              <div className="device-state-row">
+                <dt>방화벽</dt>
+                <dd>
+                  <StatusBadge status="applied" label={`적용 ${summary.firewallApplied}`} title="실제 차단 규칙 적용" />
+                  <StatusBadge status="pending" label={`대기 ${summary.firewallPending}`} title="차단 규칙 적용 대기" />
+                  <StatusBadge status="failed" label={`실패 ${summary.firewallFailed}`} title="차단 규칙 적용 실패" />
+                </dd>
+              </div>
+            </dl>
+            <p className="device-summary-note">
+              등록·신뢰·방화벽 요약은 현재 페이지 기준이며, 검색어는 목록에만 적용됩니다.
+            </p>
           </section>
+          {summary.registrationUnknown > 0 && (
+            <div className="page-warning-banner" role="alert">
+              <div>
+                <strong>등록 상태 확인 불가 {summary.registrationUnknown}대</strong>
+                <p>등록 정책 정보를 확인할 수 없습니다. 기기 상세에서 조회 상태를 확인해 주세요.</p>
+              </div>
+            </div>
+          )}
         </>
       )}
 
