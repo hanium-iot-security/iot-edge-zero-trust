@@ -700,6 +700,17 @@ function getCaptureSummary(packetFeatures) {
 
 
 
+function getCaptureBadge(summary, count, state) {
+  if (state?.status === "error") return { status: "unknown", label: "확인 불가" };
+  if (!state?.lastSuccessAt) return { status: "unknown", label: "조회 중" };
+  if (count === 0) return { status: "no_data", label: "자료 없음" };
+  if (summary.failed > 0 || summary.excluded > 0) {
+    return { status: "degraded", label: "수집 품질 저하" };
+  }
+  if (summary.eligible !== count) return { status: "unknown", label: "확인 불가" };
+  return { status: "normal", label: "수집 양호" };
+}
+
 function formatResourceValue(value) {
 
   if (value === null || value === undefined || value === "") {
@@ -1374,6 +1385,8 @@ export default function Dashboard() {
     [packetFeatures]
 
   );
+
+  const captureBadge = getCaptureBadge(captureSummary, packetFeatures.length, sourceState.packetFeatures);
 
   const gatewayStatus = useMemo(
 
@@ -2780,45 +2793,7 @@ export default function Dashboard() {
 
                   </div>
 
-                  <StatusBadge
-
-                    status={
-
-                      sourceHasSuccess("packetFeatures")
-
-                        ? captureSummary.failed > 0 || captureSummary.excluded > 0
-
-                          ? "degraded"
-
-                          : "normal"
-
-                        : sourceState.packetFeatures?.status === "error"
-
-                          ? "failed"
-
-                          : "unknown"
-
-                    }
-
-                    label={
-
-                      sourceHasSuccess("packetFeatures")
-
-                        ? captureSummary.failed > 0 || captureSummary.excluded > 0
-
-                          ? "DEGRADED"
-
-                          : "NORMAL"
-
-                        : sourceState.packetFeatures?.status === "error"
-
-                          ? "확인 불가"
-
-                          : "조회 중"
-
-                    }
-
-                  />
+                  <StatusBadge status={captureBadge.status} label={captureBadge.label} />
 
                 </div>
 

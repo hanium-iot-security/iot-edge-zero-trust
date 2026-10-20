@@ -533,3 +533,52 @@ test("Isolation refresh preserves release target ID then sequentially releases w
   assert.equal(app.button("복구 실행").props.disabled, false);
   app.cleanup();
 });
+
+
+function packetQualityBadge(app) {
+  const panel = app.find((node) => node.type === "article" && app.textContent(node).includes("패킷 수집 상태"));
+  const header = panel.children.find((node) => node?.props?.className === "panel-header");
+  return header.children.find((node) => node?.type === "StatusBadge").props;
+}
+
+test("empty capture results and a failed refresh never advertise healthy collection; cached counts remain", async () => {
+  let items = [];
+  let failure = false;
+  const app = await componentHarness("Dashboard", {
+    ...dashboardApi(async () => ({ items: [] })),
+    getPacketFeatureLogs: async () => {
+      if (failure) throw new Error("packet refresh failed");
+      return { items };
+    },
+  });
+  assert.equal(packetQualityBadge(app).label, "자료 없음");
+  assert.notEqual(packetQualityBadge(app).status, "normal");
+  items = [{ capture_eligible: true, segment_status: "PROCESSED", coverage_ratio: 0.997 }];
+  await app.advance(10_000);
+  assert.equal(packetQualityBadge(app).label, "수집 양호");
+  failure = true;
+  await app.advance(10_000);
+  assert.equal(packetQualityBadge(app).label, "확인 불가");
+  assert.notEqual(packetQualityBadge(app).status, "normal");
+  const count = app.find((node) => node.type === "SummaryCard" && node.props.title === "분석 가능");
+  assert.equal(Number(count.props.value), 1, "failed refresh preserves the prior successful count");
+  assert.equal(count.props.stale, true);
+  app.cleanup();
+});
+
+test("unknown capture eligibility stays unconfirmed while failed or excluded rows indicate degraded quality", async () => {
+  let items = [{ segment_status: "PROCESSED" }];
+  const app = await componentHarness("Dashboard", {
+    ...dashboardApi(async () => ({ items: [] })),
+    getPacketFeatureLogs: async () => ({ items }),
+  });
+  assert.equal(packetQualityBadge(app).label, "확인 불가");
+  assert.notEqual(packetQualityBadge(app).status, "normal");
+  for (const row of [{ capture_eligible: false }, { segment_status: "FAILED", capture_eligible: true }]) {
+    items = [row];
+    await app.advance(10_000);
+    assert.equal(packetQualityBadge(app).label, "수집 품질 저하");
+    assert.equal(packetQualityBadge(app).status, "degraded");
+  }
+  app.cleanup();
+});
