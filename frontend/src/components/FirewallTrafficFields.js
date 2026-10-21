@@ -16,7 +16,7 @@ export default function FirewallTrafficFields({ rule }) {
   return createElement(
     Fragment,
     null,
-    ...[["Protocol", labels.protocol], ["Port", labels.port]].map(([name, value]) =>
+    ...[["프로토콜", labels.protocol], ["포트", labels.port]].map(([name, value]) =>
       createElement("div", { key: name },
         createElement("dt", null, name),
         createElement("dd", null, value),

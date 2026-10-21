@@ -1,3 +1,4 @@
+
 .dashboard-page {
   width: 100%;
   max-width: 100%;
@@ -7,6 +8,7 @@
   /* ========================================
      SOURCE STATE
      ======================================== */
+
   .source-state-note {
     display: flex;
     align-items: flex-start;
@@ -26,6 +28,7 @@
 
     span {
       color: var(--color-slate-600);
+      overflow-wrap: anywhere;
     }
   }
 
@@ -91,6 +94,7 @@
   /* ========================================
      STATUS
      ======================================== */
+
   .status-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -99,6 +103,7 @@
   }
 
   .status-panel {
+    min-width: 0;
     margin-bottom: 0;
   }
 
@@ -113,11 +118,13 @@
     margin: 18px 0 0;
     color: var(--color-slate-500);
     font-size: 12px;
+    line-height: 1.5;
   }
 
   /* ========================================
      API HEALTH
      ======================================== */
+
   .health-grid {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -128,19 +135,20 @@
     min-width: 0;
     padding: 14px;
     border: 1px solid var(--border-color);
-    border-radius: 2px;
+    border-radius: 8px;
     background: var(--color-slate-50);
 
     span {
       display: block;
       margin-bottom: 7px;
       color: var(--color-slate-500);
-      font-size: 16px;
+      font-size: 13px;
       font-weight: 700;
     }
 
     strong {
       display: block;
+      min-width: 0;
       overflow-wrap: anywhere;
       color: var(--color-slate-900);
       font-size: 16px;
@@ -148,25 +156,9 @@
   }
 
   /* ========================================
-     CHART
-     ======================================== */
-  .chart-wrap {
-    width: 100%;
-    min-width: 0;
-    overflow: hidden;
-  }
-
-  .chart-loading {
-    display: flex;
-    min-height: 320px;
-    align-items: center;
-    justify-content: center;
-    color: var(--color-slate-500);
-  }
-
-  /* ========================================
      TABLE
      ======================================== */
+
   .table-panel {
     width: 100%;
     max-width: 100%;
@@ -191,6 +183,7 @@
   /* ========================================
      TRUST SCORE
      ======================================== */
+
   .score-cell {
     display: flex;
     min-width: 92px;
@@ -242,6 +235,7 @@
   /* ========================================
      TABLE CELLS
      ======================================== */
+
   .registration-cell {
     display: flex;
     min-width: 145px;
@@ -274,6 +268,7 @@
   /* ========================================
      TABLE ROW STATUS
      ======================================== */
+
   .row-warning {
     background: #fffbeb;
 
@@ -299,8 +294,151 @@
   }
 
   /* ========================================
+     PHASE 9
+     AI WARNINGS / RUNTIME / CAPTURE WINDOW
+     ======================================== */
+
+  [aria-label="AI 및 Packet 운영 상태"] {
+    min-width: 0;
+
+    .panel-header {
+      margin-bottom: 16px;
+
+      h2 {
+        color: var(--color-slate-950);
+      }
+
+      .panel-description {
+        max-width: 850px;
+        line-height: 1.6;
+      }
+    }
+
+    .summary-card-grid {
+      margin-bottom: 18px;
+    }
+
+    .source-state-note {
+      margin-bottom: 10px;
+    }
+
+    .health-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      align-items: start;
+    }
+
+    .health-item {
+      min-width: 0;
+      padding: 16px;
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      background: var(--color-slate-50);
+
+      span {
+        display: block;
+        margin-bottom: 12px;
+        color: var(--color-slate-600);
+        font-size: 12px;
+        font-weight: 700;
+        line-height: 1.5;
+      }
+
+      strong {
+        display: block;
+        min-width: 0;
+        max-width: 100%;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+        color: var(--color-slate-800);
+        font-size: 12px;
+        font-weight: 500;
+        line-height: 1.65;
+        white-space: pre-wrap;
+      }
+
+      pre {
+        max-width: 100%;
+        max-height: 320px;
+        overflow: auto;
+        margin: 0;
+        padding: 12px;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        background: var(--surface);
+        color: var(--color-slate-800);
+        font-family:
+          ui-monospace,
+          SFMono-Regular,
+          Menlo,
+          Consolas,
+          monospace;
+        font-size: 11px;
+        line-height: 1.55;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+    }
+  }
+
+  /* ========================================
+     WARNING BANNER
+     ======================================== */
+
+  .page-warning-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    gap: 10px;
+
+    span {
+      color: var(--color-slate-500);
+      font-size: 12px;
+    }
+  }
+
+  .warning-message-list {
+    margin: 8px 0 0;
+    padding-left: 18px;
+    color: var(--color-slate-600);
+    font-size: 12px;
+    line-height: 1.6;
+
+    li {
+      margin-bottom: 4px;
+      overflow-wrap: anywhere;
+    }
+  }
+
+  /* ========================================
+     ERROR BOX
+     ======================================== */
+
+  .error-box {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+
+    strong {
+      color: var(--color-danger);
+      font-size: 14px;
+    }
+
+    p {
+      margin: 6px 0 0;
+      color: var(--color-slate-600);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+  }
+
+  /* ========================================
      RESPONSIVE
      ======================================== */
+
   @media (max-width: 1280px) {
     .health-grid {
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -310,6 +448,12 @@
   @media (max-width: 1100px) {
     .status-grid {
       grid-template-columns: 1fr;
+    }
+
+    [aria-label="AI 및 Packet 운영 상태"] {
+      .health-grid {
+        grid-template-columns: 1fr;
+      }
     }
   }
 
@@ -323,6 +467,26 @@
     .registration-state-guide {
       flex-direction: column;
       gap: 3px;
+    }
+
+    .error-box {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+
+    .page-warning-actions {
+      justify-content: flex-start;
+    }
+
+    [aria-label="AI 및 Packet 운영 상태"] {
+      .health-item {
+        padding: 12px;
+
+        strong,
+        pre {
+          font-size: 11px;
+        }
+      }
     }
   }
 }

@@ -1,3 +1,4 @@
+import * as uiText from "../utils/uiText.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
@@ -129,6 +130,7 @@ async function componentHarness(name, api, clock = createClock()) {
     ...Object.fromEntries(importedNames.map((importedName) => [importedName,
       /^(get|create|execute|recovery)/.test(importedName) ? async () => ({ items: [] }) : importedName])),
     ...mqttTimestamp,
+    ...uiText,
     ...firewallRuleSelection,
     ...api,
     ...hooks,
@@ -262,19 +264,21 @@ test("saved pending policy resyncs 5120 to 6000 and next publish-count save reta
   const server = deviceServer(clock);
   const app = await componentHarness("Devices", server.api, clock);
   await openSensor(app);
-  await app.change("policy-admin-key", "test-admin");
-  await app.change("policy-payload-max", "6000");
-  await app.change("policy-reason", "raise payload limit");
-  await app.click("정책 변경 저장");
+  await app.change("rule-key", "test-admin");
+  await app.change("rule-payload_size_max", "6000");
+  await app.change("rule-reason", "raise payload limit");
+  await app.click("규칙 정책 변경 저장");
   assert.equal(server.writes.length, 1);
-  assert.equal(app.input("policy-payload-max").props.value, "5120");
-  assert.equal(app.input("policy-payload-max").props.disabled, true);
+  assert.equal(app.input("rule-key").props.value, "", "successful save clears the administrator key");
+  assert.equal(app.input("rule-payload_size_max").props.value, "5120");
+  assert.equal(app.input("rule-payload_size_max").props.disabled, true);
   await app.advance(10_750);
-  assert.equal(app.input("policy-payload-max").props.value, "6000");
-  assert.equal(app.input("policy-payload-max").props.disabled, false);
-  await app.change("policy-publish-max", "20");
-  await app.change("policy-reason", "raise publish count");
-  await app.click("정책 변경 저장");
+  assert.equal(app.input("rule-payload_size_max").props.value, "6000");
+  assert.equal(app.input("rule-payload_size_max").props.disabled, false);
+  await app.change("rule-key", "test-admin");
+  await app.change("rule-publish_count_max", "20");
+  await app.change("rule-reason", "raise publish count");
+  await app.click("규칙 정책 변경 저장");
   assert.equal(server.writes.length, 2);
   assert.equal(server.writes[1].payload.expected_revision, 2);
   assert.equal(server.writes[1].payload.policy.payload_size_max_bytes, 6000);
@@ -291,18 +295,18 @@ test("409 refresh and later scheduled callback preserve edited fields and update
   };
   const app = await componentHarness("Devices", server.api, clock);
   await openSensor(app);
-  await app.change("policy-admin-key", "test-admin");
-  await app.change("policy-payload-max", "6200");
-  await app.change("policy-publish-max", "21");
-  await app.change("policy-reason", "keep my draft");
-  await app.click("정책 변경 저장");
-  assert.equal(app.input("policy-payload-max").props.value, "6200");
-  assert.equal(app.input("policy-reason").props.value, "keep my draft");
+  await app.change("rule-key", "test-admin");
+  await app.change("rule-payload_size_max", "6200");
+  await app.change("rule-publish_count_max", "21");
+  await app.change("rule-reason", "keep my draft");
+  await app.click("규칙 정책 변경 저장");
+  assert.equal(app.input("rule-payload_size_max").props.value, "6200");
+  assert.equal(app.input("rule-reason").props.value, "keep my draft");
   await app.advance(10_750);
-  assert.equal(app.input("policy-payload-max").props.value, "6200");
-  assert.equal(app.input("policy-publish-max").props.value, "21");
-  assert.equal(app.input("policy-reason").props.value, "keep my draft");
-  assert.equal(app.input("policy-byte-max").props.value, "3100");
+  assert.equal(app.input("rule-payload_size_max").props.value, "6200");
+  assert.equal(app.input("rule-publish_count_max").props.value, "21");
+  assert.equal(app.input("rule-reason").props.value, "keep my draft");
+  assert.equal(app.input("rule-byte_rate_max").props.value, "3100");
   app.cleanup();
 });
 
@@ -313,18 +317,102 @@ for (const recovery of ["ErrorState retry", "manual policy refresh"]) {
     server.setPending({ ...policy(2, 6000), effective_from: new Date(clock.now + 10_000).toISOString() });
     const app = await componentHarness("Devices", server.api, clock);
     await openSensor(app);
+    await app.change("rule-key", "test-admin");
     server.failNextPolicy(new Error("temporary policy outage"));
     await app.advance(10_750);
     const error = app.find((node) => node.type === "ErrorState" && node.props.message === "temporary policy outage");
-    assert.equal(app.button("정책 변경 저장").props.disabled, true);
+    assert.equal(app.button("규칙 정책 변경 저장").props.disabled, true);
     if (recovery === "ErrorState retry") await app.act(() => error.props.onRetry());
     else await app.click("정책 새로고침");
     assert.equal(app.nodes().some((node) => node.type === "ErrorState" && node.props.message === "temporary policy outage"), false);
-    assert.equal(app.input("policy-payload-max").props.value, "6000");
-    assert.equal(app.button("정책 변경 저장").props.disabled, false);
+    assert.equal(app.input("rule-payload_size_max").props.value, "6000");
+    assert.equal(app.button("규칙 정책 변경 저장").props.disabled, false);
     app.cleanup();
   });
 }
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+async function openDevice(app, deviceId) {
+  const table = app.find((node) => node.type === "DataTable" && node.props.onRowClick);
+  await app.act(() => table.props.onRowClick(table.props.rows.find((row) => row.device_id === deviceId)));
+}
+
+function selectedDetail(app) {
+  return app.find((node) => node.type === "DetailModal" && node.props.open && node.props.title.endsWith("상세 상태"));
+}
+
+test("delayed policy refresh for device A cannot overwrite device B draft or next write", async () => {
+  const a = { ...sensor, device_id: "sensor_A" };
+  const b = { ...sensor, device_id: "sensor_B" };
+  const stale = deferred();
+  const writes = [];
+  let delayA = false;
+  const app = await componentHarness("Devices", {
+    getDevices: async () => ({ items: [a, b], total: 2 }),
+    getFirewallRules: async () => ({ items: [] }),
+    getDeviceDetail: async (id) => id === a.device_id ? a : b,
+    getTrustScoreHistory: async () => ({ items: [] }),
+    getDevicePolicy: async (id) => id === a.device_id && delayA
+      ? stale.promise
+      : { current: policy(1, id === a.device_id ? 5120 : 9100), latest_revision: 1 },
+    createDevicePolicyRevision: async (deviceId, payload) => { writes.push({ deviceId, payload }); },
+  });
+  await openDevice(app, a.device_id);
+  delayA = true;
+  await app.click("정책 새로고침");
+  await app.act(() => selectedDetail(app).props.onClose());
+  await openDevice(app, b.device_id);
+  stale.resolve({ current: policy(1, 5120), latest_revision: 1 });
+  await app.settle();
+  assert.equal(selectedDetail(app).props.title, "sensor_B 상세 상태");
+  assert.equal(app.input("rule-payload_size_max").props.value, "9100");
+  await app.change("rule-publish_count_max", "22");
+  await app.change("rule-key", "test-admin");
+  await app.change("rule-reason", "change device B publish count");
+  await app.click("규칙 정책 변경 저장");
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].deviceId, b.device_id);
+  assert.equal(writes[0].payload.policy.payload_size_max_bytes, 9100);
+  assert.equal(writes[0].payload.policy.publish_count_max, 22);
+  app.cleanup();
+});
+
+test("closed device A refresh error cannot clear device B loading state or show a stale error", async () => {
+  const a = { ...sensor, device_id: "sensor_A" };
+  const b = { ...sensor, device_id: "sensor_B" };
+  const stale = deferred();
+  const current = deferred();
+  let delayA = false;
+  const app = await componentHarness("Devices", {
+    getDevices: async () => ({ items: [a, b], total: 2 }),
+    getFirewallRules: async () => ({ items: [] }),
+    getDeviceDetail: async (id) => id === a.device_id ? a : b,
+    getTrustScoreHistory: async () => ({ items: [] }),
+    getDevicePolicy: async (id) => id === b.device_id ? current.promise
+      : delayA ? stale.promise : { current: policy(1), latest_revision: 1 },
+  });
+  await openDevice(app, a.device_id);
+  delayA = true;
+  await app.click("정책 새로고침");
+  await app.act(() => selectedDetail(app).props.onClose());
+  await openDevice(app, b.device_id);
+  stale.reject(new Error("old device A refresh failed"));
+  await app.settle();
+  assert.equal(app.nodes().some((node) => node.type === "ErrorState" && node.props.message === "old device A refresh failed"), false);
+  assert.equal(app.nodes().some((node) => node.type === "LoadingState" && node.props.title === "규칙 정책 조회 중"), true);
+  assert.equal(app.button("규칙 정책 변경 저장").props.disabled, true);
+  current.resolve({ current: policy(1, 9100), latest_revision: 1 });
+  await app.settle();
+  assert.equal(app.input("rule-payload_size_max").props.value, "9100");
+  assert.equal(app.button("규칙 정책 변경 저장").props.disabled, false);
+  app.cleanup();
+});
 
 function dashboardApi(gateway) {
   return {
@@ -416,32 +504,81 @@ test("Isolation refresh preserves release target ID then sequentially releases w
   await app.change("recovery-admin-key", "test-admin");
   await app.change("firewall-release-reason", "release exact wide rule");
   await app.change("firewall-release-confirmation", "RELEASE-FIREWALL-RULE-20");
-  await app.click("Firewall 해제 요청");
+  await app.click("방화벽 해제 요청");
   assert.equal(releases.length, 0, "confirmation for another scope must not dispatch");
   await app.change("firewall-release-confirmation", "RELEASE-FIREWALL-RULE-21");
-  await app.click("Firewall 해제 요청");
+  await app.click("방화벽 해제 요청");
   assert.equal(releases[0].ruleId, 21);
   rules = rules.map((rule) => rule.id === 21 ? { ...rule, status: "REMOVED", updated_at: "2026-10-12T00:00:01Z" } : rule);
   await app.act(() => app.find((node) => node.type === "PageHeader").props.onRefresh());
   assert.equal(app.find((node) => node.type === "FirewallTrafficFields").props.rule.id, 20);
   requestStatus = "SUCCEEDED";
   await app.advance(2_000);
-  assert.equal(app.button("Firewall 해제 요청").props.disabled, false, "completed request 21 must remain matched to rule 21 after selection changes to rule 20");
-  assert.equal(app.button("Preflight 실행").props.disabled, true, "remaining MQTT scope still blocks Recovery");
+  assert.equal(app.button("방화벽 해제 요청").props.disabled, false, "completed request 21 must remain matched to rule 21 after selection changes to rule 20");
+  assert.equal(app.button("사전 점검 실행").props.disabled, true, "remaining MQTT scope still blocks Recovery");
   await app.change("firewall-release-reason", "release exact failed MQTT rule");
   await app.change("firewall-release-confirmation", "RELEASE-FIREWALL-RULE-20");
   requestStatus = "PENDING";
-  await app.click("Firewall 해제 요청");
+  await app.click("방화벽 해제 요청");
   assert.deepEqual(releases.map((item) => item.ruleId), [21, 20]);
   assert.equal(releases[1].options.confirmation, "RELEASE-FIREWALL-RULE-20");
   rules = rules.map((rule) => ({ ...rule, status: "REMOVED" }));
   requestStatus = "SUCCEEDED";
   await app.advance(2_000);
-  await app.click("Preflight 실행");
+  await app.click("사전 점검 실행");
   assert.equal(preflightCalls[0].expected_trust_score, 20);
-  assert.equal(app.button("Recovery 실행").props.disabled, true, "can_execute alone cannot bypass runtime verification");
+  assert.equal(app.button("복구 실행").props.disabled, true, "can_execute alone cannot bypass runtime verification");
   runtimeStatus = "VERIFIED_RELEASED";
-  await app.click("Preflight 실행");
-  assert.equal(app.button("Recovery 실행").props.disabled, false);
+  await app.click("사전 점검 실행");
+  assert.equal(app.button("복구 실행").props.disabled, false);
+  app.cleanup();
+});
+
+
+function packetQualityBadge(app) {
+  const panel = app.find((node) => node.type === "article" && app.textContent(node).includes("패킷 수집 상태"));
+  const header = panel.children.find((node) => node?.props?.className === "panel-header");
+  return header.children.find((node) => node?.type === "StatusBadge").props;
+}
+
+test("empty capture results and a failed refresh never advertise healthy collection; cached counts remain", async () => {
+  let items = [];
+  let failure = false;
+  const app = await componentHarness("Dashboard", {
+    ...dashboardApi(async () => ({ items: [] })),
+    getPacketFeatureLogs: async () => {
+      if (failure) throw new Error("packet refresh failed");
+      return { items };
+    },
+  });
+  assert.equal(packetQualityBadge(app).label, "자료 없음");
+  assert.notEqual(packetQualityBadge(app).status, "normal");
+  items = [{ capture_eligible: true, segment_status: "PROCESSED", coverage_ratio: 0.997 }];
+  await app.advance(10_000);
+  assert.equal(packetQualityBadge(app).label, "수집 양호");
+  failure = true;
+  await app.advance(10_000);
+  assert.equal(packetQualityBadge(app).label, "확인 불가");
+  assert.notEqual(packetQualityBadge(app).status, "normal");
+  const count = app.find((node) => node.type === "SummaryCard" && node.props.title === "분석 가능");
+  assert.equal(Number(count.props.value), 1, "failed refresh preserves the prior successful count");
+  assert.equal(count.props.stale, true);
+  app.cleanup();
+});
+
+test("unknown capture eligibility stays unconfirmed while failed or excluded rows indicate degraded quality", async () => {
+  let items = [{ segment_status: "PROCESSED" }];
+  const app = await componentHarness("Dashboard", {
+    ...dashboardApi(async () => ({ items: [] })),
+    getPacketFeatureLogs: async () => ({ items }),
+  });
+  assert.equal(packetQualityBadge(app).label, "확인 불가");
+  assert.notEqual(packetQualityBadge(app).status, "normal");
+  for (const row of [{ capture_eligible: false }, { segment_status: "FAILED", capture_eligible: true }]) {
+    items = [row];
+    await app.advance(10_000);
+    assert.equal(packetQualityBadge(app).label, "수집 품질 저하");
+    assert.equal(packetQualityBadge(app).status, "degraded");
+  }
   app.cleanup();
 });
