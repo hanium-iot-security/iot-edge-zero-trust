@@ -138,6 +138,12 @@ def apply_trust_score_v2_until(
     )
     if completed_before is not None and completed_before > cutoff:
         raise ValueError("existing Trust checkpoint exceeds cycle_cutoff")
+    # A lagging required detector can move the shared cycle start backwards,
+    # but its new evidence must not reopen windows Trust already completed.
+    late_event_boundary = (
+        max(range_start, completed_before)
+        if completed_before is not None else range_start
+    )
 
     events = _fetch_candidate_events(
         db,
@@ -156,8 +162,8 @@ def apply_trust_score_v2_until(
     observed_ai_event_count = 0
 
     for event in events:
-        if _is_before_current_cycle(event, range_start):
-            reason = _past_event_processing_reason(event, range_start)
+        if _is_before_current_cycle(event, late_event_boundary):
+            reason = _past_event_processing_reason(event, late_event_boundary)
             if resolver is not None and event.get("device_id"):
                 window_start, _ = _event_window(event)
                 resolution = resolver.resolve(str(event["device_id"]), window_start)
