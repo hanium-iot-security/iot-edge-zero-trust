@@ -226,6 +226,41 @@ def _feature_rows(db_session, segment_id: int) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "vlan_header",
+    [b"", b"\x81\x00\x00\x01", b"\x88\xa8\x00\x01\x81\x00\x00\x01"],
+    ids=["untagged", "single-vlan", "double-vlan"],
+)
+@pytest.mark.parametrize(
+    ("include_valid", "error_code"),
+    [(False, "PCAP_PARSE_ERROR"), (True, "PARTIAL_CAPTURE")],
+    ids=["only-malformed", "mixed-valid-malformed"],
+)
+def test_declared_ipv4_decode_failure_preserves_failed_segment_and_raw_file(
+    db_session, ready_dir: Path, include_valid: bool, error_code: str, vlan_header: bytes
+) -> None:
+    csid = _insert_capture_session(db_session)
+    segment = _insert_segment(db_session, csid)
+    pcap_path = ready_dir / segment["file_name"]
+    malformed = b"\x00" * 12 + vlan_header + b"\x08\x00" + b"\x44" + b"\x00" * 45
+    with pcap_path.open("wb") as handle:
+        writer = dpkt.pcap.Writer(handle)
+        if include_valid:
+            writer.writepkt(_make_eth_bytes(ESP_IP, PI_IP), ts=WINDOW_TS + 0.25)
+        writer.writepkt(malformed, ts=WINDOW_TS + 0.5)
+    original = pcap_path.read_bytes()
+
+    status = process_segment(db_session, segment, ready_dir, PI_IP, {})
+
+    assert status == "FAILED"
+    state = _segment_status(db_session, segment["id"])
+    assert state["status"] == "FAILED"
+    assert state["error_code"] == error_code
+    assert state["processed_at"] is None
+    assert _feature_rows(db_session, segment["id"]) == []
+    assert pcap_path.read_bytes() == original
+
+
 def test_processed_when_normal_pcap_has_matching_packets(
     db_session, ready_dir: Path
 ) -> None:

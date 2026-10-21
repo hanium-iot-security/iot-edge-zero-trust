@@ -70,6 +70,20 @@ def _first_record_caplen(pcap_bytes: bytes) -> int:
     return struct.unpack("<I", pcap_bytes[32:36])[0]
 
 
+def _classic_pcap_bytes(
+    records: list[tuple[int, int, bytes]],
+    *,
+    endian: str = "<",
+    nanoseconds: bool = False,
+) -> bytes:
+    magic = 0xA1B23C4D if nanoseconds else 0xA1B2C3D4
+    header = struct.pack(f"{endian}IHHIIII", magic, 2, 4, 0, 0, 65535, 1)
+    return header + b"".join(
+        struct.pack(f"{endian}IIII", seconds, fraction, len(frame), len(frame)) + frame
+        for seconds, fraction, frame in records
+    )
+
+
 PI_IP = "192.168.0.20"
 ESP_IP = "192.168.0.10"
 EXTERNAL_IP = "10.0.0.1"
@@ -123,6 +137,115 @@ def _udp_pkt(
 
 
 class TestParsePcap:
+    @pytest.mark.parametrize("endian", ["<", ">"], ids=["little", "big"])
+    @pytest.mark.parametrize("nanoseconds", [False, True], ids=["micro", "nano"])
+    def test_classic_timestamp_formats_preserve_window_and_iat(
+        self, tmp_path: Path, endian: str, nanoseconds: bool
+    ) -> None:
+        # 256 swaps to 65536, keeping a broken endian reader's attempted read bounded.
+        frame = _eth_ip_tcp_bytes().ljust(256, b"\x00")
+        divisor = 1_000_000_000 if nanoseconds else 1_000_000
+        pcap = tmp_path / "timestamps.pcap"
+        pcap.write_bytes(_classic_pcap_bytes(
+            [
+                (int(WINDOW_TS), divisor // 4, frame),
+                (int(WINDOW_TS), divisor * 3 // 4, frame),
+                (int(WINDOW_TS) + 10, 0, frame),
+            ],
+            endian=endian,
+            nanoseconds=nanoseconds,
+        ))
+
+        packets = parse_pcap(pcap)
+
+        assert [packet.timestamp for packet in packets] == pytest.approx(
+            [WINDOW_TS + 0.25, WINDOW_TS + 0.75, WINDOW_TS + 10], rel=0, abs=1e-7
+        )
+        rows = build_packet_features(packets, PI_IP, WINDOW_START, WINDOW_END)
+        assert len(rows) == 1
+        assert rows[0]["packet_count"] == 2
+        assert rows[0]["mean_inter_arrival_time"] == pytest.approx(0.5)
+
+    @pytest.mark.parametrize(
+        "vlan_header",
+        [b"", b"\x81\x00\x00\x01", b"\x88\xa8\x00\x01\x81\x00\x00\x01"],
+        ids=["untagged", "single-vlan", "double-vlan"],
+    )
+    @pytest.mark.parametrize("include_valid", [False, True], ids=["only", "mixed"])
+    def test_declared_ipv4_decode_failure_is_not_silently_ignored(
+        self, tmp_path: Path, include_valid: bool, vlan_header: bytes
+    ) -> None:
+        # Complete Ethernet record; IPv4 IHL=4 is invalid. dpkt absorbs the inner
+        # UnpackError, so this must exercise the actual decoder without a mock.
+        malformed = b"\x00" * 12 + vlan_header + b"\x08\x00" + b"\x44" + b"\x00" * 45
+        records = [(int(WINDOW_TS), 500_000, malformed)]
+        if include_valid:
+            records.insert(0, (int(WINDOW_TS), 250_000, _eth_ip_tcp_bytes()))
+        pcap = tmp_path / "malformed-ipv4.pcap"
+        pcap.write_bytes(_classic_pcap_bytes(records))
+
+        expected = PartialPcapError if include_valid else PcapParseError
+        with pytest.raises(expected) as error:
+            parse_pcap(pcap)
+        if not include_valid:
+            assert not isinstance(error.value, PartialPcapError)
+
+    @pytest.mark.parametrize("include_valid", [False, True], ids=["only", "with-ipv4"])
+    def test_valid_arp_and_ipv6_remain_ignored(
+        self, tmp_path: Path, include_valid: bool
+    ) -> None:
+        arp = bytes(dpkt.ethernet.Ethernet(
+            dst=b"\xff" * 6,
+            src=b"\x00" * 5 + b"\x01",
+            type=dpkt.ethernet.ETH_TYPE_ARP,
+            data=dpkt.arp.ARP(),
+        ))
+        ipv6 = bytes(dpkt.ethernet.Ethernet(
+            dst=b"\xff" * 6,
+            src=b"\x00" * 5 + b"\x01",
+            type=dpkt.ethernet.ETH_TYPE_IP6,
+            data=dpkt.ip6.IP6(src=b"\x00" * 16, dst=b"\x00" * 16, nxt=59, data=b""),
+        ))
+        records = [(int(WINDOW_TS), 250_000, arp), (int(WINDOW_TS), 500_000, ipv6)]
+        if include_valid:
+            records.append((int(WINDOW_TS), 750_000, _eth_ip_tcp_bytes()))
+        pcap = tmp_path / "ignored-protocols.pcap"
+        pcap.write_bytes(_classic_pcap_bytes(records))
+
+        packets = parse_pcap(pcap)
+
+        assert len(packets) == int(include_valid)
+        if include_valid:
+            assert packets[0].src_ip == ESP_IP
+            assert packets[0].dst_ip == PI_IP
+
+    @pytest.mark.parametrize(
+        "tag_types", [(0x8100,), (0x88A8, 0x8100)], ids=["single-vlan", "double-vlan"]
+    )
+    def test_valid_vlan_ipv4_preserves_packet_and_ip_length(
+        self, tmp_path: Path, tag_types: tuple[int, ...]
+    ) -> None:
+        untagged = _eth_ip_tcp_bytes()
+        payload = untagged[12:]
+        for tag_type in reversed(tag_types):
+            payload = struct.pack(">HH", tag_type, 1) + payload
+        tagged = untagged[:12] + payload
+        pcap = tmp_path / "vlan-ipv4.pcap"
+        pcap.write_bytes(_classic_pcap_bytes([(int(WINDOW_TS), 250_000, tagged)]))
+
+        packets = parse_pcap(pcap)
+
+        assert len(packets) == 1
+        assert packets[0].src_ip == ESP_IP
+        assert packets[0].dst_ip == PI_IP
+        assert packets[0].protocol == "TCP"
+        assert packets[0].dst_port == 1883
+        assert packets[0].packet_length == len(untagged) - 14
+        rows = build_packet_features(packets, PI_IP, WINDOW_START, WINDOW_END)
+        assert len(rows) == 1
+        assert rows[0]["packet_count"] == 1
+        assert rows[0]["total_bytes"] == len(untagged) - 14
+
     def test_file_not_found_raises(self, tmp_path: Path) -> None:
         with pytest.raises(FileNotFoundError):
             parse_pcap(tmp_path / "nonexistent.pcap")
