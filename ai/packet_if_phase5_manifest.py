@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from ipaddress import IPv4Address, ip_address
+import json
 from pathlib import PurePosixPath, Path
 import re
 from typing import Any
@@ -152,6 +153,20 @@ def load_verified_run_manifest(
         raise ValueError(f"invalid Run Manifest: {path}") from exc
 
     actual = run_manifest_sha256(manifest)
+    if actual != expected:
+        # Older v1 pins predate the optional firewall release ID field. Accept
+        # only that missing null; all other typed normalization stays pinned.
+        raw_payload = json.loads(raw_manifest)
+        legacy_payload = manifest.to_dict()
+        release_ids = legacy_payload["matched_ids"].pop("firewall_release_request_ids")
+        raw_sha256 = run_manifest_sha256(raw_payload)
+        if (
+            raw_payload.get("run_manifest_schema_version") == "phase5-run-manifest-v1"
+            and release_ids is None
+            and "firewall_release_request_ids" not in raw_payload.get("matched_ids", {})
+            and run_manifest_sha256(legacy_payload) == raw_sha256
+        ):
+            actual = raw_sha256
     if actual != expected:
         raise ValueError(
             "Run Manifest SHA256 mismatch: "
