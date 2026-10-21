@@ -17,7 +17,7 @@ import platform
 import shutil
 import subprocess
 import tempfile
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import joblib
 import numpy as np
@@ -54,6 +54,8 @@ from edge.packet.capture_policy import (
 
 logger = logging.getLogger(__name__)
 
+_TRAINING_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
 DEFAULT_MODEL_VERSION = "packet-if-v1"
 DEFAULT_N_ESTIMATORS = 100
 DEFAULT_RANDOM_STATE = 42
@@ -85,6 +87,7 @@ def train_packet_isolation_forest(
     git_commit_sha: str,
     manifest_sha256: str,
     capture_policy: CapturePolicy = DEFAULT_CAPTURE_POLICY,
+    before_publish: Callable[[], None] | None = None,
 ) -> PacketIFTrainingArtifacts:
     """Train으로 학습하고 Validation으로 Threshold를 정한 뒤 Test를 평가합니다."""
     _validate_training_options(
@@ -109,7 +112,10 @@ def train_packet_isolation_forest(
     if train_matrix.shape[0] == 0 or validation_matrix.shape[0] == 0:
         raise ValueError("train and validation datasets must contain rows")
 
-    with _artifact_staging_directory(artifact_dir) as staging_dir:
+    with _artifact_staging_directory(
+        artifact_dir,
+        before_publish=before_publish,
+    ) as staging_dir:
         staging_paths = _artifact_paths(staging_dir)
         model = IsolationForest(
             n_estimators=n_estimators,
@@ -231,7 +237,20 @@ def train_from_files(
     git_commit_sha: str | None = None,
     capture_policy: CapturePolicy | None = None,
 ) -> PacketIFTrainingArtifacts:
+    dataset_sha256 = file_sha256(dataset_path)
+    manifest_sha256 = file_sha256(manifest_path)
     dataset = load_packet_if_dataset(dataset_path, manifest_path)
+    _require_training_inputs_unchanged(
+        dataset_path,
+        manifest_path,
+        dataset_sha256=dataset_sha256,
+        manifest_sha256=manifest_sha256,
+    )
+    if dataset.manifest.dataset_sha256 != dataset_sha256:
+        raise RuntimeError(
+            "Packet IF training Dataset changed while loading: "
+            f"{dataset_path}"
+        )
     commit_sha = git_commit_sha or current_git_commit_sha()
     resolved_capture_policy = capture_policy or CapturePolicy.from_env()
     return train_packet_isolation_forest(
@@ -242,9 +261,32 @@ def train_from_files(
         n_estimators=n_estimators,
         random_state=random_state,
         git_commit_sha=commit_sha,
-        manifest_sha256=file_sha256(manifest_path),
+        manifest_sha256=manifest_sha256,
         capture_policy=resolved_capture_policy,
+        before_publish=lambda: _require_training_inputs_unchanged(
+            dataset_path,
+            manifest_path,
+            dataset_sha256=dataset_sha256,
+            manifest_sha256=manifest_sha256,
+        ),
     )
+
+
+def _require_training_inputs_unchanged(
+    dataset_path: Path,
+    manifest_path: Path,
+    *,
+    dataset_sha256: str,
+    manifest_sha256: str,
+) -> None:
+    for path, expected_sha256, label in (
+        (dataset_path, dataset_sha256, "Dataset"),
+        (manifest_path, manifest_sha256, "Dataset Manifest"),
+    ):
+        if file_sha256(path) != expected_sha256:
+            raise RuntimeError(
+                f"Packet IF training {label} changed during training: {path}"
+            )
 
 
 def current_git_commit_sha() -> str:
@@ -254,6 +296,7 @@ def current_git_commit_sha() -> str:
             check=True,
             capture_output=True,
             text=True,
+            cwd=_TRAINING_REPOSITORY_ROOT,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise RuntimeError("unable to resolve current Git commit SHA") from exc
@@ -378,6 +421,8 @@ def _validate_artifact_destination(
 @contextmanager
 def _artifact_staging_directory(
     artifact_dir: Path,
+    *,
+    before_publish: Callable[[], None] | None = None,
 ) -> Iterator[Path]:
     parent = artifact_dir.parent
     parent.mkdir(parents=True, exist_ok=True)
@@ -416,6 +461,8 @@ def _artifact_staging_directory(
                 "Packet IF artifact appeared during build; refusing to replace "
                 f"it: {artifact_dir}"
             )
+        if before_publish is not None:
+            before_publish()
         os.rename(staging_dir, artifact_dir)
         staging_dir = None
         _fsync_directory(parent)
