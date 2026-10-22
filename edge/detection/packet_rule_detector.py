@@ -224,10 +224,19 @@ def detect_packet_rules(
 
     events: list[dict[str, Any]] = []
     duration = float(row["captured_duration_seconds"])
+    legacy_v3 = policy.version == "packet-rule-policy-v3"
+    # An explicitly pinned incumbent policy keeps its original float boundary
+    # and whole-peer SYN evidence. Other versions retain the v4 path below.
+    if legacy_v3 and duration <= 0:
+        raise ValueError("captured_duration_seconds must be > 0; caller must filter with is_capture_eligible() first")
 
     packet_count = row["packet_count"]
-    packets_per_second = effective_packets_per_second(packet_count, duration)
-    if include_rate_rules and _rate_exceeds(packet_count, duration, policy.packet_rate_threshold):
+    packets_per_second = (float(packet_count) / duration if legacy_v3
+                          else effective_packets_per_second(packet_count, duration))
+    if include_rate_rules and (
+        packets_per_second > policy.packet_rate_threshold if legacy_v3
+        else _rate_exceeds(packet_count, duration, policy.packet_rate_threshold)
+    ):
         events.append(
             {
                 "event_type": PACKET_RATE_ANOMALY,
@@ -238,8 +247,12 @@ def detect_packet_rules(
         )
 
     total_bytes = row["total_bytes"]
-    bytes_per_second = effective_bytes_per_second(total_bytes, duration)
-    if include_rate_rules and _rate_exceeds(total_bytes, duration, policy.byte_rate_threshold):
+    bytes_per_second = (float(total_bytes) / duration if legacy_v3
+                        else effective_bytes_per_second(total_bytes, duration))
+    if include_rate_rules and (
+        bytes_per_second > policy.byte_rate_threshold if legacy_v3
+        else _rate_exceeds(total_bytes, duration, policy.byte_rate_threshold)
+    ):
         events.append(
             {
                 "event_type": BYTE_RATE_ANOMALY,
@@ -272,6 +285,27 @@ def detect_packet_rules(
         )
 
     mqtt_related_packet_count = int(row["mqtt_related_packet_count"])
+    if legacy_v3:
+        if (
+            tcp_syn_count > policy.broker_dos_tcp_syn_threshold
+            and mqtt_related_packet_count > policy.broker_dos_mqtt_packet_threshold
+        ):
+            events.append(
+                {
+                    "event_type": BROKER_DOS_SUSPECTED,
+                    "severity": _SEVERITY_BY_EVENT[BROKER_DOS_SUSPECTED],
+                    "observed_value": {
+                        "tcp_syn_count": tcp_syn_count,
+                        "mqtt_related_packet_count": mqtt_related_packet_count,
+                    },
+                    "threshold": {
+                        "tcp_syn_count": policy.broker_dos_tcp_syn_threshold,
+                        "mqtt_related_packet_count": policy.broker_dos_mqtt_packet_threshold,
+                    },
+                }
+            )
+        return events
+
     broker_syn_value = row.get("broker_target_syn_count")
     # The feature owner supplies this count only for verified IPv4 Broker
     # destination TCP SYN packets (SYN=1, ACK=0). Old rows remain unknown.
