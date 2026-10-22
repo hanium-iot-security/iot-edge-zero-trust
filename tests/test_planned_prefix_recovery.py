@@ -338,13 +338,17 @@ def test_confirmed_tail_waits_for_mqtt_trust_and_accepts_later_real_progress(pre
     "wrong_reason", "wrong_failure", "wrong_first_segment", "wrong_boundary", "missing_pair",
     "wrong_rule_id", "wrong_if_id", "packet_boundary_split", "current_id_regressed",
 ])
-def test_later_prefix_progress_needs_exact_unmodified_gap_consumption_evidence(prefix_db, change):
+@pytest.mark.parametrize("lagging", [False, True])
+def test_later_prefix_progress_needs_exact_unmodified_gap_consumption_evidence(prefix_db, change, lagging):
     conn, directory, operation, _ = prefix_db
     apply(conn, inspect(conn, operation), directory)
     advance_for_drain(conn)
     if change != "no_audit":
         record_confirmed_tail(conn)
     advance_for_drain(conn, 110)
+    if lagging:
+        conn.execute("UPDATE detector_checkpoints SET last_completed_window_end=? "
+                     "WHERE source_table!='packet_feature_logs'", (utc(20),))
     if change == "packet_boundary_split":
         conn.execute("UPDATE detector_checkpoints SET last_completed_window_end=? WHERE detector_name='packet_if'", (utc(90),))
     elif change == "current_id_regressed":
@@ -529,3 +533,52 @@ def test_real_pipeline_processes_empty_and_normal_prefix_then_waits_at_new_loss(
         for table, rows in originals.items():
             assert [tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid")] == rows
         assert conn.execute("SELECT COUNT(*) FROM detection_events").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("end", [80, 90, 100, 110])
+def test_single_prefix_valid_packet_progress_waits_for_earlier_mqtt_trust(prefix_db, end):
+    conn, directory, operation, _ = prefix_db
+    apply(conn, inspect(conn, operation), directory)
+    advance_for_drain(conn)
+    if end >= 100:
+        record_confirmed_tail(conn)
+    advance_for_drain(conn, end)
+    conn.execute("UPDATE detector_checkpoints SET last_completed_window_end=? "
+                 "WHERE source_table!='packet_feature_logs'", (utc(20),))
+    conn.commit()
+    before = protected(conn), checkpoint_rows(conn), conn.total_changes
+    result = planned.check_prefix_drain(conn, operation["operation_id"])
+    assert result["result"] == "WAIT" and result["prefix_end"] == utc(90)
+    assert (protected(conn), checkpoint_rows(conn), conn.total_changes) == before
+    assert conn.execute("SELECT COUNT(*) FROM packet_detection_gaps").fetchone()[0] == int(end >= 100)
+
+
+@pytest.mark.parametrize("end", [60, 80, 90, 100])
+def test_single_prefix_split_packet_boundaries_hold_even_while_other_stages_lag(prefix_db, end):
+    conn, directory, operation, _ = prefix_db
+    apply(conn, inspect(conn, operation), directory)
+    advance_for_drain(conn, end)
+    conn.execute("UPDATE detector_checkpoints SET last_completed_window_end=? WHERE detector_name='packet_if'",
+                 (utc(end + 10),))
+    conn.execute("UPDATE detector_checkpoints SET last_completed_window_end=? "
+                 "WHERE source_table!='packet_feature_logs'", (utc(20),))
+    conn.commit()
+    before = protected(conn), checkpoint_rows(conn), conn.total_changes
+    with pytest.raises(planned.PlannedMaintenanceError, match="Packet checkpoints disagree"):
+        planned.check_prefix_drain(conn, operation["operation_id"])
+    assert (protected(conn), checkpoint_rows(conn), conn.total_changes) == before
+
+
+@pytest.mark.parametrize("detector", ["packet_rule", "packet_if"])
+def test_single_prefix_exact_boundary_requires_source_ids_before_mqtt_trust_wait(prefix_db, detector):
+    conn, directory, operation, _ = prefix_db
+    apply(conn, inspect(conn, operation), directory)
+    advance_for_drain(conn)
+    conn.execute("UPDATE detector_checkpoints SET last_processed_id=3 WHERE detector_name=?", (detector,))
+    conn.execute("UPDATE detector_checkpoints SET last_completed_window_end=? "
+                 "WHERE source_table!='packet_feature_logs'", (utc(20),))
+    conn.commit()
+    before = protected(conn), checkpoint_rows(conn), conn.total_changes
+    with pytest.raises(planned.PlannedMaintenanceError, match="source IDs have not been consumed"):
+        planned.check_prefix_drain(conn, operation["operation_id"])
+    assert (protected(conn), checkpoint_rows(conn), conn.total_changes) == before

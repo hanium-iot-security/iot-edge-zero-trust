@@ -6,7 +6,7 @@ from pathlib import Path
 import sqlite3
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
@@ -16,6 +16,10 @@ from edge.packet.segment_gap_recovery import (
     verify_segment_gap_plan,
 )
 from edge.packet import segment_gap_recovery as recovery
+from edge.packet.confirmed_gaps import advance_confirmed_packet_gap
+from edge.packet.confirmed_partial_capture import approved_partial_capture_gap
+from test_confirmed_gap_runtime import _partial_files
+from test_segment_gap_runtime import runtime, _segment, _time, CAPTURE_ID, format_db_utc
 
 
 CAPTURE_UUID = "11111111-1111-4111-8111-111111111111"
@@ -659,3 +663,106 @@ def test_batch_malformed_chain_entries_remains_fail_closed(chain_evidence):
     requested = _chain_segments(seed, conn)
     assert recovery.approved_segment_gaps(conn, requested) == [None, None, None]
     assert approved_segment_gap(conn, requested[0]) is None
+
+
+def confirmed_prefix_manual_case(runtime, tmp_path, monkeypatch, count):
+    """Real016 commit, healthy consumption, then a separately approved manual gap."""
+    factory, database, source = runtime
+    with factory() as db:
+        _, initial_id = _segment(db, source, 0)
+        earlier_id, _ = _partial_files(db, tmp_path, source, 10, monkeypatch)
+        _, consumed_id = _segment(db, source, 20)
+        failed = [_partial_files(db, tmp_path, source, at, monkeypatch)
+                  for at in range(30, 30 + count * 10, 10)]
+        _segment(db, source, 30 + count * 10)
+        for detector in recovery.DETECTORS:
+            db.execute(text("INSERT INTO detector_checkpoints VALUES (:name,'packet_feature_logs',:id,:at,:at)"),
+                       {"name": detector, "id": initial_id, "at": format_db_utc(_time(10))})
+        db.commit()
+        assert advance_confirmed_packet_gap(db, range_start=_time(10), cutoff=_time(30))
+        db.commit()
+    conn = open_database(database)
+    try:
+        earlier = dict(conn.execute("SELECT * FROM packet_capture_segments WHERE id=?", (earlier_id,)).fetchone())
+        assert approved_partial_capture_gap(conn, earlier) is not None
+        assert approved_segment_gap(conn, earlier) is None
+        assert {row[0] for row in conn.execute("SELECT last_processed_id FROM detector_checkpoints "
+                                              "WHERE source_table='packet_feature_logs'")} == {initial_id}
+        conn.execute("UPDATE detector_checkpoints SET last_processed_id=?,last_completed_window_end=?,updated_at=? "
+                     "WHERE source_table='packet_feature_logs'",
+                     (consumed_id, format_db_utc(_time(30)), format_db_utc(_time(30))))
+        conn.commit()
+        # Later loss has a preserved PCAP but no diagnostics: it needs manual approval.
+        for _, path in failed:
+            path.with_suffix(".pcap.capture.json").unlink()
+        kwargs = dict(capture_session_id=CAPTURE_ID, approved_by="woomin", reason="Approve only the later loss",
+                      repository_commit="a" * 40, database_path=str(database),
+                      backup_path=str((tmp_path / "manual.backup.db").resolve()))
+        if count == 1:
+            builder = build_segment_gap_plan
+            kwargs.update(failed_segment_id=failed[0][0], preserved_pcap_path=str(failed[0][1]), pcap_sha256="b" * 64)
+        else:
+            builder = recovery.build_segment_gap_chain_plan
+            kwargs.update(failed_segment_ids=[item[0] for item in failed],
+                          preserved_pcaps=[{"path": str(path), "sha256": "b" * 64} for _, path in failed])
+        return conn, earlier, builder, kwargs
+    except Exception:
+        conn.close()
+        raise
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_manual_recovery_accepts_prior_confirmed_partial_audit(runtime, tmp_path, monkeypatch, count):
+    conn, earlier, builder, kwargs = confirmed_prefix_manual_case(runtime, tmp_path, monkeypatch, count)
+    try:
+        before = protected(conn)
+        automatic = [tuple(row) for row in conn.execute("SELECT * FROM packet_detection_gaps")]
+        checkpoints = recovery._checkpoint_pair(conn)
+        plan = builder(conn, **kwargs)
+        assert {name: item["before"] for name, item in plan["checkpoints"].items()} == checkpoints
+        assert conn.execute("SELECT COUNT(*) FROM packet_segment_gap_recoveries").fetchone()[0] == 0
+        apply(conn, plan)
+        assert protected(conn) == before
+        assert [tuple(row) for row in conn.execute("SELECT * FROM packet_detection_gaps")] == automatic
+        assert recovery._checkpoint_pair(conn) == {name: item["after"] for name, item in plan["checkpoints"].items()}
+        assert approved_partial_capture_gap(conn, earlier) is not None
+        assert approved_segment_gap(conn, earlier) is None
+        audits = [dict(row) for row in conn.execute("SELECT * FROM packet_segment_gap_recoveries")]
+        assert len(audits) == count and all(row["failed_segment_id"] != earlier["id"] for row in audits)
+        assert all(json.loads(row["plan_json"]) == plan for row in audits)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("change", ["missing_audit", "bad_digest", "changed_partial", "changed_checkpoint"])
+def test_manual_recovery_rechecks_prior_confirmed_proof_before_writing(runtime, tmp_path, monkeypatch, count, change):
+    conn, earlier, builder, kwargs = confirmed_prefix_manual_case(runtime, tmp_path, monkeypatch, count)
+    try:
+        plan = builder(conn, **kwargs)
+        if change in ("missing_audit", "bad_digest"):
+            trigger_name = "packet_detection_gaps_no_delete" if change == "missing_audit" else "packet_detection_gaps_no_update"
+            trigger = conn.execute("SELECT sql FROM sqlite_master WHERE name=?", (trigger_name,)).fetchone()[0]
+            conn.execute(f"DROP TRIGGER {trigger_name}")
+            if change == "missing_audit":
+                conn.execute("DELETE FROM packet_detection_gaps")
+            else:
+                conn.execute("UPDATE packet_detection_gaps SET plan_sha256=?", ("0" * 64,))
+            conn.execute(trigger)
+        elif change == "changed_partial":
+            conn.execute("UPDATE packet_capture_segments SET error_message='changed' WHERE id=?", (earlier["id"],))
+        else:
+            conn.execute("UPDATE detector_checkpoints SET last_processed_id=999 WHERE detector_name='packet_if'")
+        conn.commit()
+        before = protected(conn), recovery._checkpoint_pair(conn), conn.total_changes
+        if change != "changed_checkpoint":
+            with pytest.raises(SegmentGapRecoveryError, match="Earlier Capture gap"):
+                builder(conn, **kwargs)
+        conn.execute("BEGIN IMMEDIATE")
+        with pytest.raises(SegmentGapRecoveryError, match="checkpoint changed|Earlier Capture gap"):
+            apply_segment_gap_plan(conn, plan, backup_sha256="c" * 64)
+        assert (protected(conn), recovery._checkpoint_pair(conn), conn.total_changes) == before
+        assert conn.execute("SELECT COUNT(*) FROM packet_segment_gap_recoveries").fetchone()[0] == 0
+        conn.rollback()
+    finally:
+        conn.close()

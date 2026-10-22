@@ -310,17 +310,22 @@ def check_prefix_drain(db, operation_id):
     if proof.get("intermediate_proofs"):
         return _check_chain_drain(db, operation_id, plan, checkpoints)
     end = proof["prefix_end"]
-    if any(parse_db_utc(row["last_completed_window_end"]) < parse_db_utc(end) for row in checkpoints.values()):
+    boundaries = {checkpoints[name]["last_completed_window_end"] for name in p.PACKET_DETECTORS}
+    p._require(len(boundaries) == 1, "Packet checkpoints disagree during failed-prefix drain.")
+    boundary = parse_db_utc(boundaries.pop())
+    if boundary < parse_db_utc(end):
         return {"result": "WAIT", "reason": "Healthy prefix processing is incomplete.", "prefix_end": end}
     expected_ids = _prefix_source_ids(db, proof, {
         name: plan["checkpoints"][name]["before"]["last_processed_id"] for name in p.PACKET_DETECTORS})
     result = {"result": "PREFIX_DRAINED_RECOVERY_REQUIRED", "operation_id": operation_id,
             "prefix_end": end, "failed_segment_id": proof["failure"]["id"],
             "successor_session_id": proof["successor_session_id"], "checkpoints": checkpoints}
-    if all(checkpoints[name]["last_completed_window_end"] == end for name in p.PACKET_DETECTORS):
-        p._fully_drained(db, checkpoints, end, exact_boundaries=False)
+    if boundary == parse_db_utc(end):
         p._require(all(checkpoints[name]["last_processed_id"] == expected_ids[name] for name in p.PACKET_DETECTORS),
                    "Healthy prefix source IDs have not been consumed.")
+        if any(parse_db_utc(row["last_completed_window_end"]) < boundary for row in checkpoints.values()):
+            return {"result": "WAIT", "reason": "Healthy prefix processing is incomplete.", "prefix_end": end}
+        p._fully_drained(db, checkpoints, end, exact_boundaries=False)
         return result
     gap = _confirmed_tail_audit(db, proof, expected_ids)
     gap_end = parse_db_utc(gap["window_end"])

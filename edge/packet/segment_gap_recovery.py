@@ -21,6 +21,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from edge.detection.phase4_time import format_db_utc, parse_db_utc, require_utc_window_boundary
+from edge.packet.confirmed_partial_capture import approved_partial_capture_gap
 
 
 PLAN_SCHEMA_VERSION = "packet-segment-gap-recovery-v1"
@@ -500,7 +501,9 @@ def _validate_current(db, plan: Mapping) -> None:
             break
         _require(start == expected, "Original Capture prefix has a missing or overlapping Window.")
         if not _healthy(db, segment):
-            _require(approved_segment_gap(db, segment) is not None, "Earlier Capture gap lacks a valid approved audit.")
+            _require(approved_segment_gap(db, segment) is not None
+                     or approved_partial_capture_gap(db, segment) is not None,
+                     "Earlier Capture gap lacks a valid approved audit.")
         expected = _window(segment["window_end"])
     _require(expected == failure_start, "The consumed prefix does not reach this failed Window.")
     following = [row for row in segments if row["window_start"] == plan["window_end"]]
