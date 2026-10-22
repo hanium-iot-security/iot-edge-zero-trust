@@ -6,10 +6,11 @@ backup and integrity checks finish before the short checkpoint write transaction
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -112,8 +113,27 @@ def connection(database, *, readonly=False):
         conn.close()
 
 
-def online_backup(database, artifact_root, *, timeout=120):
-    """Bounded SQLite snapshot, hash and integrity checks outside a write lock."""
+def online_backup(database, artifact_root, *, timeout=600):
+    """Copy, verify, hash and publish a snapshot within one finite budget."""
+    try:
+        timeout = float(timeout)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise MaintenanceHold("backup timeout must be finite positive seconds") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise MaintenanceHold("backup timeout must be finite positive seconds")
+    deadline = time.monotonic() + timeout
+
+    def remaining(*_):
+        if time.monotonic() >= deadline:
+            raise MaintenanceHold("online backup or verification timed out")
+        return 0
+
+    def paced_copy(_status, pages_remaining, _total):
+        remaining()
+        if pages_remaining > 0:
+            time.sleep(0.02)
+            remaining()
+
     root = artifact_root.resolve()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     folder = root / str(uuid.uuid4())
@@ -123,29 +143,54 @@ def online_backup(database, artifact_root, *, timeout=120):
     with backup.open("xb"):
         pass
     os.chmod(backup, 0o600)
-    deadline = time.monotonic() + timeout
+    remaining()
 
-    def remaining(*_):
-        if time.monotonic() >= deadline:
-            raise MaintenanceHold("online backup or verification timed out")
-        return 0
-
-    with connection(database, readonly=True) as source, sqlite3.connect(backup) as target:
-        source.backup(target, pages=256, progress=remaining, sleep=0.05)
+    with connection(database, readonly=True) as source, closing(sqlite3.connect(backup)) as target:
+        wal = source.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        if wal:
+            # A real read pins the WAL snapshot so concurrent commits cannot
+            # restart each paced backup step. Closing source releases it.
+            source.execute("BEGIN")
+            source.execute("SELECT COUNT(*) FROM sqlite_schema").fetchone()
+        remaining()
+        source.backup(target, pages=16 if wal else 256,
+                      progress=paced_copy if wal else remaining, sleep=0.05)
+        remaining()
         target.set_progress_handler(remaining, 10000)
-        if target.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
-            raise MaintenanceHold("backup failed integrity check")
-        if target.execute("PRAGMA foreign_key_check").fetchall():
-            raise MaintenanceHold("backup failed foreign-key check")
+        try:
+            if target.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+                raise MaintenanceHold("backup failed integrity check")
+            remaining()
+            if target.execute("PRAGMA foreign_key_check").fetchall():
+                raise MaintenanceHold("backup failed foreign-key check")
+            remaining()
+        except sqlite3.OperationalError:
+            # SQLite translates a raised progress-handler deadline to
+            # "interrupted"; retain the maintenance timeout when that happens.
+            remaining()
+            raise
     digest = hashlib.sha256()
     with backup.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             remaining()
             digest.update(chunk)
     sha = digest.hexdigest()
-    with backup.with_suffix(".db.sha256").open("x", encoding="ascii") as stream:
-        os.chmod(backup.with_suffix(".db.sha256"), 0o600)
-        stream.write(f"{sha}  {backup.name}\n")
+    remaining()
+    checksum = backup.with_suffix(".db.sha256")
+    created = False
+    try:
+        with checksum.open("x", encoding="ascii") as stream:
+            created = True
+            os.chmod(checksum, 0o600)
+            remaining()
+            stream.write(f"{sha}  {backup.name}\n")
+        remaining()
+    except BaseException:
+        # A failed publication must not leave a newly created success sidecar.
+        # An exclusive-open collision belongs to somebody else; preserve it.
+        if created:
+            checksum.unlink(missing_ok=True)
+        raise
     return {"backup_path": str(backup), "backup_sha256": sha}
 
 

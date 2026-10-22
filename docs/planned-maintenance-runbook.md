@@ -95,6 +95,10 @@ sudo venv/bin/python -m edge.maintenance.run_planned_maintenance cancel \
 
 ## 선택적 부팅 연동
 
+온라인 백업의 기본 제한은 복사·무결성/FK 검사·SHA256 계산·체크섬 게시 전체를 합한 600초다. WAL에서는 읽기 스냅샷을 고정한 뒤 16페이지마다 남은 페이지가 있을 때만 20ms 양보하며, 다른 Journal 모드는 기존 빠른 복사를 유지하고 모드를 변경하지 않는다. 실패하거나 제한을 넘으면 승인을 소비하지 않고 새 성공 체크섬을 남기지 않으며 자동 재시도하지 않는다. CLI의 준비 대기 옵션(--timeout)과 재개 후 진행 검증 옵션(--verify-timeout)은 별도 제한이다.
+
+부팅 Unit의 TimeoutStartSec=1080은 준비 120초·백업 600초·진행 검증 120초와 추가 240초를 포함한다. 추가 시간은 Orchestrator 정지 최대 80초(명령 35·활성 확인 10·종료 결과 확인 35), 재시작 35초, 공유 Lock 네 개 대기 60초, 시간 동기화 확인 10초, SQLite 쓰기 Lock 대기 5초 및 여유 50초로 산정했다. 저장장치 I/O와 각 SQLite 단계는 협력적으로 제한을 확인하므로 Unit 제한이 바깥 경계를 제공한다.
+
 CLI와 실제 Pi 검증을 완료한 후 `infra/systemd/planned-maintenance-resume.service`를 설치·활성화한다. 단순 `After=` 대신 명령이 시간 동기화·새 Session·Feature 준비 상태를 직접 검사한다. 실패하면 Journal에 남기고 자동 반복하지 않는다. 운영 설정 경로가 다르면 Unit 경로부터 수정한다. 전체 Unit을 설치했다고 실장비 검증이 완료된 것은 아니다.
 
 root로 실행되는 부팅 Unit은 `sudo`의 원래 사용자 소유권 정보가 없으므로, Unit의 Git 환경 설정에서 배포 저장소 한 경로만 `safe.directory`로 지정한다. 전역 Git 설정이나 소유권·Git-ignore 검사는 변경하지 않는다. 배포 경로를 바꾸면 WorkingDirectory·ExecStart·환경 파일 경로와 함께 `GIT_CONFIG_VALUE_0`도 일치시킨다.
