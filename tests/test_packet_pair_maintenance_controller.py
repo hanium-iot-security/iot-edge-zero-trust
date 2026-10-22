@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import time
 from types import SimpleNamespace
@@ -47,7 +48,7 @@ def fixture(tmp_path, monkeypatch):
     token = "abcdef123456"
     state = tmp_path / token
     state.mkdir()
-    spec = dict(controller_unit="hanium-pair-maintenance-controller-"+token+".service",
+    spec = dict(token=token, boot_id="owned-boot", controller_unit="hanium-pair-maintenance-controller-"+token+".service",
                 worker_unit="hanium-pair-maintenance-job-"+token+".service",
                 classifier_unit="hanium-pair-maintenance-classifier-"+token+".service",
                 rescue_unit="hanium-pair-maintenance-rescue-"+token,
@@ -86,6 +87,8 @@ def fixture(tmp_path, monkeypatch):
         return ""
 
     module.record = record
+    real_sealed = module.sealed
+    module.sealed = lambda path: Path(path)  # OS file metadata boundary.
     module.ctl = ctl
     module.show = lambda name: dict(rows[name])
     module.jobs = lambda: ""
@@ -95,6 +98,8 @@ def fixture(tmp_path, monkeypatch):
     record(state, "original", original)
     record(state, "controller-cgroup", dict(group="/owned/controller"))
     record(state, "worker-cgroup", dict(group="/owned/worker"))
+    record(state, "pause-requested", {})
+    module.claim_operation(spec)
     for name in active:
         if name != module.BROKER:
             rows[name].update(ActiveState="inactive", MainPID="0")
@@ -104,11 +109,16 @@ def fixture(tmp_path, monkeypatch):
                                      ControlGroup="/owned/worker")
     return SimpleNamespace(m=module, state=state, spec=spec, rows=rows, original=original,
                            events=events, calls=calls, populated=populated,
-                           record=record, temp=tmp_path)
+                           record=record, temp=tmp_path, real_sealed=real_sealed)
 
 
 def starts(fixture):
     return [name for action, name in fixture.events if action == "start"]
+
+
+def clear_fixture_owner(f):
+    (f.temp / "active-operation/owner.json").unlink()
+    (f.temp / "active-operation").rmdir()
 
 
 @pytest.mark.parametrize("state", ["NOT_COMMITTED_VERIFIED", "COMMITTED_VERIFIED"])
@@ -122,6 +132,10 @@ def test_verified_zero_or_two_restore_original_actives_only(fixture, monkeypatch
     receipt = json.loads((fixture.state / "restored.json").read_text())
     assert receipt["classification"] == state and receipt["held_processing_units"] == []
     assert receipt["recovery_complete"] is False
+    assert not (fixture.temp / "active-operation").exists()
+    events = list(fixture.events)
+    fixture.m.restore(fixture.spec, fixture.state, independent=True)
+    assert fixture.events == events  # Same-operation rescue after completion is inert.
 
 
 @pytest.mark.parametrize("state", ["PARTIAL_HOLD", "UNKNOWN_HOLD", "classifier_timeout"])
@@ -137,6 +151,7 @@ def test_partial_unknown_and_failed_classifier_restore_ingress_hold_processing(f
     receipt = json.loads((fixture.state / "restored.json").read_text())
     assert set(receipt["held_processing_units"]) == fixture.m.PROCESSING
     assert receipt["classification"] == ("UNKNOWN_HOLD" if state == "classifier_timeout" else state)
+    assert (fixture.temp / "active-operation/owner.json").exists()
 
 
 @pytest.mark.parametrize("group", ["/owned/worker", "/owned/controller"])
@@ -147,6 +162,7 @@ def test_unproved_owned_teardown_prevents_every_service_resume(fixture, monkeypa
         fixture.m.restore(fixture.spec, fixture.state, independent=group.endswith("controller"))
     assert not starts(fixture)
     assert not (fixture.state / "restored.json").exists()
+    assert (fixture.temp / "active-operation/owner.json").exists()
 
 
 def test_independent_cancel_controller_reap_precedes_lock_worker_and_classification(fixture, monkeypatch):
@@ -263,6 +279,7 @@ def test_pi_worker_preserves_project_configuration_without_root_or_memory_db_ove
 
 def test_cancel_before_launch_never_dispatches_mutating_worker(fixture, monkeypatch):
     m = fixture.m
+    clear_fixture_owner(fixture)
     state = fixture.temp / "fresh-controller-state"
     spec = fixture.spec | dict(capture_main_pid=int(fixture.original[m.CAPTURE]["MainPID"]),
         capture_main_birth="owned-birth", capture_session=dict(id=117, session_id="owned-capture",
@@ -361,6 +378,7 @@ def retained(fixture, monkeypatch):
         f.rows[name] = dict(f.original[name])
     monkeypatch.setattr(m, "process_birth", lambda pid: "owned-birth")
     monkeypatch.setattr(m, "session_row", lambda _: dict(f.spec["capture_session"]))
+    f.record(f.temp / "active-operation", "owner", m.operation_owner(f.spec))
     return f
 
 
@@ -420,6 +438,7 @@ def test_capture_preserving_classifier_checks_capture_again_after_read(retained,
 @pytest.mark.parametrize("keep", [True, False])
 def test_controller_mode_pauses_only_approved_services_and_sets_worker_priority(retained, monkeypatch, cancelled, keep):
     f, m = retained, retained.m
+    clear_fixture_owner(f)
     state = f.temp / "retained-full-controller"
     spec = f.spec | dict(allow_capture_appends=keep, driver_sha256=m.digest(SOURCE), boot_id="owned-boot",
                         spec_file=str(f.temp / "spec.json"))
@@ -520,3 +539,311 @@ def test_classifier_priority_is_lowered_only_while_capture_is_retained(case, req
     assert len(commands) == 1
     priority = [value for value in commands[0] if value.startswith(("--property=Nice=", "--property=IOSchedulingClass="))]
     assert priority == (["--property=Nice=10", "--property=IOSchedulingClass=idle"] if case == "retained" else [])
+
+
+def controller_run(f, monkeypatch, keep):
+    """Actual execute composition; only the systemd/process boundary is modelled."""
+    m = f.m
+    clear_fixture_owner(f)
+    state = f.temp / "fresh-execute"
+    spec = f.spec | dict(allow_capture_appends=keep, driver_sha256=m.digest(SOURCE),
+                        spec_file=str(f.temp / "spec.json"))
+    for name in m.ALL:
+        f.rows[name] = dict(f.original[name])
+    f.rows[spec["controller_unit"]].update(MainPID=str(os.getpid()), ControlGroup="/owned/controller")
+    real_read = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda path, *args, **kwargs:
+        "0::/owned/controller" if path.as_posix() == "/proc/self/cgroup" else real_read(path, *args, **kwargs))
+    capture = dict(spec["capture_session"])
+    monkeypatch.setattr(m, "session_row", lambda _: dict(capture))
+
+    def terminate(*args):
+        assert not keep
+        f.events.append(("term", m.CAPTURE))
+        f.rows[m.CAPTURE].update(ActiveState="inactive", MainPID="0")
+        capture.update(status="COMPLETED", ended_at="owned-end")
+
+    monkeypatch.setattr(m, "graceful_capture_term", terminate)
+    dispatched = []
+
+    def run(command, **kwargs):
+        dispatched.append(command)
+        if "--on-active=150s" in command:
+            f.rows[spec["rescue_unit"]+".timer"]["ActiveState"] = "active"
+        else:
+            assert "--worker" in command and "--property=User=pi" in command
+            f.rows[spec["worker_unit"]].update(ActiveState="active", MainPID="501",
+                ControlGroup="/owned/worker", User="pi", Group="pi")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(m.subprocess, "run", run)
+    return spec, state, dispatched
+
+
+def other_spec(spec):
+    token = "012345abcdef"
+    return {key: value.replace(spec["token"], token) if isinstance(value, str) else value
+            for key, value in spec.items()}
+
+
+@pytest.mark.parametrize("keep,other_keep", [(True, True), (True, False), (False, True), (False, False)])
+def test_active_operation_rejects_second_token_before_any_os_action(retained, monkeypatch, keep, other_keep):
+    f, m = retained, retained.m
+    spec, state, dispatched = controller_run(f, monkeypatch, keep)
+    real_poll = m.poll
+    collisions_rejected = []
+
+    def poll(predicate, deadline, reason):
+        if reason == "Recovery worker exceeded90s+teardown; HOLD":
+            assert len(dispatched) == 2 and (state / "accepted.json").exists()
+            assert f.rows[spec["worker_unit"]]["ActiveState"] == "active"
+            second = other_spec(spec) | dict(allow_capture_appends=other_keep)
+            with monkeypatch.context() as guarded:
+                guarded.setattr(m, "show", lambda *args: pytest.fail("Second token reached OS before ownership rejection"))
+                guarded.setattr(m, "ctl", lambda *args, **kwargs: pytest.fail("Second token changed a service"))
+                with pytest.raises(m.Hold, match="Another maintenance operation"):
+                    m.execute(second, f.temp / second["token"])
+            collisions_rejected.append(True)
+            f.rows[spec["worker_unit"]].update(ActiveState="inactive", MainPID="0")
+        real_poll(predicate, deadline, reason)
+
+    monkeypatch.setattr(m, "poll", poll)
+    monkeypatch.setattr(m, "classify", lambda *args: observation(spec, "COMMITTED_VERIFIED"))
+    m.execute(spec, state)
+    assert collisions_rejected == [True]  # execute records ordinary callback errors as HOLD.
+    assert json.loads((state / "restored.json").read_text())["classification"] == "COMMITTED_VERIFIED"
+
+
+@pytest.mark.parametrize("keep", [True, False])
+@pytest.mark.parametrize("populated", [False, True])
+def test_execute_worker_deadline_reaps_before_classification_and_restoration(retained, monkeypatch, keep, populated):
+    f, m = retained, retained.m
+    spec, state, dispatched = controller_run(f, monkeypatch, keep)
+    real_poll = m.poll
+
+    def poll(predicate, deadline, reason):
+        if reason == "Recovery worker exceeded90s+teardown; HOLD":
+            assert len(dispatched) == 2 and (state / "accepted.json").exists()
+            assert json.loads((state / "worker-cgroup.json").read_text())["group"] == "/owned/worker"
+            f.events.append(("deadline", "worker"))
+            if populated:
+                f.populated.add("/owned/worker")
+            raise m.Hold(reason)
+        real_poll(predicate, deadline, reason)
+
+    def classify(*args):
+        assert m.stopped(spec["worker_unit"], "/owned/worker")
+        f.events.append(("classify", "after-deadline"))
+        return observation(spec, "NOT_COMMITTED_VERIFIED")
+
+    monkeypatch.setattr(m, "poll", poll)
+    monkeypatch.setattr(m, "classify", classify)
+    if populated:
+        with pytest.raises(m.Hold, match="not positively terminated"):
+            m.execute(spec, state)
+        assert not starts(f) and not (state / "restored.json").exists()
+        assert ("classify", "after-deadline") not in f.events
+        assert (f.temp / "active-operation/owner.json").exists()
+    else:
+        m.execute(spec, state)
+        reap = f.events.index(("stop", spec["worker_unit"]))
+        classify_at = f.events.index(("classify", "after-deadline"))
+        assert f.events.index(("deadline", "worker")) < reap < classify_at
+        assert all(classify_at < i for i, (action, _) in enumerate(f.events) if action == "start")
+        assert (state / "restored.json").exists()
+        assert not (f.temp / "active-operation").exists()
+
+
+@pytest.mark.parametrize("keep", [True, False])
+def test_dead_controller_with_orphan_worker_does_not_release_ownership(retained, monkeypatch, keep):
+    f, m = retained, retained.m
+    f.rows[f.spec["controller_unit"]].update(ActiveState="inactive", MainPID="0")
+    f.populated.add("/owned/worker")
+    before = list(f.events)
+    second = other_spec(f.spec) | dict(allow_capture_appends=keep)
+    with pytest.raises(m.Hold, match="Another maintenance operation"):
+        m.execute(second, f.temp / second["token"])
+    assert f.events == before and f.rows[f.spec["worker_unit"]]["ActiveState"] == "active"
+    with pytest.raises(m.Hold, match="not positively terminated"):
+        m.restore(f.spec, f.state, independent=True)
+    assert not starts(f) and (f.temp / "active-operation/owner.json").exists()
+
+
+@pytest.mark.parametrize("change", ["boot_id", "token", "request_sha256", "database_path", "paused_units"])
+def test_foreign_owner_refuses_rescue_before_any_service_action(retained, change):
+    f, m = retained, retained.m
+    owner = json.loads((f.temp / "active-operation/owner.json").read_text())
+    owner[change] = [] if change == "paused_units" else "foreign"
+    f.record(f.temp / "active-operation", "owner", owner)
+    before = list(f.events)
+    with pytest.raises(m.Hold, match="ownership differs"):
+        m.restore(f.spec, f.state, independent=True)
+    assert f.events == before and not (f.state / "cancelled.json").exists()
+
+
+@pytest.mark.parametrize("result", ["PARTIAL_HOLD", "UNKNOWN_HOLD"])
+def test_unresolved_hold_keeps_fence_across_idempotent_rescue(retained, monkeypatch, result):
+    f, m = retained, retained.m
+    monkeypatch.setattr(m, "classify", lambda *args: observation(f.spec, result))
+    m.restore(f.spec, f.state, independent=True)
+    m.restore(f.spec, f.state, independent=True)
+    assert not starts(f) and (f.temp / "active-operation/owner.json").exists()
+    second = other_spec(f.spec)
+    with pytest.raises(m.Hold, match="Another maintenance operation"):
+        m.execute(second, f.temp / second["token"])
+    assert not starts(f)
+
+
+def test_full_restore_allows_new_owner_and_old_rescuer_cannot_touch_it(retained, monkeypatch):
+    f, m = retained, retained.m
+    monkeypatch.setattr(m, "classify", lambda *args: observation(f.spec, "COMMITTED_VERIFIED"))
+    m.restore(f.spec, f.state, independent=False)
+    second = other_spec(f.spec)
+    m.claim_operation(second)
+    before = list(f.events)
+    with pytest.raises(m.Hold, match="ownership differs"):
+        m.restore(f.spec, f.state, independent=True)
+    assert f.events == before
+    m.require_owner(second)
+
+
+def test_rescuer_rechecks_owner_after_waiting_for_restore_lock(retained, monkeypatch):
+    f, m = retained, retained.m
+    second = other_spec(f.spec)
+    boundary = []
+
+    def previous_owner_completed(*args):
+        # Model completion between the first ownership check and lock acquisition.
+        m.release_operation(f.spec)
+        m.claim_operation(second)
+        boundary.append(len(f.events))
+
+    monkeypatch.setattr(m.fcntl, "flock", previous_owner_completed)
+    with pytest.raises(m.Hold, match="ownership differs"):
+        m.restore(f.spec, f.state, independent=True)
+    assert all(action not in ("start", "stop") for action, _ in f.events[boundary[0]:])
+    m.require_owner(second)
+
+
+@pytest.mark.parametrize("failure", ["controller_identity", "rescue_dispatch", "fresh_identity"])
+def test_failure_before_pause_releases_fence_without_shared_service_action(retained, monkeypatch, failure):
+    f, m = retained, retained.m
+    spec, state, _ = controller_run(f, monkeypatch, True)
+    if failure == "controller_identity":
+        f.rows[spec["controller_unit"]]["MainPID"] = "foreign"
+    elif failure == "rescue_dispatch":
+        monkeypatch.setattr(m.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("dispatch")))
+    else:
+        monkeypatch.setattr(m, "session_row", lambda _: spec["capture_session"] | dict(first_window_start="changed"))
+    m.execute(spec, state)
+    assert not any(action in ("start", "stop", "term") for action, _ in f.events)
+    assert not (state / "pause-requested.json").exists()
+    assert not (f.temp / "active-operation").exists()
+    assert json.loads((state / "not-started.json").read_text())["service_actions"] is False
+    before = list(f.events)
+    m.restore(spec, state, independent=True)
+    assert f.events == before
+
+
+@pytest.fixture
+def sealed_spec(retained, monkeypatch):
+    """Actual sealed/load_spec/main guards; fake only root/boot/file ownership."""
+    f, m = retained, retained.m
+    frozen = f.temp / ("frozen-" + f.spec["token"])
+    frozen.mkdir()
+    driver, request_file, spec_file = (frozen / name for name in ("controller.py", "request.json", "spec.json"))
+    driver.write_bytes(SOURCE.read_bytes())
+    m.OPS = f.temp / "artifacts"
+    artifacts = m.OPS / f.spec["token"]
+    artifacts.mkdir(parents=True)
+    capture = f.spec["capture_session"] | dict(session_id="11111111-2222-3333-4444-555555555555")
+    spec = f.spec | dict(schema="packet-pair-maintenance-v1", approval_received=True,
+        approval_scope="capture-retained-canonical-pair-recovery", capture_session=capture,
+        capture_session_id=capture["id"], capture_session_uuid=capture["session_id"],
+        preflight_observed_at=time.time(), driver_sha256=m.digest(driver),
+        request_file=str(request_file), artifact_dir=str(artifacts))
+    reviewed = dict(plan_sha256=spec["request_sha256"], scope=dict(allow_capture_appends=True),
+                    capture_session_identity=dict(capture))
+
+    def write():
+        request_file.write_text(json.dumps(reviewed), encoding="utf-8")
+        spec["request_file_sha256"] = m.digest(request_file)
+        spec_file.write_text(json.dumps(spec), encoding="utf-8")
+
+    write()
+    monkeypatch.setattr(m, "__file__", str(driver))
+    monkeypatch.setattr(m, "os", SimpleNamespace(name="posix", getuid=lambda: 0))
+    monkeypatch.setattr(m, "sealed", f.real_sealed)
+    real_read, real_stat = Path.read_text, Path.stat
+    monkeypatch.setattr(Path, "read_text", lambda path, *args, **kwargs:
+        spec["boot_id"] if path.as_posix() == "/proc/sys/kernel/random/boot_id" else real_read(path, *args, **kwargs))
+
+    def metadata(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if path in (driver, request_file, spec_file, artifacts):
+            fields = list(result)
+            fields[0] = stat.S_IFDIR | 0o700 if path == artifacts else stat.S_IFREG | 0o444
+            fields[4] = 1000 if path == artifacts else 0
+            return os.stat_result(fields)
+        return result
+
+    monkeypatch.setattr(Path, "stat", metadata)
+    monkeypatch.setattr(sys, "argv", [str(driver), "--execute", "--spec", str(spec_file)])
+    return SimpleNamespace(f=f, m=m, spec=spec, reviewed=reviewed, write=write, path=spec_file)
+
+
+@pytest.mark.parametrize("keep", [True, False])
+def test_main_accepts_consistent_sealed_capture_mode_and_identity(sealed_spec, monkeypatch, keep):
+    f, m = sealed_spec, sealed_spec.m
+    f.spec["allow_capture_appends"] = f.reviewed["scope"]["allow_capture_appends"] = keep
+    f.spec["approval_scope"] = "capture-retained-canonical-pair-recovery" if keep else "capture-pause-canonical-pair-recovery"
+    f.write()
+    executed = []
+    monkeypatch.setattr(m, "execute", lambda spec, state: executed.append((spec, state)))
+    m.main()
+    assert len(executed) == 1 and executed[0][0]["capture_session"] == f.spec["capture_session"]
+    assert executed[0][1] == m.BASE / f.spec["token"]
+    assert not f.f.calls
+
+
+@pytest.mark.parametrize("change,reason", [("signed_mode", "Signed capture mode changed"),
+    ("signed_non_bool", "Signed capture mode changed"), ("spec_non_bool", "Invalid capture mode"),
+    ("retained_full_identity", "Signed retained Capture identity changed")])
+def test_main_rejects_sealed_request_mismatch_before_execute_or_services(sealed_spec, monkeypatch, change, reason):
+    f, m = sealed_spec, sealed_spec.m
+    if change == "signed_mode":
+        f.reviewed["scope"]["allow_capture_appends"] = False
+    elif change == "signed_non_bool":
+        f.reviewed["scope"]["allow_capture_appends"] = "true"
+    elif change == "spec_non_bool":
+        f.spec["allow_capture_appends"] = "true"
+    else:
+        f.reviewed["capture_session_identity"]["first_window_start"] = "changed-with-same-uuid"
+    f.write()  # Keep file hash/source/header valid so this reaches the intended guard.
+    monkeypatch.setattr(m, "execute", lambda *args: pytest.fail("Invalid sealed request reached execute"))
+    with pytest.raises(m.Hold, match=reason):
+        m.main()
+    assert not f.f.calls
+
+
+def test_atomic_owner_creation_arbitrates_simultaneous_tokens(retained):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    f, m = retained, retained.m
+    clear_fixture_owner(f)
+    barrier = Barrier(2)
+
+    def claim(spec):
+        barrier.wait(timeout=5)
+        try:
+            m.claim_operation(spec)
+            return spec["token"]
+        except m.Hold:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        winners = [token for token in pool.map(claim, [f.spec, other_spec(f.spec)]) if token]
+    assert len(winners) == 1
+    assert json.loads((f.temp / "active-operation/owner.json").read_text())["token"] == winners[0]
+    assert not f.calls

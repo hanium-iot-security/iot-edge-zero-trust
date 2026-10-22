@@ -86,6 +86,43 @@ def record(state, name, value, public=False):
     temporary.replace(target)
 
 
+def operation_owner(spec):
+    return dict(boot_id=spec['boot_id'], token=spec['token'], request_sha256=spec['request_sha256'],
+        database_path=str(PROJECT / 'backend/data/iot_security.db'),
+        paused_units=list(service_scope(spec)['paused']))
+
+
+def claim_operation(spec):
+    # mkdir arbitrates all tokens/modes; the owner survives controller death.
+    fence = BASE / 'active-operation'
+    try:
+        fence.mkdir(mode=0o700)
+    except FileExistsError:
+        raise Hold('Another maintenance operation owns this host; inspect its HOLD, no takeover')
+    record(fence, 'owner', operation_owner(spec))
+
+
+def require_owner(spec):
+    owner = BASE / 'active-operation/owner.json'
+    require(owner.exists() and json.loads(sealed(owner).read_text()) == operation_owner(spec),
+            'Maintenance operation ownership differs; no service actions')
+
+
+def release_operation(spec):
+    # Called only under this token's restore.lock, after quiescence/restoration.
+    require_owner(spec)
+    (BASE / 'active-operation/owner.json').unlink()
+    (BASE / 'active-operation').rmdir()
+
+
+def finished(state):
+    if (state / 'not-started.json').exists():
+        return True
+    receipt = state / 'restored.json'
+    return receipt.exists() and json.loads(receipt.read_text())['classification'] in (
+        'NOT_STARTED', 'NOT_COMMITTED_VERIFIED', 'COMMITTED_VERIFIED')
+
+
 def ctl(*args, timeout=2, check=True):
     result = subprocess.run(['/usr/bin/systemctl', *args], capture_output=True,
         text=True, timeout=timeout)
@@ -298,6 +335,9 @@ def restoration_units(original, result, spec=None):
 
 def restore(spec, state, independent):
     require(state.exists(), 'Original state missing; inspect only')
+    if not (BASE / 'active-operation').exists() and finished(state):
+        return
+    require_owner(spec)
     record(state, 'cancelled', dict(monotonic=time.monotonic()), public=True)
     if independent:
         try:
@@ -312,6 +352,15 @@ def restore(spec, state, independent):
         except BlockingIOError:
             return
         try:
+            # A delayed rescuer may have waited while the owner completed.
+            if not (BASE / 'active-operation').exists() and finished(state):
+                return
+            require_owner(spec)
+            if not (state / 'pause-requested.json').exists():
+                # No shared service action or worker dispatch was possible.
+                record(state, 'not-started', dict(service_actions=False, database_committed=False))
+                release_operation(spec)
+                return
             original = json.loads((state / 'original.json').read_text())
             scope = service_scope(spec)
             receipt = state / 'worker-cgroup.json'
@@ -327,6 +376,8 @@ def restore(spec, state, independent):
                 require(all(show(name)['ActiveState'] == 'active' for name in previous['restored_units']),
                     'Previously restored state changed')
                 require(all(stopped(name) for name in previous['held_processing_units']), 'Held processing unexpectedly active')
+                if finished(state):
+                    release_operation(spec)
                 return
             if (state / 'capture-term.json').exists() and not (state / 'capture-closed.json').exists():
                 poll(lambda: stopped(CAPTURE), time.monotonic() + 5,
@@ -368,16 +419,31 @@ def restore(spec, state, independent):
                 worker_quiesced=True, classifier_quiesced=True, root_operating_sqlite_connections=0,
                 classification=result['state'], restored_units=active + timers, held_processing_units=held,
                 recovery_complete=False))
+            if full:
+                release_operation(spec)
         except Exception as error:
             hold(state, str(error), error_type=type(error).__name__, services_resume_unverified=True)
             raise
 
 
 def execute(spec, state):
-    scope = service_scope(spec)
+    service_scope(spec)
     require(not state.exists(), 'One-use state already exists; no retry')
     BASE.mkdir(mode=0o755, exist_ok=True)
     state.mkdir(mode=0o755)
+    claim_operation(spec)
+    try:
+        execute_owned(spec, state)
+    except Exception as error:
+        hold(state, str(error), error_type=type(error).__name__, audit_classification_required=True)
+    finally:
+        restore(spec, state, independent=False)
+        if (state / 'restored.json').exists():
+            ctl('--no-block', 'stop', spec['rescue_unit'] + '.timer', check=False)
+
+
+def execute_owned(spec, state):
+    scope = service_scope(spec)
     owned = show(spec['controller_unit'])
     group = next(line[3:] for line in Path('/proc/self/cgroup').read_text().splitlines() if line.startswith('0::'))
     require(owned['MainPID'] == str(os.getpid()) and owned['ControlGroup'] == group,
@@ -410,6 +476,7 @@ def execute(spec, state):
         require(fresh['status'] == 'RUNNING' and fresh['ended_at'] is None, 'Fresh Capture is not RUNNING')
         require(fresh == spec['capture_session'], 'Capture full identity changed')
         record(state, 'capture-before', fresh)
+        record(state, 'pause-requested', dict(monotonic=time.monotonic()))
         if scope['keep']:
             verify_retained_capture(spec)
         else:
@@ -457,10 +524,6 @@ def execute(spec, state):
             exit_status=show(spec['worker_unit'])['ExecMainStatus'], classification_required=True))
     except Exception as error:
         hold(state, str(error), error_type=type(error).__name__, audit_classification_required=True)
-    finally:
-        restore(spec, state, independent=False)
-        if (state / 'restored.json').exists():
-            ctl('--no-block', 'stop', spec['rescue_unit'] + '.timer', check=False)
 
 
 def worker(state):
