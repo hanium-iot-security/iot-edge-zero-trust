@@ -12,7 +12,7 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import sqlite3
 from uuid import UUID, uuid4
@@ -158,7 +158,48 @@ def _checkpoints(db, required=REQUIRED_CHECKPOINTS):
     return result
 
 
-def _segments(db, session, policy, *, allow_ready=False, feature_rows=None, segment_rows=None):
+def _approved_source_gaps(db, segments):
+    from edge.packet.segment_gap_recovery import approved_segment_gaps
+    from edge.packet.confirmed_partial_capture import approved_partial_capture_gaps
+    failed = [row for row in segments if row["status"] == "FAILED" and row["error_code"] == "PARTIAL_CAPTURE"]
+    old = approved_segment_gaps(db, failed)
+    partial = approved_partial_capture_gaps(db, failed)
+    return {row["id"]: audit for row, prior, current in zip(failed, old, partial)
+            if (audit := prior or current) is not None}
+
+
+def _source_gap_metadata(segments, audits):
+    result = []
+    for segment in segments:
+        if segment["status"] != "FAILED" and segment["error_code"] is None:
+            continue
+        audit = audits.get(segment["id"])
+        _require(audit is not None, "Source Capture gap has no valid approved audit.")
+        if audit.get("loss_kind") == "PARTIAL_CAPTURE":
+            result.append({"segment_id": segment["id"], "audit_table": "packet_detection_gaps",
+                           "loss_kind": "PARTIAL_CAPTURE", **{key: audit[key] for key in
+                           ("id", "plan_sha256", "pcap_sha256", "diagnostics_sha256", "evidence_sha256")}})
+        else:
+            result.append({"segment_id": segment["id"], **{key: audit[key] for key in
+                          ("id", "operation_id", "plan_sha256", "backup_sha256", "pcap_sha256")}})
+    return result
+
+
+def _source_gap_seal(db, session):
+    failed = _rows(db, "SELECT * FROM packet_capture_segments WHERE capture_session_id=:id AND "
+                   "(status='FAILED' OR error_code IS NOT NULL) ORDER BY window_start,id", {"id": session["id"]})
+    return _source_gap_metadata(failed, _approved_source_gaps(db, failed))
+
+
+def _verify_source_gap_seal(db, snapshot):
+    if "audited_segment_gaps" in snapshot:
+        _require(bool(snapshot["audited_segment_gaps"])
+                 and snapshot["audited_segment_gaps"] == _source_gap_seal(db, snapshot["session"]),
+                 "Sealed source gap audits changed.")
+
+
+def _segments(db, session, policy, *, allow_ready=False, approved_gaps=None,
+              feature_rows=None, segment_rows=None):
     start = _window(session["first_window_start"])
     rows = (segment_rows if segment_rows is not None else
             _rows(db, "SELECT * FROM packet_capture_segments WHERE capture_session_id=:id ORDER BY window_start,id",
@@ -175,13 +216,17 @@ def _segments(db, session, policy, *, allow_ready=False, feature_rows=None, segm
         _require(_window(row["window_start"]) == start, "Capture has a missing or overlapping Window.")
         end = _window(row["window_end"])
         _require(parse_db_utc(end) - parse_db_utc(start) == timedelta(seconds=10), "Invalid Capture Window.")
+        _require(row["capture_interface"] == session["capture_interface"], "Capture interface changed.")
+        features = by_segment.get(row["id"], [])
+        if approved_gaps is not None and row["id"] in approved_gaps:
+            _require(not features, "Audited failed Capture gained Packet Features.")
+            start = end
+            continue
         view_status = "PROCESSED" if allow_ready and row["status"] == "READY" else row["status"]
         eligible = is_capture_eligible(CaptureEligibilitySegment(
             view_status, row["error_code"], row["start_delay_seconds"], row["captured_duration_seconds"]), policy)
         _require(eligible.eligible and row["error_message"] is None and row["file_name"] is not None,
                  f"Capture is not healthy: {row['id']}:{eligible.exclusion_reason}.")
-        _require(row["capture_interface"] == session["capture_interface"], "Capture interface changed.")
-        features = by_segment.get(row["id"], [])
         _require(all(item["window_start"] == start and item["window_end"] == end for item in features),
                  "Packet Feature Window differs from its Capture.")
         _require((row["status"] == "PROCESSED" and bool(features))
@@ -193,10 +238,17 @@ def _segments(db, session, policy, *, allow_ready=False, feature_rows=None, segm
 def _source_snapshot(db, session, policy):
     features = _rows(db, "SELECT f.* FROM packet_feature_logs f JOIN packet_capture_segments s ON s.id=f.capture_segment_id "
                      "WHERE s.capture_session_id=:id ORDER BY f.id", {"id": session["id"]})
-    segments = _segments(db, session, policy, feature_rows=features)
-    return {"session": session, "segment_count": len(segments), "segment_sha256": _digest(segments),
+    segments = _rows(db, "SELECT * FROM packet_capture_segments WHERE capture_session_id=:id ORDER BY window_start,id",
+                     {"id": session["id"]})
+    gaps = _approved_source_gaps(db, segments)
+    segments = _segments(db, session, policy, feature_rows=features, segment_rows=segments, approved_gaps=gaps)
+    result = {"session": session, "segment_count": len(segments), "segment_sha256": _digest(segments),
             "feature_count": len(features), "feature_sha256": _digest(features),
             "capture_policy": asdict(policy), "final_boundary": segments[-1]["window_end"]}
+    sealed_gaps = _source_gap_metadata(segments, gaps)
+    if sealed_gaps:
+        result["audited_segment_gaps"] = sealed_gaps
+    return result
 
 
 def _no_old_pending(db, boundary):
@@ -317,6 +369,7 @@ def _bound_source(db, operation, *, verify_hashes=True):
     snapshot, sealed, policy = _sealed_source(operation)
     session = _session(db, operation["source_session_id"])
     _require(session == snapshot["session"], "Sealed source Session changed.")
+    _verify_source_gap_seal(db, snapshot)
     if verify_hashes:
         _require(snapshot == _source_snapshot(db, session, policy),
                  "Source Capture evidence changed after planned shutdown.")
@@ -516,6 +569,11 @@ caller write transaction. A committed retry returns the same audit only.
         return _validated_audit(conn, get_operation(conn, plan["operation_id"]), check_current_checkpoints=True)
 
 
+def _absolute_evidence_path(value):
+    """A copied audit records its source host's path; no local file is opened here."""
+    return isinstance(value, str) and (PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute())
+
+
 def _validated_audit(db, operation, *, check_current_checkpoints=False):
     _require(operation["status"] == "RESUMED", "Maintenance is not RESUMED.")
     audit = _one(db, f"SELECT * FROM {AUDIT_TABLE} WHERE operation_id=:id", {"id": operation["operation_id"]})
@@ -528,9 +586,10 @@ def _validated_audit(db, operation, *, check_current_checkpoints=False):
     for key in ("operation_id", "target_session_id", "target_boot_id", "plan_sha256"):
         _require(audit[key] == plan[key], "Resume audit differs from plan.")
     _require(audit["resumed_at"] == operation["resumed_at"] and _HEX64.fullmatch(audit["backup_sha256"])
-             and Path(audit["backup_path"]).is_absolute(), "Resume backup/completion evidence is invalid.")
+             and _absolute_evidence_path(audit["backup_path"]), "Resume backup/completion evidence is invalid.")
     source, sealed, _ = _sealed_source(operation)
     _require(_session(db, operation["source_session_id"]) == source["session"], "Sealed source Session changed.")
+    _verify_source_gap_seal(db, source)
     _require(parse_db_utc(operation["ready_at"]) <= parse_db_utc(operation["resumed_at"]) <= parse_db_utc(operation["expires_at"]),
              "Resume occurred outside its authorized lifetime.")
     _require(source == plan["source_snapshot"] and sealed == plan["checkpoint_snapshot"], "Sealed plan source changed.")
@@ -643,15 +702,19 @@ def get_processing_cutoff(db):
     session = _session(db, operation["source_session_id"])
     if operation["status"] == "READY":
         _require(session["status"] == "COMPLETED", "READY source is no longer COMPLETED.")
+        _bound_source(db, operation, verify_hashes=False)
         return parse_db_utc(_window(operation["source_final_boundary"]))
     _require(session["status"] in ("RUNNING", "COMPLETED"), "Requested source Session failed.")
-    segments = _rows(db, "SELECT window_start,window_end,status,error_code FROM packet_capture_segments "
+    segments = _rows(db, "SELECT * FROM packet_capture_segments "
                      "WHERE capture_session_id=:id ORDER BY window_start,id", {"id": session["id"]})
     if session["first_window_start"] is None:
         return None
+    approved_gaps = _approved_source_gaps(db, segments)
     boundary = _window(session["first_window_start"])
     for segment in segments:
-        _require(segment["window_start"] == boundary and segment["status"] != "FAILED" and segment["error_code"] is None,
+        _require(segment["window_start"] == boundary
+                 and ((segment["status"] != "FAILED" and segment["error_code"] is None)
+                      or segment["id"] in approved_gaps),
                  "Requested source has an unapproved Capture gap.")
         end = _window(segment["window_end"])
         _require(parse_db_utc(end) - parse_db_utc(boundary) == timedelta(seconds=10), "Malformed source Capture Window.")

@@ -207,3 +207,137 @@ def test_segment_interface_inconsistent_with_session_blocks(db):
     db.execute(text("UPDATE packet_capture_segments SET capture_interface='wlan0' WHERE capture_session_id=2"))
     db.commit()
     assert advance(db) is None
+
+
+@pytest.mark.parametrize("late", [False, True], ids=["recorded-gap", "late-tail"])
+def test_source_lookup_uses_existing_expression_index(db, monkeypatch, late):
+    from edge.packet import confirmed_gaps
+
+    if late:
+        db.execute(text("UPDATE packet_capture_sessions SET status='FAILED' WHERE id=1"))
+        segment(db, 1, 10, 'FAILED')
+        db.execute(text('UPDATE packet_capture_sessions SET capture_gap_start=:end WHERE id=2'),
+                   {'end': utc(20)})
+        db.commit()
+    statements = []
+    original = confirmed_gaps._rows
+
+    def observed(session, sql, params=None):
+        if 'SELECT pcs.* FROM packet_capture_sessions pcs' in sql:
+            statements.append((sql, params))
+        return original(session, sql, params)
+
+    monkeypatch.setattr(confirmed_gaps, '_rows', observed)
+    assert confirmed_gaps._candidate(db, utc(10), BASE + timedelta(seconds=40), pair(db))
+    assert len(statements) == 1
+    sql, params = statements[0]
+    details = [row[3] for row in db.execute(text('EXPLAIN QUERY PLAN ' + sql), params)]
+    assert any('SEARCH seg USING INDEX idx_packet_segments_gap_end' in item for item in details), details
+    assert not any('SCAN seg' in item for item in details), details
+
+
+def test_foreign_feature_overlap_reaches_global_absence_guard(db, monkeypatch):
+    from edge.packet import confirmed_gaps
+    from edge.packet.capture_session_repository import get_packet_feature_ready_through
+
+    # The foreign segment is later than the gap and outside both candidate
+    # sessions. Only its feature overlaps; neither candidate readiness changes.
+    foreign = '44444444-4444-4444-8444-444444444444'
+    db.execute(text("INSERT INTO packet_capture_sessions(id,session_id,capture_interface,started_at,"
+                    "first_window_start,status) VALUES (3,:session,'wlan0',:start,:start,'COMPLETED')"),
+               {'session': foreign, 'start': utc(70)})
+    foreign_segment = segment(db, 3, 70, status='PROCESSED', interface='wlan0')
+    db.execute(text("INSERT INTO packet_feature_logs(capture_segment_id,peer_ip,direction,window_start,"
+                    "window_end,packet_count,total_bytes,avg_packet_size,max_packet_size) "
+                    "VALUES (:segment,'192.0.2.44','INBOUND',:start,:end,1,1,1,1)"),
+               {'segment': foreign_segment, 'start': utc(10), 'end': utc(20)})
+    db.commit()
+    assert get_packet_feature_ready_through(db, session_id=SOURCE).packet_feature_ready_through == BASE + timedelta(seconds=10)
+    assert get_packet_feature_ready_through(db, session_id=TARGET).packet_feature_ready_through == BASE + timedelta(seconds=40)
+    statements = []
+    original = confirmed_gaps._rows
+
+    def observed(session, sql, params=None):
+        if sql.startswith('SELECT id FROM packet_feature_logs WHERE capture_segment_id=:failed OR'):
+            statements.append((sql, params))
+        return original(session, sql, params)
+
+    monkeypatch.setattr(confirmed_gaps, '_rows', observed)
+    before = pair(db)
+    assert advance(db) is None
+    assert len(statements) == 1
+    assert statements[0][1] == {'start': utc(10), 'end': utc(30), 'failed': -1}
+    assert pair(db) == before
+    assert db.execute(text('SELECT COUNT(*) FROM packet_detection_gaps')).scalar_one() == 0
+
+
+@pytest.mark.parametrize("source_start", [utc(0), "2026-10-14 00:00:00", "2026-10-14T00:00:00+00:00"])
+def test_indexed_source_lookup_preserves_canonical_utc_requirement(db, source_start):
+    # Modern schema rejects these legacy encodings. Inject them deliberately
+    # to characterize the existing reader without relaxing migration checks.
+    db.execute(text("PRAGMA ignore_check_constraints=ON"))
+    db.execute(text('UPDATE packet_capture_segments SET window_start=:start WHERE capture_session_id=1'),
+               {'start': source_start})
+    db.execute(text('UPDATE packet_capture_sessions SET first_window_start=:start WHERE id=1'),
+               {'start': source_start})
+    db.execute(text('PRAGMA ignore_check_constraints=OFF'))
+    db.commit()
+    if source_start == utc(0):
+        assert advance(db)['window_end'] == utc(30)
+    else:
+        with pytest.raises(ValueError, match='does not match format'):
+            advance(db)
+        db.rollback()
+        assert db.execute(text('SELECT COUNT(*) FROM packet_detection_gaps')).scalar_one() == 0
+
+
+def test_indexed_source_lookup_keeps_exact_boundary_and_late_duration_checks(db):
+    db.execute(text("PRAGMA ignore_check_constraints=ON"))
+    db.execute(text('UPDATE packet_capture_segments SET window_end=:end WHERE capture_session_id=1'),
+               {'end': '2026-10-14T00:00:10+00:00'})
+    db.execute(text('PRAGMA ignore_check_constraints=OFF'))
+    db.commit()
+    assert advance(db) is None
+    db.rollback()
+    db.execute(text('UPDATE packet_capture_segments SET window_end=:end WHERE capture_session_id=1'),
+               {'end': utc(10)})
+    db.execute(text("UPDATE packet_capture_sessions SET status='FAILED' WHERE id=1"))
+    failed = segment(db, 1, 10, 'FAILED')
+    db.execute(text('PRAGMA ignore_check_constraints=ON'))
+    db.execute(text('UPDATE packet_capture_segments SET window_end=:end WHERE id=:id'),
+               {'end': utc(30), 'id': failed})
+    db.execute(text('PRAGMA ignore_check_constraints=OFF'))
+    db.commit()
+    assert advance(db) is None
+    assert db.execute(text('SELECT COUNT(*) FROM packet_detection_gaps')).scalar_one() == 0
+
+
+@pytest.mark.parametrize('writer_state', ['active', 'committed-after-snapshot'])
+def test_competing_writer_or_stale_snapshot_cannot_commit_gap(db, writer_state):
+    from contextlib import closing
+    import sqlite3
+    from sqlalchemy.exc import OperationalError
+
+    db.rollback()
+    assert db.execute(text('PRAGMA journal_mode=WAL')).scalar_one() == 'wal'
+    db.execute(text('PRAGMA busy_timeout=0'))
+    db.commit()
+    before = pair(db)
+    db.rollback()
+    if writer_state == 'committed-after-snapshot':
+        db.connection().exec_driver_sql('BEGIN')
+        assert pair(db) == before  # Pin the actual WAL read snapshot.
+    with closing(sqlite3.connect(db.get_bind().url.database, timeout=0)) as writer:
+        writer.execute('BEGIN IMMEDIATE')
+        writer.execute('UPDATE packet_capture_sessions SET capture_gap_start=NULL WHERE id=2')
+        if writer_state == 'committed-after-snapshot':
+            writer.commit()
+        with pytest.raises(OperationalError, match='locked'):
+            advance(db)
+        db.rollback()
+        writer.commit()
+    assert pair(db) == before
+    assert db.execute(text('SELECT COUNT(*) FROM packet_detection_gaps')).scalar_one() == 0
+    assert db.execute(text('SELECT capture_gap_start FROM packet_capture_sessions WHERE id=2')).scalar_one() is None
+    assert advance(db) is None
+    db.rollback()

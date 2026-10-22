@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
 import sqlite3
+from pathlib import PurePosixPath, PureWindowsPath
 
 import pytest
 from sqlalchemy import create_engine
@@ -121,6 +122,186 @@ def protected(conn):
     tables = ("devices", "mqtt_logs", "feature_logs", "packet_capture_sessions", "packet_capture_segments",
               "packet_feature_logs", "detection_events", "trust_score_history", "isolation_history", "firewall_rules")
     return {table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid")] for table in tables}
+
+
+def audited_partial_source(conn, source_pk, directory, *, chain=False):
+    from edge.packet.segment_gap_recovery import build_segment_gap_plan, build_segment_gap_chain_plan, apply_segment_gap_plan
+    failed_id = conn.execute("SELECT id FROM packet_capture_segments WHERE capture_session_id=? AND window_start=?",
+                             (source_pk, utc(10))).fetchone()[0]
+    conn.execute("DELETE FROM packet_feature_logs WHERE capture_segment_id=?", (failed_id,))
+    conn.execute("UPDATE packet_capture_segments SET status='FAILED',error_code='PARTIAL_CAPTURE',"
+                 "error_message='tcpdump kernel packet loss' WHERE id=?", (failed_id,))
+    failed_ids = [failed_id]
+    if chain:
+        for start in (20, 30):
+            segment = add_segment(conn, source_pk, start, status="FAILED")
+            conn.execute("UPDATE packet_capture_segments SET error_code='PARTIAL_CAPTURE',"
+                         "error_message='tcpdump kernel packet loss' WHERE id=?", (segment,))
+            failed_ids.append(segment)
+    tail_start = 40 if chain else 20
+    tail = add_segment(conn, source_pk, tail_start)
+    conn.execute("UPDATE detector_checkpoints SET last_processed_id=1,last_completed_window_end=?,updated_at=? "
+                 "WHERE source_table='packet_feature_logs'", (utc(10), utc(10)))
+    conn.commit()
+    options = dict(capture_session_id=SOURCE, approved_by="woomin", reason="Explicit failed-window audit",
+                   repository_commit="a"*40, database_path=str((directory/'iot.db').resolve()),
+                   backup_path=str((directory/'gap.backup.db').resolve()))
+    if chain:
+        plan = build_segment_gap_chain_plan(conn, **options, failed_segment_ids=failed_ids,
+                 preserved_pcaps=[{"path": str((directory/f"{source_pk}-{start}.pcap").resolve()), "sha256": "b"*64}
+                                  for start in (10, 20, 30)])
+    else:
+        plan = build_segment_gap_plan(conn, **options, failed_segment_id=failed_id,
+                 preserved_pcap_path=str((directory/f"{source_pk}-10.pcap").resolve()), pcap_sha256="b"*64)
+    with transaction(conn):
+        apply_segment_gap_plan(conn, plan, backup_sha256="c"*64)
+    # Represents consumed healthy tail; real catch-up is covered in runtime tests.
+    tail_feature = conn.execute("SELECT id FROM packet_feature_logs WHERE capture_segment_id=?", (tail,)).fetchone()[0]
+    conn.execute("UPDATE detector_checkpoints SET last_processed_id=? WHERE source_table='packet_feature_logs'",
+                 (tail_feature,))
+    conn.execute("UPDATE detector_checkpoints SET last_completed_window_end=?,updated_at=?",
+                 (utc(tail_start+10), utc(tail_start+10)))
+    conn.commit()
+    return failed_id
+
+
+def ready_with_audited_partial_source(db, *, chain=False):
+    conn, source_pk, directory = db
+    failed = audited_partial_source(conn, source_pk, directory, chain=chain)
+    boundary = 50 if chain else 30
+    with transaction(conn):
+        operation = request_stop(conn, approved_by="woomin", reason="Close an audited source",
+                                 source_session_id=SOURCE, source_boot_id=OLD_BOOT, now=utc(boundary-5))
+    conn.execute("UPDATE packet_capture_sessions SET status='COMPLETED',ended_at=? WHERE session_id=?",
+                 (utc(boundary), SOURCE))
+    conn.commit()
+    with transaction(conn):
+        operation = finalize_stop(conn, operation["operation_id"], now=utc(boundary+5))
+    return operation, failed
+
+
+def test_audited_partial_source_can_drain_and_seal_without_normalizing_failed_capture(db):
+    conn, source_pk, directory = db
+    failed = audited_partial_source(conn, source_pk, directory)
+    with transaction(conn):
+        operation = request_stop(conn, approved_by="woomin", reason="Close an audited source",
+                                 source_session_id=SOURCE, source_boot_id=OLD_BOOT, now=utc(25))
+    before = protected(conn)
+    assert get_processing_cutoff(conn) == BASE + timedelta(seconds=30)
+    assert protected(conn) == before
+    conn.execute("UPDATE packet_capture_sessions SET status='COMPLETED',ended_at=? WHERE session_id=?",
+                 (utc(30), SOURCE))
+    conn.commit()
+    before = protected(conn)
+    with transaction(conn):
+        operation = finalize_stop(conn, operation["operation_id"], now=utc(35))
+    snapshot = json.loads(operation["source_snapshot_json"])
+    assert operation["status"] == "READY" and snapshot["audited_segment_gaps"][0]["segment_id"] == failed
+    assert get_processing_cutoff(conn) == BASE + timedelta(seconds=30)
+    assert protected(conn) == before
+    assert conn.execute("SELECT status FROM packet_capture_segments WHERE id=?", (failed,)).fetchone()[0] == "FAILED"
+
+
+def add_target_after_audited_source(conn, *, boundary=30):
+    target = add_session(conn, TARGET, 60, gap=boundary)
+    add_segment(conn, target, 60)
+    conn.commit()
+
+
+@pytest.mark.parametrize("chain", [False, True])
+def test_audited_partial_source_resumes_into_healthy_target_without_approving_failed_data(db, chain):
+    conn, _, directory = db
+    operation, failed = ready_with_audited_partial_source(db, chain=chain)
+    boundary = 50 if chain else 30
+    assert len(json.loads(operation["source_snapshot_json"])["audited_segment_gaps"]) == (3 if chain else 1)
+    add_target_after_audited_source(conn, boundary=boundary)
+    plan = inspect_resume(conn, operation["operation_id"], target_session_id=TARGET,
+                          current_boot_id=NEW_BOOT, time_synchronized=True, now=utc(75))
+    before = protected(conn)
+    with transaction(conn):
+        apply_resume(conn, plan, now=utc(75), backup_path=str((directory/'resume.db').resolve()), backup_sha256="d"*64)
+    assert protected(conn) == before
+    assert approved_intervals(conn)[0]["window_start"] == utc(boundary)
+    assert conn.execute("SELECT status FROM packet_capture_segments WHERE id=?", (failed,)).fetchone()[0] == "FAILED"
+
+
+@pytest.mark.parametrize("change", ["unaudited", "invalid_audit", "failed_feature", "unfinished_stage"])
+def test_partial_source_is_not_ready_without_valid_audit_and_complete_drain(db, change):
+    conn, source_pk, directory = db
+    failed = audited_partial_source(conn, source_pk, directory)
+    if change == "unaudited":
+        conn.execute("DELETE FROM packet_segment_gap_recoveries")
+    elif change == "invalid_audit":
+        conn.execute("UPDATE packet_segment_gap_recoveries SET plan_json='{}'")
+    elif change == "failed_feature":
+        conn.execute("INSERT INTO packet_feature_logs(capture_segment_id,peer_ip,direction,window_start,window_end,"
+                     "packet_count,total_bytes,avg_packet_size,max_packet_size) VALUES (?,'192.168.0.4','INBOUND',?,?,1,10,10,10)",
+                     (failed, utc(10), utc(20)))
+    else:
+        conn.execute("UPDATE detector_checkpoints SET last_completed_window_end=?,updated_at=? "
+                     "WHERE detector_name='mqtt_feature_builder'", (utc(20), utc(20)))
+    conn.commit()
+    with transaction(conn):
+        operation = request_stop(conn, approved_by="woomin", reason="Close an audited source",
+                                 source_session_id=SOURCE, source_boot_id=OLD_BOOT, now=utc(25))
+    conn.execute("UPDATE packet_capture_sessions SET status='COMPLETED',ended_at=? WHERE session_id=?",
+                 (utc(30), SOURCE))
+    conn.commit()
+    before = protected(conn)
+    with pytest.raises(PlannedMaintenanceError):
+        with transaction(conn):
+            finalize_stop(conn, operation["operation_id"], now=utc(35))
+    assert get_operation(conn, operation["operation_id"])["status"] == "REQUESTED"
+    assert protected(conn) == before
+
+
+@pytest.mark.parametrize("stage", ["ready_cutoff", "inspect_resume", "committed_interval"])
+@pytest.mark.parametrize("change", ["deleted", "valid_replacement"])
+def test_sealed_gap_audit_cannot_be_deleted_or_replaced_on_cheap_read_paths(db, stage, change):
+    from uuid import uuid4
+    from edge.packet.segment_gap_recovery import canonical_plan_sha256, approved_segment_gap
+    conn, _, directory = db
+    operation, failed_id = ready_with_audited_partial_source(db)
+    if stage != "ready_cutoff":
+        add_target_after_audited_source(conn)
+    if stage == "committed_interval":
+        plan = inspect_resume(conn, operation["operation_id"], target_session_id=TARGET,
+                              current_boot_id=NEW_BOOT, time_synchronized=True, now=utc(75))
+        with transaction(conn):
+            apply_resume(conn, plan, now=utc(75), backup_path=str((directory/'resume.db').resolve()), backup_sha256="d"*64)
+    if change == "deleted":
+        conn.execute("DELETE FROM packet_segment_gap_recoveries")
+    else:
+        # This replacement is internally valid but was not the audit sealed by READY.
+        audit = dict(conn.execute("SELECT * FROM packet_segment_gap_recoveries").fetchone())
+        gap_plan = json.loads(audit["plan_json"])
+        gap_plan["operation_id"] = str(uuid4())
+        gap_plan["plan_sha256"] = canonical_plan_sha256(gap_plan)
+        conn.execute("UPDATE packet_segment_gap_recoveries SET operation_id=?,plan_sha256=?,plan_json=?",
+                     (gap_plan["operation_id"], gap_plan["plan_sha256"], json.dumps(gap_plan)))
+        failed = dict(conn.execute("SELECT * FROM packet_capture_segments WHERE id=?", (failed_id,)).fetchone())
+        assert approved_segment_gap(conn, failed) is not None
+    conn.commit()
+    before = protected(conn)
+    with pytest.raises(PlannedMaintenanceError):
+        if stage == "ready_cutoff":
+            get_processing_cutoff(conn)
+        elif stage == "inspect_resume":
+            inspect_resume(conn, operation["operation_id"], target_session_id=TARGET,
+                           current_boot_id=NEW_BOOT, time_synchronized=True, now=utc(75), verify_source_hashes=False)
+        else:
+            approved_intervals(conn)
+    assert protected(conn) == before
+
+
+def test_audited_gap_permission_is_source_only_and_default_target_segment_checks_remain_strict(db):
+    from edge.maintenance import planned
+    from edge.packet.capture_policy import DEFAULT_CAPTURE_POLICY
+    conn, source_pk, directory = db
+    audited_partial_source(conn, source_pk, directory)
+    session = dict(conn.execute("SELECT * FROM packet_capture_sessions WHERE id=?", (source_pk,)).fetchone())
+    with pytest.raises(PlannedMaintenanceError, match="not healthy"):
+        planned._segments(conn, session, DEFAULT_CAPTURE_POLICY)
 
 
 def test_request_is_not_ready_and_running_cutoff_follows_final_segment(db):
@@ -373,6 +554,32 @@ def test_audit_remains_valid_after_later_target_failure_and_checkpoint_progress(
     assert approved_intervals(conn)[0]["window_end"] == utc(60)
     assert resolve_planned_transition(conn, BASE + timedelta(seconds=60),
                                       [dict(row) for row in conn.execute("SELECT * FROM detector_checkpoints WHERE detector_name IN ('packet_rule','packet_if')")]) is None
+
+
+@pytest.mark.parametrize("source_path_type,backup_path", [
+    (PurePosixPath, "/srv/capture-evidence/planned/database.backup.db"),
+    (PureWindowsPath, "C:/CaptureEvidence/planned/database.backup.db"),
+])
+def test_copied_resume_audit_accepts_source_host_absolute_path_without_reinterpreting_it(db, monkeypatch,
+                                                                                     source_path_type,
+                                                                                     backup_path):
+    from edge.maintenance import planned
+    conn, _, _ = db
+    plan = resume_plan(conn, ready(conn))
+    # Create the immutable record with its source-host path semantics, then read on this host.
+    with monkeypatch.context() as source_host:
+        source_host.setattr(planned, "Path", source_path_type)
+        with transaction(conn):
+            apply_resume(conn, plan, now=utc(80), backup_path=backup_path, backup_sha256="a" * 64)
+    before = protected(conn)
+    assert approved_intervals(conn)[0]["backup_path"] == backup_path
+    assert protected(conn) == before
+
+
+@pytest.mark.parametrize("value", ["backup.db", "../backup.db", "C:backup.db", "\\backup.db", "", None])
+def test_source_host_evidence_path_still_rejects_relative_or_missing_paths(value):
+    from edge.maintenance.planned import _absolute_evidence_path
+    assert not _absolute_evidence_path(value)
 
 
 def test_cancel_invalidates_approval_without_mutating_capture_or_trust(db):
@@ -730,3 +937,87 @@ def test_committed_empty_prefix_tampering_invalidates_audit_and_exclusions(db, c
         approved_intervals(conn)
     assert get_operation(conn, operation["operation_id"])["status"] == "RESUMED"
     assert conn.execute("SELECT COUNT(*) FROM planned_maintenance_resumes").fetchone()[0] == 1
+
+def typed_partial_source(conn, source_pk, directory, monkeypatch):
+    """Persist a real016 proof through the runtime API, with actual closed files."""
+    import struct
+    from sqlalchemy import text
+    from backend.app import config
+    from edge.packet.pcap_naming import build_pcap_filename
+    from edge.packet.confirmed_gaps import advance_confirmed_packet_gap
+    failed = conn.execute("SELECT id FROM packet_capture_segments WHERE capture_session_id=? AND window_start=?", (source_pk, utc(10))).fetchone()[0]
+    name = build_pcap_filename(session_id=SOURCE, interface="eth0", window_start=BASE+timedelta(seconds=10), window_end=BASE+timedelta(seconds=20), tmp=False)
+    conn.execute("DELETE FROM packet_feature_logs WHERE capture_segment_id=?", (failed,))
+    conn.execute("UPDATE packet_capture_segments SET status='FAILED',error_code='PARTIAL_CAPTURE',error_message='tcpdump kernel loss',file_name=?,packet_count=NULL WHERE id=?", (name, failed))
+    tail = add_segment(conn, source_pk, 20)
+    conn.execute("UPDATE detector_checkpoints SET last_processed_id=1,last_completed_window_end=?,updated_at=? WHERE source_table='packet_feature_logs'", (utc(10),utc(10)))
+    conn.commit()
+    path = directory/name
+    path.write_bytes(struct.pack("<IHHIIII",0xA1B2C3D4,2,4,0,0,65535,1))
+    metadata=dict(schema_version="packet-capture-diagnostics-v1",session_id=SOURCE,capture_interface="eth0",
+        window_start=utc(10),window_end=utc(20),pcap_file_name=name,expected_pcap_file_name=name,success=False,
+        error_code="PARTIAL_CAPTURE",file_validation_error=None,completed_full_window=True,terminated_cleanly=True,
+        exit_code=-15,stderr_complete=True,packets_captured=0,packets_received=1,packets_dropped=1,
+        packets_dropped_by_interface=None,drop_status="observed_loss")
+    path.with_suffix(".pcap.capture.json").write_text(json.dumps(metadata))
+    monkeypatch.setattr(config,"settings",config.settings.model_copy(update={"pcap_failed_dir":str(directory)}))
+    database=conn.execute("PRAGMA database_list").fetchone()[2]
+    engine=create_engine(f"sqlite:///{database}")
+    try:
+        with Session(engine) as db:
+            assert advance_confirmed_packet_gap(db, range_start=BASE+timedelta(seconds=10), cutoff=BASE+timedelta(seconds=30))
+            db.commit()
+    finally:
+        engine.dispose()
+    conn.execute("UPDATE detector_checkpoints SET last_completed_window_end=?,updated_at=?",(utc(30),utc(30)))
+    last_feature=conn.execute("SELECT id FROM packet_feature_logs WHERE capture_segment_id=?",(tail,)).fetchone()[0]
+    conn.execute("UPDATE detector_checkpoints SET last_processed_id=? WHERE source_table='packet_feature_logs'",(last_feature,))
+    conn.commit()
+    return failed,path
+
+
+@pytest.mark.parametrize("mutation", [None,"failed_row","healthy_feature","replacement_audit"])
+def test_typed016_partial_closure_resume_and_seal(db, monkeypatch, mutation):
+    conn, source_pk, directory=db
+    failed,path=typed_partial_source(conn,source_pk,directory,monkeypatch)
+    with transaction(conn):
+        operation=request_stop(conn,approved_by="woomin",reason="Close confirmed coverage loss",source_session_id=SOURCE,source_boot_id=OLD_BOOT,now=utc(25))
+    conn.execute("UPDATE packet_capture_sessions SET status='COMPLETED',ended_at=? WHERE session_id=?",(utc(30),SOURCE))
+    conn.commit()
+    with transaction(conn):
+        operation=finalize_stop(conn,operation["operation_id"],now=utc(35))
+    sealed=json.loads(operation["source_snapshot_json"])["audited_segment_gaps"][0]
+    assert sealed["audit_table"] == "packet_detection_gaps" and sealed["loss_kind"] == "PARTIAL_CAPTURE"
+    assert "operation_id" not in sealed and "backup_sha256" not in sealed
+    path.unlink()
+    path.with_suffix(".pcap.capture.json").unlink()
+    add_target_after_audited_source(conn)
+    plan=inspect_resume(conn,operation["operation_id"],target_session_id=TARGET,current_boot_id=NEW_BOOT,time_synchronized=True,now=utc(75))
+    with transaction(conn):
+        apply_resume(conn,plan,now=utc(75),backup_path=str((directory/'typed.resume.db').resolve()),backup_sha256="d"*64)
+    assert approved_intervals(conn)[0]["window_start"] == utc(30)
+    if mutation is None:
+        assert conn.execute("SELECT status,error_code FROM packet_capture_segments WHERE id=?",(failed,)).fetchone()[:] == ("FAILED","PARTIAL_CAPTURE")
+        return
+    if mutation == "failed_row":
+        # Deliberate corruption bypasses the first-line sealed-source trigger;
+        # the independent read-only016 proof must still reject it.
+        trigger = conn.execute("SELECT sql FROM sqlite_master WHERE name='trg_planned_maintenance_source_segment_update'").fetchone()[0]
+        conn.execute("DROP TRIGGER trg_planned_maintenance_source_segment_update")
+        conn.execute("UPDATE packet_capture_segments SET error_message='altered' WHERE id=?",(failed,))
+        conn.execute(trigger)
+    elif mutation == "healthy_feature":
+        trigger = conn.execute("SELECT sql FROM sqlite_master WHERE name='trg_planned_maintenance_source_feature_update'").fetchone()[0]
+        conn.execute("DROP TRIGGER trg_planned_maintenance_source_feature_update")
+        conn.execute("UPDATE packet_feature_logs SET total_bytes=total_bytes+1 WHERE window_start=?",(utc(20),))
+        conn.execute(trigger)
+    else:
+        from edge.packet.confirmed_partial_capture import digest
+        row=conn.execute("SELECT * FROM packet_detection_gaps").fetchone()
+        evidence=json.loads(row["evidence_json"])
+        evidence["failed_segments"][0]["pcap_sha256"]="e"*64
+        conn.execute("DROP TRIGGER packet_detection_gaps_no_update")
+        conn.execute("UPDATE packet_detection_gaps SET evidence_json=?,plan_sha256=?",(json.dumps(evidence),digest(evidence)))
+    conn.commit()
+    with pytest.raises(PlannedMaintenanceError, match="gap"):
+        approved_intervals(conn)

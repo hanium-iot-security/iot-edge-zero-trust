@@ -7,8 +7,23 @@
 대상은 바로 다음 같은 인터페이스 Session에 기록된 수집 공백과, 실제 Capture가
 시작되지 않은 정확한 10초 `FAILED/LATE_CAPTURE`다. 다음 Session의 첫 정상 특징
 구간까지 준비돼야 한다. READY, 정상 미처리 자료, 알 수 없는 실패, 겹침, 중간
-Session, Rule·IF 경계 불일치는 자동으로 넘기지 않는다. 기존 PARTIAL_CAPTURE
-복구 절차는 그대로 사용한다.
+Session, Rule·IF 경계 불일치는 자동으로 넘기지 않는다.
+
+같은 Session의 연속 `FAILED/PARTIAL_CAPTURE`도 닫힌 PCAP·수집 진단·정확한
+10초 실패 구간과 다음 정상 입력이 확인되면 v2 감사로 기록한다. 기존
+`RECORDED_CAPTURE_GAP`에 `loss_kind=PARTIAL_CAPTURE`를 함께 보존하며, v1 감사도
+계속 읽는다. PCAP 해시는 SQLite writer 획득 전에 준비하고, writer 획득 후
+파일 식별 정보·DB 증거·두 체크포인트를 다시 확인한다. 알 수 없는 진단, 파일
+누락, 겹침, 실패 구간의 feature, 다음 정상 입력 부재는 전진을 허용하지 않는다.
+이미 기록된 v2 감사의 읽기 검증은 파일 보존기간이나 현재 Session 상태에
+의존하지 않으며, source 증거가 바뀌면 readiness와 정비 마감·재개를 차단한다.
+
+수동 복구의 v1 단일 구간과 v2의 명시적 2~3개 연속 구간 승인도 유지한다.
+`dry-run-chain --allow-source-appends`는 승인 때 고정한 입력·설정·체크포인트와
+백업을 검증하면서 같은 Session의 정상 후속 수집 및 허용된 producer 추가
+기록만 허용한다. 기존 보호 입력 변경이나 새 실패는 기존 승인을 사용할 수
+없다. 정비 source seal은 수동 감사와 확정 부분손실 감사를 각각 원래 형식으로
+기록하며, 확정 감사에 가상의 수동 승인이나 백업 정보를 만들지 않는다.
 
 두 Packet 처리 경계와 감사 한 건은 같은 SQLite 트랜잭션에서 저장한다.
 AI Runtime Evidence가 활성화되어 있으면 기존 Packet AI 경고 구간도 같은 트랜잭션에서 중단하며, 공백을 추론 완료 기록으로 만들지 않는다.
@@ -19,7 +34,8 @@ AI Runtime Evidence가 활성화되어 있으면 기존 Packet AI 경고 구간�
 감사 생성 후 옵션을 꺼도 이미 기록된 경계의 catch-up은 마무리할 수 있다.
 
 공백마다 백업·서비스 중단·개별 승인을 실행하지 않는다. 정상 처리 중에는 공백
-쓰기 경로를 호출하지 않는다. 운영자는 `PACKET_UNINSPECTED_GAP` 경고와 감사표에서
+쓰기 경로를 호출하지 않는다. 처리 시작 경계가 cutoff 이상인 대기 cycle도
+SQLite writer를 요청하지 않는다. 운영자는 `PACKET_UNINSPECTED_GAP` 경고와 감사표에서
 시작·끝·원인을 확인하고, 반복되는 수집 실패 원인은 별도로 해결해야 한다.
 
 ## 배포와 검증

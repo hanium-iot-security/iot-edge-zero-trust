@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from edge.detection.phase4_time import format_db_utc, parse_db_utc, require_utc_window_boundary
 from edge.packet.capture_session_repository import LATE_CAPTURE, get_packet_feature_ready_through
+from edge.packet.confirmed_partial_capture import prepare_partial_capture, validate_partial_evidence
 
 DETECTORS = ('packet_rule', 'packet_if')
 TABLE = 'packet_detection_gaps'
@@ -58,11 +59,16 @@ def _no_inputs(db, start, end, failed_id):
 
 def _candidate(db, start, cutoff, checkpoints):
     """Read a bounded, provable loss; pending input returns no candidate."""
-    sources = _rows(db, "SELECT DISTINCT pcs.* FROM packet_capture_sessions pcs "
-                    "JOIN packet_capture_segments seg ON seg.capture_session_id=pcs.id "
-                    "WHERE pcs.status IN ('COMPLETED','FAILED') AND "
-                    "(seg.window_end=:start OR (seg.window_start=:start AND seg.status='FAILED' "
-                    "AND seg.error_code=:late))", {'start': start, 'late': LATE_CAPTURE})
+    # A valid closed prefix ends at start; a valid late tail ends ten seconds
+    # later (checked below). Bound candidate IDs using migration 016's existing
+    # epoch index before loading sessions. Keep the exact text predicates: the
+    # index narrows work without relaxing the stored boundary bindings.
+    sources = _rows(db, "SELECT pcs.* FROM packet_capture_sessions pcs "
+                    "WHERE pcs.status IN ('COMPLETED','FAILED') AND pcs.id IN ("
+                    "SELECT seg.capture_session_id FROM packet_capture_segments seg "
+                    "WHERE unixepoch(seg.window_end) BETWEEN unixepoch(:start) AND unixepoch(:start)+10 "
+                    "AND (seg.window_end=:start OR (seg.window_start=:start AND seg.status='FAILED' "
+                    "AND seg.error_code=:late)))", {'start': start, 'late': LATE_CAPTURE})
     candidates = []
     for source in sources:
         segments = _rows(db, 'SELECT * FROM packet_capture_segments WHERE capture_session_id=:id '
@@ -142,19 +148,31 @@ def advance_confirmed_packet_gap(db: Session, *, range_start: datetime, cutoff: 
     cutoff = require_utc_window_boundary(cutoff, 'cutoff')
     if not _schema_exists(db):
         raise ValueError('Migration 016 packet_detection_gaps is required for confirmed gap continuation.')
-    # Acquire the writer before evidence reads; an existing stale snapshot fails.
+    # Failed PCAPs may be large. Hash them while readers/capture can continue,
+    # then recheck DB evidence and constant-time file identity under the writer.
+    checkpoints = _pair(db)
+    if not _complete_pair(checkpoints, start):
+        return None
+    partial = prepare_partial_capture(db, start, cutoff, checkpoints)
     connection = db.connection()
     if not connection.connection.driver_connection.in_transaction:
         connection.exec_driver_sql('BEGIN IMMEDIATE')
     else:
         connection.exec_driver_sql('UPDATE detector_checkpoints SET last_processed_id=last_processed_id WHERE 0')
-    checkpoints = _pair(db)
-    if not _complete_pair(checkpoints, start):
+    if _pair(db) != checkpoints:
         return None
-    evidence = _candidate(db, start, cutoff, checkpoints)
+    evidence = partial or _candidate(db, start, cutoff, checkpoints)
     if evidence is None:
         return None
-    # Evidence was read after acquiring the writer: concurrent capture writes
+    if partial is not None:
+        proposed = {'evidence_json': _json(partial), 'plan_sha256': _digest(partial),
+                    'status': 'UNINSPECTED', 'reason': partial['reason'],
+                    'window_start': start, 'window_end': partial['window_end'],
+                    'source_session_id': partial['source']['session_id'],
+                    'target_session_id': partial['target']['session_id']}
+        if validate_partial_evidence(db, proposed, verify_files=True) != partial:
+            return None
+    # Evidence was revalidated under the writer: concurrent capture writes
     # cannot alter it before this insert and the checkpoint compare-and-swaps.
     result = _transition(evidence)
     db.execute(text('INSERT INTO packet_detection_gaps(source_session_id,target_session_id,window_start,window_end,status,reason,evidence_json,plan_sha256) '
@@ -177,7 +195,7 @@ def validated_confirmed_gap_evidence(audit) -> dict | None:
     """Validate stored digest and bindings; callers also verify source and progress."""
     try:
         evidence = json.loads(audit['evidence_json'])
-        if (evidence['version'] != 1 or evidence['status'] != audit['status'] or audit['status'] != 'UNINSPECTED'
+        if (evidence['version'] not in (1, 2) or evidence['status'] != audit['status'] or audit['status'] != 'UNINSPECTED'
                 or _digest(evidence) != audit['plan_sha256'] or evidence['reason'] != audit['reason']
                 or evidence['window_start'] != audit['window_start'] or evidence['window_end'] != audit['window_end']
                 or evidence['source']['session_id'] != audit['source_session_id']
@@ -210,7 +228,8 @@ def resolve_confirmed_packet_gap(db: Session, *, range_start: datetime, boundary
             return None
         # No filesystem or live-session identity dependency: only the recorded
         # source loss, first healthy target input and checkpoint provenance bind.
-        current = _candidate(db, start, boundary + timedelta(seconds=10), before)
+        current = (validate_partial_evidence(db, rows[0]) if evidence['version'] == 2 else
+                   _candidate(db, start, boundary + timedelta(seconds=10), before))
         if current != evidence:
             return None
         return _transition(evidence)

@@ -15,6 +15,7 @@ from edge.packet.segment_gap_recovery import (
     build_segment_gap_plan, canonical_plan_sha256, resolve_segment_gap_transition,
     verify_segment_gap_plan,
 )
+from edge.packet import segment_gap_recovery as recovery
 
 
 CAPTURE_UUID = "11111111-1111-4111-8111-111111111111"
@@ -374,3 +375,287 @@ def test_old_recovery_still_blocks_unapproved_or_changed_gap(evidence, tmp_path,
     assert not readiness.full_ready
     assert "NON_TERMINAL_OR_ERROR" in readiness.blocking_reasons
     assert "FAILED_OR_EXTRACTOR_ERROR" in readiness.live_resume_blocking_reasons
+
+
+def seed_segment_gap_chain_database(path):
+    seed = seed_segment_gap_database(path)
+    with open_database(seed["database_path"]) as conn:
+        conn.execute("UPDATE packet_capture_segments SET file_name='normal-4.pcap' WHERE id=?", (seed["segment_ids"][4],))
+        for index in (1, 2, 3):
+            segment_id = seed["segment_ids"][index]
+            conn.execute("DELETE FROM packet_feature_logs WHERE capture_segment_id=?", (segment_id,))
+            conn.execute("UPDATE packet_capture_segments SET status='FAILED',error_code='PARTIAL_CAPTURE',"
+                         "error_message=?,file_name=? WHERE id=?",
+                         (f"kernel packet loss {index}", f"failed-{index}.pcap", segment_id))
+        conn.execute("UPDATE packet_capture_segments SET status='EMPTY',error_code=NULL,error_message=NULL "
+                     "WHERE id=?", (seed["segment_ids"][4],))
+        conn.commit()
+    seed["failed_segment_ids"] = seed["segment_ids"][1:4]
+    return seed
+
+
+def chain_kwargs(seed, directory):
+    return {"capture_session_id": seed["capture_session_id"],
+            "failed_segment_ids": seed["failed_segment_ids"],
+            "approved_by": "woomin", "reason": "Approved exact three-window kernel loss",
+            "repository_commit": "a" * 40, "database_path": str(seed["database_path"]),
+            "backup_path": str((directory / "chain-backup.db").resolve()),
+            "preserved_pcaps": [{"path": str((directory / f"failed-{index}.pcap").resolve()),
+                                 "sha256": str(index) * 64} for index in (1, 2, 3)]}
+
+
+@pytest.fixture
+def chain_evidence(tmp_path):
+    seed = seed_segment_gap_chain_database(tmp_path / "chain.db")
+    conn = open_database(seed["database_path"])
+    yield seed, conn, chain_kwargs(seed, tmp_path)
+    conn.close()
+
+
+def test_chain_atomic_audits_preserve_capture_features_trust_and_source_ids(chain_evidence):
+    seed, conn, kwargs = chain_evidence
+    before = protected(conn)
+    plan = recovery.build_segment_gap_chain_plan(conn, **kwargs)
+    assert plan["schema_version"] == "packet-segment-gap-recovery-v2"
+    assert plan["coverage"] == "UNINSPECTED"
+    assert [entry["failed_segment_id"] for entry in plan["failed_segments"]] == seed["failed_segment_ids"]
+    assert (plan["window_start"], plan["window_end"]) == (utc(10), utc(40))
+    result = apply(conn, plan)
+    assert len(result["audits"]) == 3
+    audits = [dict(row) for row in conn.execute("SELECT * FROM packet_segment_gap_recoveries ORDER BY window_start")]
+    assert len({row["operation_id"] for row in audits}) == 3
+    assert all(json.loads(row["plan_json"]) == plan for row in audits)
+    assert [(row["window_start"], row["window_end"]) for row in audits] == [(utc(n), utc(n+10)) for n in (10,20,30)]
+    assert protected(conn) == before
+    pair = [dict(row) for row in conn.execute("SELECT * FROM detector_checkpoints WHERE source_table='packet_feature_logs'")]
+    assert {row["last_processed_id"] for row in pair} == {1}
+    assert {row["last_completed_window_end"] for row in pair} == {utc(40)}
+    for segment_id in seed["failed_segment_ids"]:
+        segment = dict(conn.execute("SELECT * FROM packet_capture_segments WHERE id=?", (segment_id,)).fetchone())
+        assert approved_segment_gap(conn, segment) is not None
+    assert resolve_segment_gap_transition(conn, BASE + timedelta(seconds=40), pair) is not None
+    conn.execute("BEGIN IMMEDIATE")
+    with pytest.raises(SegmentGapRecoveryError):
+        apply_segment_gap_plan(conn, plan, backup_sha256="c"*64)
+    conn.rollback()
+    assert conn.execute("SELECT count(*) FROM packet_segment_gap_recoveries").fetchone()[0] == 3
+
+
+@pytest.mark.parametrize("change", ["missing", "duplicate", "reversed", "different_session", "hole", "feature", "overlap", "following"])
+def test_chain_exact_approved_range_rejects_unbound_evidence(chain_evidence, change):
+    seed, conn, kwargs = chain_evidence
+    if change == "missing":
+        kwargs["failed_segment_ids"] = kwargs["failed_segment_ids"][:2]
+        kwargs["preserved_pcaps"] = kwargs["preserved_pcaps"][:2]
+    elif change == "duplicate":
+        kwargs["failed_segment_ids"][1] = kwargs["failed_segment_ids"][0]
+    elif change == "reversed":
+        kwargs["failed_segment_ids"].reverse()
+        kwargs["preserved_pcaps"].reverse()
+    elif change == "different_session":
+        conn.execute("INSERT INTO packet_capture_sessions(session_id,capture_interface,started_at,first_window_start,status) "
+                     "VALUES ('22222222-2222-4222-8222-222222222222','eth0',?,?,'COMPLETED')", (utc(0), utc(0)))
+        other = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("UPDATE packet_capture_segments SET capture_session_id=? WHERE id=?", (other, seed["failed_segment_ids"][1]))
+    elif change == "hole":
+        conn.execute("UPDATE packet_capture_segments SET window_start=?,window_end=? WHERE id=?", (utc(70),utc(80),seed["failed_segment_ids"][1]))
+    elif change == "feature":
+        conn.execute("INSERT INTO packet_feature_logs(capture_segment_id,peer_ip,direction,window_start,window_end,packet_count,total_bytes,avg_packet_size,max_packet_size) "
+                     "VALUES (?,'192.0.2.9','INBOUND',?,?,1,10,10,10)", (seed["failed_segment_ids"][1],utc(20),utc(30)))
+    elif change == "overlap":
+        conn.execute("INSERT INTO packet_capture_segments(capture_session_id,file_name,capture_interface,window_start,window_end,status) "
+                     "VALUES (?,'overlap.pcap','eth1',?,?,'EMPTY')", (1,utc(20),utc(30)))
+    else:
+        conn.execute("UPDATE packet_capture_segments SET status='READY' WHERE id=?", (seed["segment_ids"][4],))
+    conn.commit()
+    with pytest.raises(SegmentGapRecoveryError):
+        recovery.build_segment_gap_chain_plan(conn, **kwargs)
+    assert conn.execute("SELECT count(*) FROM packet_segment_gap_recoveries").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("tamper", ["missing_audit", "different_operation", "different_backup", "different_plan", "changed_failed", "checkpoint_id"])
+def test_chain_every_audit_required_even_after_later_progress(chain_evidence, tamper):
+    seed, conn, kwargs = chain_evidence
+    apply(conn, recovery.build_segment_gap_chain_plan(conn, **kwargs))
+    middle = seed["failed_segment_ids"][1]
+    if tamper == "missing_audit":
+        conn.execute("DELETE FROM packet_segment_gap_recoveries WHERE failed_segment_id=?", (middle,))
+    elif tamper == "different_operation":
+        conn.execute("UPDATE packet_segment_gap_recoveries SET operation_id='22222222-2222-4222-8222-222222222222' WHERE failed_segment_id=?", (middle,))
+    elif tamper == "different_backup":
+        conn.execute("UPDATE packet_segment_gap_recoveries SET backup_sha256=? WHERE failed_segment_id=?", ("d"*64,middle))
+    elif tamper == "different_plan":
+        conn.execute("UPDATE packet_segment_gap_recoveries SET plan_json='{}' WHERE failed_segment_id=?", (middle,))
+    elif tamper == "changed_failed":
+        conn.execute("UPDATE packet_capture_segments SET error_message='replaced original' WHERE id=?", (middle,))
+    else:
+        conn.execute("UPDATE detector_checkpoints SET last_processed_id=999 WHERE detector_name='packet_if'")
+    conn.commit()
+    for segment_id in seed["failed_segment_ids"]:
+        segment = dict(conn.execute("SELECT * FROM packet_capture_segments WHERE id=?", (segment_id,)).fetchone())
+        assert approved_segment_gap(conn, segment) is None
+    if tamper != "checkpoint_id":
+        conn.execute("UPDATE detector_checkpoints SET last_completed_window_end=?,updated_at=?,last_processed_id=3 WHERE source_table='packet_feature_logs'", (utc(60),utc(60)))
+        conn.commit()
+        for segment_id in seed["failed_segment_ids"]:
+            segment = dict(conn.execute("SELECT * FROM packet_capture_segments WHERE id=?", (segment_id,)).fetchone())
+            assert approved_segment_gap(conn, segment) is None
+
+
+def test_chain_middle_audit_failure_rolls_back_all_rows_and_both_checkpoints(chain_evidence):
+    _, conn, kwargs = chain_evidence
+    plan = recovery.build_segment_gap_chain_plan(conn, **kwargs)
+    before = [tuple(row) for row in conn.execute("SELECT * FROM detector_checkpoints ORDER BY detector_name")]
+    middle = plan["failed_segments"][1]["failed_segment_id"]
+    conn.execute(f"CREATE TRIGGER reject_middle_audit BEFORE INSERT ON packet_segment_gap_recoveries WHEN NEW.failed_segment_id={middle} BEGIN SELECT RAISE(ABORT,'injected chain audit failure'); END")
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    with pytest.raises(sqlite3.IntegrityError, match="injected"):
+        apply_segment_gap_plan(conn, plan, backup_sha256="c"*64)
+    assert [tuple(row) for row in conn.execute("SELECT * FROM detector_checkpoints ORDER BY detector_name")] == before
+    assert conn.execute("SELECT count(*) FROM packet_segment_gap_recoveries").fetchone()[0] == 0
+    conn.commit()
+
+
+@pytest.mark.parametrize("source_path", ["/srv/capture-evidence/backup.db", "C:/review/backup.db"])
+def test_chain_source_host_absolute_evidence_readable_locally(chain_evidence, source_path):
+    _, conn, kwargs = chain_evidence
+    kwargs["backup_path"] = source_path
+    plan = recovery.build_segment_gap_chain_plan(conn, **kwargs)
+    assert len(apply(conn, plan)["audits"]) == 3
+
+
+@pytest.mark.parametrize("change", ["checkpoint", "failed", "sha", "coverage", "count_one", "count_four", "relative_backup"])
+def test_chain_plan_changes_and_limits_hold_before_mutation(chain_evidence, change):
+    seed, conn, kwargs = chain_evidence
+    if change in ("count_one", "count_four", "relative_backup"):
+        if change == "count_one":
+            kwargs["failed_segment_ids"] = kwargs["failed_segment_ids"][:1]
+            kwargs["preserved_pcaps"] = kwargs["preserved_pcaps"][:1]
+        elif change == "count_four":
+            kwargs["failed_segment_ids"] += [seed["segment_ids"][4]]
+            kwargs["preserved_pcaps"] += [{"path": str(Path(kwargs["backup_path"]).parent / "normal-4.pcap"), "sha256": "d"*64}]
+        else:
+            kwargs["backup_path"] = "relative.db"
+        with pytest.raises(SegmentGapRecoveryError):
+            recovery.build_segment_gap_chain_plan(conn, **kwargs)
+        return
+    plan = recovery.build_segment_gap_chain_plan(conn, **kwargs)
+    if change == "checkpoint":
+        conn.execute("UPDATE detector_checkpoints SET updated_at='changed' WHERE detector_name='packet_if'")
+        conn.commit()
+    elif change == "failed":
+        conn.execute("UPDATE packet_capture_segments SET error_message='changed' WHERE id=?", (seed["failed_segment_ids"][1],))
+        conn.commit()
+    elif change == "sha":
+        plan["failed_segments"][1]["pcap_sha256"] = "d"*64
+    else:
+        plan["coverage"] = "INSPECTED"
+        plan["plan_sha256"] = canonical_plan_sha256(plan)
+    before = [tuple(row) for row in conn.execute("SELECT * FROM detector_checkpoints ORDER BY detector_name")]
+    conn.execute("BEGIN IMMEDIATE")
+    with pytest.raises(SegmentGapRecoveryError):
+        apply_segment_gap_plan(conn, plan, backup_sha256="c"*64)
+    assert [tuple(row) for row in conn.execute("SELECT * FROM detector_checkpoints ORDER BY detector_name")] == before
+    assert conn.execute("SELECT count(*) FROM packet_segment_gap_recoveries").fetchone()[0] == 0
+    conn.rollback()
+
+
+def test_chain_explicit_two_window_limit_and_outer_rollback(chain_evidence):
+    seed, conn, kwargs = chain_evidence
+    third = seed["failed_segment_ids"][2]
+    conn.execute("UPDATE packet_capture_segments SET status='EMPTY',error_code=NULL,error_message=NULL WHERE id=?", (third,))
+    conn.commit()
+    kwargs["failed_segment_ids"] = kwargs["failed_segment_ids"][:2]
+    kwargs["preserved_pcaps"] = kwargs["preserved_pcaps"][:2]
+    plan = recovery.build_segment_gap_chain_plan(conn, **kwargs)
+    conn.execute("BEGIN IMMEDIATE")
+    result = apply_segment_gap_plan(conn, plan, backup_sha256="c"*64)
+    assert len(result["audits"]) == 2
+    conn.rollback()
+    assert conn.execute("SELECT count(*) FROM packet_segment_gap_recoveries").fetchone()[0] == 0
+    assert {row[0] for row in conn.execute("SELECT last_completed_window_end FROM detector_checkpoints")} == {utc(10)}
+
+
+def test_v1_still_rejects_a_following_partial_chain(chain_evidence, tmp_path):
+    seed, conn, _ = chain_evidence
+    with pytest.raises(SegmentGapRecoveryError, match="healthy contiguous"):
+        build_segment_gap_plan(conn, **plan_kwargs(seed, tmp_path))
+
+
+@pytest.mark.parametrize("path", ["/srv/capture-evidence/backup.db", "C:/evidence/backup.db"])
+def test_v1_audit_source_host_path_formats_are_readable(evidence, path):
+    _, conn, kwargs = evidence
+    kwargs["backup_path"] = path
+    assert apply(conn, build_segment_gap_plan(conn, **kwargs))["backup_path"] == path
+
+
+def _chain_segments(seed, conn):
+    return [dict(conn.execute("SELECT * FROM packet_capture_segments WHERE id=?", (segment_id,)).fetchone())
+            for segment_id in seed["failed_segment_ids"]]
+
+
+def test_batch_read_validates_one_chain_once_and_keeps_request_order(chain_evidence, monkeypatch):
+    seed, conn, kwargs = chain_evidence
+    apply(conn, recovery.build_segment_gap_chain_plan(conn, **kwargs))
+    segments = _chain_segments(seed, conn)[::-1]
+    visited = []
+    real_check = recovery._no_gap_features_or_overlap
+    def count_check(db, segment):
+        visited.append(segment["id"])
+        return real_check(db, segment)
+    monkeypatch.setattr(recovery, "_no_gap_features_or_overlap", count_check)
+    audits = recovery.approved_segment_gaps(conn, segments)
+    assert [audit["failed_segment_id"] for audit in audits] == [segment["id"] for segment in segments]
+    assert visited == seed["failed_segment_ids"]
+    # Every read call establishes its own proof; this is no cross-call cache.
+    conn.execute("DELETE FROM packet_segment_gap_recoveries WHERE failed_segment_id=?", (seed["failed_segment_ids"][1],))
+    conn.commit()
+    assert recovery.approved_segment_gaps(conn, segments) == [None, None, None]
+
+
+@pytest.mark.parametrize("supplied", ["changed_full_snapshot", "changed_partial_snapshot"])
+def test_batch_bad_supplied_chain_member_closes_whole_chain(chain_evidence, supplied):
+    seed, conn, kwargs = chain_evidence
+    apply(conn, recovery.build_segment_gap_chain_plan(conn, **kwargs))
+    segments = _chain_segments(seed, conn)
+    if supplied == "changed_full_snapshot":
+        segments[1]["error_message"] = "different supplied evidence"
+    else:
+        segments[1] = {"id": segments[1]["id"], "status": "EMPTY", "feature_count": 0}
+    assert recovery.approved_segment_gaps(conn, segments) == [None, None, None]
+    assert approved_segment_gap(conn, segments[1]) is None
+
+
+def test_batch_partial_reader_fields_and_v1_independence(evidence, tmp_path):
+    seed, conn, kwargs = evidence
+    _consume_two_approved_gaps_and_close(seed, conn, kwargs, tmp_path)
+    segments = [dict(conn.execute("SELECT * FROM packet_capture_segments WHERE id=?", (segment_id,)).fetchone())
+                for segment_id in (seed["first_failed_segment_id"], seed["second_failed_segment_id"])]
+    requested = [{"id": segment["id"], "status": segment["status"], "feature_count": 0} for segment in segments]
+    assert all(recovery.approved_segment_gaps(conn, requested))
+    conn.execute("UPDATE packet_segment_gap_recoveries SET plan_json='{}' WHERE failed_segment_id=?", (seed["first_failed_segment_id"],))
+    conn.commit()
+    outcomes = recovery.approved_segment_gaps(conn, requested)
+    assert outcomes[0] is None and outcomes[1]["failed_segment_id"] == seed["second_failed_segment_id"]
+
+
+def test_batch_partial_chain_reader_preserves_single_api_result(chain_evidence):
+    seed, conn, kwargs = chain_evidence
+    apply(conn, recovery.build_segment_gap_chain_plan(conn, **kwargs))
+    requested = [{"id": segment_id, "status": "FAILED", "feature_count": 0} for segment_id in seed["failed_segment_ids"]]
+    expected = [approved_segment_gap(conn, segment) for segment in requested]
+    assert recovery.approved_segment_gaps(conn, requested) == expected
+
+
+def test_batch_malformed_chain_entries_remains_fail_closed(chain_evidence):
+    seed, conn, kwargs = chain_evidence
+    plan = recovery.build_segment_gap_chain_plan(conn, **kwargs)
+    apply(conn, plan)
+    plan["failed_segments"] = None
+    plan["plan_sha256"] = canonical_plan_sha256(plan)
+    conn.execute("UPDATE packet_segment_gap_recoveries SET plan_json=?", (json.dumps(plan),))
+    conn.commit()
+    requested = _chain_segments(seed, conn)
+    assert recovery.approved_segment_gaps(conn, requested) == [None, None, None]
+    assert approved_segment_gap(conn, requested[0]) is None

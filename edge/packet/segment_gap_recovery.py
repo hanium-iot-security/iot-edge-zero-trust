@@ -1,4 +1,4 @@
-"""Pure evidence and transactional recovery for one approved failed Window.
+"""Pure evidence and transactional recovery for explicitly approved failed Windows.
 
 No filesystem, process, lock, backup or service operations occur here. The CLI
 owns those boundaries. Capture/Feature rows remain unchanged; one audit binds
@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
-from pathlib import Path
+from pathlib import PurePosixPath, PureWindowsPath
 import re
 import sqlite3
 from typing import Any
@@ -24,6 +24,7 @@ from edge.detection.phase4_time import format_db_utc, parse_db_utc, require_utc_
 
 
 PLAN_SCHEMA_VERSION = "packet-segment-gap-recovery-v1"
+CHAIN_PLAN_SCHEMA_VERSION = "packet-segment-gap-recovery-v2"
 AUDIT_TABLE = "packet_segment_gap_recoveries"
 DETECTORS = ("packet_rule", "packet_if")
 SOURCE_TABLE = "packet_feature_logs"
@@ -65,9 +66,14 @@ def _uuid(value: object) -> str:
 
 
 def _absolute_path(value: object) -> str:
-    _require(isinstance(value, str) and bool(value) and Path(value).is_absolute(),
+    _require(isinstance(value, str) and bool(value)
+             and (PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute()),
              "Evidence paths must be absolute.")
     return value
+
+
+def _path_name(value: str) -> str:
+    return PureWindowsPath(value).name if PureWindowsPath(value).is_absolute() else PurePosixPath(value).name
 
 
 def _window(value: object) -> datetime:
@@ -96,6 +102,9 @@ calculate_plan_sha256 = canonical_plan_sha256
 
 def verify_segment_gap_plan(plan: Mapping) -> None:
     _require(isinstance(plan, Mapping), "Plan must be an object.")
+    if plan.get("schema_version") == CHAIN_PLAN_SCHEMA_VERSION:
+        _verify_chain_plan(plan)
+        return
     _require(plan.get("schema_version") == PLAN_SCHEMA_VERSION, "Unsupported gap plan schema.")
     _require(plan.get("plan_sha256") == canonical_plan_sha256(plan), "Gap plan SHA256 mismatch.")
     _uuid(plan.get("operation_id"))
@@ -119,7 +128,7 @@ def verify_segment_gap_plan(plan: Mapping) -> None:
              and failed.get("window_start") == plan["window_start"]
              and failed.get("window_end") == plan["window_end"], "Failed Segment binding is invalid.")
     _require(isinstance(failed.get("file_name"), str) and bool(failed["file_name"])
-             and Path(plan["preserved_pcap_path"]).name == Path(failed["file_name"]).name,
+             and _path_name(plan["preserved_pcap_path"]) == _path_name(failed["file_name"]),
              "The preserved PCAP must keep the failed Segment filename.")
     pair = plan.get("checkpoints")
     _require(isinstance(pair, Mapping) and set(pair) == set(DETECTORS), "Both Packet checkpoints are required.")
@@ -141,6 +150,64 @@ def verify_segment_gap_plan(plan: Mapping) -> None:
                  "Packet source IDs must be preserved valid integers.")
         _require(isinstance(before["updated_at"], str) and bool(before["updated_at"]),
                  "Checkpoint updated_at evidence is required.")
+
+
+def _verify_chain_plan(plan: Mapping) -> None:
+    _require(plan.get("plan_sha256") == canonical_plan_sha256(plan), "Gap plan SHA256 mismatch.")
+    _uuid(plan.get("operation_id"))
+    _uuid(plan.get("capture_session_id"))
+    _require(plan.get("coverage") == "UNINSPECTED", "Chain coverage must remain UNINSPECTED.")
+    entries = plan.get("failed_segments")
+    _require(isinstance(entries, list) and 2 <= len(entries) <= 3,
+             "An explicit chain must contain two or three failed Windows.")
+    start, end = _window(plan.get("window_start")), _window(plan.get("window_end"))
+    expected = start
+    seen_ids, seen_operations, seen_paths = set(), {plan["operation_id"]}, set()
+    for entry in entries:
+        _require(isinstance(entry, Mapping) and set(entry) == {
+            "operation_id", "failed_segment_id", "failed_segment", "preserved_pcap_path", "pcap_sha256",
+        }, "Exact per-Window chain evidence is required.")
+        _uuid(entry.get("operation_id"))
+        _require(entry["operation_id"] not in seen_operations, "Chain operation IDs must be distinct.")
+        seen_operations.add(entry["operation_id"])
+        failed = entry.get("failed_segment")
+        _require(isinstance(failed, Mapping), "Failed Segment binding is invalid.")
+        # Reuse the v1 schema's exact failure, path and checkpoint invariants for
+        # each ten-second entry, while the envelope binds the whole approval.
+        single = {key: plan.get(key) for key in (
+            "capture_session_id", "approved_by", "reason", "repository_commit", "database_path", "backup_path",
+        )}
+        single.update(entry)
+        single.update(schema_version=PLAN_SCHEMA_VERSION, window_start=failed.get("window_start"),
+                      window_end=failed.get("window_end"))
+        pair = plan.get("checkpoints")
+        _require(isinstance(pair, Mapping) and set(pair) == set(DETECTORS), "Both Packet checkpoints are required.")
+        single["checkpoints"] = {}
+        for detector in DETECTORS:
+            item = pair[detector]
+            _require(isinstance(item, Mapping) and set(item) == {"before", "after"}
+                     and isinstance(item["before"], Mapping) and isinstance(item["after"], Mapping),
+                     "Checkpoint pair is invalid.")
+            before = dict(item["before"])
+            after = dict(item["after"])
+            before["last_completed_window_end"] = single["window_start"]
+            after["last_completed_window_end"] = single["window_end"]
+            after["updated_at"] = single["window_end"]
+            single["checkpoints"][detector] = {"before": before, "after": after}
+        single["plan_sha256"] = canonical_plan_sha256(single)
+        verify_segment_gap_plan(single)
+        _require(entry["failed_segment_id"] not in seen_ids, "Failed Segment IDs must be distinct.")
+        seen_ids.add(entry["failed_segment_id"])
+        _require(_window(single["window_start"]) == expected, "Failed Windows must be ordered and contiguous.")
+        expected = _window(single["window_end"])
+        _require(entry["preserved_pcap_path"] not in seen_paths, "Preserved PCAP paths must be distinct.")
+        seen_paths.add(entry["preserved_pcap_path"])
+    _require(expected == end, "Chain end does not match the approved Windows.")
+    for detector in DETECTORS:
+        before, after = plan["checkpoints"][detector]["before"], plan["checkpoints"][detector]["after"]
+        _require(before["last_completed_window_end"] == plan["window_start"]
+                 and after["last_completed_window_end"] == after["updated_at"] == plan["window_end"],
+                 "Checkpoint transition binding is invalid.")
 
 
 def _require_schema(db) -> None:
@@ -188,15 +255,21 @@ def _healthy(db, segment: Mapping) -> bool:
                                              or (segment["status"] == "EMPTY" and count == 0))
 
 
-def _validated_audit(db, failed: Mapping) -> dict | None:
-    _require_schema(db)
-    audit = _one(db, f"SELECT * FROM {AUDIT_TABLE} WHERE failed_segment_id=:id", {"id": failed["id"]})
+def _validated_audit(db, failed: Mapping, *, audit: Mapping | None = None,
+                     plan: Mapping | None = None, schema_checked: bool = False) -> dict | None:
+    if not schema_checked:
+        _require_schema(db)
+    if audit is None:
+        audit = _one(db, f"SELECT * FROM {AUDIT_TABLE} WHERE failed_segment_id=:id", {"id": failed["id"]})
     if audit is None:
         return None
-    try:
-        plan = json.loads(audit["plan_json"])
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise SegmentGapRecoveryError("Recovery audit plan JSON is invalid.") from exc
+    if plan is None:
+        try:
+            plan = json.loads(audit["plan_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise SegmentGapRecoveryError("Recovery audit plan JSON is invalid.") from exc
+    if isinstance(plan, Mapping) and plan.get("schema_version") == CHAIN_PLAN_SCHEMA_VERSION:
+        return _validated_chain_audit(db, failed, audit, plan)
     verify_segment_gap_plan(plan)
     for key in ("operation_id", "capture_session_id", "failed_segment_id", "window_start", "window_end",
                 "plan_sha256", "approved_by", "reason", "repository_commit", "database_path",
@@ -233,12 +306,136 @@ def _validated_audit(db, failed: Mapping) -> dict | None:
     return result
 
 
+def _chain_row_values(plan: Mapping, entry: Mapping) -> dict:
+    fields = ("capture_session_id", "plan_sha256", "approved_by", "reason", "repository_commit",
+              "database_path", "backup_path")
+    values = {key: plan[key] for key in fields}
+    values.update({key: entry[key] for key in (
+        "operation_id", "failed_segment_id", "preserved_pcap_path", "pcap_sha256",
+    )})
+    values.update({key: entry["failed_segment"][key] for key in ("window_start", "window_end")})
+    return values
+
+
+def _validated_chain_audit(db, failed: Mapping, supplied_audit: Mapping, plan: Mapping) -> dict:
+    audits = _validated_chain_audits(db, supplied_audit, plan)
+    _validate_supplied_chain_segment(plan, failed)
+    return audits[failed["id"]]
+
+
+def _validate_supplied_chain_segment(plan: Mapping, failed: Mapping) -> None:
+    expected = next((entry["failed_segment"] for entry in plan["failed_segments"]
+                     if entry["failed_segment_id"] == failed["id"]), None)
+    _require(expected is not None and all(key not in expected or expected[key] == value for key, value in failed.items()),
+             "Supplied failed Segment differs from current evidence.")
+
+
+def _validated_chain_audits(db, supplied_audit: Mapping, plan: Mapping) -> dict[int, dict]:
+    verify_segment_gap_plan(plan)
+    session = _one(db, "SELECT * FROM packet_capture_sessions WHERE session_id=:sid",
+                   {"sid": plan["capture_session_id"]})
+    _require(session is not None, "Recovery audit belongs to another Capture Session.")
+    all_audits = []
+    for entry in plan["failed_segments"]:
+        audit = _one(db, f"SELECT * FROM {AUDIT_TABLE} WHERE failed_segment_id=:id",
+                     {"id": entry["failed_segment_id"]})
+        _require(audit is not None, "An approved chain audit is missing.")
+        values = _chain_row_values(plan, entry)
+        _require(all(audit[key] == value for key, value in values.items()),
+                 "Chain audit row differs from its bound plan.")
+        try:
+            bound = json.loads(audit["plan_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise SegmentGapRecoveryError("Recovery audit plan JSON is invalid.") from exc
+        _require(bound == plan, "Chain audits do not share the complete approved envelope.")
+        _require(isinstance(audit.get("backup_sha256"), str) and _HEX64.fullmatch(audit["backup_sha256"])
+                 and audit["backup_sha256"] == supplied_audit["backup_sha256"],
+                 "Chain audit backup SHA256 differs or is invalid.")
+        current = _one(db, "SELECT * FROM packet_capture_segments WHERE id=:id",
+                       {"id": entry["failed_segment_id"]})
+        _require(current == entry["failed_segment"] and current["capture_session_id"] == session["id"],
+                 "Failed Segment changed after chain approval.")
+        _no_gap_features_or_overlap(db, current)
+        all_audits.append(audit)
+    _require(any(audit["id"] == supplied_audit["id"] for audit in all_audits),
+             "Recovery audit is not in its approved chain.")
+    # Exactly these entries may share the chain envelope; extra rows with its
+    # SHA would be a malformed or partially replaced batch, never coverage.
+    same_plan = _rows(db, f"SELECT id FROM {AUDIT_TABLE} WHERE plan_sha256=:sha", {"sha": plan["plan_sha256"]})
+    _require({row["id"] for row in same_plan} == {row["id"] for row in all_audits},
+             "Chain audit set differs from its exact approval.")
+    for detector, row in _checkpoint_pair(db).items():
+        _require(row["last_completed_window_end"] is not None, "Packet checkpoints have not crossed this chain.")
+        actual = parse_db_utc(row["last_completed_window_end"])
+        end = _window(plan["window_end"])
+        _require(actual >= end, "Packet checkpoints have not both crossed this approved chain.")
+        preserved_id = plan["checkpoints"][detector]["before"]["last_processed_id"]
+        if actual == end:
+            _require(row == plan["checkpoints"][detector]["after"],
+                     "Chain-end checkpoint must match its approved after snapshot.")
+        elif preserved_id is not None:
+            _require(isinstance(row["last_processed_id"], int) and not isinstance(row["last_processed_id"], bool)
+                     and row["last_processed_id"] >= preserved_id, "Checkpoint source IDs cannot rewind after a gap.")
+    return {audit["failed_segment_id"]: {**audit, "checkpoints": plan["checkpoints"],
+            "boundary": _window(plan["window_end"]), "target_session_id": plan["capture_session_id"],
+            "chain_operation_id": plan["operation_id"], "coverage": plan["coverage"]} for audit in all_audits}
+
+
+def approved_segment_gaps(db, segments: Sequence[Mapping]) -> list[dict | None]:
+    """Fresh read-only proofs in request order; each v2 chain is checked once.
+
+    Proofs live only in this call. Every chain still verifies all audit rows,
+    original failures, overlap/Feature absence and both current checkpoints.
+    A bad requested member closes that complete chain's requested results.
+    """
+    errors = (SegmentGapRecoveryError, sqlite3.Error, SQLAlchemyError, ValueError, TypeError, KeyError)
+    results = [None] * len(segments)
+    try:
+        _require_schema(db)
+    except errors:
+        return results
+    groups = {}
+    for index, segment in enumerate(segments):
+        try:
+            audit = _one(db, f"SELECT * FROM {AUDIT_TABLE} WHERE failed_segment_id=:id", {"id": segment["id"]})
+            if audit is None:
+                continue
+            plan = json.loads(audit["plan_json"])
+            if isinstance(plan, Mapping) and plan.get("schema_version") == CHAIN_PLAN_SCHEMA_VERSION:
+                key = (plan.get("operation_id"), plan.get("plan_sha256"))
+                groups.setdefault(key, []).append((index, segment, audit, plan))
+            else:
+                results[index] = _validated_audit(db, segment, audit=audit, plan=plan, schema_checked=True)
+        except errors:
+            continue
+    rejected_ids = set()
+    for members in groups.values():
+        plan = members[0][3]
+        try:
+            audits = _validated_chain_audits(db, members[0][2], plan)
+            for _, segment, supplied_audit, supplied_plan in members:
+                _require(supplied_plan == plan, "Requested chain plans differ.")
+                _validate_supplied_chain_segment(plan, segment)
+                _require(all(audits[segment["id"]][key] == value for key, value in supplied_audit.items()),
+                         "Requested chain audit changed during validation.")
+            for index, segment, _, _ in members:
+                results[index] = audits[segment["id"]]
+        except errors:
+            # Also close a requested row whose replaced plan claims to be v1
+            # while another row still binds it to this incomplete v2 chain.
+            entries = plan.get("failed_segments")
+            for entry in entries if isinstance(entries, list) else []:
+                if isinstance(entry, Mapping) and isinstance(entry.get("failed_segment_id"), int):
+                    rejected_ids.add(entry["failed_segment_id"])
+    for index, segment in enumerate(segments):
+        if isinstance(segment, Mapping) and isinstance(segment.get("id"), int) and segment["id"] in rejected_ids:
+            results[index] = None
+    return results
+
+
 def approved_segment_gap(db, segment: Mapping) -> dict | None:
     """Read-only, fail-closed validation for readiness scans (008 may be absent)."""
-    try:
-        return _validated_audit(db, segment)
-    except (SegmentGapRecoveryError, sqlite3.Error, SQLAlchemyError, ValueError, TypeError, KeyError):
-        return None
+    return approved_segment_gaps(db, [segment])[0]
 
 
 def resolve_segment_gap_transition(db, boundary: datetime, checkpoint_rows: Sequence[Mapping] | Mapping) -> dict | None:
@@ -279,15 +476,17 @@ def _validate_current(db, plan: Mapping) -> None:
     running = _rows(db, "SELECT session_id FROM packet_capture_sessions WHERE status='RUNNING'")
     _require(len(running) == 1 and running[0]["session_id"] == plan["capture_session_id"],
              "Only the target Capture Session may be RUNNING.")
-    failed = _one(db, "SELECT * FROM packet_capture_segments WHERE id=:id", {"id": plan["failed_segment_id"]})
-    _require(failed == plan["failed_segment"] and failed["capture_session_id"] == session["id"],
-             "Failed Segment no longer matches its approved evidence.")
-    _no_gap_features_or_overlap(db, failed)
-    _require(_one(db, f"SELECT id FROM {AUDIT_TABLE} WHERE capture_session_id=:sid AND failed_segment_id=:id",
-                  {"sid": plan["capture_session_id"], "id": plan["failed_segment_id"]}) is None,
-             "This failed Window already has a recovery audit.")
-    _require(_one(db, f"SELECT id FROM {AUDIT_TABLE} WHERE operation_id=:operation",
-                  {"operation": plan["operation_id"]}) is None, "Recovery operation identity already exists.")
+    entries = plan["failed_segments"] if plan["schema_version"] == CHAIN_PLAN_SCHEMA_VERSION else [plan]
+    for entry in entries:
+        failed = _one(db, "SELECT * FROM packet_capture_segments WHERE id=:id", {"id": entry["failed_segment_id"]})
+        _require(failed == entry["failed_segment"] and failed["capture_session_id"] == session["id"],
+                 "Failed Segment no longer matches its approved evidence.")
+        _no_gap_features_or_overlap(db, failed)
+        _require(_one(db, f"SELECT id FROM {AUDIT_TABLE} WHERE failed_segment_id=:id",
+                      {"id": entry["failed_segment_id"]}) is None, "This failed Window already has a recovery audit.")
+    for operation_id in {plan["operation_id"], *(entry["operation_id"] for entry in entries)}:
+        _require(_one(db, f"SELECT id FROM {AUDIT_TABLE} WHERE operation_id=:operation",
+                      {"operation": operation_id}) is None, "Recovery operation identity already exists.")
     pair = _checkpoint_pair(db)
     _require(all(pair[detector] == plan["checkpoints"][detector]["before"] for detector in DETECTORS),
              "A Packet checkpoint changed after plan creation.")
@@ -307,6 +506,40 @@ def _validate_current(db, plan: Mapping) -> None:
     following = [row for row in segments if row["window_start"] == plan["window_end"]]
     _require(len(following) == 1 and _healthy(db, following[0]),
              "A healthy contiguous Window must follow the failed Window.")
+
+
+def build_segment_gap_chain_plan(connection: sqlite3.Connection, *, capture_session_id: str,
+                                 failed_segment_ids: Sequence[int], preserved_pcaps: Sequence[Mapping],
+                                 approved_by: str, reason: str, repository_commit: str, database_path: str,
+                                 backup_path: str, generated_at: str | None = None) -> dict[str, Any]:
+    """Bind two or three explicitly listed consecutive PARTIAL_CAPTURE Windows."""
+    _require_schema(connection)
+    _require(isinstance(failed_segment_ids, (list, tuple)) and 2 <= len(failed_segment_ids) <= 3
+             and isinstance(preserved_pcaps, (list, tuple)) and len(preserved_pcaps) == len(failed_segment_ids),
+             "An exact two- or three-Window ID/PCAP list is required.")
+    entries = []
+    for segment_id, pcap in zip(failed_segment_ids, preserved_pcaps):
+        _require(isinstance(segment_id, int) and not isinstance(segment_id, bool) and segment_id > 0,
+                 "A positive failed Segment ID is required.")
+        failed = _one(connection, "SELECT * FROM packet_capture_segments WHERE id=:id", {"id": segment_id})
+        _require(failed is not None and isinstance(pcap, Mapping) and set(pcap) == {"path", "sha256"},
+                 "Failed Segment and exact preserved PCAP binding are required.")
+        entries.append({"operation_id": str(uuid4()), "failed_segment_id": segment_id,
+                        "failed_segment": failed, "preserved_pcap_path": pcap["path"], "pcap_sha256": pcap["sha256"]})
+    pair = _checkpoint_pair(connection)
+    start, end = entries[0]["failed_segment"]["window_start"], entries[-1]["failed_segment"]["window_end"]
+    plan = {"schema_version": CHAIN_PLAN_SCHEMA_VERSION, "operation_id": str(uuid4()),
+            "capture_session_id": capture_session_id, "coverage": "UNINSPECTED",
+            "window_start": start, "window_end": end, "failed_segments": entries,
+            "checkpoints": {detector: {"before": before, "after": {
+                **before, "last_completed_window_end": end, "updated_at": end,
+            }} for detector, before in pair.items()},
+            "approved_by": approved_by, "reason": reason, "repository_commit": repository_commit,
+            "database_path": str(database_path), "backup_path": str(backup_path),
+            "generated_at": generated_at or datetime.now(timezone.utc).isoformat()}
+    plan["plan_sha256"] = canonical_plan_sha256(plan)
+    _validate_current(connection, plan)
+    return plan
 
 
 def build_segment_gap_plan(connection: sqlite3.Connection, *, capture_session_id: str, failed_segment_id: int,
@@ -337,7 +570,7 @@ def build_segment_gap_plan(connection: sqlite3.Connection, *, capture_session_id
 
 
 def apply_segment_gap_plan(connection: sqlite3.Connection, plan: Mapping, *, backup_sha256: str) -> dict:
-    """Revalidate and atomically change both Packet checkpoints plus one audit.
+    """Revalidate and atomically change both Packet checkpoints plus bound audits.
 
     The caller must own its transaction and commit it only after all external
     evidence and backup checks pass. SAVEPOINT also protects callers that catch
@@ -363,21 +596,27 @@ def apply_segment_gap_plan(connection: sqlite3.Connection, plan: Mapping, *, bac
         fields = ("operation_id", "capture_session_id", "failed_segment_id", "window_start", "window_end",
                   "plan_sha256", "approved_by", "reason", "repository_commit", "database_path",
                   "backup_path", "preserved_pcap_path", "pcap_sha256")
-        audit_values = {key: plan[key] for key in fields}
-        audit_values.update(plan_json=json.dumps(dict(plan), sort_keys=True, separators=(",", ":"),
-                                                ensure_ascii=False, allow_nan=False), backup_sha256=backup_sha256)
-        columns = ",".join(audit_values)
-        placeholders = ",".join(":" + key for key in audit_values)
-        connection.execute(f"INSERT INTO {AUDIT_TABLE} ({columns}) VALUES ({placeholders})", audit_values)
-        _require(connection.total_changes - changes_before == 3, "Recovery must change exactly two checkpoints and one audit.")
+        chain = plan["schema_version"] == CHAIN_PLAN_SCHEMA_VERSION
+        values = ([_chain_row_values(plan, entry) for entry in plan["failed_segments"]]
+                  if chain else [{key: plan[key] for key in fields}])
+        plan_json = json.dumps(dict(plan), sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+        for audit_values in values:
+            audit_values.update(plan_json=plan_json, backup_sha256=backup_sha256)
+            columns = ",".join(audit_values)
+            placeholders = ",".join(":" + key for key in audit_values)
+            connection.execute(f"INSERT INTO {AUDIT_TABLE} ({columns}) VALUES ({placeholders})", audit_values)
+        _require(connection.total_changes - changes_before == 2 + len(values),
+                 "Recovery must change exactly two checkpoints and the approved audits.")
         pair = _checkpoint_pair(connection)
         _require(all(pair[detector] == plan["checkpoints"][detector]["after"] for detector in DETECTORS),
                  "Updated checkpoint verification failed.")
         _require(not connection.execute("PRAGMA foreign_key_check").fetchall(), "Recovery foreign-key check failed.")
-        audit = _validated_audit(connection, plan["failed_segment"])
-        _require(audit is not None, "Committed recovery audit cannot be validated.")
+        failed = ([entry["failed_segment"] for entry in plan["failed_segments"]] if chain else [plan["failed_segment"]])
+        audits = [_validated_audit(connection, segment) for segment in failed]
+        _require(all(audit is not None for audit in audits), "Committed recovery audit cannot be validated.")
         connection.execute("RELEASE SAVEPOINT apply_segment_gap")
-        return audit
+        return ({"operation_id": plan["operation_id"], "audits": audits,
+                 "window_start": plan["window_start"], "window_end": plan["window_end"]} if chain else audits[0])
     except Exception:
         connection.execute("ROLLBACK TO SAVEPOINT apply_segment_gap")
         connection.execute("RELEASE SAVEPOINT apply_segment_gap")

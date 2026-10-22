@@ -680,6 +680,7 @@ def run_orchestration_cycle(
                     packet_ready_through = packet_readiness.packet_feature_ready_through
                     if (
                         settings.packet_confirmed_gap_policy_enabled
+                        and range_start < cutoff
                         and set(PACKET_STAGE_NAMES).issubset(registry.required_names)
                         and (packet_ready_through is None or packet_ready_through <= range_start)
                     ):
