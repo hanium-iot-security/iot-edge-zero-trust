@@ -28,7 +28,7 @@ def _ready_evidence(db, session, policy):
             "features_sha256": p._digest(features), "feature_count": len(features)}
 
 
-def _proof(db, operation, target_id, successor_id, policy):
+def _pair_proof(db, target_id, successor_id, policy):
     target, successor = p._session(db, target_id), p._session(db, successor_id)
     p._require(target["status"] == "FAILED" and target["ended_at"] is not None,
                "Prefix target must be a closed FAILED Session.")
@@ -76,6 +76,40 @@ def _proof(db, operation, target_id, successor_id, policy):
                             "feature_count": len(features), "feature_sha256": p._digest(features)},
         "failure": failure, "prefix_end": start, "successor_session_id": successor_id,
     }
+
+
+def _proof(db, operation, target_id, successor_id, policy):
+    """Preserve one failed-prefix proof, or bind exactly two adjacent failures."""
+    target, successor = p._session(db, target_id), p._session(db, successor_id)
+    intermediate = p._rows(db, "SELECT * FROM packet_capture_sessions WHERE id>:target AND id<:successor ORDER BY id",
+                           {"target": target["id"], "successor": successor["id"]})
+    p._require(len(intermediate) <= 1, "At most two closed FAILED Sessions are supported.")
+    if not intermediate:
+        return _pair_proof(db, target_id, successor_id, policy)
+    middle = intermediate[0]
+    target, _, prefix, proof = _pair_proof(db, target_id, middle["session_id"], policy)
+    _, successor, _, child = _pair_proof(db, middle["session_id"], successor_id, policy)
+    # An unrelated feature must not claim time in either preserved prefix, even
+    # if its own Capture row is elsewhere. Failed-tail overlap is checked above.
+    for session, pair in ((target, proof), (middle, child)):
+        p._require(not p._rows(db, "SELECT id FROM packet_feature_logs WHERE "
+                              "(capture_segment_id IS NULL OR capture_segment_id NOT IN "
+                              "(SELECT id FROM packet_capture_segments WHERE capture_session_id=:id)) "
+                              "AND unixepoch(window_start)<unixepoch(:end) "
+                              "AND unixepoch(window_end)>unixepoch(:start)",
+                              {"id": session["id"], "start": session["first_window_start"],
+                               "end": pair["failure"]["window_end"]}),
+                   "Unrelated Packet Features overlap a failed Session prefix or tail.")
+    proof["intermediate_proofs"] = [child]
+    proof["chain_adjacency"] = [
+        {"source_session_id": session["session_id"], "source_ended_at": session["ended_at"],
+         "failed_segment_id": pair["failure"]["id"], "failure_window_end": pair["failure"]["window_end"],
+         "successor_session": {key: following[key] for key in
+                               ("id", "session_id", "capture_interface", "started_at", "first_window_start")}}
+        for session, pair, following in ((target, proof, middle), (middle, child, successor))
+    ]
+    proof["successor_session_id"] = successor_id
+    return target, successor, prefix, proof
 
 
 def inspect_prefix_recovery(conn, operation_id, *, target_session_id, successor_session_id,
@@ -132,12 +166,10 @@ def apply_prefix_recovery(conn, plan, *, now, backup_path, backup_sha256):
                            backup_sha256=backup_sha256, inspect=inspect)
 
 
-def validate_prefix_audit(db, operation, plan):
-    recorded = plan["failed_prefix_recovery"]
-    policy = p.CapturePolicy(**plan["source_snapshot"]["capture_policy"])
-    _, successor, _, actual = _proof(db, operation, plan["target_session_id"], recorded["successor_session_id"], policy)
+def _validate_failed_snapshot(db, actual, recorded):
     current_snapshot, sealed_snapshot = actual["target_snapshot"], recorded["target_snapshot"]
-    p._require(all(actual[key] == recorded[key] for key in actual if key != "target_snapshot")
+    p._require(all(actual[key] == recorded[key] for key in actual
+                   if key not in ("target_snapshot", "intermediate_proofs"))
                and {key: value for key, value in current_snapshot.items() if key != "feature_sha256"}
                == {key: value for key, value in sealed_snapshot.items() if key != "feature_sha256"},
                "Failed-prefix recovery evidence changed.")
@@ -146,6 +178,18 @@ def validate_prefix_audit(db, operation, plan):
                              {"id": current_snapshot["session"]["id"]})
     p._require(packet_feature_evidence_matches(target_features, sealed_snapshot["feature_sha256"]),
                "Failed-prefix recovery evidence changed.")
+
+
+def validate_prefix_audit(db, operation, plan):
+    recorded = plan["failed_prefix_recovery"]
+    policy = p.CapturePolicy(**plan["source_snapshot"]["capture_policy"])
+    _, successor, _, actual = _proof(db, operation, plan["target_session_id"], recorded["successor_session_id"], policy)
+    _validate_failed_snapshot(db, actual, recorded)
+    current_children, sealed_children = actual.get("intermediate_proofs", []), recorded.get("intermediate_proofs", [])
+    p._require(isinstance(sealed_children, list) and len(current_children) == len(sealed_children),
+               "Failed-prefix recovery chain changed.")
+    for current_child, sealed_child in zip(current_children, sealed_children):
+        _validate_failed_snapshot(db, current_child, sealed_child)
     evidence = recorded["successor_evidence"]
     p._require({key: successor[key] for key in evidence["session"]} == evidence["session"],
                "Successor identity changed after prefix recovery.")
@@ -190,6 +234,72 @@ def _confirmed_tail_audit(db, proof, expected_ids):
     return audit
 
 
+def _prefix_source_ids(db, proof, previous_ids):
+    expected_ids = {}
+    for name in p.PACKET_DETECTORS:
+        direction = "AND f.direction='INBOUND' " if name == "packet_rule" else ""
+        rows = p._rows(db, "SELECT MAX(f.id) AS id FROM packet_feature_logs f JOIN packet_capture_segments s "
+                       "ON s.id=f.capture_segment_id WHERE s.capture_session_id=:id " + direction,
+                       {"id": proof["target_snapshot"]["session"]["id"]})
+        expected_ids[name] = rows[0]["id"] if rows[0]["id"] is not None else previous_ids[name]
+    return expected_ids
+
+
+def _check_chain_drain(db, operation_id, plan, checkpoints):
+    """Project two pair views only after get_resume_audit validated the full plan."""
+    proof = plan["failed_prefix_recovery"]
+    child, = proof["intermediate_proofs"]
+    middle = child["target_snapshot"]["session"]
+    # The first successor is the middle Session, not the final running Session
+    # stored at top level. Its first row was bound by the validated prefix seal.
+    first = p._one(db, "SELECT * FROM packet_capture_segments WHERE capture_session_id=:id "
+                   "ORDER BY window_start,id LIMIT 1", {"id": middle["id"]})
+    pairs = (
+        {**proof, "successor_session_id": proof["chain_adjacency"][0]["successor_session"]["session_id"],
+         "successor_evidence": {"empty_prefix": [], "segment": first}},
+        {**child, "successor_evidence": proof["successor_evidence"]},
+    )
+    boundaries = {checkpoints[name]["last_completed_window_end"] for name in p.PACKET_DETECTORS}
+    p._require(len(boundaries) == 1, "Packet checkpoints disagree during failed-prefix chain drain.")
+    boundary = parse_db_utc(boundaries.pop())
+    expected_ids = {name: plan["checkpoints"][name]["before"]["last_processed_id"] for name in p.PACKET_DETECTORS}
+    confirmed = []
+    result = {"operation_id": operation_id, "successor_session_id": proof["successor_session_id"],
+              "prefix_ends": [pair["prefix_end"] for pair in pairs], "confirmed_tails": confirmed,
+              "checkpoints": checkpoints}
+    for pair in pairs:
+        end = pair["prefix_end"]
+        expected_ids = _prefix_source_ids(db, pair, expected_ids)
+        result.update(prefix_end=end, failed_segment_id=pair["failure"]["id"])
+        if boundary < parse_db_utc(end):
+            return {**result, "result": "WAIT", "reason": "Healthy prefix processing is incomplete."}
+        tail = {"source_session_id": pair["target_snapshot"]["session"]["session_id"],
+                "successor_session_id": pair["successor_session_id"], "failed_segment_id": pair["failure"]["id"],
+                "window_start": end, "window_end": pair["failure"]["window_end"]}
+        if boundary == parse_db_utc(end):
+            p._require(all(checkpoints[name]["last_processed_id"] == expected_ids[name] for name in p.PACKET_DETECTORS),
+                       "Healthy prefix source IDs have not been consumed.")
+            if any(parse_db_utc(row["last_completed_window_end"]) < boundary for row in checkpoints.values()):
+                return {**result, "result": "WAIT", "reason": "Healthy prefix MQTT/Trust catchup is incomplete."}
+            p._fully_drained(db, checkpoints, end, exact_boundaries=False)
+            return {**result, "result": "PREFIX_DRAINED_RECOVERY_REQUIRED", "pending_tail": tail,
+                    "reason": "This healthy prefix is drained; its failed tail has not been crossed."}
+        # Validate every crossed tail before considering MQTT/Trust lag. Current
+        # checkpoints alone cannot prove either prefix's historical consumption.
+        gap = _confirmed_tail_audit(db, pair, expected_ids)
+        p._require(boundary >= parse_db_utc(gap["window_end"])
+                   and all(expected_ids[name] is None or (checkpoints[name]["last_processed_id"] is not None
+                           and checkpoints[name]["last_processed_id"] >= expected_ids[name]) for name in p.PACKET_DETECTORS),
+                   "Packet checkpoints do not preserve the confirmed prefix consumption.")
+        confirmed.append({**tail, "status": gap["status"], "plan_sha256": gap["plan_sha256"]})
+    final_end = confirmed[-1]["window_end"]
+    if any(parse_db_utc(row["last_completed_window_end"]) < parse_db_utc(final_end) for row in checkpoints.values()):
+        return {**result, "result": "WAIT", "reason": "Confirmed gaps MQTT/Trust catchup is incomplete."}
+    p._fully_drained(db, {name: row for name, row in checkpoints.items() if name not in p.PACKET_DETECTORS},
+                     final_end, exact_boundaries=False)
+    return {**result, "result": "PREFIX_DRAINED_CONFIRMED_GAP"}
+
+
 def check_prefix_drain(db, operation_id):
     audit = p.get_resume_audit(db, operation_id)
     plan = json.loads(audit["plan_json"])
@@ -197,20 +307,13 @@ def check_prefix_drain(db, operation_id):
     proof = plan["failed_prefix_recovery"]
     required = tuple((name, row["source_table"]) for name, row in plan["checkpoint_snapshot"].items())
     checkpoints = p._checkpoints(db, required)
+    if proof.get("intermediate_proofs"):
+        return _check_chain_drain(db, operation_id, plan, checkpoints)
     end = proof["prefix_end"]
     if any(parse_db_utc(row["last_completed_window_end"]) < parse_db_utc(end) for row in checkpoints.values()):
         return {"result": "WAIT", "reason": "Healthy prefix processing is incomplete.", "prefix_end": end}
-    session_id = proof["target_snapshot"]["session"]["id"]
-    expected_ids = {}
-    for name in p.PACKET_DETECTORS:
-        direction = "AND f.direction='INBOUND' " if name == "packet_rule" else ""
-        rows = p._rows(db, "SELECT MAX(f.id) AS id FROM packet_feature_logs f JOIN packet_capture_segments s "
-                       "ON s.id=f.capture_segment_id WHERE s.capture_session_id=:id " + direction,
-                       {"id": session_id})
-        expected = rows[0]["id"]
-        if expected is None:
-            expected = plan["checkpoints"][name]["before"]["last_processed_id"]
-        expected_ids[name] = expected
+    expected_ids = _prefix_source_ids(db, proof, {
+        name: plan["checkpoints"][name]["before"]["last_processed_id"] for name in p.PACKET_DETECTORS})
     result = {"result": "PREFIX_DRAINED_RECOVERY_REQUIRED", "operation_id": operation_id,
             "prefix_end": end, "failed_segment_id": proof["failure"]["id"],
             "successor_session_id": proof["successor_session_id"], "checkpoints": checkpoints}
