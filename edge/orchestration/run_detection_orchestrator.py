@@ -347,6 +347,7 @@ def _bounded_replay_audit_matches(db: Session, candidate, plan: dict, boundary: 
     """Admit a new closed-target operation only with its actual signed input proof."""
     from edge.detection.packet_checkpoint_recovery import PacketCheckpointRecoveryError, verify_plan_sha256
     from edge.detection.packet_checkpoint_recovery_repository import bounded_replay_target_evidence
+    from edge.packet.feature_evidence import packet_feature_manifest_matches
 
     try:
         verify_plan_sha256(plan)
@@ -378,7 +379,10 @@ def _bounded_replay_audit_matches(db: Session, candidate, plan: dict, boundary: 
                                    {"id": session["id"]}).mappings())
         actual = bounded_replay_target_evidence(
             session, segments, features, allow_failed_target_session=allow_failed_target)
-        if actual is None or any(evidence.get(key) != value for key, value in actual.items()):
+        if (actual is None
+                or any(evidence.get(key) != value for key, value in actual.items() if key != "input_sha256")
+                or not packet_feature_manifest_matches(
+                    [dict(row) for row in segments], [dict(row) for row in features], evidence["input_sha256"])):
             return False
         if allow_failed_target:
             return plan.get("failed_target_tail") == actual["failed_target_tail"]

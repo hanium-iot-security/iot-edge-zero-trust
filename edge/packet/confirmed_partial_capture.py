@@ -23,6 +23,7 @@ from edge.packet.capture_policy import (
     CapturePolicy, CaptureEligibilitySegment, is_capture_eligible, compute_effective_capture_window,
 )
 from edge.packet.pcap_naming import build_pcap_filename
+from edge.packet.feature_evidence import packet_feature_evidence_matches
 
 SESSION_FIELDS = ('id', 'session_id', 'capture_interface', 'started_at', 'first_window_start',
                   'capture_gap_start', 'capture_gap_end')
@@ -280,7 +281,8 @@ def validate_partial_evidence(db, audit, *, verify_files=False):
             and healthy[0]['capture_session_id'] == source[0]['id'] and healthy[0]['capture_interface'] == source[0]['capture_interface']
             and healthy[0]['window_start'] == evidence['window_end'])
         features = _healthy(db, healthy[0], CapturePolicy(**evidence['capture_policy']))
-        _require(digest(features) == evidence['target_features_sha256'] and len(features) == evidence['target_feature_count'])
+        _require(packet_feature_evidence_matches(features, evidence['target_features_sha256'], ensure_ascii=True)
+                 and len(features) == evidence['target_feature_count'])
         return evidence
     except ERRORS:
         return None

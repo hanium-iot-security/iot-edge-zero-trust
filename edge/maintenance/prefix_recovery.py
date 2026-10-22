@@ -7,6 +7,7 @@ from datetime import timedelta
 
 from edge.detection.phase4_time import parse_db_utc
 from edge.maintenance import planned as p
+from edge.packet.feature_evidence import packet_feature_evidence_matches
 from edge.packet.confirmed_gaps import SESSION_FIELDS, validated_confirmed_gap_evidence
 
 
@@ -135,7 +136,16 @@ def validate_prefix_audit(db, operation, plan):
     recorded = plan["failed_prefix_recovery"]
     policy = p.CapturePolicy(**plan["source_snapshot"]["capture_policy"])
     _, successor, _, actual = _proof(db, operation, plan["target_session_id"], recorded["successor_session_id"], policy)
-    p._require(all(actual[key] == recorded[key] for key in actual), "Failed-prefix recovery evidence changed.")
+    current_snapshot, sealed_snapshot = actual["target_snapshot"], recorded["target_snapshot"]
+    p._require(all(actual[key] == recorded[key] for key in actual if key != "target_snapshot")
+               and {key: value for key, value in current_snapshot.items() if key != "feature_sha256"}
+               == {key: value for key, value in sealed_snapshot.items() if key != "feature_sha256"},
+               "Failed-prefix recovery evidence changed.")
+    target_features = p._rows(db, "SELECT f.* FROM packet_feature_logs f JOIN packet_capture_segments s "
+                             "ON s.id=f.capture_segment_id WHERE s.capture_session_id=:id ORDER BY f.id",
+                             {"id": current_snapshot["session"]["id"]})
+    p._require(packet_feature_evidence_matches(target_features, sealed_snapshot["feature_sha256"]),
+               "Failed-prefix recovery evidence changed.")
     evidence = recorded["successor_evidence"]
     p._require({key: successor[key] for key in evidence["session"]} == evidence["session"],
                "Successor identity changed after prefix recovery.")
@@ -145,7 +155,8 @@ def validate_prefix_audit(db, operation, plan):
     empty = p._rows(db, "SELECT * FROM packet_capture_segments WHERE capture_session_id=:id "
                     "AND window_start<:start ORDER BY window_start,id",
                     {"id": successor["id"], "start": evidence["segment"]["window_start"]})
-    p._require(segment == evidence["segment"] and p._digest(features) == evidence["features_sha256"]
+    p._require(segment == evidence["segment"]
+               and packet_feature_evidence_matches(features, evidence["features_sha256"])
                and len(features) == evidence["feature_count"] and empty == evidence["empty_prefix"],
                "Successor readiness evidence changed after prefix recovery.")
     p._require(not p._rows(db, "SELECT f.id FROM packet_feature_logs f JOIN packet_capture_segments s "

@@ -25,6 +25,7 @@ from edge.detection.phase4_time import format_db_utc, parse_db_utc, require_utc_
 from edge.packet.capture_policy import (
     CaptureEligibilitySegment, CapturePolicy, DEFAULT_CAPTURE_POLICY, is_capture_eligible,
 )
+from edge.packet.feature_evidence import packet_feature_evidence_matches
 
 
 REQUIRED_CHECKPOINTS = tuple(item for item in PHASE4_CHECKPOINT_KEYS if item[0] != "mqtt_if")
@@ -371,7 +372,14 @@ def _bound_source(db, operation, *, verify_hashes=True):
     _require(session == snapshot["session"], "Sealed source Session changed.")
     _verify_source_gap_seal(db, snapshot)
     if verify_hashes:
-        _require(snapshot == _source_snapshot(db, session, policy),
+        current = _source_snapshot(db, session, policy)
+        _require({key: value for key, value in snapshot.items() if key != "feature_sha256"}
+                 == {key: value for key, value in current.items() if key != "feature_sha256"},
+                 "Source Capture evidence changed after planned shutdown.")
+        features = _rows(db, "SELECT f.* FROM packet_feature_logs f JOIN packet_capture_segments s "
+                         "ON s.id=f.capture_segment_id WHERE s.capture_session_id=:id ORDER BY f.id",
+                         {"id": session["id"]})
+        _require(packet_feature_evidence_matches(features, snapshot["feature_sha256"]),
                  "Source Capture evidence changed after planned shutdown.")
     return snapshot, sealed, policy
 
@@ -599,7 +607,7 @@ def _validated_audit(db, operation, *, check_current_checkpoints=False):
     segment = _one(db, "SELECT * FROM packet_capture_segments WHERE id=:id", {"id": first["segment"]["id"]})
     features = _rows(db, "SELECT * FROM packet_feature_logs WHERE capture_segment_id=:id ORDER BY id",
                      {"id": first["segment"]["id"]})
-    _require(segment == first["segment"] and _digest(features) == first["features_sha256"]
+    _require(segment == first["segment"] and packet_feature_evidence_matches(features, first["features_sha256"])
              and len(features) == first["feature_count"], "First target Packet evidence changed.")
     empty_prefix = first.get("empty_prefix", [])
     if empty_prefix:
