@@ -481,6 +481,7 @@ test("Isolation refresh preserves release target ID then sequentially releases w
   let requestStatus = "PENDING";
   let runtimeStatus = "UNAVAILABLE";
   const preflightCalls = [];
+  const recoveryCalls = [];
   const api = {
     getIsolationHistory: async () => ({ items: [], total: 0 }),
     getIsolatedDevices: async () => ({ items: [device] }),
@@ -496,6 +497,7 @@ test("Isolation refresh preserves release target ID then sequentially releases w
       preflightCalls.push(payload);
       return { device_id: sensor.device_id, can_execute: true, firewall_runtime_verification: { status: runtimeStatus } };
     },
+    executeRecovery: async (payload) => { recoveryCalls.push(payload); },
   };
   const app = await componentHarness("Isolation", api, clock);
   const table = app.find((node) => node.type === "DataTable" && node.props.tableLabel === "현재 격리된 기기");
@@ -509,6 +511,10 @@ test("Isolation refresh preserves release target ID then sequentially releases w
   await app.change("firewall-release-confirmation", "RELEASE-FIREWALL-RULE-21");
   await app.click("방화벽 해제 요청");
   assert.equal(releases[0].ruleId, 21);
+  assert.equal(app.input("recovery-reason").props.value, "release exact wide rule");
+  assert.equal(app.input("recovery-confirmation").props.value, "");
+  assert.equal(preflightCalls.length, 0, "copying the reason must not run preflight");
+  assert.equal(recoveryCalls.length, 0, "copying the reason must not execute Recovery");
   rules = rules.map((rule) => rule.id === 21 ? { ...rule, status: "REMOVED", updated_at: "2026-10-12T00:00:01Z" } : rule);
   await app.act(() => app.find((node) => node.type === "PageHeader").props.onRefresh());
   assert.equal(app.find((node) => node.type === "FirewallTrafficFields").props.rule.id, 20);
@@ -522,6 +528,7 @@ test("Isolation refresh preserves release target ID then sequentially releases w
   await app.click("방화벽 해제 요청");
   assert.deepEqual(releases.map((item) => item.ruleId), [21, 20]);
   assert.equal(releases[1].options.confirmation, "RELEASE-FIREWALL-RULE-20");
+  assert.equal(app.input("recovery-reason").props.value, "release exact wide rule");
   rules = rules.map((rule) => ({ ...rule, status: "REMOVED" }));
   requestStatus = "SUCCEEDED";
   await app.advance(2_000);
@@ -534,6 +541,67 @@ test("Isolation refresh preserves release target ID then sequentially releases w
   app.cleanup();
 });
 
+
+for (const [label, draft, expected] of [
+  ["whitespace", " \t\n ", "release after new block"],
+  ["edited", "  operator-specific recovery justification  ", "  operator-specific recovery justification  "],
+]) {
+  test(`Isolation ${label} Recovery reason survives a new block and resets for another device`, async () => {
+    const device = { ...sensor, status: "isolated", trust_score: 20 };
+    const otherDevice = { ...device, device_id: "sensor_02", ip_address: "192.168.1.31" };
+    let rules = [{ id: 21, device_id: device.device_id, status: "REMOVED", scope: "PI_INPUT_IPV4_ALL" }];
+    const releases = [];
+    const preflights = [];
+    const recoveries = [];
+    const app = await componentHarness("Isolation", {
+      getIsolationHistory: async () => ({ items: [], total: 0 }),
+      getIsolatedDevices: async () => ({ items: [device, otherDevice] }),
+      getFirewallRules: async () => ({ items: rules }),
+      getRecoveryHistory: async () => ({ items: [] }),
+      createFirewallReleaseRequest: async (ruleId, options) => {
+        releases.push({ ruleId, options });
+        return { id: 100 + ruleId, device_id: device.device_id, firewall_rule_id: ruleId, status: "PENDING" };
+      },
+      getFirewallReleaseRequest: async () => ({ id: 122, device_id: device.device_id, firewall_rule_id: 22, status: "PENDING" }),
+      recoveryPreflight: async (payload) => {
+        preflights.push(payload);
+        return { device_id: device.device_id, can_execute: true, current_trust_score: 20, firewall_runtime_verification: { status: "VERIFIED_RELEASED" } };
+      },
+      executeRecovery: async (payload) => { recoveries.push(payload); },
+    });
+    await openDevice(app, device.device_id);
+    await app.change("recovery-admin-key", "test-admin");
+    await app.click("사전 점검 실행");
+    assert.equal(app.input("recovery-reason").props.disabled, false);
+    await app.change("recovery-reason", draft);
+
+    rules = [...rules, { id: 22, device_id: device.device_id, status: "APPLIED", scope: "PI_INPUT_IPV4_ALL" }];
+    await app.act(() => app.find((node) => node.type === "PageHeader").props.onRefresh());
+    assert.equal(app.input("recovery-reason").props.disabled, true);
+    await app.change("firewall-release-reason", "  release after new block  ");
+    await app.change("firewall-release-confirmation", "RELEASE-FIREWALL-RULE-22");
+    await app.click("방화벽 해제 요청");
+
+    assert.equal(app.input("recovery-reason").props.value, expected);
+    assert.equal(releases.length, 1);
+    assert.equal(releases[0].ruleId, 22);
+    assert.equal(releases[0].options.reason, "release after new block");
+    assert.equal(releases[0].options.confirmation, "RELEASE-FIREWALL-RULE-22");
+    assert.equal(preflights.length, 1, "only the manual preflight should run");
+    assert.equal(recoveries.length, 0);
+    assert.equal(app.input("recovery-confirmation").props.value, "");
+    assert.equal(app.button("복구 실행").props.disabled, true);
+
+    const modal = app.find((node) => node.type === "DetailModal" && node.props.open && node.props.title === `${device.device_id} 복구`);
+    assert.equal(modal.props.closeDisabled, false, "the HTTP release response has settled");
+    await app.act(() => modal.props.onClose());
+    await openDevice(app, otherDevice.device_id);
+    for (const id of ["recovery-admin-key", "firewall-release-reason", "firewall-release-confirmation", "recovery-reason", "recovery-confirmation"]) {
+      assert.equal(app.input(id).props.value, "", `${id} must reset for the other device`);
+    }
+    app.cleanup();
+  });
+}
 
 function packetQualityBadge(app) {
   const panel = app.find((node) => node.type === "article" && app.textContent(node).includes("패킷 수집 상태"));

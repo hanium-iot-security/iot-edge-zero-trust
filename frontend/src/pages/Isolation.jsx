@@ -1362,6 +1362,7 @@ export default function Isolation() {
                 deviceId: targetDeviceId,
                 firewallRuleId: targetRuleId,
             });
+            setRecoveryReason((current) => current.trim() ? current : reason);
             setReleaseRequest(response);
         }
         catch (err) {
