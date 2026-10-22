@@ -19,6 +19,7 @@ from edge.detection.mqtt_adapters import (
 from edge.features.collect_feature_logs import produce_mqtt_features_until
 from edge.mqtt.subscriber import build_mqtt_log_row, insert_mqtt_log
 from edge.policy.repository import load_policy_resolver
+from edge.policy.ai_window_decision import AIRevision, decide_ai_window
 from edge.policy.resolver import (
     INVALID_POLICY_REVISION, INVALID_REGISTRATION_REVISION, POLICY_AVAILABLE,
     POLICY_UNAVAILABLE, UNREGISTERED_AT_WINDOW,
@@ -216,6 +217,161 @@ def test_pending_predictor_receives_feature_and_event_is_recorded_without_respon
     assert events[0]["processed_at"] is not None
     assert checkpoint == END
     assert _run(session_factory)[0].processed_event_count == 0
+
+
+def test_phase9_mqtt_ai_selector_skips_off_without_skipping_stage_checkpoint(
+    session_factory, monkeypatch,
+):
+    monkeypatch.setattr("edge.detection.mqtt_adapters.load_model", lambda path: object())
+    seen = []
+    def predict(row, _model_path):
+        seen.append(row["window_start"])
+        return {"is_anomaly": True, "prediction": -1,
+                "anomaly_score": -0.9, "event_type": "AI_ANOMALY"}
+    monkeypatch.setattr("edge.detection.mqtt_adapters.predict_feature_window", predict)
+    revisions = [
+        AIRevision("esp32_01", 1, "OFF", T0),
+        AIRevision("esp32_01", 2, "OBSERVE", T1),
+    ]
+    with session_factory() as db:
+        _seed(db, status="ACTIVE")
+        for start, end in ((T0, T1), (T1, T2)):
+            db.execute(text("""INSERT INTO feature_logs
+                (device_id, window_start, window_end, publish_count, max_payload_size)
+                VALUES ('esp32_01', :start, :end, 2, 100)"""),
+                {"start": start.isoformat().replace("+00:00", "Z"),
+                 "end": end.isoformat().replace("+00:00", "Z")})
+        db.commit()
+    selector = lambda resolution: decide_ai_window(
+        resolution, revisions, stage_activation_from=T1
+    )
+    with session_factory() as db:
+        with db.begin():
+            result = MqttIsolationForestStage(
+                model_path=Path("unused.joblib"), ai_window_selector=selector,
+                trust_ai_mode="observe",
+            ).run_until(db, cycle_range_start=T0, cycle_cutoff=T2)
+        assert result.created_event_count == 1
+        assert seen == [END]
+        assert [(record.window_start, record.input_count, record.inference_count,
+                 record.normal_count, record.anomaly_count, record.exclusion_counts,
+                 record.ai_revision, record.ai_mode)
+                for record in result.ai_completion_records] == [
+                    (T0, 1, 0, 0, 0, {"AI_OFF_AT_WINDOW": 1}, 1, "OFF"),
+                    (T1, 1, 1, 0, 1, {}, 2, "OBSERVE"),
+                ]
+        event = db.execute(text("""SELECT analysis_window_start, evidence_json
+            FROM detection_events WHERE detector_type='AI'""")).mappings().one()
+        assert event["analysis_window_start"] == END
+        evidence = json.loads(event["evidence_json"])
+        assert evidence["device_ai_revision"] == 2
+        assert evidence["model_version"] is None
+        assert evidence["detection_policy_version"] == "mqtt-if-v1"
+        checkpoint = db.execute(text("""SELECT last_completed_window_end
+            FROM detector_checkpoints WHERE detector_name='mqtt_if'""")).scalar_one()
+        assert checkpoint == T2.isoformat().replace("+00:00", "Z")
+
+
+def test_phase9_disabled_reason_precedes_maintenance_exclusion(
+    session_factory, monkeypatch,
+):
+    monkeypatch.setattr("edge.detection.mqtt_adapters.load_model", lambda path: object())
+    monkeypatch.setattr("edge.detection.mqtt_adapters.overlaps_maintenance",
+                        lambda *args: True)
+    monkeypatch.setattr("edge.detection.mqtt_adapters.predict_feature_window",
+                        lambda *args: pytest.fail("DISABLED must not reach the predictor"))
+    with session_factory() as db:
+        _seed(db, status="DISABLED")
+        db.execute(text("""INSERT INTO feature_logs
+            (device_id, window_start, window_end, publish_count, max_payload_size)
+            VALUES ('esp32_01', :start, :end, 2, 100)"""),
+            {"start": START, "end": END})
+        db.commit()
+    with session_factory() as db:
+        with db.begin():
+            result = MqttIsolationForestStage(
+                model_path=Path("unused.joblib"),
+                ai_window_selector=lambda resolution: decide_ai_window(
+                    resolution, [], stage_activation_from=T0,
+                ),
+                trust_ai_mode="observe",
+            ).run_until(db, cycle_range_start=T0, cycle_cutoff=T1)
+        (record,) = result.ai_completion_records
+        assert record.exclusion_counts == {"DISABLED_AT_WINDOW": 1}
+        assert record.inference_count == 0
+
+
+def test_phase9_mqtt_ai_rejects_global_enforce_mode() -> None:
+    with pytest.raises(ValueError, match="TRUST_AI_MODE=observe"):
+        MqttIsolationForestStage(
+            ai_window_selector=lambda resolution: decide_ai_window(
+                resolution, [], stage_activation_from=T0,
+            ),
+            trust_ai_mode="enforce",
+        )
+
+
+@pytest.mark.parametrize("model_kind", ["missing", "wrong_type", "unfitted"])
+def test_phase9_all_off_still_requires_a_healthy_mqtt_model(
+    session_factory, tmp_path, model_kind,
+):
+    import joblib
+    from sklearn.ensemble import IsolationForest
+
+    with session_factory() as db:
+        _seed(db, status="ACTIVE")
+        db.execute(text("""INSERT INTO feature_logs
+            (device_id, window_start, window_end, publish_count, max_payload_size)
+            VALUES ('esp32_01', :start, :end, 1, 100)"""),
+            {"start": START, "end": END})
+        db.commit()
+    missing_model = tmp_path / "missing-mqtt.joblib"
+    if model_kind != "missing":
+        joblib.dump({} if model_kind == "wrong_type" else IsolationForest(), missing_model)
+    with session_factory() as db:
+        with pytest.raises(FileNotFoundError if model_kind == "missing" else ValueError):
+            with db.begin():
+                MqttIsolationForestStage(
+                    model_path=missing_model,
+                    ai_window_selector=lambda resolution: decide_ai_window(
+                        resolution, [AIRevision("esp32_01", 1, "OFF", T0)],
+                        stage_activation_from=T0,
+                    ),
+                    trust_ai_mode="observe",
+                ).run_until(db, cycle_range_start=T0, cycle_cutoff=T1)
+        assert db.execute(text("""SELECT COUNT(*) FROM detector_checkpoints
+            WHERE detector_name='mqtt_if'""")).scalar_one() == 0
+
+
+def test_phase9_ai_completion_sink_and_checkpoint_roll_back_together(
+    session_factory, monkeypatch,
+):
+    monkeypatch.setattr("edge.detection.mqtt_adapters.predict_feature_window",
+                        lambda row, path: {"is_anomaly": False, "prediction": 1,
+                                           "anomaly_score": 0.1, "event_type": None})
+    with session_factory() as db:
+        _seed(db, status="ACTIVE")
+        db.execute(text("CREATE TABLE ai_completion_probe (device_id TEXT, inferred INTEGER)"))
+        db.execute(text("""INSERT INTO feature_logs
+            (device_id, window_start, window_end, publish_count, max_payload_size)
+            VALUES ('esp32_01', :start, :end, 2, 100)"""),
+            {"start": START, "end": END})
+        db.commit()
+
+    def sink(db, records):
+        assert len(records) == 1 and records[0].normal_count == 1
+        db.execute(text("INSERT INTO ai_completion_probe VALUES ('esp32_01', 1)"))
+        raise RuntimeError("completion store failed")
+
+    with session_factory() as db:
+        with pytest.raises(RuntimeError, match="completion store failed"):
+            with db.begin():
+                MqttIsolationForestStage(
+                    model_path=Path("unused.joblib"), completion_sink=sink,
+                ).run_until(db, cycle_range_start=T0, cycle_cutoff=T1)
+        assert db.execute(text("SELECT COUNT(*) FROM ai_completion_probe")).scalar_one() == 0
+        assert db.execute(text("""SELECT COUNT(*) FROM detector_checkpoints
+            WHERE detector_name='mqtt_if'""")).scalar_one() == 0
 
 
 def test_pending_window_is_not_scored_after_activation(session_factory):

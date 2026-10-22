@@ -8,6 +8,7 @@ from pydantic import BeforeValidator
 from sqlalchemy.orm import Session
 
 from backend.app.database import get_db
+from backend.app.schemas.device_ai_policy_schema import AiPolicyRevisionRequest, AiPolicySnapshotResponse
 from backend.app.schemas.device_schema import DeviceItem, DeviceListResponse
 from backend.app.schemas.device_policy_schema import (
     DeviceRegistrationRequest,
@@ -16,6 +17,7 @@ from backend.app.schemas.device_policy_schema import (
     PolicySnapshotResponse,
 )
 from backend.app.security import RecoveryAdminContext, require_recovery_admin
+from backend.app.services.device_ai_policy_service import get_device_ai_policy, revise_device_ai_policy
 from backend.app.services.device_policy_service import (
     DevicePolicyConfigError, create_device, get_device_policy, revise_device_policy,
 )
@@ -88,6 +90,21 @@ def revise_device_policy_command(
     db: Session = Depends(get_db),
 ) -> dict:
     return revise_device_policy(db, device_id, request, admin)
+
+
+@router.get("/{device_id}/ai-policy", response_model=AiPolicySnapshotResponse)
+def get_device_ai_policy_detail(device_id: DeviceIdPath, db: Session = Depends(get_db)) -> dict:
+    return get_device_ai_policy(db, device_id)
+
+
+@router.post("/{device_id}/ai-policy-revisions", response_model=AiPolicySnapshotResponse, status_code=201)
+def revise_device_ai_policy_command(
+    device_id: DeviceIdPath,
+    request: AiPolicyRevisionRequest,
+    admin: RecoveryAdminContext = Depends(require_recovery_admin),
+    db: Session = Depends(get_db),
+) -> dict:
+    return revise_device_ai_policy(db, device_id, request, admin)
 
 
 @router.get("", response_model=DeviceListResponse)

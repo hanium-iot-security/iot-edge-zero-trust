@@ -309,3 +309,113 @@
     }
   }
 }
+/* =========================================================
+   AI Runtime
+   ========================================================= */
+
+.gateway-page {
+  .ai-runtime-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+    margin-top: 16px;
+  }
+
+  .ai-runtime-card {
+    min-width: 0;
+    padding: 16px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    background: var(--color-slate-50);
+  }
+
+  .ai-runtime-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 14px;
+
+    strong {
+      overflow-wrap: anywhere;
+      color: var(--color-slate-900);
+      font-size: 14px;
+    }
+  }
+
+  .ai-runtime-list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    margin: 0;
+
+    > div {
+      min-width: 0;
+      padding: 11px;
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    dt {
+      margin-bottom: 5px;
+      color: var(--color-slate-500);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    dd {
+      margin: 0;
+      overflow-wrap: anywhere;
+      color: var(--color-slate-800);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .ai-runtime-error {
+      grid-column: 1 / -1;
+    }
+  }
+
+  .ai-runtime-note {
+    margin-top: 14px;
+    color: var(--color-slate-600);
+    font-size: 12px;
+    line-height: 1.6;
+  }
+
+  .ai-runtime-raw {
+    margin-top: 16px;
+    padding: 12px 14px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background: var(--color-slate-50);
+
+    summary {
+      cursor: pointer;
+      color: var(--color-slate-700);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    pre {
+      max-height: 350px;
+      overflow: auto;
+      margin: 12px 0 0;
+      padding: 12px;
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--color-slate-700);
+      font-size: 11px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+  }
+
+  @media (max-width: 760px) {
+    .ai-runtime-grid,
+    .ai-runtime-list {
+      grid-template-columns: 1fr;
+    }
+  }
+}

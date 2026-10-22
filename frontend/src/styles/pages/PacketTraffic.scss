@@ -183,3 +183,41 @@
     }
   }
 }
+/* Phase 9: 필수 Session 및 기간 입력. 기존 PacketTraffic.scss 끝에 추가 */
+.packet-page {
+  .packet-capture-query-form {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    margin: 12px 0;
+    .filter-item { min-width: 0; }
+    .filter-item > span, .filter-item > label { display: block; margin-bottom: 6px; font-size: 12px; font-weight: 700; }
+    .filter-item input { width: 100%; min-width: 0; max-width: 100%; box-sizing: border-box; }
+  }
+  @media (max-width: 920px) { .packet-capture-query-form { grid-template-columns: 1fr; } }
+}
+
+.packet-page {
+  .packet-capture-details > summary {
+    cursor: pointer;
+    color: var(--color-slate-700);
+    font-size: 13px;
+    font-weight: 700;
+    padding: 10px 0;
+  }
+  .packet-capture-toolbar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin: 14px 0;
+    font-size: 12px;
+    select {
+      padding: 8px 10px;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--color-slate-700);
+    }
+  }
+}

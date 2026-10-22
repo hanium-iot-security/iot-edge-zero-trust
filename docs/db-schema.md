@@ -355,10 +355,15 @@ Packet segment에서 추출한 peer/direction별 feature row입니다.
 | tcp_syn_count | INTEGER | TCP SYN 수 |
 | mqtt_related_packet_count | INTEGER | MQTT 관련 packet 수 |
 | non_mqtt_tcp_udp_packet_count | INTEGER | MQTT 외 TCP/UDP packet 수 |
+| broker_target_ip | TEXT | Migration 013: 검증한 Broker IPv4, 미설정·과거 행 NULL |
+| broker_target_port | INTEGER | Migration 013: 목적지 TCP 1883, 미설정·과거 행 NULL |
+| broker_target_syn_count | INTEGER | Migration 013: 해당 목적지의 SYN=1/ACK=0 패킷 수, 미설정·과거 행 NULL |
 | capture_scope | TEXT | capture scope |
 | created_at | DATETIME | 생성 시각 |
 
 `(capture_segment_id, peer_ip, direction)`은 중복될 수 없습니다. `window_start`, `window_end`는 정수 초 UTC 경계의 `YYYY-MM-DDTHH:MM:SSZ` 형식이어야 하며, feature window는 정확히 10초여야 합니다. 소수점 이하 초가 포함된 시각은 저장하지 않습니다. 격리 상태 기기의 feature 저장을 막는 DB 제약은 두지 않습니다.
+
+Migration 013은 세 Broker 필드를 함께 NULL 또는 함께 유효한 값으로 저장합니다. 기존 행은 재계산하거나 0으로 채우지 않습니다. 설정된 대상에서 SYN이 없을 때만 0이며 재전송도 패킷 횟수에 포함합니다. 기존 SYN·MQTT 지표와 Packet IF의 6개 입력은 유지합니다. 상세 설정은 [Broker Feature 연결](phase9-broker-target-feature.md)을 따릅니다.
 
 ## gateway_metrics
 
@@ -612,6 +617,49 @@ READY를 기록하는 Transaction부터 source Session·Segment·Packet Feature�
 검사합니다. 전체 완료 Session의 증적 Hash는 Capture가 멈춘 종료 준비 및 Read-only
 재개 검사에서 확인하고, 실제 재개 Write Transaction은 검증된 봉인과 대상 경계를
 재검증하여 기존 Session 전체를 다시 Hash하지 않습니다.
+
+## AI 실행 근거와 반복 경고 — Migration 014
+
+기존 정책·이벤트·Checkpoint·Trust 테이블의 값과 의미를 유지하는 추가 Migration입니다.
+운영 적용이나 초기 데이터 생성을 API에서 실행하지 않습니다.
+
+| 테이블 | 역할 |
+| --- | --- |
+| `ai_runtime_snapshot` | singleton JSON. 실제 Orchestrator run/Boot/관측 시각·설정·Stage 결과 |
+| `ai_device_completions` | `(detector_name,device_key)`별 마지막 원본 Window의 AI 완료 근거 JSON |
+| `ai_warning_keys` | 기기·탐지기·유형·모델·경고 버전 키, 고정 W/N/C, 최근 bucket·마지막 경고 결정 시각 |
+| `ai_warning_aggregates` | 키/bucket별 고유 집계, count·최초/최근 시각·억제·종료·결정 상태 |
+| `ai_warning_events` | 집계와 실제 detection event FK·원본 Window 연결. 이벤트 ID 중복 저장 방지 |
+
+완료의 입력 수는 추론+사유별 제외, 추론 수는 정상+이상과 일치해야 합니다. 같은 원본 Window의
+재시도는 합산하거나 관측 시각을 새 실행처럼 갱신하지 않습니다. `device_key=''`는 입력 없는
+Stage 표지이며 등록 기기로 반환하지 않습니다. 기기를 식별하지 못한 Packet 입력도 임의 기기의
+성공으로 만들지 않고 Stage 선택 행 수와 구분합니다. 과거 완료 기록은 실패로 덮지 않습니다.
+
+저장 함수는 caller의 Session을 사용하고 commit하지 않습니다. Stage 성공 기록·기기 결과·경고·
+이벤트·Checkpoint가 같은 트랜잭션에서 확정됩니다. 실패 관측은 기존 rollback 후 별도 짧은
+트랜잭션으로 기록합니다. API는 명시적인 읽기 트랜잭션을 사용하고 JSON을 공개 필드로 검증합니다.
+
+WarningLedger는 매번 해당 키의 최신/대상 bucket과 notification 상태를 복원합니다. rollback된
+메모리 집계를 재사용하지 않으며 전체 과거 ledger를 매 Cycle 읽지 않습니다. 원본 이벤트는
+삭제·재작성하지 않습니다. 동일 정책 버전에 다른 W/N/C를 붙이면 저장을 거부합니다.
+명시적 전량 제외·Stage 전체 무입력은 열린 집계를 `INPUT_INTERRUPTED`로 닫습니다. 이후 지연
+자료는 보존하지만 재통지하지 않습니다. 다른 기기 입력이 계속되는 동안 특정 기기만 무수신인
+상태는 완료 기록이 없어 이 저장 계층에서 자동 판정하지 않습니다.
+기기·기간 집계 조회 및 제한된 원본 이벤트 조회용 Index를 추가합니다.
+
+## ai_stage_activations
+
+Migration 015는 AI Stage별 최초 승인 시작 경계를 불변 저장합니다. Stage·source table·모델
+version/SHA256·경계 B·계획 hash/JSON·적용 시각을 담고 Stage마다 한 행만 허용합니다.
+계획에는 이전 Checkpoint, Trust/required Stage 경계, 과거 제외 범위·행 수·내용 hash,
+승인자·사유·준비 시각과 검토한 실행 구성을 보존합니다. UPDATE·DELETE는 거부합니다.
+
+준비는 읽기 전용입니다. 명시적 적용은 기존 Orchestrator 잠금과 하나의 DB 트랜잭션 안에서
+계획을 다시 검증하고 감사와 해당 Stage의 시작 Checkpoint만 함께 기록합니다. 재시도는 같은
+계획과 실제 저장 결과를 대조하고 이미 전진한 처리 위치를 되돌리지 않습니다. Migration은
+승인 행을 seed하지 않습니다. 모델 교체·새 승인 이력 확장은 별도 작업입니다.
+사용법과 범위는 [기기별 추론 연결 절차](phase9-ai-policy-runtime.md)를 참고합니다.
 
 ## 주요 Index
 

@@ -315,9 +315,9 @@ def test_runner_applies_new_database_in_order(tmp_path: Path) -> None:
     result = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        assert result.applied_versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         assert result.baselined_versions == []
-        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         assert _table_exists(connection, "packet_capture_sessions")
         assert _table_exists(connection, "trust_score_history")
 
@@ -491,7 +491,7 @@ def test_packet_checkpoint_recovery_migration_applies_005_to_existing_004(
             ).fetchall()),
         }
     result = apply_migrations(db_path, MIGRATIONS_DIR)
-    assert result.applied_versions == [5, 6, 7, 8, 9, 10, 11, 12]
+    assert result.applied_versions == [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     with connect_database(db_path) as connection:
         after = {
             "checkpoints": tuple(connection.execute(
@@ -783,6 +783,30 @@ def test_applied_migration_record_requires_matching_sql_file(tmp_path: Path) -> 
         assert not _table_exists(connection, "version_two")
 
 
+def test_renumbered_migration_is_rejected_before_pending_sql(tmp_path: Path) -> None:
+    db_path = tmp_path / "renumbered.db"
+    migrations_dir = tmp_path / "migrations"
+    migrations_dir.mkdir()
+    old = migrations_dir / "001_old_feature.sql"
+    old.write_text("CREATE TABLE original (value TEXT);", encoding="utf-8")
+    apply_migrations(db_path, migrations_dir)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("INSERT INTO original VALUES ('keep')")
+        before = connection.execute("SELECT * FROM schema_migrations").fetchall()
+    old.rename(migrations_dir / "001_replacement_feature.sql")
+    (migrations_dir / "002_pending.sql").write_text(
+        "CREATE TABLE pending (id INTEGER);", encoding="utf-8"
+    )
+
+    with pytest.raises(MigrationError, match="001 name mismatch"):
+        apply_migrations(db_path, migrations_dir)
+
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("SELECT * FROM original").fetchall() == [("keep",)]
+        assert connection.execute("SELECT * FROM schema_migrations").fetchall() == before
+        assert connection.execute("SELECT name FROM sqlite_master WHERE name='pending'").fetchall() == []
+
+
 def test_partial_legacy_db_is_not_baselined_or_auto_repaired(
     tmp_path: Path,
 ) -> None:
@@ -1009,8 +1033,8 @@ def test_runner_applies_002_and_003_to_existing_001_db_and_preserves_rows(
 
     with connect_database(db_path) as connection:
         assert result.baselined_versions == [1]
-        assert result.applied_versions == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        assert result.applied_versions == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         device = connection.execute(
             "SELECT device_id, status, trust_score FROM devices"
         ).fetchone()
@@ -1051,10 +1075,10 @@ def test_runner_skips_already_applied_migrations(tmp_path: Path) -> None:
     second = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert first.applied_versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        assert first.applied_versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         assert second.applied_versions == []
-        assert second.skipped_versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        assert second.skipped_versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 
 
 def test_runner_sorts_migration_files_by_version(tmp_path: Path) -> None:
@@ -1189,8 +1213,8 @@ def test_failed_002_migration_can_be_retried_after_fix(tmp_path: Path) -> None:
     result = apply_migrations(db_path, migrations_dir)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        assert result.applied_versions == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         assert not _table_exists(connection, "retry_marker")
         assert _table_exists(connection, "packet_capture_sessions")
         assert "failed_retry_column" not in _column_names(
@@ -2188,8 +2212,8 @@ def test_phase4_migration_applies_003_to_existing_002_and_preserves_segments(
     result = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        assert result.applied_versions == [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         assert {
             "actual_capture_started_at",
             "capture_stop_requested_at",
@@ -2867,8 +2891,8 @@ def test_trust_score_compensation_migration_applies_004_to_existing_003(
     result = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [4, 5, 6, 7, 8, 9, 10, 11, 12]
-        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        assert result.applied_versions == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         assert _table_exists(connection, "trust_score_compensations")
         assert tuple(
             connection.execute(

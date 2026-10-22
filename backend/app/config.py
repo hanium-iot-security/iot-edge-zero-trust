@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     orchestrator_enabled_stages: str = "mqtt_feature_rule,mqtt_message_rule"
     orchestrator_required_stages: str = "mqtt_feature_rule,mqtt_message_rule"
     orchestrator_lock_path: str = ""
+    # Opt-in until the runtime evidence migration is installed.
+    runtime_evidence_enabled: bool = False
+    ai_device_policy_enabled: bool = False
+    ai_warning_policy_version: str = ""
+    ai_warning_window_seconds: int | None = None
+    ai_warning_count_threshold: int | None = None
+    ai_warning_cooldown_seconds: int | None = None
     # AI inference/checkpoints keep running in both modes. Only Trust changes.
     trust_ai_mode: Literal["enforce", "observe"] = "enforce"
 
@@ -75,10 +82,19 @@ class Settings(BaseSettings):
     capture_time_epsilon_seconds: float = 0.01
     capture_policy_version: str = "packet-capture-policy-v1"
 
+    # MQTT Isolation Forest: all empty keeps the legacy joblib loader.
+    mqtt_if_artifact_dir: str = ""
+    mqtt_if_expected_model_version: str = ""
+    mqtt_if_expected_bundle_sha256: str = ""
+
     # Packet Isolation Forest
     packet_if_artifact_dir: str = ""
     packet_if_expected_model_version: str = ""
     packet_if_expected_bundle_sha256: str = ""
+
+    # Explicit IPv4/TCP 1883 Broker target; empty IP leaves its metric unknown.
+    broker_target_ip: str = ""
+    broker_target_port: int = 1883
 
     # Packet Rule Detector
     packet_rule_packet_rate_threshold: float = 10.0
@@ -88,7 +104,7 @@ class Settings(BaseSettings):
     packet_rule_broker_dos_tcp_syn_threshold: int = 10
     packet_rule_broker_dos_mqtt_packet_threshold: int = 20
     packet_rule_excluded_peer_ips: str = ""
-    packet_rule_policy_version: str = "packet-rule-policy-v3"
+    packet_rule_policy_version: str = "packet-rule-policy-v4"
 
     # Firewall Worker
     firewall_worker_interval_seconds: float = 5.0

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from backend.app.config import Settings, settings
 from edge.detection.detector_contract import DetectorStage
@@ -30,6 +31,10 @@ from edge.detection.packet_rule_detector import (
 )
 from edge.orchestration.packet_stage_readiness import PacketFeatureReadyStage
 from edge.packet.capture_policy import CapturePolicy
+
+if TYPE_CHECKING:
+    from edge.orchestration.runtime_evidence import RuntimeEvidence
+
 
 MQTT_FEATURE_RULE = "mqtt_feature_rule"
 MQTT_MESSAGE_RULE = "mqtt_message_rule"
@@ -78,7 +83,7 @@ def _build_packet_if(app_settings: Settings) -> DetectorStage:
 STAGE_BUILDERS: dict[str, StageBuilder] = {
     MQTT_FEATURE_RULE: lambda _settings: MqttFeatureRuleStage(),
     MQTT_MESSAGE_RULE: lambda _settings: MqttMessageRuleStage(),
-    MQTT_IF: lambda _settings: MqttIsolationForestStage(),
+    MQTT_IF: lambda app_settings: MqttIsolationForestStage.from_settings(app_settings=app_settings),
     PACKET_RULE: _build_packet_rule,
     PACKET_IF: _build_packet_if,
 }
@@ -98,6 +103,7 @@ class ConfiguredStage:
 @dataclass(frozen=True)
 class StageRegistry:
     stages: tuple[ConfiguredStage, ...]
+    runtime_evidence: RuntimeEvidence | None = None
 
     @property
     def detector_stages(self) -> tuple[DetectorStage, ...]:
@@ -145,6 +151,7 @@ def build_stage_registry(
     enabled: Sequence[str],
     required: Sequence[str],
     app_settings: Settings = settings,
+    runtime_evidence: RuntimeEvidence | None = None,
 ) -> StageRegistry:
     enabled_names = tuple(enabled)
     required_names = set(required)
@@ -170,10 +177,16 @@ def build_stage_registry(
     for name in enabled_names:
         try:
             stage = STAGE_BUILDERS[name](app_settings)
-        except (OSError, ValueError) as exc:
-            raise StageConfigurationError(
-                f"failed to configure stage {name!r}: {exc}"
-            ) from exc
+        except Exception as exc:
+            if runtime_evidence is not None:
+                runtime_evidence.stage_failed(name, "STAGE_INITIALIZATION_FAILED")
+            if isinstance(exc, (OSError, ValueError)):
+                raise StageConfigurationError(
+                    f"failed to configure stage {name!r}: {exc}"
+                ) from exc
+            raise
+        if runtime_evidence is not None:
+            runtime_evidence.register_stage(name, stage)
         configured_stages.append(
             ConfiguredStage(
                 name=name,
@@ -181,12 +194,15 @@ def build_stage_registry(
                 required=name in required_names,
             )
         )
-    return StageRegistry(stages=tuple(configured_stages))
+    return StageRegistry(stages=tuple(configured_stages), runtime_evidence=runtime_evidence)
 
 
-def load_stage_registry(app_settings: Settings = settings) -> StageRegistry:
+def load_stage_registry(
+    app_settings: Settings = settings, *, runtime_evidence: RuntimeEvidence | None = None,
+) -> StageRegistry:
     return build_stage_registry(
         enabled=parse_stage_names(app_settings.orchestrator_enabled_stages),
         required=parse_stage_names(app_settings.orchestrator_required_stages),
         app_settings=app_settings,
+        runtime_evidence=runtime_evidence,
     )

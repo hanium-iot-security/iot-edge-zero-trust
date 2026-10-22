@@ -206,9 +206,9 @@ def test_same_bytes_snapshot_used_even_if_all_files_replaced(tmp_path, monkeypat
     reads = Counter()
     original_read = bundle._read_regular_file
 
-    def counted(path):
+    def counted(path, **kwargs):
         reads[path.name] += 1
-        return original_read(path)
+        return original_read(path, **kwargs)
 
     monkeypatch.setattr(bundle, "_read_regular_file", counted)
     inspection = _inspect(directory)
@@ -424,3 +424,53 @@ def test_invalid_inference_scores_fail_closed(tmp_path, monkeypatch, scores) -> 
     monkeypatch.setattr(artifact.model, "decision_function", lambda matrix: scores)
     with pytest.raises(ValueError, match="invalid decision scores"):
         bundle.score_mqtt_feature_rows(artifact, [_row()])
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5])
+def test_invalid_inspection_size_limit_rejected_before_read(tmp_path, monkeypatch, limit):
+    monkeypatch.setattr(bundle, "_read_regular_file", lambda *args, **kwargs: pytest.fail("unexpected read"))
+    with pytest.raises(ValueError, match="positive integer"):
+        bundle.inspect_mqtt_if_bundle(tmp_path, expected_bundle_sha256="a" * 64, maximum_file_bytes=limit)
+
+
+def test_inspection_size_limit_allows_exact_boundary_and_rejects_oversize(tmp_path, monkeypatch):
+    directory = tmp_path / "bundle"
+    _fixture(directory, stored_object={"opaque": "no model deserialization"})
+    pin = _pin(directory)
+    largest = max((directory / name).stat().st_size for name in bundle.MQTT_IF_BUNDLE_FILENAMES)
+    monkeypatch.setattr(bundle.joblib, "load", _never_unpickle)
+    assert bundle.inspect_mqtt_if_bundle(directory, expected_bundle_sha256=pin,
+                                        maximum_file_bytes=largest).bundle_sha256 == pin
+    with pytest.raises(ValueError, match="size limit"):
+        bundle.inspect_mqtt_if_bundle(directory, expected_bundle_sha256=pin, maximum_file_bytes=largest - 1)
+
+
+def test_size_limit_bounds_actual_read_when_file_grows_after_stat(tmp_path, monkeypatch):
+    path = tmp_path / "growing-model"
+    path.write_bytes(b"small")
+    original_fdopen = bundle.os.fdopen
+    reads = []
+
+    class GrowingStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.stream.close()
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def read(self, size=-1):
+            reads.append(size)
+            with path.open("ab") as writer:
+                writer.write(b"larger than the read limit")
+            return self.stream.read(size)
+
+    monkeypatch.setattr(bundle.os, "fdopen", lambda *args: GrowingStream(original_fdopen(*args)))
+    with pytest.raises(ValueError, match="size limit"):
+        bundle._read_regular_file(path, maximum_file_bytes=8)
+    assert reads == [9]

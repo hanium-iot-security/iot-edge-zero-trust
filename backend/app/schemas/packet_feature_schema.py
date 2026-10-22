@@ -21,6 +21,9 @@ class PacketFeatureItem(BaseModel):
     mean_inter_arrival_time: float
     distinct_dest_port_count: int
     tcp_syn_count: int
+    broker_target_ip: str | None = None
+    broker_target_port: Literal[1883] | None = None
+    broker_target_syn_count: int | None = None
     mqtt_related_packet_count: int
     non_mqtt_tcp_udp_packet_count: int
     packets_per_second: float
@@ -43,3 +46,4 @@ class PacketFeatureItem(BaseModel):
 class PacketFeatureListResponse(BaseModel):
     items: list[PacketFeatureItem]
     total: int
+    snapshot_max_id: int

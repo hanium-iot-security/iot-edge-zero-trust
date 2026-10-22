@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ai.mqtt_if_artifact import (
+    MQTTIFArtifact, inspect_mqtt_if_bundle, load_inspected_mqtt_if_artifact,
+)
+from backend.app.config import Settings, settings
 from edge.detection import runtime_checkpoint_repository as checkpoints
-from edge.detection.ai_detector import DEFAULT_MODEL_PATH, predict_feature_window
+from edge.detection.ai_detector import (
+    DEFAULT_MODEL_PATH, load_model, predict_bundle_feature_window, predict_feature_window,
+)
+from edge.detection.ai_run_evidence import AICompletionCollector, AICompletionRecord
 from edge.detection.detection_event_writer import write_detection_event
 from edge.detection.detector_contract import DetectorRunResult, validate_cycle_window
 from edge.detection.phase4_time import (
@@ -27,8 +35,10 @@ from edge.detection.rule_detector import (
     detect_feature_rules,
     detect_mqtt_rules,
 )
+from edge.policy.ai_runtime_selector import load_ai_runtime_selector
 from edge.policy.repository import load_policy_resolver
-from edge.policy.resolver import DevicePolicyRevision, POLICY_AVAILABLE
+from edge.policy.resolver import DevicePolicyRevision, POLICY_AVAILABLE, PolicyResolution
+from edge.policy.ai_window_decision import AIWindowDecision, require_observe_trust_mode
 from edge.trust.trust_policy import POLICY_UNAVAILABLE, incident_family_for_event
 from edge.maintenance.processing import maintenance_windows, overlaps_maintenance, require_processing_cutoff
 
@@ -289,8 +299,68 @@ class MqttIsolationForestStage:
     source_table = "feature_logs"
     policy_version = MQTT_IF_POLICY_VERSION
 
-    def __init__(self, *, model_path: Path = DEFAULT_MODEL_PATH) -> None:
+    def __init__(
+        self, *, model_path: Path = DEFAULT_MODEL_PATH,
+        artifact: MQTTIFArtifact | None = None,
+        ai_window_selector: Callable[[PolicyResolution], AIWindowDecision] | None = None,
+        completion_sink: Callable[[Session, tuple[AICompletionRecord, ...]], None] | None = None,
+        trust_ai_mode: str | None = None,
+        ai_device_policy_enabled: bool = False,
+    ) -> None:
+        if ai_device_policy_enabled and ai_window_selector is not None:
+            raise ValueError("stored AI policy and an external selector cannot be combined")
+        if ai_device_policy_enabled and artifact is None:
+            raise ValueError("AI_DEVICE_POLICY_ENABLED requires a pinned MQTT Bundle")
+        if ai_window_selector is not None or artifact is not None or ai_device_policy_enabled:
+            require_observe_trust_mode(
+                settings.trust_ai_mode if trust_ai_mode is None else trust_ai_mode
+            )
         self.model_path = model_path
+        if artifact is not None and model_path != DEFAULT_MODEL_PATH:
+            raise ValueError("configure either a MQTT Bundle or a legacy model path")
+        self.artifact = artifact
+        self.bundle_evidence = {}
+        if artifact is not None:
+            metadata = artifact.inspection.metadata
+            self.bundle_evidence = {key: metadata[key] for key in (
+                "feature_version", "feature_order", "transform_version", "score_method",
+                "score_direction", "threshold_operator", "threshold_source", "interval_semantics",
+            )}
+            self.policy_version = (
+                f"{MQTT_IF_POLICY_VERSION}:{artifact.inspection.model_version}:"
+                f"{artifact.inspection.bundle_sha256[:12]}"
+            )
+        self.ai_device_policy_enabled = ai_device_policy_enabled
+        self.ai_window_selector = ai_window_selector
+        self.completion_sink = completion_sink
+
+    @classmethod
+    def from_settings(
+        cls, *, app_settings: Settings = settings,
+        ai_window_selector: Callable[[PolicyResolution], AIWindowDecision] | None = None,
+        completion_sink: Callable[[Session, tuple[AICompletionRecord, ...]], None] | None = None,
+    ) -> "MqttIsolationForestStage":
+        if app_settings.ai_device_policy_enabled:
+            require_observe_trust_mode(app_settings.trust_ai_mode)
+            if ai_window_selector is not None:
+                raise ValueError("stored AI policy and an external selector cannot be combined")
+        configured = (app_settings.mqtt_if_artifact_dir.strip(),
+                      app_settings.mqtt_if_expected_model_version.strip(),
+                      app_settings.mqtt_if_expected_bundle_sha256.strip())
+        artifact = None
+        if any(configured):
+            if not all(configured):
+                raise ValueError("MQTT_IF_ARTIFACT_DIR, MQTT_IF_EXPECTED_MODEL_VERSION and "
+                                 "MQTT_IF_EXPECTED_BUNDLE_SHA256 must be configured together")
+            require_observe_trust_mode(app_settings.trust_ai_mode)
+            inspection = inspect_mqtt_if_bundle(
+                Path(configured[0]), expected_model_version=configured[1],
+                expected_bundle_sha256=configured[2],
+            )
+            artifact = load_inspected_mqtt_if_artifact(inspection)
+        return cls(artifact=artifact, ai_window_selector=ai_window_selector,
+                   completion_sink=completion_sink, trust_ai_mode=app_settings.trust_ai_mode,
+                   ai_device_policy_enabled=app_settings.ai_device_policy_enabled)
 
     def run_until(
         self,
@@ -303,11 +373,31 @@ class MqttIsolationForestStage:
             cycle_range_start=cycle_range_start,
             cycle_cutoff=cycle_cutoff,
         )
-        before = _checkpoint_before(db, self.detector_name, self.source_table)
+        if self.ai_window_selector is not None and self.artifact is None:
+            # OFF is a policy decision, not proof that an enabled model stage
+            # is healthy. A missing/broken model must not advance its CP.
+            load_model(self.model_path)
+        selector = self.ai_window_selector
+        if self.ai_device_policy_enabled:
+            selector = load_ai_runtime_selector(
+                db, stage_name=self.detector_name, source_table=self.source_table,
+                model_version=self.artifact.inspection.model_version,
+                bundle_sha256=self.artifact.inspection.bundle_sha256,
+                cycle_range_start=range_start)
+            before = selector.checkpoint
+            resolver = selector.resolver
+            if cutoff <= before["last_completed_window_end"]:
+                return replace(_run_result(self.detector_name, self.source_table,
+                                           range_start, cutoff, [], 0, before,
+                                           before["last_processed_id"]),
+                               completed_window_end_after=before["last_completed_window_end"])
+            range_start = before["last_completed_window_end"]
+        else:
+            before = _checkpoint_before(db, self.detector_name, self.source_table)
+            resolver = load_policy_resolver(db)
         require_processing_cutoff(db, cutoff)
         maintenance = maintenance_windows(db)
         device_ips = _registered_device_ips(db)
-        resolver = load_policy_resolver(db)
         rows = _select_feature_rows(
             db,
             range_start=range_start,
@@ -316,18 +406,41 @@ class MqttIsolationForestStage:
 
         created_count = 0
         last_processed_after = before["last_processed_id"]
+        completion = AICompletionCollector(self.detector_name)
         for row in rows:
             source_id = int(row["id"])
             last_processed_after = _max_optional_id(last_processed_after, source_id)
             feature_row = dict(row)
             window_start = parse_db_utc(feature_row["window_start"], "window_start")
-            if overlaps_maintenance(maintenance, window_start, parse_db_utc(feature_row["window_end"], "window_end")):
-                continue
+            device_id = str(feature_row["device_id"])
+            completion.input(device_id, window_start)
             resolution = (
                 resolver.resolve(str(feature_row["device_id"]), window_start)
                 if resolver is not None else None
             )
-            result = predict_feature_window(feature_row, self.model_path)
+            ai_decision = None
+            if selector is not None:
+                if resolution is None:
+                    raise RuntimeError("Phase 9 AI policy requires a registration snapshot")
+                ai_decision = selector(resolution)
+                if not ai_decision.infer:
+                    completion.exclude(device_id, window_start, ai_decision.reason,
+                                       ai_revision=ai_decision.ai_revision,
+                                       ai_mode=ai_decision.mode)
+                    continue
+            if overlaps_maintenance(maintenance, window_start, parse_db_utc(feature_row["window_end"], "window_end")):
+                completion.exclude(device_id, window_start, "MAINTENANCE",
+                                   ai_revision=ai_decision.ai_revision if ai_decision else None,
+                                   ai_mode=ai_decision.mode if ai_decision else None)
+                continue
+            result = (predict_bundle_feature_window(feature_row, self.artifact)
+                      if self.artifact is not None else predict_feature_window(feature_row, self.model_path))
+            completion.inferred(
+                device_id, window_start, anomaly=bool(result["is_anomaly"]),
+                model_version=result.get("model_version"), bundle_sha256=result.get("bundle_sha256"),
+                ai_revision=(ai_decision.ai_revision if ai_decision else None),
+                ai_mode=(ai_decision.mode if ai_decision else None),
+            )
             if not result["is_anomaly"]:
                 continue
             event_type = result["event_type"]
@@ -363,8 +476,26 @@ class MqttIsolationForestStage:
                         "prediction": result["prediction"],
                         "anomaly_score": result["anomaly_score"],
                     },
-                    "thresholds": {},
-                    "model_version": self.policy_version,
+                    "thresholds": ({"anomaly_score": result["threshold"], "operator": "<"}
+                                   if self.artifact is not None else {}),
+                    "model_version": result.get("model_version"),
+                    "bundle_sha256": result.get("bundle_sha256"),
+                    "detection_policy_version": MQTT_IF_POLICY_VERSION,
+                    **self.bundle_evidence,
+                    **({key: result[key] for key in (
+                        "raw_decision_score", "feature_values", "interval_is_fallback",
+                    )} if self.artifact is not None else {}),
+                    "device_ai_revision": (
+                        ai_decision.ai_revision if ai_decision is not None else None
+                    ),
+                    "device_ai_mode": (
+                        ai_decision.mode if ai_decision is not None else None
+                    ),
+                    "ai_approved_start": (
+                        format_db_utc(ai_decision.approved_start)
+                        if ai_decision is not None and ai_decision.approved_start is not None
+                        else None
+                    ),
                     "cycle_range_start": format_db_utc(range_start),
                     "cycle_cutoff": format_db_utc(cutoff),
                     "window_start": format_db_utc(window_start),
@@ -379,6 +510,9 @@ class MqttIsolationForestStage:
             if written.inserted:
                 created_count += 1
 
+        completion_records = completion.records(cutoff)
+        if self.completion_sink is not None:
+            self.completion_sink(db, completion_records)
         _advance_checkpoint(
             db,
             detector_name=self.detector_name,
@@ -387,7 +521,7 @@ class MqttIsolationForestStage:
             completed_window_end=cutoff,
             updated_at=cutoff,
         )
-        return _run_result(
+        return replace(_run_result(
             self.detector_name,
             self.source_table,
             range_start,
@@ -396,7 +530,7 @@ class MqttIsolationForestStage:
             created_count,
             before,
             last_processed_after,
-        )
+        ), ai_completion_records=completion_records)
 
 
 def _checkpoint_before(

@@ -10,15 +10,20 @@ Phase 8 기기 등록·정책 API는 [기기 정책 v1 계약](contracts/device-
 ```txt
 GET /api/health
 GET /api/models
+GET /api/runtime-status
+GET /api/ai-warnings
 GET /api/dashboard/summary
 GET /api/devices
 GET /api/devices/{device_id}
 POST /api/devices
 GET /api/devices/{device_id}/policy
 POST /api/devices/{device_id}/policy-revisions
+GET /api/devices/{device_id}/ai-policy
+POST /api/devices/{device_id}/ai-policy-revisions
 GET /api/mqtt-logs
 GET /api/feature-logs
 GET /api/packet-feature-logs
+GET /api/packet-capture-windows
 GET /api/gateway-metrics
 GET /api/detection-events
 GET /api/trust-score/summary
@@ -26,6 +31,7 @@ GET /api/trust-score/{device_id}/history
 GET /api/trust-score/compensations
 GET /api/isolation/history
 GET /api/firewall-rules
+GET /api/firewall-runtime-status
 POST /api/firewall-rules/{source_rule_id}/scope-extension-requests
 POST /api/firewall-rules/{rule_id}/release-requests
 GET /api/firewall-release-requests/{request_id}
@@ -112,11 +118,143 @@ auto_response_eligible, auto_response_exclusion_reason
 loopback 또는 HTTPS 경로에서 전송합니다. 세부 절차는
 [기기 정책 API 운영 확인](device-policy-api-runbook.md)을 따릅니다.
 
+## Device AI 설정 APIs
+
+Migration 012의 기기별 AI 설정을 읽고 새 revision으로 변경합니다. 기존 등록·Rule 정책
+API와 응답은 유지합니다. 선택 모드 저장만 수행하며 Stage 활성화, 모델 로딩, 시작
+Checkpoint 적용, 추론·Trust·방화벽 실행은 하지 않습니다. 실제 실행 상태와 구분해야 합니다.
+
+| 경로 | 요청·응답 |
+| --- | --- |
+| `GET /api/devices/{device_id}/ai-policy` | 관리자 키 없이 200 `{device_id,server_time,latest_revision,current,pending}` |
+| `POST /api/devices/{device_id}/ai-policy-revisions` | 기존 `X-Recovery-Admin-Key` 인증. 아래 세 필드만 입력하고 저장 후 201로 GET과 같은 구조 반환 |
+
+```json
+{
+  "expected_revision": 1,
+  "mode": "OBSERVE",
+  "reason": "검토한 후보의 관찰 설정"
+}
+```
+
+`expected_revision`은 양의 정수이며 숫자 문자열·실수·bool을 거부합니다. `mode`는
+`OFF` 또는 `OBSERVE`만 허용합니다. 사유는 기존 정책과 동일하게 앞뒤 공백 제거 후
+1~500자이며 제어 문자를 거부합니다. `created_by`, 효력 시각, 모델·Stage·기기 ID 등
+추가 필드를 입력할 수 없습니다. 작성자는 서버의 인증 principal입니다.
+
+current/pending은 null 또는 `device_id,revision,mode,effective_from,created_at,created_by,reason`
+객체입니다. 등록 직후에는 current=null, pending=OFF revision 1일 수 있습니다. 누락되거나
+손상된 AI 설정을 OFF로 만들어 반환하지 않습니다.
+
+쓰기 잠금 후 정한 시각의 **엄격히 다음 UTC 10초 경계**에 효력이 시작됩니다. 공용
+Firewall 파일 잠금 → DB 쓰기 잠금 순서를 기존 정책 명령과 공유하며 이전 revision은
+변경하지 않습니다. POST의 server_time/current/pending은 접수 시각 기준이므로 저장 후와
+효력 경계 이후에는 GET으로 확인합니다. 충돌·응답 유실 시 자동 재전송하지 않고 GET으로
+실제 저장 여부를 확인합니다.
+
+OBSERVE 변경은 `TRUST_AI_MODE=observe`일 때만 허용하고 DISABLED 기기는 거부합니다.
+OFF 변경과 GET은 전역 enforce에서도 허용합니다. OFF 저장 역시 실행 중 Stage를 끄거나
+즉시 처리를 중단하는 명령은 아닙니다. 기기별 설정의 Runtime 연결은 #118의 후속 통합입니다.
+
+| 상태 | 의미 |
+| --- | --- |
+| 401 | 관리자 키 누락·불일치 |
+| 404 | 미등록 기기 |
+| 409 | `REVISION_CONFLICT`, `PENDING_REVISION_EXISTS`, `NO_POLICY_CHANGE`, `STATE_TRANSITION_BLOCKED`, `POLICY_WRITE_BUSY` |
+| 422 | 잘못된 경로 ID·자료형·사유·모드 또는 추가 필드. ENFORCE 거부 |
+| 503 | 관리자 인증 설정 없음, AI Migration·이관·설정 불가/손상 또는 OBSERVE의 전역 모드 조건 불충족 |
+
+AI 설정 관련 503 코드는 `AI_POLICY_UNAVAILABLE`입니다. 기존 Rule 정책의 기반 스키마부터
+없으면 공용 연결의 `POLICY_UNAVAILABLE`, 잠금 설정이 잘못되면 `DEVICE_POLICY_CONFIG_UNAVAILABLE`을
+유지합니다. 409의 revision 충돌·예정 충돌은 기존 형식의 current_revision/pending_revision/latest_revision을
+제공하고, 422는 입력 원문 없이 type/loc/msg만 반환합니다.
+
+운영에서는 Migration 012와 기존 기기의 승인 목록 이관을 먼저 마쳐야 합니다. API 요청으로
+Migration·이관을 실행하지 않으며, Pi 적용과 기기별 실제 추론·화면 연결은 별도 검증 대상입니다.
+
+## 실제 실행 근거와 AI 경고 조회
+
+두 API는 관리자 키 없는 읽기 전용입니다. Migration 014이 필요하며 요청 중 Migration·
+모델 로딩·Stage 활성화·서비스 제어를 수행하지 않습니다. SQLite의 한 읽기 snapshot에서
+실행 관측과 완료 기록 또는 경고 목록·total을 함께 읽습니다.
+
+### GET /api/runtime-status
+
+선택적인 `device_id`는 completion 목록만 필터링합니다. Stage 관측은 프로세스 전체 정보입니다.
+기존 등록 API와 동일한 대소문자·숫자·밑줄·하이픈 ID를 허용합니다.
+
+- `server_time`, `observed_at`, `run_id`, `boot_id`: 응답 시각과 실제 Orchestrator 관측의 출처.
+- `status`: 같은 Boot에서 45초 이내에 관측한 STARTING/RUNNING/FAILED/STOPPED 또는 UNKNOWN.
+  이는 마지막 관측 결과이며 현재 프로세스 생존을 보장하는 값이 아닙니다.
+- `last_observation_status`: 만료되어도 보존하는 마지막 기록의 상태.
+- `freshness`, `age_seconds`, `max_age_seconds`, `reason_code`: FRESH/STALE/MISSING/FUTURE/
+  BOOT_MISMATCH/BOOT_UNAVAILABLE 구분. 미래·다른 Boot·Boot 확인 불가도 UNKNOWN입니다.
+  Windows처럼 `/proc` Boot ID가 없는 환경에서 임의의 현재 Boot를 만들지 않습니다.
+- `stages`: 실제 실행 프로세스의 enabled/required, 초기화·완료·무입력·실패 관측,
+  실제 모델 version/hash, 마지막 완료 데이터 경계·입력 ID, 선택 행·이벤트 수.
+  `trust_ai_mode`는 실행 Cycle의 전역 Trust 모드이며 기기별 AI 선택 모드와 다릅니다.
+  `ai_device_policy_enabled`는 실제 Stage의 저장 정책 연결 사용 여부입니다. 과거 관측에는 null일 수 있습니다.
+- `completions`: 기기·탐지기별 마지막 원본 Window의 입력/추론/정상/이상/사유별 제외 수,
+  실제 모델·AI revision/mode와 run/Boot/관측 시각. CURRENT는 같은 최근 실행의 근거,
+  HISTORICAL은 이전 실행·오래된 근거입니다. CURRENT도 해당 기기의 현재 추론 성공 보장은 아닙니다.
+
+정상 추론은 `normal_count`로 확인하며 이벤트 없음·Checkpoint·API 설정으로 추정하지 않습니다.
+무입력은 `device_id=null, window_start=null`의 Stage 기록으로만 남깁니다. 다른 기기 전진이나
+빈 목록을 선택 기기의 정상으로 바꾸지 않습니다. 처리한 원본 Window 경계와 실제 관측 시각은
+서로 다르며, 과거 자료 replay가 최근 실행됐더라도 최근 데이터 처리 완료를 뜻하지 않습니다.
+현재 정책은 기존 `ai-policy` API에서 별도로 조회하며 완료 기록의 과거 revision을 덮지 않습니다.
+
+저장소는 있으나 관측이 없으면 200 UNKNOWN/MISSING과 null 시각·빈 목록을 반환합니다.
+스키마 누락·저장 자료 손상·DB 읽기 실패는 503 `RUNTIME_EVIDENCE_UNAVAILABLE`입니다.
+마지막 성공 완료 자료는 이후 Stage 실패·프로세스 재시작으로 삭제하지 않습니다.
+
+### GET /api/ai-warnings
+
+`device_id`, timezone 포함 `from`/`to`, `limit`(기본100, 1~500), `offset`(기본0)을 받습니다.
+한쪽 시각만 지정할 수 있고 UTC로 비교합니다. 기간에 완전히 포함되는 집계 bucket만 반환하며
+경계는 포함합니다. 역순·timezone 누락·UTC 범위 초과는 422, 같은 시작/종료는 빈 기간입니다.
+`bucket_start DESC,id DESC` 정렬과 같은 필터의 `{items,total}`을 제공합니다.
+
+목록은 버전별 기준 N에 도달하고 경고 생성 결정 또는 cooldown 억제 이력이 있는 집계만 포함합니다.
+N 미달 집계와 중단 뒤 지연 자료로만 N에 도달한 집계는 내부 보존하되 새 경고로 표시하지 않습니다.
+항목에는 기기·탐지기·이벤트 유형·모델·경고 정책 버전, bucket 시작/끝, 중복 Window를 제외한 count,
+최초/최근 Window, `notified_at`, `suppressed_count`, `closed`, `last_decision`, `updated_at`,
+원본 `event_ids`/`analysis_windows`가 있습니다. `notified_at`은 집계기의 경고 생성 결정 시각이며
+외부 알림 전송 성공을 뜻하지 않습니다. 이 변경은 외부 메시지를 전송하지 않습니다.
+
+기기별 추론 0·명시적 제외 또는 Stage 전체 무입력은 열린 집계를 `INPUT_INTERRUPTED`로 닫습니다.
+이후 같은 bucket의 지연 자료는 참조에 추가하되 새 경고를 만들지 않습니다. 다른 기기는 계속
+입력되지만 특정 기기의 행만 누락된 경우에는 개별 무수신을 자동 판정하지 않습니다.
+
+`server_time`, `observed_at`, `source_status`, `reason_code`로 자료 생성 상태를 함께 제공합니다.
+FRESH/RUNNING 관측과 명시된 경고 정책이 있을 때 AVAILABLE, 기준이 미설정이면
+POLICY_UNCONFIGURED, 관측 없음·만료·실패 등은 UNKNOWN입니다. 과거 집계는 그대로 조회하므로
+AVAILABLE은 최근 관측과 정책 존재를 뜻하며 기기별 selector 연결·추론·알림 전송을 보장하지 않습니다.
+실제 기기별 처리는 runtime-status의 완료 근거로 별도 확인합니다. 스키마·자료·DB 오류는
+503 `AI_WARNING_DATA_UNAVAILABLE`이며 원본 SQL·설정 경로·예외 메시지를 노출하지 않습니다.
+
+### 실행 기록 연결 범위
+
+Migration 014 뒤 `RUNTIME_EVIDENCE_ENABLED=true`인 기존 Orchestrator에서만 기록을 발행합니다.
+성공 Stage 관측·AI 완료·경고 저장은 기존 이벤트·Checkpoint와 같은 트랜잭션입니다.
+저장 실패 시 함께 rollback하며 초기화·실행 실패는 rollback 후 별도 실패 관측을 시도합니다.
+실패 기록도 저장하지 못하면 기존 관측의 만료로 확인 불가를 표시하고 원래 오류를 보존합니다.
+새 상주 프로세스나 메시지별 상태 쓰기를 만들지 않습니다.
+
+반복 경고는 `AI_WARNING_POLICY_VERSION`, `AI_WARNING_WINDOW_SECONDS`,
+`AI_WARNING_COUNT_THRESHOLD`, `AI_WARNING_COOLDOWN_SECONDS`를 모두 명시해야 합니다.
+운영 W/N/C 기본값은 없고 일부 설정만 있으면 Orchestrator 기동을 거부합니다. 실제 저장된
+OBSERVE 이상 이벤트와 일치하는 완료 근거만 집계합니다. 저장된 기기별 OFF/OBSERVE 적용은
+`AI_DEVICE_POLICY_ENABLED=true`와 Migration 015의 모델별 승인 시작 기록이 별도로 필요합니다.
+[기기별 추론 연결 절차](phase9-ai-policy-runtime.md)를 따르며 조회 API나 관측 설정만으로
+Stage·모델을 활성화하지 않습니다. 독립 detector runner의 관측 저장·실제 Pi·부하·화면 연결은
+별도 검증 대상입니다.
+
 ## 모델 정보 API
 
 ### GET /api/models
 
-관리자 키를 요구하지 않는 공개 조회입니다. 서버에 설정된 Packet IF Artifact의
+관리자 키를 요구하지 않는 공개 조회입니다. 서버에 설정된 Packet IF·MQTT IF Bundle의
 계약과 실제 실행 상태를 구분하며, 모델 활성화·역직렬화·추론은 실행하지 않습니다.
 응답은 `200 {observed_at, models}`이고 `models`에는 `packet_if`, `mqtt_if`가 들어갑니다.
 Artifact를 읽을 수 없거나 계약이 잘못된 경우도 해당 항목의 상태로 반환합니다.
@@ -134,15 +272,19 @@ Artifact를 읽을 수 없거나 계약이 잘못된 경우도 해당 항목의 
 | `artifact_status` | 의미 |
 | --- | --- |
 | `BUNDLE_METADATA_VERIFIED` | 외부 설정의 Bundle SHA·모델 Version, 개별 모델/Report SHA, Metadata 계약과 Report UTF-8 JSON 객체 형태 확인 |
-| `UNCONFIGURED` | Packet Artifact 경로·기대 Version·기대 Bundle SHA 중 필수 설정 누락 |
+| `UNCONFIGURED` | 해당 Artifact 경로·기대 Version·기대 Bundle SHA 중 필수 설정 누락. MQTT는 세 설정 모두 비어 있으면 아래 legacy 상태 |
 | `UNAVAILABLE` | 필수 파일 누락 또는 읽기 권한/파일 접근 실패 |
 | `INVALID` | Hash·Version·Metadata 계약 불일치, 잘못된 Report 형태, 크기 상한 초과 또는 안전하지 않은 경로 |
-| `LEGACY_CONTRACT_UNAVAILABLE` | MQTT 기존 단일 Joblib 경로에 같은 외부 pin·Bundle·Metadata 계약이 준비되지 않음 |
+| `LEGACY_CONTRACT_UNAVAILABLE` | MQTT Bundle 설정이 모두 비어 있어 기존 단일 Joblib 경로 사용. 해당 경로는 외부 pin·Bundle·Metadata 계약 없음 |
 
 공개 Metadata에는 모델·Feature·변환·Dataset·정상 정책 Version, Feature 순서,
 Threshold와 비교 방향·출처, 생성 시각, Bundle/Dataset/Manifest SHA, 분할별 행 수와
 정해진 CapturePolicy 필드만 포함합니다. 선택적인 `normal_policy_version`은 null일 수
 있습니다. 내부 경로·임의 확장 필드·Report 원문과 평가 수치는 노출하지 않습니다.
+MQTT Bundle은 모델·Feature·변환 Version, 5개 Feature 순서, nominal 10초 Window,
+`decision_function` 점수·낮을수록 이상인 방향·엄격한 `<` Threshold·출처와 Bundle SHA,
+한 건 Window의 5.0초 대체 간격 의미를 반환합니다. MQTT 설정은
+`MQTT_IF_ARTIFACT_DIR`, `MQTT_IF_EXPECTED_MODEL_VERSION`, `MQTT_IF_EXPECTED_BUNDLE_SHA256`입니다.
 MQTT 정책 Version을 모델 Version으로 표시하지 않습니다.
 
 검증 성공 시 `bundle_sha256_verified`, `metadata_contract_verified`,
@@ -285,7 +427,36 @@ Root 프로세스 시작을 하지 않으며 `iot-edge-api.service`의 `NoNewPri
 후속이며 P9-06 전체 완료가 아닙니다. 검증 기록과 세부 계약은
 [모델 정보·복구 관리 API](phase9-model-management-api.md)를 참조합니다.
 
-## Packet Gateway Read APIs
+## Feature 및 Packet Gateway Read APIs
+
+### GET /api/feature-logs
+
+기존 MQTT Feature 목록에 선택적인 `from`·`to` 기간 필터를 제공합니다.
+
+- `device_id`: 기존 기기 필터
+- `from`, `to`: timezone이 있는 ISO 8601 시각. UTC로 비교하며 한쪽만 지정할 수 있습니다.
+- `limit`: 기본 100, 1~500. `offset`: 기본 0, 0 이상
+- `snapshot_max_id`: 첫 응답의 전역 Feature 최대 ID를 다음 페이지에 전달하는 선택 인자
+
+`window_start >= from`이고 `window_end <= to`인 **완전히 포함된 Window**만 반환합니다.
+경계와 같은 값은 포함하고, 일부만 겹치는 Window는 제외합니다. 기간의 끝과 시작이 같으면
+일반적인 10초 Window는 포함되지 않습니다. 잘못된 시각·timezone 누락·역순 기간은 422입니다.
+
+```text
+/api/feature-logs?device_id=esp32_01&from=2026-10-01T00:00:00Z&to=2026-10-01T01:00:00Z
+```
+
+응답은 `{items,total,snapshot_max_id}`입니다. 기존 `window_start DESC,id DESC` 정렬,
+페이지 처리와 응답의 저장 시각 원문은 유지합니다. total에도 동일한 기간·기기·최대 ID 필터가
+적용됩니다. 기존 Feature writer의 Window 경계는
+UTC 정수 초이며, 공백/T/Z/명시적 UTC offset 형식을 UTC 초로 비교합니다. 분수 초 요청은
+시작 경계를 올림·종료 경계를 내림하여 정수 초 Window의 포함 여부를 정확하게 판단합니다.
+기간을 생략하면 기존 조회와 같습니다.
+
+페이지 기준과 별도 Capture 관측은 [그래프용 읽기 API](phase9-graph-read-api.md)를 참조합니다.
+이 기준은 새로운 ID의 유입만 막으며 요청 사이 기존 행 수정·삭제까지 동결하지 않습니다.
+원본 MQTT 로그의 `received_at` 해석, 새 그래프·집계는 변경하지 않습니다. Feature 응답의
+단일 메시지 간격 값만으로 실제 송신 주기를 판정하지 않습니다.
 
 ### GET /api/packet-feature-logs
 
@@ -300,15 +471,31 @@ Query parameters:
 - `to`: timezone-aware ISO 8601 timestamp
 - `limit`: default `100`, minimum `1`, maximum `500`
 - `offset`: default `0`, minimum `0`
+- `snapshot_max_id`: optional insertion watermark returned by the first page
 
 Response wrapper:
 
 ```json
 {
   "items": [],
-  "total": 0
+  "total": 0,
+  "snapshot_max_id": 0
 }
 ```
+
+Each item also returns nullable `broker_target_ip`, `broker_target_port`, and
+`broker_target_syn_count` from the stored row. Migration 013 records the verified
+IPv4 destination, TCP port 1883, and inbound SYN=1/ACK=0 packet count in the
+original 10-second window (including retransmissions). Historical or unconfigured
+rows return all three as `null`; a measured zero is `0`. Current environment
+settings never rewrite the meaning of historical rows.
+
+The existing Packet time filter uses `window_start >= from` and `window_start <= to`.
+This differs from MQTT's complete-window containment. The separate bounded
+`GET /api/packet-capture-windows` requires `session_id`, `from`, and `to`, returns at
+most one hour/360 fully contained windows, and distinguishes stored READY, EMPTY,
+FAILED, PROCESSED and absent records. See [graph read API](phase9-graph-read-api.md)
+for pagination and capture-state semantics.
 
 Each item includes packet window fields from `packet_feature_logs`, the joined `session_id`, UTC `Z` timestamps, and derived values based on the fixed 10 second packet window:
 
@@ -553,6 +740,7 @@ Migration 011의 두 scope는 `MQTT_IPV4_TCP_1883`(Pi INPUT의 TCP 1883)와
 미검증입니다. 자동 신규 광역 격리 정책·광역 확장 승인 Frontend는 후속 미완료 범위입니다.
 
 ### GET /api/firewall-rules
+GET /api/firewall-runtime-status
 
 Query parameters:
 
@@ -606,6 +794,16 @@ MQTT scope의 `protocol`/`dest_port`는 `tcp`/`1883`이고 광역 scope에서는
 scope 필터는 제공하지 않으며 `status`, `device_id`, `source_ip`로 조회합니다.
 
 The backend only reads DB state. It does not run Firewall Worker logic or iptables.
+
+### GET /api/firewall-runtime-status
+
+공개 읽기 전용 API로 기존 5초 Firewall runtime Snapshot과 현재 DB fingerprint를
+확인합니다. `MATCH`, `MISMATCH`, `WAITING`, `UNKNOWN`과 `warnings`/`waiting` 목록,
+경고의 최초·최신 관측시각 및 관측 간 지속시간을 반환합니다. PENDING 작업·해제와
+관측 이후 DB 변경은 `WAITING`, stale/future/boot·스키마·관측 오류는 `UNKNOWN`입니다.
+자동 repair나 sudo/iptables 실행, DB 쓰기는 하지 않습니다. `MATCH`는 Recovery 승인과
+다르며 기존 대상별 Recovery Gate는 유지됩니다. 응답 필드와 Pi 검증 범위는
+[Phase 9 방화벽 주기 대조](phase9-firewall-consistency.md)를 참조합니다.
 
 ### POST /api/firewall-rules/{source_rule_id}/scope-extension-requests
 
@@ -954,6 +1152,7 @@ GET /api/trust-score/{device_id}/history
 GET /api/trust-score/compensations
 GET /api/isolation/history
 GET /api/firewall-rules
+GET /api/firewall-runtime-status
 POST /api/firewall-rules/{source_rule_id}/scope-extension-requests
 POST /api/firewall-rules/{rule_id}/release-requests
 GET /api/firewall-release-requests/{request_id}

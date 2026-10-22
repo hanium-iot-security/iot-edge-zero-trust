@@ -340,6 +340,9 @@ def test_observer_does_not_run_os_command_when_worker_lock_is_busy(recovery_env,
 
 def test_observer_os_read_holds_firewall_lock_but_no_db_write_lock(recovery_env, monkeypatch):
     database, _, runner, _ = recovery_env
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{database.as_posix()}")
+    monkeypatch.setattr(run_firewall_runtime_snapshot, "current_boot_id",
+                        lambda: "11111111-1111-4111-8111-111111111111")
 
     def verify_locks():
         with pytest.raises(RuntimeLockError):

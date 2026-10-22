@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from ipaddress import IPv4Address
 from typing import Any
 
 from sqlalchemy import bindparam, text
@@ -14,6 +15,37 @@ from edge.policy.repository import load_policy_resolver
 
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 RECONCILIATION_STATUS_BATCH_SIZE = 500
+
+BROKER_TARGET_COLUMNS = ("broker_target_ip", "broker_target_port", "broker_target_syn_count")
+
+
+def _has_broker_target_schema(db: Session) -> bool:
+    columns = {row[1] for row in db.execute(text("PRAGMA table_info(packet_feature_logs)"))}
+    present = set(BROKER_TARGET_COLUMNS) & columns
+    if present and present != set(BROKER_TARGET_COLUMNS):
+        raise ValueError("Packet Broker target schema is incomplete")
+    return bool(present)
+
+
+def require_broker_target_schema(db: Session) -> None:
+    if not _has_broker_target_schema(db):
+        raise ValueError("Packet Broker target evidence requires Migration 013")
+
+
+def _broker_target_values(row: dict[str, Any]) -> dict[str, Any]:
+    values = {name: row.get(name) for name in BROKER_TARGET_COLUMNS}
+    if all(value is None for value in values.values()):
+        return values
+    ip, port, count = (values[name] for name in BROKER_TARGET_COLUMNS)
+    if (not isinstance(ip, str) or type(port) is not int or port != 1883
+            or type(count) is not int or count < 0):
+        raise ValueError("Packet Broker evidence requires IPv4, port 1883 and a nonnegative integer count")
+    try:
+        if str(IPv4Address(ip)) != ip:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("Packet Broker target must be a canonical IPv4 address") from exc
+    return values
 
 
 def load_ip_device_map(db: Session) -> dict[str, str]:
@@ -171,8 +203,17 @@ def insert_packet_feature_rows(
     capture_scope: str,
 ) -> int:
     inserted_count = 0
+    has_broker_target = _has_broker_target_schema(db)
+    # Validate the whole batch before any feature insert, including legacy schemas.
+    broker_values = [_broker_target_values(row) for row in feature_rows]
+    if not has_broker_target and any(
+        value is not None for values in broker_values for value in values.values()
+    ):
+        raise ValueError("Packet Broker target evidence requires Migration 013")
+    extra_columns = ", " + ", ".join(BROKER_TARGET_COLUMNS) if has_broker_target else ""
+    extra_values = ", " + ", ".join(":" + name for name in BROKER_TARGET_COLUMNS) if has_broker_target else ""
     resolver = load_policy_resolver(db)
-    for row in feature_rows:
+    for row, broker in zip(feature_rows, broker_values):
         device_id = (
             resolver.device_id_for_ip(
                 str(row["peer_ip"]),
@@ -184,7 +225,7 @@ def insert_packet_feature_rows(
         # NOT NULL/CHECK failures still propagate so the caller can rollback.
         result = db.execute(
             text(
-                """
+                f"""
                 INSERT INTO packet_feature_logs (
                     capture_segment_id,
                     device_id,
@@ -201,7 +242,7 @@ def insert_packet_feature_rows(
                     tcp_syn_count,
                     mqtt_related_packet_count,
                     non_mqtt_tcp_udp_packet_count,
-                    capture_scope
+                    capture_scope{extra_columns}
                 )
                 VALUES (
                     :capture_segment_id,
@@ -219,7 +260,7 @@ def insert_packet_feature_rows(
                     :tcp_syn_count,
                     :mqtt_related_packet_count,
                     :non_mqtt_tcp_udp_packet_count,
-                    :capture_scope
+                    :capture_scope{extra_values}
                 )
                 ON CONFLICT(capture_segment_id, peer_ip, direction) DO NOTHING
                 """
@@ -241,6 +282,7 @@ def insert_packet_feature_rows(
                 "mqtt_related_packet_count": row["mqtt_related_packet_count"],
                 "non_mqtt_tcp_udp_packet_count": row["non_mqtt_tcp_udp_packet_count"],
                 "capture_scope": capture_scope,
+                **(broker if has_broker_target else {}),
             },
         )
         inserted_count += max(result.rowcount or 0, 0)
@@ -258,6 +300,7 @@ def list_packet_feature_logs(
     to_at: datetime | None = None,
     limit: int = 100,
     offset: int = 0,
+    snapshot_max_id: int | None = None,
 ) -> list[dict[str, Any]]:
     where_clause, params = _packet_feature_filters(
         session_id=session_id,
@@ -266,8 +309,14 @@ def list_packet_feature_logs(
         direction=direction,
         from_at=from_at,
         to_at=to_at,
+        snapshot_max_id=snapshot_max_id,
     )
     params.update({"limit": limit, "offset": offset})
+    has_broker_target = _has_broker_target_schema(db)
+    broker_projection = ", ".join(
+        f"pfl.{name}" if has_broker_target else f"NULL AS {name}"
+        for name in BROKER_TARGET_COLUMNS
+    )
     rows = db.execute(
         text(
             f"""
@@ -289,6 +338,7 @@ def list_packet_feature_logs(
                 pfl.tcp_syn_count,
                 pfl.mqtt_related_packet_count,
                 pfl.non_mqtt_tcp_udp_packet_count,
+                {broker_projection},
                 pfl.capture_scope,
                 pfl.created_at,
                 pcsg.status AS segment_status,
@@ -319,6 +369,7 @@ def count_packet_feature_logs(
     direction: str | None = None,
     from_at: datetime | None = None,
     to_at: datetime | None = None,
+    snapshot_max_id: int | None = None,
 ) -> int:
     where_clause, params = _packet_feature_filters(
         session_id=session_id,
@@ -327,6 +378,7 @@ def count_packet_feature_logs(
         direction=direction,
         from_at=from_at,
         to_at=to_at,
+        snapshot_max_id=snapshot_max_id,
     )
     row = db.execute(
         text(
@@ -353,9 +405,13 @@ def _packet_feature_filters(
     direction: str | None,
     from_at: datetime | None,
     to_at: datetime | None,
+    snapshot_max_id: int | None = None,
 ) -> tuple[str, dict[str, Any]]:
     filters: list[str] = []
     params: dict[str, Any] = {}
+    if snapshot_max_id is not None:
+        filters.append("pfl.id <= :snapshot_max_id")
+        params["snapshot_max_id"] = snapshot_max_id
     if session_id is not None:
         filters.append("pcs.session_id = :session_id")
         params["session_id"] = session_id
