@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -566,6 +567,175 @@ def test_train_rejects_dataset_capture_policy_version_mismatch(
             git_commit_sha=GIT_COMMIT_SHA,
             capture_policy=CapturePolicy(version="packet-capture-policy-v2"),
         )
+
+
+def test_current_git_commit_uses_code_repository_when_cwd_is_elsewhere(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    code_repository = Path(trainer.__file__).resolve().parents[1]
+    caller_repository = tmp_path / "caller-repository"
+    caller_repository.mkdir()
+    caller_head = "b" * 40
+    queried_directories: list[Path] = []
+
+    def fake_run(command: list[str], **kwargs: object):
+        assert command == ["git", "rev-parse", "HEAD"]
+        directory = Path(kwargs.get("cwd") or Path.cwd()).resolve()
+        queried_directories.append(directory)
+        head = GIT_COMMIT_SHA if directory == code_repository else caller_head
+        return trainer.subprocess.CompletedProcess(command, 0, f"{head}\n", "")
+
+    monkeypatch.chdir(caller_repository)
+    monkeypatch.setattr(trainer.subprocess, "run", fake_run)
+
+    assert trainer.current_git_commit_sha() == GIT_COMMIT_SHA
+    assert queried_directories == [code_repository]
+
+
+@pytest.mark.parametrize("source_name", ["dataset", "manifest"])
+def test_train_rejects_input_changed_during_load_before_training(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_name: str,
+) -> None:
+    dataset_path, manifest_path = _write_training_bundle(tmp_path)
+    source_path = dataset_path if source_name == "dataset" else manifest_path
+    artifact_dir = tmp_path / "packet-if-v1"
+    original_load = trainer.load_packet_if_dataset
+    training_calls: list[object] = []
+
+    def load_then_change(dataset_input: Path, manifest_input: Path):
+        dataset = original_load(dataset_input, manifest_input)
+        source_path.write_text(f"{source_name} changed during load\n", encoding="utf-8")
+        return dataset
+
+    def record_training_call(*args: object, **kwargs: object):
+        training_calls.append((args, kwargs))
+        return object()
+
+    monkeypatch.setattr(trainer, "load_packet_if_dataset", load_then_change)
+    monkeypatch.setattr(trainer, "train_packet_isolation_forest", record_training_call)
+
+    with pytest.raises(RuntimeError, match="changed"):
+        train_from_files(
+            dataset_path=dataset_path,
+            manifest_path=manifest_path,
+            artifact_dir=artifact_dir,
+            git_commit_sha=GIT_COMMIT_SHA,
+            capture_policy=CapturePolicy(),
+        )
+
+    assert training_calls == []
+    assert not artifact_dir.exists()
+
+
+def test_train_rejects_loaded_manifest_hash_mismatch_before_training(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset_path, manifest_path = _write_training_bundle(tmp_path)
+    original_bytes = {
+        path: path.read_bytes() for path in (dataset_path, manifest_path)
+    }
+    original_hashes = {path: file_sha256(path) for path in original_bytes}
+    artifact_dir = tmp_path / "packet-if-v1"
+    original_load = trainer.load_packet_if_dataset
+    training_calls: list[object] = []
+
+    def load_with_different_manifest_hash(dataset_input: Path, manifest_input: Path):
+        dataset = original_load(dataset_input, manifest_input)
+        original_hash = original_hashes[dataset_path]
+        assert dataset.manifest.dataset_sha256 == original_hash
+        different_hash = ("0" if original_hash[0] != "0" else "1") + original_hash[1:]
+        return replace(
+            dataset,
+            manifest=replace(dataset.manifest, dataset_sha256=different_hash),
+        )
+
+    def record_training_call(*args: object, **kwargs: object):
+        training_calls.append((args, kwargs))
+        return object()
+
+    monkeypatch.setattr(
+        trainer, "load_packet_if_dataset", load_with_different_manifest_hash
+    )
+    monkeypatch.setattr(trainer, "train_packet_isolation_forest", record_training_call)
+
+    with pytest.raises(RuntimeError, match="Dataset changed while loading"):
+        train_from_files(
+            dataset_path=dataset_path,
+            manifest_path=manifest_path,
+            artifact_dir=artifact_dir,
+            git_commit_sha=GIT_COMMIT_SHA,
+            capture_policy=CapturePolicy(),
+        )
+
+    assert training_calls == []
+    assert not artifact_dir.exists()
+    assert not list(tmp_path.glob(".packet-if-v1.*.tmp"))
+    assert not (tmp_path / ".packet-if-v1.build.lock").exists()
+    assert {path: path.read_bytes() for path in original_bytes} == original_bytes
+    assert {path: file_sha256(path) for path in original_hashes} == original_hashes
+
+
+@pytest.mark.parametrize("source_name", ["dataset", "manifest"])
+def test_train_rechecks_inputs_immediately_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_name: str,
+) -> None:
+    dataset_path, manifest_path = _write_training_bundle(tmp_path)
+    source_path = dataset_path if source_name == "dataset" else manifest_path
+    original_source_bytes = source_path.read_bytes()
+    artifact_dir = tmp_path / "packet-if-v1"
+    original_write_json = trainer._write_json
+
+    class StubIsolationForest:
+        """Exercise publication without fitting or scoring an actual model."""
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def fit(self, _matrix: np.ndarray):
+            return self
+
+        def decision_function(self, matrix: np.ndarray) -> np.ndarray:
+            return np.zeros(matrix.shape[0], dtype=float)
+
+    def write_stub_model(destination: Path, _model: object) -> None:
+        destination.write_bytes(b"stub artifact without a fitted model")
+
+    def change_input_after_metadata_write(path: Path, payload: dict[str, object]) -> None:
+        original_write_json(path, payload)
+        if path.name == "metadata.json":
+            source_path.write_text(
+                f"{source_name} changed before publish\n",
+                encoding="utf-8",
+            )
+
+    def reject_unchecked_publication(_source: Path, destination: Path) -> None:
+        assert Path(destination) == artifact_dir
+        assert source_path.read_bytes() != original_source_bytes
+        raise AssertionError("publication attempted before input recheck")
+
+    monkeypatch.setattr(trainer, "IsolationForest", StubIsolationForest)
+    monkeypatch.setattr(trainer, "_write_joblib", write_stub_model)
+    monkeypatch.setattr(trainer, "_write_json", change_input_after_metadata_write)
+    monkeypatch.setattr(trainer.os, "rename", reject_unchecked_publication)
+
+    with pytest.raises(RuntimeError, match="changed"):
+        train_from_files(
+            dataset_path=dataset_path,
+            manifest_path=manifest_path,
+            artifact_dir=artifact_dir,
+            git_commit_sha=GIT_COMMIT_SHA,
+            capture_policy=CapturePolicy(),
+        )
+
+    assert not artifact_dir.exists()
+    assert not list(tmp_path.glob(".packet-if-v1.*.tmp"))
+    assert not (tmp_path / ".packet-if-v1.build.lock").exists()
 
 
 def _format_utc(value: datetime) -> str:

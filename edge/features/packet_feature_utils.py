@@ -25,6 +25,8 @@ PCAP_GLOBAL_HEADER_SIZE = 24   # magic + version + zone + sigfigs + snaplen + ne
 PCAP_RECORD_HEADER_SIZE = 16   # ts_sec + ts_usec + caplen + orig_len
 PCAP_MAGIC_LE = 0xa1b2c3d4    # little-endian pcap (표준)
 PCAP_MAGIC_BE = 0xd4c3b2a1    # big-endian pcap
+PCAP_MAGIC_NANO_LE = 0xa1b23c4d
+PCAP_MAGIC_NANO_BE = 0x4d3cb2a1
 
 
 class PcapParseError(Exception):
@@ -89,7 +91,10 @@ def parse_pcap(path: Path) -> list[ParsedPacket]:
             # global header 이후를 raw bytes로 읽어 각 record의 완결성을 검증한다.
             f.seek(0)
             magic_le = struct.unpack("<I", f.read(4))[0]
-            endian = "<" if magic_le == PCAP_MAGIC_LE else ">"
+            endian = "<" if magic_le in (PCAP_MAGIC_LE, PCAP_MAGIC_NANO_LE) else ">"
+            timestamp_divisor = (
+                1e9 if magic_le in (PCAP_MAGIC_NANO_LE, PCAP_MAGIC_NANO_BE) else 1e6
+            )
             f.seek(PCAP_GLOBAL_HEADER_SIZE)
 
             total_records = 0
@@ -116,10 +121,20 @@ def parse_pcap(path: Path) -> list[ParsedPacket]:
                     parse_errors += 1
                     break
 
-                ts = ts_sec + ts_usec / 1e6
+                ts = ts_sec + ts_usec / timestamp_divisor
 
                 try:
                     eth = dpkt.ethernet.Ethernet(body)
+                    declared_type = (
+                        eth.vlan_tags[-1].type if getattr(eth, "vlan_tags", None) else eth.type
+                    )
+                    # dpkt retains raw bytes when an inner IPv4 decode fails.
+                    # Such a frame is not an intentionally ignored ARP/IPv6 record.
+                    if (
+                        declared_type == dpkt.ethernet.ETH_TYPE_IP
+                        and not isinstance(eth.data, dpkt.ip.IP)
+                    ):
+                        raise dpkt.UnpackError("declared IPv4 packet could not be decoded")
                     valid_records += 1  # Ethernet 파싱 성공 (IP 여부 무관)
                     if not isinstance(eth.data, dpkt.ip.IP):
                         continue

@@ -634,6 +634,115 @@ def test_trust_v2_marks_past_window_events_as_late_without_legacy_inference(
         assert checkpoint["last_completed_window_end"] == "2026-07-23T10:00:10Z"
 
 
+@pytest.mark.parametrize("previous_penalty", [False, True], ids=["previously-clear", "previously-scored"])
+@pytest.mark.parametrize("event_type, detector_type, family", [
+    ("LARGE_PAYLOAD", "RULE", "MESSAGE_POLICY"),
+    ("AI_ANOMALY", "AI", "AI_ONLY"),
+    ("AI_PACKET_ANOMALY", "AI", "AI_ONLY"),
+])
+def test_trust_v2_uses_own_completed_boundary_for_new_late_events(
+    SessionLocal, previous_penalty, event_type, detector_type, family,
+) -> None:
+    """A lagging required detector must not reopen an already completed window."""
+    next_cutoff = datetime(2026, 7, 23, 10, 0, 20, tzinfo=timezone.utc)
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01", trust_score=100)
+        if previous_penalty:
+            _insert_event(db, "esp32_01", "ABNORMAL_TOPIC", incident_family="MESSAGE_POLICY")
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            first = apply_trust_score_v2_until(
+                db, cycle_range_start=CYCLE_START, cycle_cutoff=CUTOFF,
+                ai_mode="enforce",
+            )
+        previous_history = [tuple(row) for row in db.execute(
+            text("SELECT * FROM trust_score_history ORDER BY id")
+        )]
+        assert first.created_history_count == int(previous_penalty)
+
+    with SessionLocal() as db:
+        late_event = _insert_event(
+            db, "esp32_01", event_type,
+            detector_type=detector_type, incident_family=family,
+            detected_at="2026-07-23T10:00:20Z",
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        with db.begin():
+            result = apply_trust_score_v2_until(
+                db, cycle_range_start=CYCLE_START, cycle_cutoff=next_cutoff,
+                ai_mode="enforce",
+            )
+        assert result.processed_event_count == 1
+        assert result.created_history_count == 0
+        assert result.created_isolation_count == result.created_firewall_rule_count == 0
+        assert result.changes == []
+        assert db.execute(text("SELECT trust_score FROM devices")).scalar_one() == (
+            80 if previous_penalty else 100
+        )
+        assert [tuple(row) for row in db.execute(
+            text("SELECT * FROM trust_score_history ORDER BY id")
+        )] == previous_history
+        event = db.execute(text(
+            "SELECT processing_reason, applied_to_score, processed_at "
+            "FROM detection_events WHERE id = :id"
+        ), {"id": late_event}).mappings().one()
+        assert event["processing_reason"] == PROCESSING_LATE_EVENT
+        assert event["applied_to_score"] == 0
+        assert event["processed_at"] == "2026-07-23T10:00:20Z"
+        checkpoint = db.execute(text(
+            "SELECT last_processed_id, last_completed_window_end FROM detector_checkpoints "
+            "WHERE detector_name = 'trust_score_v2' AND source_table = 'detection_events'"
+        )).mappings().one()
+        assert checkpoint["last_processed_id"] == late_event
+        assert checkpoint["last_completed_window_end"] == "2026-07-23T10:00:20Z"
+
+
+@pytest.mark.parametrize("event_type, detector_type, family", [
+    ("LARGE_PAYLOAD", "RULE", "MESSAGE_POLICY"),
+    ("AI_ANOMALY", "AI", "AI_ONLY"),
+    ("AI_PACKET_ANOMALY", "AI", "AI_ONLY"),
+])
+def test_trust_v2_keeps_window_starting_at_own_completed_boundary_current(
+    SessionLocal, event_type, detector_type, family,
+) -> None:
+    next_cutoff = datetime(2026, 7, 23, 10, 0, 20, tzinfo=timezone.utc)
+    with SessionLocal() as db:
+        _insert_device(db, "esp32_01", trust_score=100)
+        db.commit()
+    with SessionLocal() as db:
+        with db.begin():
+            apply_trust_score_v2_until(
+                db, cycle_range_start=CYCLE_START, cycle_cutoff=CUTOFF,
+                ai_mode="enforce",
+            )
+    with SessionLocal() as db:
+        current_event = _insert_event(
+            db, "esp32_01", event_type,
+            detector_type=detector_type, incident_family=family,
+            detected_at="2026-07-23T10:00:20Z",
+            analysis_window_start="2026-07-23T10:00:10Z",
+            analysis_window_end="2026-07-23T10:00:20Z",
+        )
+        db.commit()
+    with SessionLocal() as db:
+        with db.begin():
+            result = apply_trust_score_v2_until(
+                db, cycle_range_start=CYCLE_START, cycle_cutoff=next_cutoff,
+                ai_mode="enforce",
+            )
+        assert result.processed_event_count == result.created_history_count == 1
+        assert result.changes[0].representative_event_ids == [current_event]
+        assert result.changes[0].analysis_window_start == CUTOFF
+        assert result.changes[0].new_score == 100 + score_delta_for_event(event_type)
+        assert db.execute(text(
+            "SELECT processing_reason FROM detection_events WHERE id = :id"
+        ), {"id": current_event}).scalar_one() == PROCESSING_APPLIED
+
+
 def test_trust_v2_keeps_explicit_legacy_migration_marker_without_scoring(
     SessionLocal,
 ) -> None:
