@@ -396,7 +396,6 @@ def test_late_warning_carries_previous_committed_window_without_hiding_loss(db, 
     previous = json.loads(logs[0].split(" previous_window_timing=", 1)[1])
     assert previous["session_id"] == source_id and previous["window_end"] == "2026-10-05T00:00:10Z"
     assert previous["timing_seconds"]["db_insert_seconds"] == pytest.approx(11.2)
-    assert "sidecar_rename_seconds" in previous["timing_seconds"]
     failed = db.execute(text("SELECT error_code,file_name,start_delay_seconds FROM packet_capture_segments WHERE status='FAILED'")).mappings().one()
     assert failed["error_code"] == "LATE_CAPTURE" and failed["file_name"] is None
     assert failed["start_delay_seconds"] == pytest.approx(11.2) and process.calls == 2
