@@ -77,6 +77,113 @@ def _write_run_manifest(tmp_path: Path) -> tuple[Path, str]:
     return path, digest
 
 
+def _write_legacy_run_manifest(tmp_path: Path) -> tuple[Path, str]:
+    payload = _run_manifest().to_dict()
+    del payload["matched_ids"]["firewall_release_request_ids"]
+    path = tmp_path / "run-manifest.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    digest = run_manifest_sha256(payload)
+    Path(f"{path}.sha256").write_text(f"{digest}\n", encoding="ascii")
+    return path, digest
+
+
+def test_load_verified_run_manifest_preserves_legacy_pin_and_originals(
+    tmp_path: Path,
+) -> None:
+    path, digest = _write_legacy_run_manifest(tmp_path)
+    sidecar = Path(f"{path}.sha256")
+    originals = path.read_bytes(), sidecar.read_bytes()
+
+    manifest = load_verified_run_manifest(path, expected_sha256=digest)
+
+    assert manifest.run_id == "run-packet-flood-01"
+    assert manifest.matched_ids.firewall_release_request_ids is None
+    assert run_manifest_sha256(manifest) != digest
+    assert (path.read_bytes(), sidecar.read_bytes()) == originals
+
+
+@pytest.mark.parametrize("release_ids", [None, [14]])
+def test_load_verified_run_manifest_rejects_explicit_release_ids_with_legacy_pin(
+    tmp_path: Path, release_ids: list[int] | None,
+) -> None:
+    path, digest = _write_legacy_run_manifest(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["matched_ids"]["firewall_release_request_ids"] = release_ids
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Run Manifest SHA256 mismatch"):
+        load_verified_run_manifest(path, expected_sha256=digest)
+
+
+@pytest.mark.parametrize("sidecar_value, error", [
+    ("0" * 64, "Run Manifest sidecar SHA256 mismatch"),
+    ("wrong_file", "references the wrong file"),
+])
+def test_load_verified_run_manifest_checks_legacy_sidecar(
+    tmp_path: Path, sidecar_value: str, error: str,
+) -> None:
+    path, digest = _write_legacy_run_manifest(tmp_path)
+    content = (
+        f"{digest}  another-run-manifest.json"
+        if sidecar_value == "wrong_file" else sidecar_value
+    )
+    Path(f"{path}.sha256").write_text(f"{content}\n", encoding="ascii")
+
+    with pytest.raises(ValueError, match=error):
+        load_verified_run_manifest(path, expected_sha256=digest)
+
+
+def test_load_verified_run_manifest_rejects_tampered_legacy_value(
+    tmp_path: Path,
+) -> None:
+    path, digest = _write_legacy_run_manifest(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["scenario"]["scenario_id"] = "port_scan"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Run Manifest SHA256 mismatch"):
+        load_verified_run_manifest(path, expected_sha256=digest)
+
+
+@pytest.mark.parametrize("missing_path", [
+    ("failure_reason",),
+    ("matched_ids", "trigger_event_ids"),
+])
+def test_load_verified_run_manifest_rejects_other_missing_defaults_in_legacy(
+    tmp_path: Path, missing_path: tuple[str, ...],
+) -> None:
+    path, _ = _write_legacy_run_manifest(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    parent = payload
+    for key in missing_path[:-1]:
+        parent = parent[key]
+    del parent[missing_path[-1]]
+    digest = run_manifest_sha256(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    Path(f"{path}.sha256").write_text(f"{digest}\n", encoding="ascii")
+
+    with pytest.raises(ValueError, match="Run Manifest SHA256 mismatch"):
+        load_verified_run_manifest(path, expected_sha256=digest)
+
+
+@pytest.mark.parametrize("change", ["invalid_status", "unknown_field"])
+def test_load_verified_run_manifest_validates_legacy_contract_before_hash(
+    tmp_path: Path, change: str,
+) -> None:
+    path, _ = _write_legacy_run_manifest(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if change == "invalid_status":
+        payload["statuses"]["scenario_status"] = "NOT_A_STATUS"
+    else:
+        payload["matched_ids"]["unknown_ids"] = None
+    digest = run_manifest_sha256(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    Path(f"{path}.sha256").write_text(f"{digest}\n", encoding="ascii")
+
+    with pytest.raises(ValueError, match="invalid Run Manifest"):
+        load_verified_run_manifest(path, expected_sha256=digest)
+
+
 def test_load_verified_run_manifest_checks_canonical_hash_and_sidecar(
     tmp_path: Path,
 ) -> None:
@@ -384,6 +491,29 @@ def test_dataset_run_reference_verifies_collection_manifest(tmp_path: Path) -> N
     assert collection is not None
     assert collection.session_id == SESSION_ID
     assert collection.provenance_mode.value == "VERIFIED_RETROSPECTIVE_IMPORT"
+
+
+@pytest.mark.parametrize("tamper_evidence", [False, True])
+def test_legacy_run_preserves_verified_collection_evidence_checks(
+    tmp_path: Path, tamper_evidence: bool,
+) -> None:
+    run_path, reference = _write_run_with_collection(
+        tmp_path, tamper_evidence=tamper_evidence,
+    )
+    payload = json.loads(run_path.read_text(encoding="utf-8"))
+    del payload["matched_ids"]["firewall_release_request_ids"]
+    digest = run_manifest_sha256(payload)
+    run_path.write_text(json.dumps(payload), encoding="utf-8")
+    Path(f"{run_path}.sha256").write_text(f"{digest}\n", encoding="ascii")
+    reference = replace(reference, sha256=digest)
+
+    if tamper_evidence:
+        with pytest.raises(ValueError, match="artifact"):
+            _load_chain(run_path, reference)
+    else:
+        collection = _load_chain(run_path, reference)
+        assert collection is not None
+        assert collection.session_id == SESSION_ID
 
 
 def test_chain_rejects_collection_hash_mismatch(tmp_path: Path) -> None:
