@@ -77,7 +77,8 @@ def db(tmp_path):
         engine.dispose()
 
 
-def test_process_phases_and_exit_observation_keep_existing_wait_behavior(monkeypatch, tmp_path):
+@pytest.mark.parametrize("window_seconds", [10.0, 0.1])
+def test_process_setup_consumes_remaining_window_budget(monkeypatch, tmp_path, window_seconds):
     clock = Clock()
     child = Mock(stderr=io.BytesIO(b""))
     child.poll.return_value = None
@@ -107,16 +108,18 @@ def test_process_phases_and_exit_observation_keep_existing_wait_behavior(monkeyp
     monkeypatch.setattr(capture_runtime.subprocess, "Popen", spawn)
     monkeypatch.setattr(capture_runtime, "_StderrDrain", Drain)
     outcome = capture_runtime.TcpdumpCaptureProcess(monotonic=clock.monotonic, clock=clock.now).capture_window(
-        interface="eth0", output_path=tmp_path / "capture.pcap", window_seconds=10)
+        interface="eth0", output_path=tmp_path / "capture.pcap", window_seconds=window_seconds)
 
-    assert waits == [10, 5]
+    remaining = max(0, window_seconds - 0.3)
+    stopped = max(window_seconds, 0.3)
+    assert waits == pytest.approx([remaining, 5])
     assert outcome.completed_full_window and outcome.terminated_cleanly
     assert outcome.phase_timings_seconds == pytest.approx({
-        "spawn_seconds": 0.2, "stderr_setup_seconds": 0.1, "capture_wait_seconds": 10,
+        "spawn_seconds": 0.2, "stderr_setup_seconds": 0.1, "capture_wait_seconds": remaining,
         "termination_wait_seconds": 0.4, "stderr_drain_seconds": 0.3})
-    assert outcome.stop_requested_at == BASE + timedelta(seconds=10.3)
-    assert outcome.process_wait_completed_at == BASE + timedelta(seconds=10.7)
-    assert clock.now() == BASE + timedelta(seconds=11)
+    assert outcome.stop_requested_at == BASE + timedelta(seconds=stopped)
+    assert outcome.process_wait_completed_at == BASE + timedelta(seconds=stopped + 0.4)
+    assert clock.now() == BASE + timedelta(seconds=stopped + 0.7)
 
 
 @pytest.mark.parametrize("report_process_timing", [True, False])
@@ -220,7 +223,7 @@ def test_commit_failure_has_no_ready_completion_log_and_preserves_pcap(db, tmp_p
     assert len(list(value.ready_dir.glob("*.pcap"))) == 1
 
 
-def test_late_warning_carries_previous_committed_window_without_hiding_loss(db, tmp_path, monkeypatch, caplog):
+def test_expired_warning_carries_previous_committed_window_without_hiding_loss(db, tmp_path, monkeypatch, caplog):
     clock = Clock()
     value = config(tmp_path)
     source_pk, source_id, first = run_packet_capture.start_new_session(db, value, clock.now(), clock=clock.now)
@@ -232,7 +235,7 @@ def test_late_warning_carries_previous_committed_window_without_hiding_loss(db, 
         result = insert(*args, **kwargs)
         calls += 1
         if calls == 1:
-            clock.advance(1.2)
+            clock.advance(11.2)
         return result
 
     monkeypatch.setattr(repo, "insert_ready_segment", slow_first_insert)
@@ -246,7 +249,7 @@ def test_late_warning_carries_previous_committed_window_without_hiding_loss(db, 
     assert len(logs) == 1
     previous = json.loads(logs[0].split(" previous_window_timing=", 1)[1])
     assert previous["session_id"] == source_id and previous["window_end"] == "2026-10-05T00:00:10Z"
-    assert previous["timing_seconds"]["db_insert_seconds"] == pytest.approx(1.2)
+    assert previous["timing_seconds"]["db_insert_seconds"] == pytest.approx(11.2)
     failed = db.execute(text("SELECT error_code,file_name,start_delay_seconds FROM packet_capture_segments WHERE status='FAILED'")).mappings().one()
     assert failed["error_code"] == "LATE_CAPTURE" and failed["file_name"] is None
-    assert failed["start_delay_seconds"] == pytest.approx(1.2) and process.calls == 2
+    assert failed["start_delay_seconds"] == pytest.approx(11.2) and process.calls == 2

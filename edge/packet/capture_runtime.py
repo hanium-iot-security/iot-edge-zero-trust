@@ -7,7 +7,7 @@ DB 접근은 하지 않습니다 (capture_session_repository.py 담당).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import logging
 import json
@@ -23,7 +23,9 @@ import time
 from typing import Callable, Protocol
 import subprocess
 
-from edge.packet.capture_policy import CapturePolicy, compute_effective_capture_window
+from edge.packet.capture_policy import (
+    CaptureEligibilitySegment, CapturePolicy, compute_effective_capture_window, is_capture_eligible,
+)
 from edge.packet.pcap_naming import build_pcap_filename, tmp_filename_to_ready
 
 logger = logging.getLogger(__name__)
@@ -38,8 +40,8 @@ PARTIAL_CAPTURE = "PARTIAL_CAPTURE"
 # 프로세스는 시작됐지만 pcap 파일이 아예 생성되지 않은 채로 종료된 경우.
 PCAP_FILE_MISSING = "PCAP_FILE_MISSING"
 
-# 허용 지연(PCAP_MAX_START_DELAY_SECONDS)을 초과했거나 Window가 이미 끝나버려
-# tcpdump 프로세스를 아예 실행하지 못한 경우.
+# Window가 이미 끝나 tcpdump 프로세스를 아예 실행하지 못한 경우.
+# 시간이 남아 있으면 원본을 수집한 뒤 기존 품질 정책으로 READY 여부를 판정한다.
 LATE_CAPTURE = "LATE_CAPTURE"
 
 
@@ -210,7 +212,10 @@ class TcpdumpCaptureProcess:
         termination_wait_seconds = 0.0
         try:
             try:
-                exit_code = process.wait(timeout=window_seconds)
+                # Spawn and stderr setup consume the original remaining budget.
+                # A slow setup must never start another full capture interval.
+                remaining_seconds = max(0.0, window_seconds - (setup_finished - spawn_started))
+                exit_code = process.wait(timeout=remaining_seconds)
             except subprocess.TimeoutExpired:
                 capture_wait_finished = self._monotonic()
                 # An independent exit racing with the timeout is not our stop.
@@ -339,13 +344,13 @@ def execute_capture_window(
 ) -> CaptureWindowResult:
     """한 Window(10초)를 캡처하고 결과를 파일 이동 + Timing Metadata로 반환합니다.
 
-    capture_started_at이 주어지면 Capture 경계 상태표에 따라 지연을 판정합니다:
-      - capture_started_at이 이미 window_end 이후이거나
-      - 허용 지연(policy.max_start_delay_seconds + epsilon)을 초과했다면
-      tcpdump 프로세스를 아예 실행하지 않고 LATE_CAPTURE로 확정합니다.
+    Window가 이미 만료됐으면 프로세스를 실행하지 않고 LATE_CAPTURE로 남긴다.
+    시간이 남으면 허용 시작 지연을 넘겼어도 남은 원본을 보존한다. 정상 종료된
+    파일도 기존 공통 품질 정책을 통과해야 READY가 되며, 미달 파일은
+    FAILED/PARTIAL_CAPTURE와 실패 sidecar로 확정한다.
 
-    capture_started_at을 생략하면(레거시 호출부 호환) 지연 판정 없이 고정
-    window_seconds(window_end - window_start)로 그대로 진행합니다.
+    capture_started_at을 생략하면(레거시 호출부 호환) 고정
+    window_seconds(window_end - window_start)로 진행한다.
     """
     active_policy = policy if policy is not None else config.capture_policy
 
@@ -369,23 +374,12 @@ def execute_capture_window(
     else:
         start_delay_seconds = max(0.0, (capture_started_at - window_start).total_seconds())
 
-        already_expired = capture_started_at >= window_end
-        exceeds_allowed_delay = start_delay_seconds > active_policy.max_start_delay_seconds + active_policy.epsilon_seconds
-
-        if already_expired or exceeds_allowed_delay:
-            if already_expired:
-                reason = (
-                    f"capture_started_at({capture_started_at.isoformat()}) is at/after "
-                    f"window_end({window_end.isoformat()}); window fully expired before "
-                    f"capture could start"
-                )
-            else:
-                reason = (
-                    f"start_delay_seconds={start_delay_seconds:.3f} exceeds allowed "
-                    f"max_start_delay_seconds={active_policy.max_start_delay_seconds} "
-                    f"(+epsilon={active_policy.epsilon_seconds}); capture process not started "
-                    f"(policy_version={active_policy.version})"
-                )
+        if capture_started_at >= window_end:
+            reason = (
+                f"capture_started_at({capture_started_at.isoformat()}) is at/after "
+                f"window_end({window_end.isoformat()}); window fully expired before "
+                f"capture could start"
+            )
             logger.warning(
                 "LATE_CAPTURE: %s (window=%s~%s)",
                 reason, window_start.isoformat(), window_end.isoformat(),
@@ -442,6 +436,26 @@ def execute_capture_window(
     file_validation_error = _pcap_file_error(tmp_path) if clean_exit and tmp_path.exists() else None
     phase_timings["pcap_validation_seconds"] = monotonic() - validation_started
 
+    _effective_start, _effective_end, captured_duration_seconds = compute_effective_capture_window(
+        window_start=window_start,
+        window_end=window_end,
+        actual_capture_started_at=effective_started_at,
+        capture_stop_requested_at=capture_stop_requested_at,
+    )
+    # PROCESSED is only the shared function's timing view here. No Feature or DB
+    # row is created; publication is allowed only after this unchanged policy.
+    quality = is_capture_eligible(
+        CaptureEligibilitySegment(
+            status="PROCESSED", error_code=None,
+            start_delay_seconds=start_delay_seconds if start_delay_seconds is not None else 0.0,
+            captured_duration_seconds=captured_duration_seconds,
+        ),
+        active_policy,
+    )
+    timing_quality_failure = (
+        clean_exit and tmp_path.exists() and file_validation_error is None and not quality.eligible
+    )
+
     def with_diagnostics(result: CaptureWindowResult) -> CaptureWindowResult:
         persistence_started = monotonic()
         directory = config.ready_dir if result.success else config.failed_dir
@@ -469,6 +483,26 @@ def execute_capture_window(
             "packets_dropped_by_interface": outcome.packets_dropped_by_interface,
             "drop_status": drop_status,
         }
+        # v2 proves a clean timing-quality rejection without changing the v1
+        # meaning of completed_full_window. Incomplete diagnostics remain v1
+        # evidence, which cannot authorize the new automatic continuation.
+        if (
+            timing_quality_failure
+            and quality.exclusion_reason in ("start_delay_exceeds_policy", "captured_duration_below_policy")
+            and outcome.stderr_complete is True and outcome.stderr_error is None
+            and outcome.packets_dropped == 0
+            and outcome.packets_dropped_by_interface in (None, 0)
+        ):
+            metadata.update(
+                schema_version="packet-capture-diagnostics-v2",
+                quality_failure_reason=quality.exclusion_reason,
+                capture_policy=asdict(active_policy),
+                actual_capture_started_at=result.actual_capture_started_at.isoformat(),
+                capture_stop_requested_at=result.capture_stop_requested_at.isoformat(),
+                capture_process_exited_at=result.capture_process_exited_at.isoformat(),
+                start_delay_seconds=result.start_delay_seconds,
+                captured_duration_seconds=result.captured_duration_seconds,
+            )
         temporary = path.with_suffix(path.suffix + ".tmp")
         with temporary.open("w", encoding="utf-8") as handle:
             json.dump(metadata, handle, ensure_ascii=True, sort_keys=True)
@@ -481,13 +515,7 @@ def execute_capture_window(
                        process_wait_completed_at=outcome.process_wait_completed_at,
                        phase_timings_seconds=dict(phase_timings))
 
-    if clean_exit and tmp_path.exists() and file_validation_error is None:
-        _effective_start, _effective_end, captured_duration_seconds = compute_effective_capture_window(
-            window_start=window_start,
-            window_end=window_end,
-            actual_capture_started_at=effective_started_at,
-            capture_stop_requested_at=capture_stop_requested_at,
-        )
+    if clean_exit and tmp_path.exists() and file_validation_error is None and quality.eligible:
         final_path = config.ready_dir / ready_filename
         result = with_diagnostics(CaptureWindowResult(
             success=True,
@@ -529,18 +557,6 @@ def execute_capture_window(
     if not file_was_created:
         # 파일이 아예 생성되지 않았으므로 실제로 캡처된 데이터는 없다 (0초).
         captured_duration_seconds = 0.0
-    else:
-        # 프로세스가 명목 window_end까지 살아남지 못했다면 (자력 조기 종료)
-        # capture_stop_requested_at은 위에서 이미 capture_process_exited_at으로
-        # fallback돼 있다. window_end를 그대로 쓰면 2초 만에 죽은 캡처도
-        # captured_duration_seconds가 9~10초로 나와 실제 캡처량을 과대평가하게 된다.
-
-        _effective_start, _effective_end, captured_duration_seconds = compute_effective_capture_window(
-            window_start=window_start,
-            window_end=window_end,
-            actual_capture_started_at=effective_started_at,
-            capture_stop_requested_at=capture_stop_requested_at,
-        )
 
     if not outcome.completed_full_window:
         error_message = (
@@ -563,6 +579,13 @@ def execute_capture_window(
         error_message = file_validation_error
     elif not file_was_created:
         error_message = "tcpdump exited without creating the capture file"
+    elif timing_quality_failure:
+        error_message = (
+            f"capture timing excluded by policy: {quality.exclusion_reason} "
+            f"(policy_version={active_policy.version}, "
+            f"start_delay_seconds={start_delay_seconds}, "
+            f"captured_duration_seconds={captured_duration_seconds})"
+        )
     else:
         error_message = "tcpdump shutdown or stderr collection was not clean"
 

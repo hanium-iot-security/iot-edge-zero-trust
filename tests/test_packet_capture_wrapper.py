@@ -5,9 +5,10 @@
 """
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import io
+import json
 import subprocess
 from unittest.mock import Mock, call
 
@@ -52,7 +53,7 @@ def test_tcpdump_immediate_capture_preserves_shutdown_quality(
     monkeypatch.setattr("edge.packet.capture_runtime.subprocess.Popen", spawn)
 
     configured = {} if buffer_size_kib is None else {"buffer_size_kib": buffer_size_kib}
-    result = TcpdumpCaptureProcess(capture_filter="tcp or udp", **configured).capture_window(
+    result = TcpdumpCaptureProcess(capture_filter="tcp or udp", monotonic=lambda: 0.0, **configured).capture_window(
         interface="eth0", output_path=tmp_path / "window.pcap", window_seconds=10
     )
 
@@ -345,7 +346,8 @@ class TestExecuteCaptureWindowDriftCorrection:
 
         assert process.last_call["window_seconds"] == 10.0
 
-    def test_capture_started_at_past_window_end_does_not_invoke_process(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("late_seconds", [0, 5])
+    def test_capture_started_at_past_window_end_does_not_invoke_process(self, tmp_path: Path, late_seconds) -> None:
         """window_end을 이미 지난 채로 발견되면 tcpdump조차 실행하지 않고
         즉시 LATE_CAPTURE로 처리해야 한다 (Capture 경계 상태표: "Runtime이 현재 Window를 대기하다가
         actual_start >= window_end가 됨" -> FAILED/LATE_CAPTURE). file_name은 DB CHECK 제약상 NULL이어야 하므로
@@ -359,7 +361,7 @@ class TestExecuteCaptureWindowDriftCorrection:
         result = execute_capture_window(
             process, config, session_id=SESSION_ID,
             window_start=window_start, window_end=window_end,
-            capture_started_at=_utc(2026, 7, 15, 10, 0, 25),  # window_end보다도 늦음
+            capture_started_at=window_end + timedelta(seconds=late_seconds),
         )
 
         assert process.last_call is None  # capture_window()가 호출되지 않음
@@ -377,27 +379,127 @@ class TestExecuteCaptureWindowDriftCorrection:
         assert not (config.ready_dir / expected_ready_name).exists()
         assert not (config.failed_dir / expected_ready_name).exists()
 
-    def test_start_delay_beyond_policy_but_before_window_end_is_late_capture(self, tmp_path: Path) -> None:
-        """window은 아직 안 끝났어도, 허용 지연(기본 1.0초+epsilon)을 넘겼다면
-        tcpdump를 실행하지 않고 LATE_CAPTURE여야 한다."""
+    @pytest.mark.parametrize("delay", [1.010001, 1.270588, 9.999999])
+    def test_late_start_preserves_remaining_original_in_failed_without_ready(self, tmp_path, delay):
         config = _make_config(tmp_path)
         config.ensure_directories()
-        window_start = _utc(2026, 7, 15, 10, 0, 10)
-        window_end = _utc(2026, 7, 15, 10, 0, 20)
-        capture_started_at = window_start.replace(microsecond=500_000)  # 0.5초 지연: 허용 초과
-        process = FakeCaptureProcess(outcome=CaptureOutcome(completed_full_window=True, exit_code=-15))
-        policy = CapturePolicy(max_start_delay_seconds=0.3, minimum_duration_seconds=9.5)
-
+        start = _utc(2026, 7, 15, 10, 0, 10)
+        end = start + timedelta(seconds=10)
+        actual = start + timedelta(seconds=delay)
+        process = FakeCaptureProcess(outcome=CaptureOutcome(
+            completed_full_window=True, exit_code=-15, stop_requested_at=end,
+            stderr_complete=True, packets_dropped=0,
+        ))
         result = execute_capture_window(
-            process, config, session_id=SESSION_ID,
-            window_start=window_start, window_end=window_end,
-            capture_started_at=capture_started_at,
-            policy=policy,
+            process, config, session_id=SESSION_ID, window_start=start, window_end=end,
+            capture_started_at=actual, clock=lambda: end,
         )
+        assert process.last_call["window_seconds"] == pytest.approx(10 - delay)
+        assert not result.success and result.error_code == "PARTIAL_CAPTURE"
+        assert result.final_path == config.failed_dir / result.file_name
+        assert result.final_path.read_bytes() == Path("tests/fixtures/packet/pcap/empty_window.pcap").read_bytes()
+        assert result.actual_capture_started_at == actual
+        assert result.capture_stop_requested_at == end and result.capture_process_exited_at == end
+        assert result.start_delay_seconds == pytest.approx(delay)
+        assert result.captured_duration_seconds == pytest.approx(10 - delay)
+        assert not list(config.ready_dir.iterdir()) and not list(config.incoming_dir.iterdir())
+        metadata = json.loads(result.diagnostics_path.read_text())
+        assert metadata["success"] is False and metadata["error_code"] == "PARTIAL_CAPTURE"
+        assert metadata["completed_full_window"] is True
+        assert metadata["schema_version"] == "packet-capture-diagnostics-v2"
+        assert metadata["quality_failure_reason"] == "start_delay_exceeds_policy"
+        assert metadata["capture_policy"] == {
+            "max_start_delay_seconds": 1.0, "minimum_duration_seconds": 9.0,
+            "epsilon_seconds": 0.01, "version": "packet-capture-policy-v1",
+        }
+        assert datetime.fromisoformat(metadata["actual_capture_started_at"]) == actual
+        assert datetime.fromisoformat(metadata["capture_stop_requested_at"]) == end
+        assert datetime.fromisoformat(metadata["capture_process_exited_at"]) == end
+        assert metadata["start_delay_seconds"] == pytest.approx(delay)
+        assert metadata["captured_duration_seconds"] == pytest.approx(10 - delay)
 
-        assert process.last_call is None
-        assert result.error_code == "LATE_CAPTURE"
+    def test_custom_quality_policy_still_excludes_preserved_late_original(self, tmp_path):
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        start = _utc(2026, 7, 15, 10, 0, 10)
+        end = start + timedelta(seconds=10)
+        actual = start + timedelta(seconds=0.5)
+        process = FakeCaptureProcess(outcome=CaptureOutcome(True, -15, stop_requested_at=end))
+        policy = CapturePolicy(max_start_delay_seconds=0.3, minimum_duration_seconds=9.5)
+        result = execute_capture_window(
+            process, config, session_id=SESSION_ID, window_start=start, window_end=end,
+            capture_started_at=actual, policy=policy, clock=lambda: end,
+        )
+        assert process.last_call["window_seconds"] == pytest.approx(9.5)
+        assert not result.success and result.error_code == "PARTIAL_CAPTURE"
         assert result.start_delay_seconds == pytest.approx(0.5)
+        assert result.final_path.exists() and not list(config.ready_dir.iterdir())
+
+    def test_duration_quality_rejection_records_exact_custom_policy(self, tmp_path):
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        start = _utc(2026, 7, 15, 10, 0, 10)
+        end = start + timedelta(seconds=10)
+        policy = CapturePolicy(max_start_delay_seconds=0.5, minimum_duration_seconds=9.8)
+        process = FakeCaptureProcess(outcome=CaptureOutcome(
+            True, -15, stop_requested_at=end, stderr_complete=True, packets_dropped=0,
+        ))
+        result = execute_capture_window(
+            process, config, session_id=SESSION_ID, window_start=start, window_end=end,
+            capture_started_at=start + timedelta(seconds=0.3), policy=policy, clock=lambda: end,
+        )
+        metadata = json.loads(result.diagnostics_path.read_text())
+        assert not result.success and result.error_code == "PARTIAL_CAPTURE"
+        assert metadata["schema_version"] == "packet-capture-diagnostics-v2"
+        assert metadata["quality_failure_reason"] == "captured_duration_below_policy"
+        assert metadata["capture_policy"] == {
+            "max_start_delay_seconds": 0.5, "minimum_duration_seconds": 9.8,
+            "epsilon_seconds": 0.01, "version": "packet-capture-policy-v1",
+        }
+        assert metadata["captured_duration_seconds"] == pytest.approx(9.7)
+        assert metadata["completed_full_window"] is True
+        assert not list(config.ready_dir.iterdir())
+
+    @pytest.mark.parametrize("diagnostics", [
+        {"stderr_complete": None, "packets_dropped": None},
+        {"stderr_complete": True, "packets_dropped": None},
+        {"stderr_complete": True, "packets_dropped": 0, "stderr_error": "read failed"},
+        {"stderr_complete": True, "packets_dropped": 1},
+        {"stderr_complete": True, "packets_dropped": 0, "packets_dropped_by_interface": 1},
+    ])
+    def test_late_original_without_clean_drop_evidence_stays_v1(self, tmp_path, diagnostics):
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        start = _utc(2026, 7, 15, 10, 0, 10)
+        end = start + timedelta(seconds=10)
+        process = FakeCaptureProcess(outcome=CaptureOutcome(
+            True, -15, stop_requested_at=end, **diagnostics,
+        ))
+        result = execute_capture_window(
+            process, config, session_id=SESSION_ID, window_start=start, window_end=end,
+            capture_started_at=start + timedelta(seconds=1.27), clock=lambda: end,
+        )
+        metadata = json.loads(result.diagnostics_path.read_text())
+        assert result.error_code == "PARTIAL_CAPTURE" and result.final_path.exists()
+        assert metadata["schema_version"] == "packet-capture-diagnostics-v1"
+        assert "quality_failure_reason" not in metadata and "capture_policy" not in metadata
+        assert metadata["completed_full_window"] is True
+        assert not list(config.ready_dir.iterdir())
+
+    def test_clean_but_duration_ineligible_file_is_not_published_ready(self, tmp_path):
+        config = _make_config(tmp_path)
+        config.ensure_directories()
+        start = _utc(2026, 7, 15, 10, 0, 10)
+        end = start + timedelta(seconds=10)
+        actual_stop = start + timedelta(seconds=8.5)
+        process = FakeCaptureProcess(outcome=CaptureOutcome(True, -15, stop_requested_at=actual_stop))
+        result = execute_capture_window(
+            process, config, session_id=SESSION_ID, window_start=start, window_end=end,
+            capture_started_at=start, clock=lambda: actual_stop,
+        )
+        assert not result.success and result.error_code == "PARTIAL_CAPTURE"
+        assert result.captured_duration_seconds == 8.5
+        assert result.final_path.exists() and not list(config.ready_dir.iterdir())
 
     def test_start_delay_within_policy_before_window_end_still_captures(self, tmp_path: Path) -> None:
         config = _make_config(tmp_path)

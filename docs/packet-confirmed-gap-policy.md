@@ -1,7 +1,7 @@
 # 확인된 패킷 공백의 미검사 기록과 탐지 재개
 
 `PACKET_CONFIRMED_GAP_POLICY_ENABLED=true`이면 필수 Packet Rule·IF가 같은 경계에서
-대기할 때 확정된 미수집만 `packet_detection_gaps`에 `UNINSPECTED`로 기록한다.
+대기할 때 확인된 미수집·부분 수집의 미검사 구간만 `packet_detection_gaps`에 `UNINSPECTED`로 기록한다.
 기본값은 false이며 Migration 016이 필요하다.
 
 대상은 바로 다음 같은 인터페이스 Session에 기록된 수집 공백과, 실제 Capture가
@@ -15,8 +15,22 @@ Session, Rule·IF 경계 불일치는 자동으로 넘기지 않는다.
 계속 읽는다. PCAP 해시는 SQLite writer 획득 전에 준비하고, writer 획득 후
 파일 식별 정보·DB 증거·두 체크포인트를 다시 확인한다. 알 수 없는 진단, 파일
 누락, 겹침, 실패 구간의 feature, 다음 정상 입력 부재는 전진을 허용하지 않는다.
-이미 기록된 v2 감사의 읽기 검증은 파일 보존기간이나 현재 Session 상태에
+이미 기록된 v2·v3 감사의 읽기 검증은 파일 보존기간이나 현재 Session 상태에
 의존하지 않으며, source 증거가 바뀌면 readiness와 정비 마감·재개를 차단한다.
+
+허용 지연을 넘겼지만 아직 시간이 남은 Window는 원본을 수집하고 품질 미달이면
+FAILED/PARTIAL_CAPTURE로 남긴다. 정상 종료한 이 유형은 진단 v2의 정책·품질 제외 사유·
+실제 timing과 PCAP을 검증한다. 하나라도 진단 v2를 포함한 체인은 감사 v3로 봉인하며,
+기존 v1 진단만 포함한 감사 v2와 공백 감사 v1의 과거 검증은 유지한다. 진단 v2를
+감사 v2에 끼워 넣거나 종료 사실을 조기 종료로 바꾸어 증명하지 않는다.
+
+새 유형의 자동 전진은 종료·stderr 수집 완료, 유효 PCAP, 관측된 kernel drop 0,
+정확한 timing과 정책상 부적격 사유, 같은 Session의 정상 후속 창이 필요하다.
+진단·파일·후속 정상 창이 없거나 Drop 통계가 미확인이면 원본은 보존하고 대기한다.
+부분 원본이 있어도 감사 범위는 탐지하지 않은 명목 10초 전체다. 다음 정상 창의
+탐지는 계속되지만 Packet export/import의 실패 세션 전체 학습 보류는 유지한다.
+정상 후속 창 없는 부분 수집 tail은 자동 감사와 계획 종료 봉인도 계속 보류한다.
+별도 정상 수신 MQTT까지 이 Packet 품질 판정으로 무효화하지 않는다.
 
 수동 복구의 v1 단일 구간과 v2의 명시적 2~3개 연속 구간 승인도 유지한다.
 `dry-run-chain --allow-source-appends`는 승인 때 고정한 입력·설정·체크포인트와

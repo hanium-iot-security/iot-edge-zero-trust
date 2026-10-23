@@ -195,7 +195,7 @@ def validated_confirmed_gap_evidence(audit) -> dict | None:
     """Validate stored digest and bindings; callers also verify source and progress."""
     try:
         evidence = json.loads(audit['evidence_json'])
-        if (evidence['version'] not in (1, 2) or evidence['status'] != audit['status'] or audit['status'] != 'UNINSPECTED'
+        if (evidence['version'] not in (1, 2, 3) or evidence['status'] != audit['status'] or audit['status'] != 'UNINSPECTED'
                 or _digest(evidence) != audit['plan_sha256'] or evidence['reason'] != audit['reason']
                 or evidence['window_start'] != audit['window_start'] or evidence['window_end'] != audit['window_end']
                 or evidence['source']['session_id'] != audit['source_session_id']
@@ -228,7 +228,7 @@ def resolve_confirmed_packet_gap(db: Session, *, range_start: datetime, boundary
             return None
         # No filesystem or live-session identity dependency: only the recorded
         # source loss, first healthy target input and checkpoint provenance bind.
-        current = (validate_partial_evidence(db, rows[0]) if evidence['version'] == 2 else
+        current = (validate_partial_evidence(db, rows[0]) if evidence['version'] in (2, 3) else
                    _candidate(db, start, boundary + timedelta(seconds=10), before))
         if current != evidence:
             return None

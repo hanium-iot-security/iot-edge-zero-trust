@@ -32,6 +32,9 @@ DIAGNOSTIC_FIELDS = ('schema_version', 'session_id', 'capture_interface', 'windo
                     'file_validation_error', 'completed_full_window', 'terminated_cleanly', 'exit_code',
                     'stderr_complete', 'packets_captured', 'packets_received', 'packets_dropped',
                     'packets_dropped_by_interface', 'drop_status')
+TIMING_FIELDS = ('actual_capture_started_at', 'capture_stop_requested_at', 'capture_process_exited_at',
+                 'start_delay_seconds', 'captured_duration_seconds')
+LATE_DIAGNOSTIC_FIELDS = ('quality_failure_reason', 'capture_policy', 'stderr_error') + TIMING_FIELDS
 ERRORS = (ValueError, TypeError, KeyError, OSError, sqlite3.Error, SQLAlchemyError)
 
 
@@ -98,7 +101,7 @@ def _timing(segment):
 
 def _diagnostics(item, segment, source):
     start, end = _timing(segment)
-    _require(item['schema_version'] == 'packet-capture-diagnostics-v1'
+    _require(item['schema_version'] in ('packet-capture-diagnostics-v1', 'packet-capture-diagnostics-v2')
         and item['session_id'] == source['session_id'] and item['capture_interface'] == source['capture_interface']
         and parse_db_utc(item['window_start']) == start and parse_db_utc(item['window_end']) == end
         and item['pcap_file_name'] == item['expected_pcap_file_name'] == segment['file_name']
@@ -109,9 +112,40 @@ def _diagnostics(item, segment, source):
         value = item[key]
         _require(value is None or (isinstance(value, int) and not isinstance(value, bool) and value >= 0))
     loss = any((item[key] or 0) > 0 for key in ('packets_dropped', 'packets_dropped_by_interface'))
-    _require((loss and item['drop_status'] == 'observed_loss')
-             or (item['completed_full_window'] is False and segment['captured_duration_seconds'] < 10))
     _require(isinstance(item['completed_full_window'], bool) and isinstance(item['terminated_cleanly'], bool))
+    if item['schema_version'] == 'packet-capture-diagnostics-v1':
+        # Preserve the original proof contract for retained v1 diagnostics.
+        _require((loss and item['drop_status'] == 'observed_loss')
+                 or (item['completed_full_window'] is False and segment['captured_duration_seconds'] < 10))
+        return
+
+    # v2 describes a clean remainder of the nominal window, rejected only by
+    # the producer's timing policy. Completion must not be relabelled early exit.
+    _require(item['completed_full_window'] is True and item['terminated_cleanly'] is True
+        and item['exit_code'] in (0, -15) and item['stderr_error'] is None
+        and item['packets_dropped'] == 0 and item['packets_dropped_by_interface'] in (None, 0)
+        and item['drop_status'] == 'no_kernel_drops_reported')
+    for key in TIMING_FIELDS[:3]:
+        _require(isinstance(item[key], str)
+            and parse_db_utc(item[key], allow_subseconds=True) == parse_db_utc(segment[key], allow_subseconds=True))
+    for key in TIMING_FIELDS[3:]:
+        _require(isinstance(item[key], (int, float)) and not isinstance(item[key], bool)
+            and math.isfinite(item[key]) and item[key] == segment[key])
+    _require(parse_db_utc(item['actual_capture_started_at'], allow_subseconds=True) < end
+        and parse_db_utc(item['capture_stop_requested_at'], allow_subseconds=True) >= end
+        and 0 < item['captured_duration_seconds'] < 10)
+    snapshot = item['capture_policy']
+    _require(isinstance(snapshot, dict) and set(snapshot) ==
+        {'max_start_delay_seconds', 'minimum_duration_seconds', 'epsilon_seconds', 'version'})
+    _require(isinstance(snapshot['version'], str) and bool(snapshot['version']))
+    for key in ('max_start_delay_seconds', 'minimum_duration_seconds', 'epsilon_seconds'):
+        _require(isinstance(snapshot[key], (int, float)) and not isinstance(snapshot[key], bool)
+            and math.isfinite(snapshot[key]))
+    policy = CapturePolicy(**snapshot)
+    quality = is_capture_eligible(CaptureEligibilitySegment('PROCESSED', None,
+        segment['start_delay_seconds'], segment['captured_duration_seconds']), policy)
+    _require(item['quality_failure_reason'] in ('start_delay_exceeds_policy', 'captured_duration_below_policy')
+        and quality.exclusion_reason == item['quality_failure_reason'])
 
 
 def _healthy(db, segment, policy):
@@ -214,7 +248,9 @@ def prepare_partial_capture(db, start, cutoff, checkpoints):
             _require(_identity(sidecar)[2] <= 1024 * 1024)
             diagnostic_identity, diagnostic_sha, content = _file_proof(sidecar, retain=True)
             raw = json.loads(content)
-            metadata = {key:raw[key] for key in DIAGNOSTIC_FIELDS}
+            fields = DIAGNOSTIC_FIELDS + (LATE_DIAGNOSTIC_FIELDS
+                if raw['schema_version'] == 'packet-capture-diagnostics-v2' else ())
+            metadata = {key:raw[key] for key in fields}
             _require(_identity(sidecar) == diagnostic_identity)
             _diagnostics(metadata, segment, source)
             identity, sha, _ = _file_proof(path)
@@ -222,7 +258,9 @@ def prepare_partial_capture(db, start, cutoff, checkpoints):
             entries.append({'segment':segment, 'pcap_path':str(path), 'pcap_identity':identity, 'pcap_sha256':sha,
                 'diagnostics_path':str(sidecar), 'diagnostics_identity':diagnostic_identity,
                 'diagnostics_sha256':diagnostic_sha, 'diagnostics':metadata})
-        return {'version':2, 'status':'UNINSPECTED', 'reason':'RECORDED_CAPTURE_GAP', 'loss_kind':'PARTIAL_CAPTURE',
+        version = 3 if any(entry['diagnostics']['schema_version'] == 'packet-capture-diagnostics-v2'
+                           for entry in entries) else 2
+        return {'version':version, 'status':'UNINSPECTED', 'reason':'RECORDED_CAPTURE_GAP', 'loss_kind':'PARTIAL_CAPTURE',
             'window_start':start, 'window_end':failed[-1]['window_end'],
             'source':{key:source[key] for key in SESSION_FIELDS}, 'target':{key:source[key] for key in SESSION_FIELDS},
             'failed_segments':entries, 'target_first_segment':healthy,
@@ -236,7 +274,7 @@ def validate_partial_evidence(db, audit, *, verify_files=False):
     """No CP/lifecycle/filesystem dependency unless explicitly preparing a write."""
     try:
         evidence = json.loads(audit['evidence_json'])
-        _require(evidence['version'] == 2 and evidence['loss_kind'] == 'PARTIAL_CAPTURE'
+        _require(evidence['version'] in (2, 3) and evidence['loss_kind'] == 'PARTIAL_CAPTURE'
             and evidence['status'] == audit['status'] == 'UNINSPECTED'
             and evidence['reason'] == audit['reason'] == 'RECORDED_CAPTURE_GAP'
             and digest(evidence) == audit['plan_sha256']
@@ -274,7 +312,9 @@ def validate_partial_evidence(db, audit, *, verify_files=False):
                 _require(_identity(Path(entry['pcap_path'])) == entry['pcap_identity']
                     and _identity(Path(entry['diagnostics_path'])) == entry['diagnostics_identity'])
             failed.append(segment)
-        _require(boundary == finish)
+        has_late_diagnostics = any(entry['diagnostics']['schema_version'] == 'packet-capture-diagnostics-v2'
+                                   for entry in evidence['failed_segments'])
+        _require((evidence['version'] == 3) == has_late_diagnostics and boundary == finish)
         _unobstructed(db, _window(evidence['window_start']), finish, failed)
         healthy = rows(db, 'SELECT * FROM packet_capture_segments WHERE id=:id', {'id':evidence['target_first_segment']['id']})
         _require(len(healthy) == 1 and healthy[0] == evidence['target_first_segment']

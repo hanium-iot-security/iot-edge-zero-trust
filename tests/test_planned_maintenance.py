@@ -938,7 +938,7 @@ def test_committed_empty_prefix_tampering_invalidates_audit_and_exclusions(db, c
     assert get_operation(conn, operation["operation_id"])["status"] == "RESUMED"
     assert conn.execute("SELECT COUNT(*) FROM planned_maintenance_resumes").fetchone()[0] == 1
 
-def typed_partial_source(conn, source_pk, directory, monkeypatch):
+def typed_partial_source(conn, source_pk, directory, monkeypatch, *, timing_failure=False):
     """Persist a real016 proof through the runtime API, with actual closed files."""
     import struct
     from sqlalchemy import text
@@ -959,6 +959,20 @@ def typed_partial_source(conn, source_pk, directory, monkeypatch):
         error_code="PARTIAL_CAPTURE",file_validation_error=None,completed_full_window=True,terminated_cleanly=True,
         exit_code=-15,stderr_complete=True,packets_captured=0,packets_received=1,packets_dropped=1,
         packets_dropped_by_interface=None,drop_status="observed_loss")
+    if timing_failure:
+        from dataclasses import asdict
+        from edge.packet.capture_policy import CapturePolicy
+        actual = (BASE + timedelta(seconds=11.270588)).isoformat()
+        conn.execute("UPDATE packet_capture_segments SET actual_capture_started_at=?,"
+                     "start_delay_seconds=1.270588,captured_duration_seconds=8.729412,"
+                     "error_message='capture timing excluded by policy' WHERE id=?", (actual, failed))
+        conn.commit()
+        metadata.update(schema_version="packet-capture-diagnostics-v2",
+            quality_failure_reason="start_delay_exceeds_policy", capture_policy=asdict(CapturePolicy()),
+            actual_capture_started_at=actual, capture_stop_requested_at=utc(20),
+            capture_process_exited_at=utc(20), start_delay_seconds=1.270588,
+            captured_duration_seconds=8.729412, packets_dropped=0,
+            drop_status="no_kernel_drops_reported", stderr_error=None)
     path.with_suffix(".pcap.capture.json").write_text(json.dumps(metadata))
     monkeypatch.setattr(config,"settings",config.settings.model_copy(update={"pcap_failed_dir":str(directory)}))
     database=conn.execute("PRAGMA database_list").fetchone()[2]
@@ -977,9 +991,12 @@ def typed_partial_source(conn, source_pk, directory, monkeypatch):
 
 
 @pytest.mark.parametrize("mutation", [None,"failed_row","healthy_feature","replacement_audit"])
-def test_typed016_partial_closure_resume_and_seal(db, monkeypatch, mutation):
+@pytest.mark.parametrize("timing_failure", [False, True], ids=["drop-v2", "timing-v3"])
+def test_typed016_partial_closure_resume_and_seal(db, monkeypatch, mutation, timing_failure):
     conn, source_pk, directory=db
-    failed,path=typed_partial_source(conn,source_pk,directory,monkeypatch)
+    failed,path=typed_partial_source(conn,source_pk,directory,monkeypatch,timing_failure=timing_failure)
+    evidence=json.loads(conn.execute("SELECT evidence_json FROM packet_detection_gaps").fetchone()[0])
+    assert evidence["version"] == (3 if timing_failure else 2)
     with transaction(conn):
         operation=request_stop(conn,approved_by="woomin",reason="Close confirmed coverage loss",source_session_id=SOURCE,source_boot_id=OLD_BOOT,now=utc(25))
     conn.execute("UPDATE packet_capture_sessions SET status='COMPLETED',ended_at=? WHERE session_id=?",(utc(30),SOURCE))

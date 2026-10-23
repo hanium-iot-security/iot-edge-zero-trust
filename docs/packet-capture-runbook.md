@@ -385,7 +385,7 @@ Pi Pilot 측정 근거 없이 임의로 바꾸지 않는다. 바꿀 경우 `CAPT
 
 | 환경변수 | 기본값 | 의미 |
 |---|---|---|
-| `PCAP_MAX_START_DELAY_SECONDS` | `1.0` | 이 값을 넘는 지연으로 캡처가 시작되면 tcpdump를 아예 실행하지 않고 `LATE_CAPTURE`로 처리한다 |
+| `PCAP_MAX_START_DELAY_SECONDS` | `1.0` | AI·Rule·학습 입력의 최대 시작 지연. 아직 끝나지 않은 Window는 남은 원본을 수집하되 부적격이면 `FAILED/PARTIAL_CAPTURE`로 보존한다 |
 | `PACKET_MIN_CAPTURE_DURATION_SECONDS` | `9.0` | `10.0 - PCAP_MAX_START_DELAY_SECONDS`로 유도된 값. 두 값을 따로 바꾸면 어긋나므로 항상 함께 조정한다 |
 | `CAPTURE_TIME_EPSILON_SECONDS` | `0.01` | 부동소수점 경계 오차 허용치 |
 | `CAPTURE_POLICY_VERSION` | `packet-capture-policy-v1` | Evidence·Model Metadata에 기록되는 Policy 식별자 |
@@ -397,7 +397,7 @@ Inference), Dataset Export는 모두 이 함수를 그대로 호출해야 하며
 
 ### 6.2 Capture 경계 상태표 실기기 재현 절차
 
-세부계획 2.1 절 표와 동일하게, 아래 다섯 가지 상황을 실기기에서 재현하고 결과를
+기존 입력 품질 기준을 유지하면서 아래 다섯 가지 수집 상황을 구분해 재현하고 결과를
 `Phase 4 실기기 테스트 및 검증 결과` 문서에 기록한다.
 
 **(1) 정상 실행 (`start_delay_seconds <= 1.0`)**
@@ -409,23 +409,26 @@ Inference), Dataset Export는 모두 이 함수를 그대로 호출해야 하며
    판정에는 원본 값이 쓰였는지 확인한다 (반올림된 coverage_ratio 기준으로
    적격 판정하지 않는다).
 
-**(2) 지연 1초 초과, Window는 아직 안 끝남 (Capture Process 미실행, `LATE_CAPTURE`)**
-1. Pi에서 인위적 부하(`stress-ng` 등)를 걸어 캡처 루프가 예정 시각보다 1초
-   넘게 늦게 깨어나도록 유도하거나, 테스트 환경에서 `run_capture_loop`를
-   직접 호출해 재현한다.
-2. 해당 Window가 `status=FAILED`, `error_code=LATE_CAPTURE`, `file_name=NULL`,
-   `actual_capture_started_at=NULL`, `capture_stop_requested_at=NULL`,
-   `capture_process_exited_at=NULL`, `captured_duration_seconds=0`으로
-   기록됐는지 확인한다. `start_delay_seconds`만 감사용으로 실제 관측된 지연
-   값이 남는다.
-3. 부모 `packet_capture_sessions`가 `FAILED`로 마감되고, 다음 정수 10초
-   경계에서 새 Session이 시작됐는지(`session_id`가 바뀜) 확인한다.
+**(2) 허용 지연 초과, Window는 아직 안 끝남 (남은 원본 보존)**
+1. 테스트 환경에서 예정 시작보다 1.270588초 늦은 시각을 주입한다. 명목 10초
+   Window와 종료 경계는 유지하며, 남은 약 8.73초 동안 수집을 시도한다. 실제
+   관측 timing을 기록하므로 이 계산값을 tcpdump 입력 활성 시간으로 단정하지 않는다.
+2. 프로세스가 정상 종료하고 PCAP이 유효해도 공통 품질 판정이 부적격이면
+   `FAILED/PARTIAL_CAPTURE`와 파일·실패 sidecar를 `failed/`에 보존한다. `READY`로
+   공개하거나 Feature·Packet AI·정상 Packet 학습 입력으로 편입하지 않는다.
+3. 이 새 유형은 `packet-capture-diagnostics-v2`에 `quality_failure_reason`,
+   당시 `capture_policy`, 실제 관측 timing을 함께 기록한다. 남은 수집을 끝냈다면
+   `completed_full_window=true`를 유지한다. 기존 Drop·조기 종료는 v1을 유지한다.
+4. 같은 Session의 다음 정상 Window 수집을 계속한다. 탐지의 자동 전진은
+   [확인된 공백 정책](packet-confirmed-gap-policy.md)의 별도 증거 검증을 통과해야 한다.
+   원본 일부가 있다는 사실과 그 10초 전체가 AI 미검사라는 사실을 구분한다.
 
 **(3) Window 대기 중 완전히 만료 (`actual_start >= window_end`)**
 1. Pi를 `SIGSTOP`으로 멈췄다가 수십 초 뒤 `SIGCONT`로 재개해, 캡처 루프가
    현재 대기 중이던 Window의 window_end까지 지나버린 상태로 깨어나게 한다.
-2. 이 경우도 (2)와 동일하게 **딱 하나의** `FAILED/LATE_CAPTURE` Segment만
-   남아야 한다 (실행 중 놓친 현재 Window 한 건은 감사용으로 남긴다).
+2. tcpdump를 시작하지 않고 **딱 하나의** `FAILED/LATE_CAPTURE` Segment를 남긴다.
+   `file_name`과 실제 timing 시각은 NULL, duration은 0이며 관측 지연만 기록한다.
+   부모 Session은 FAILED로 마감하고 다음 경계에서 새 Session을 시작한다.
 
 **(4) 서비스 재시작 시 여러 과거 Window 만료 (Session Gap, 소급 Segment 없음)**
 1. `packet-capture.service`를 1분 이상 멈췄다가 재시작한다.
