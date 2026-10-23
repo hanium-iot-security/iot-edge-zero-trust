@@ -132,7 +132,7 @@ class TestApply:
 
         result = apply_migrations(path, MIGRATIONS_DIR)
 
-        assert result.applied_versions == [7, 8, 9, 10, 11, 12, 13, 14, 15]
+        assert result.applied_versions == [7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         with connect_database(path) as connection:
             after = {
                 name: [tuple(row) for row in connection.execute(sql)]

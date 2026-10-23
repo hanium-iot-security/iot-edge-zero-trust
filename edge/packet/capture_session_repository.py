@@ -310,6 +310,15 @@ def get_packet_feature_ready_through(
         {"session_id": session_id},
     ).mappings().all()
 
+    from edge.packet.segment_gap_recovery import approved_segment_gaps
+    from edge.packet.confirmed_partial_capture import approved_partial_capture_gaps
+    failed = [dict(row) for row in rows if row['status'] == 'FAILED'
+              and row['error_code'] == PARTIAL_CAPTURE and row['feature_count'] == 0]
+    old = approved_segment_gaps(db, failed) if failed else []
+    partial = approved_partial_capture_gaps(db, failed)
+    approved = {row['id'] for row, prior, current in zip(failed, old, partial)
+                if prior is not None or current is not None}
+
     for index, segment in enumerate(rows):
         window_start = _parse_db_utc(segment["window_start"])
         window_end = _parse_db_utc(segment["window_end"])
@@ -329,11 +338,7 @@ def get_packet_feature_ready_through(
         status = str(segment["status"])
         feature_count = int(segment["feature_count"])
         if status == "FAILED" and segment["error_code"] == PARTIAL_CAPTURE:
-            # Import here so the recovery inspector can use repository helpers
-            # without creating an import cycle.
-            from edge.packet.segment_gap_recovery import approved_segment_gap
-
-            if feature_count != 0 or approved_segment_gap(db, segment) is None:
+            if feature_count != 0 or segment['id'] not in approved:
                 break
         elif status not in {"PROCESSED", "EMPTY"} or segment["error_code"] is not None:
             break

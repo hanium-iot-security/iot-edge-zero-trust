@@ -170,6 +170,31 @@ def test_same_identity_retry_only_observes_drain_and_reuses_audit(prefix_runner)
     assert system.events == calls + ["authenticate"]
 
 
+def test_confirmed_gap_progress_is_accepted_by_command_and_readonly_retry(prefix_runner):
+    from tests.test_planned_prefix_recovery import advance_for_drain, record_confirmed_tail
+
+    runner, system, _, operation, _, _ = prefix_runner
+
+    def catch_up():
+        simulate_pipeline_drain(prefix_runner)
+        with sqlite3.connect(runner.database) as conn:
+            conn.row_factory = sqlite3.Row
+            record_confirmed_tail(conn)
+            advance_for_drain(conn, 110)
+
+    system.on_sleep = catch_up
+    first = recover(prefix_runner, verify_timeout=2)
+    assert first["result"] == "PREFIX_DRAINED_CONFIRMED_GAP"
+    assert first["verification"]["gap_status"] == "UNINSPECTED"
+    before, calls = snapshot(runner), system.events[:]
+    second = recover(prefix_runner)
+    assert second["result"] == "PREFIX_DRAINED_CONFIRMED_GAP" and second["reapplied"] is False
+    assert second["audit"]["plan_sha256"] == first["audit"]["plan_sha256"]
+    assert audit_count(runner) == 1 and snapshot(runner) == before
+    assert runner.status(operation)["operation"]["status"] == "RESUMED"
+    assert system.events == calls + ["authenticate"]
+
+
 def test_successor_race_before_apply_holds_and_restores_orchestrator(prefix_runner):
     runner, system, _, operation, _, _ = prefix_runner
     real_backup = runner.backup

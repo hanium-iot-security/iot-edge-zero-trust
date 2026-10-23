@@ -661,6 +661,19 @@ version/SHA256·경계 B·계획 hash/JSON·적용 시각을 담고 Stage마다 
 승인 행을 seed하지 않습니다. 모델 교체·새 승인 이력 확장은 별도 작업입니다.
 사용법과 범위는 [기기별 추론 연결 절차](phase9-ai-policy-runtime.md)를 참고합니다.
 
+## packet_detection_gaps
+
+Migration 016은 확인된 미수집 공백을 `UNINSPECTED`로 기록하는 불변 감사표입니다.
+source/target Capture Session UUID, 시작·끝, 원인(`RECORDED_CAPTURE_GAP` 또는
+`LATE_CAPTURE`), 검증 근거 JSON·SHA256과 생성 시각을 보존합니다. 같은 시작·끝은
+한 번만 기록하며 UPDATE·DELETE를 거부합니다. 감사와 두 Packet 처리 경계는 같은
+트랜잭션으로 저장하고 원본 실패·자료 ID는 변경하지 않습니다.
+
+공백 안의 자료 부재를 확인할 때 전체 이력을 훑지 않도록 `idx_packet_segments_gap_end`와
+`idx_packet_features_gap_end`를 추가합니다. 두 Index 모두 UTC 시각 표현 차이를 처리하는
+`unixepoch(window_end), unixepoch(window_start)` 표현식 Index입니다.
+자세한 범위는 [확인된 패킷 공백 정책](packet-confirmed-gap-policy.md)을 참고합니다.
+
 ## 주요 Index
 
 002 migration은 다음 조회를 위해 index를 추가합니다.

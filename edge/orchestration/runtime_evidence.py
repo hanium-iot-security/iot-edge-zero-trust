@@ -122,6 +122,10 @@ class RuntimeEvidence:
 
             delegate.completion_sink = completion_sink
 
+    def input_interrupted(self, db, *, detector_name, boundary) -> None:
+        repository.interrupt_ai_warnings(
+            db, detector_name=detector_name, boundary=boundary, observed_at=self.clock())
+
     def stage_completed(self, db, result) -> None:
         name = self._stage_names[(result.detector_name, result.source_table)]
         if (name in self._device_policy_stages

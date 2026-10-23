@@ -40,7 +40,7 @@ from edge.orchestration.stage_registry import (
 from edge.packet import capture_session_repository as capture_sessions
 from edge.packet.capture_policy import CapturePolicy
 from edge.packet.pcap_naming import build_pcap_filename
-from edge.packet.segment_gap_recovery import apply_segment_gap_plan, build_segment_gap_plan
+from edge.packet.segment_gap_recovery import apply_segment_gap_plan, build_segment_gap_plan, build_segment_gap_chain_plan
 from edge.trust.trust_score_v2 import TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE
 
 
@@ -379,3 +379,88 @@ def test_feature_window_must_match_capture_window_before_packet_stage_runs(runti
         db.commit()
         with pytest.raises(PacketFeatureRangeNotReadyError):
             require_packet_feature_ready_range(db, cycle_range_start=BASE, cycle_cutoff=_time(10))
+
+
+def _seed_chain(runtime, tmp_path):
+    session_factory, _, session_pk = runtime
+    registry = _registry(tmp_path)
+    with session_factory() as db:
+        _, first_feature = _segment(db, session_pk, 0)
+        failed_ids = [_segment(db, session_pk, seconds, status="FAILED")[0] for seconds in (10, 20, 30)]
+        _, tail_feature = _segment(db, session_pk, 40)
+        for seconds in range(0, 50, 10):
+            db.execute(text("INSERT INTO mqtt_logs(device_id,topic,payload,payload_size,received_at,is_json_valid,is_topic_valid) "
+                            "VALUES (:device,:topic,'{}',2,:received,1,1)"),
+                       {"device": DEVICE_ID, "topic": f"iot/{DEVICE_ID}/sensor", "received": format_db_utc(_time(seconds+1))})
+        db.commit()
+    run_producer_cycle(session_factory=session_factory, now=_time(51))
+    initial = run_orchestration_cycle(session_factory=session_factory, registry=registry)
+    assert initial.status == CYCLE_COMPLETED and initial.cutoff == _time(10)
+    return registry, failed_ids, first_feature, tail_feature
+
+
+def _approve_chain(runtime, failed_ids, tmp_path):
+    _, db_path, _ = runtime
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        pcaps = [{"path": str((tmp_path / conn.execute("SELECT file_name FROM packet_capture_segments WHERE id=?", (segment_id,)).fetchone()[0]).resolve()),
+                  "sha256": str(index)*64} for index, segment_id in enumerate(failed_ids, 1)]
+        plan = build_segment_gap_chain_plan(
+            conn, capture_session_id=CAPTURE_ID, failed_segment_ids=failed_ids, preserved_pcaps=pcaps,
+            approved_by="woomin", reason="Exactly approved three-window loss",
+            repository_commit="a"*40, database_path=str(db_path.resolve()), backup_path=str((tmp_path / "chain-backup.db").resolve()),
+        )
+        conn.execute("BEGIN IMMEDIATE")
+        apply_segment_gap_plan(conn, plan, backup_sha256="c"*64)
+        conn.commit()
+    return plan
+
+
+def test_three_gap_chain_reuses_real_mqtt_trust_catchup_and_detects_normal_tail(runtime, tmp_path):
+    session_factory, _, _ = runtime
+    registry, failed_ids, first_feature, tail_feature = _seed_chain(runtime, tmp_path)
+    with session_factory() as db:
+        failed_before = [dict(row) for row in db.execute(text("SELECT * FROM packet_capture_segments WHERE status='FAILED' ORDER BY id")).mappings()]
+    _approve_chain(runtime, failed_ids, tmp_path)
+    assert _readiness(session_factory).packet_feature_ready_through == _time(50)
+    catchup = run_orchestration_cycle(session_factory=session_factory, registry=registry)
+    assert catchup.status == CYCLE_COMPLETED
+    assert (catchup.range_start, catchup.cutoff) == (_time(10), _time(40))
+    assert {result.detector_name for result in catchup.stage_results} == {MQTT_FEATURE_RULE, MQTT_MESSAGE_RULE}
+    with session_factory() as db:
+        for detector in (PACKET_RULE, PACKET_IF):
+            assert _checkpoint(db, detector)["last_processed_id"] == first_feature
+            assert _checkpoint(db, detector)["last_completed_window_end"] == format_db_utc(_time(40))
+        assert _checkpoint(db, TRUST_DETECTOR_NAME, TRUST_SOURCE_TABLE)["last_completed_window_end"] == format_db_utc(_time(40))
+    tail = run_orchestration_cycle(session_factory=session_factory, registry=registry)
+    assert tail.status == CYCLE_COMPLETED
+    assert (tail.range_start, tail.cutoff) == (_time(40), _time(50))
+    packet_results = [row for row in tail.stage_results if row.detector_name in (PACKET_RULE, PACKET_IF)]
+    assert len(packet_results) == 2 and all(row.selected_count == 1 for row in packet_results)
+    with session_factory() as db:
+        assert [dict(row) for row in db.execute(text("SELECT * FROM packet_capture_segments WHERE status='FAILED' ORDER BY id")).mappings()] == failed_before
+        for detector in (PACKET_RULE, PACKET_IF):
+            assert _checkpoint(db, detector)["last_processed_id"] == tail_feature
+        assert db.execute(text("SELECT count(*) FROM packet_feature_logs")).scalar_one() == 2
+        assert db.execute(text("SELECT count(*) FROM packet_segment_gap_recoveries")).scalar_one() == 3
+        assert db.execute(text("SELECT count(*) FROM detection_events")).scalar_one() == 0
+        assert db.execute(text("SELECT count(*) FROM trust_score_history")).scalar_one() == 0
+        assert db.execute(text("SELECT trust_score FROM devices")).scalar_one() == 100
+
+
+@pytest.mark.parametrize("after_progress", [False, True])
+def test_chain_missing_middle_audit_closes_readiness_and_tail_coverage(runtime, tmp_path, after_progress):
+    session_factory, _, _ = runtime
+    registry, failed_ids, _, _ = _seed_chain(runtime, tmp_path)
+    _approve_chain(runtime, failed_ids, tmp_path)
+    if after_progress:
+        assert run_orchestration_cycle(session_factory=session_factory, registry=registry).cutoff == _time(40)
+        assert run_orchestration_cycle(session_factory=session_factory, registry=registry).cutoff == _time(50)
+    with session_factory() as db:
+        db.execute(text("DELETE FROM packet_segment_gap_recoveries WHERE failed_segment_id=:id"), {"id": failed_ids[1]})
+        db.commit()
+        with pytest.raises(PacketFeatureRangeNotReadyError):
+            require_packet_feature_ready_range(db, cycle_range_start=_time(10), cycle_cutoff=_time(50))
+    assert _readiness(session_factory).packet_feature_ready_through == _time(10)
+    outcome = run_orchestration_cycle(session_factory=session_factory, registry=registry)
+    assert outcome.status == CYCLE_SKIPPED_NO_NEW_WINDOW

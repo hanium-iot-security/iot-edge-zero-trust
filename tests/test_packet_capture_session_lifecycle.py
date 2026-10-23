@@ -903,62 +903,47 @@ class TestRunCaptureLoop:
 
 
 class TestRunCaptureLoopLateCaptureWithinWindow:
-    """정상 실행 중이며 window_start < actual_start < window_end, 지연 1초 초과" -> Capture Process를 실행하지 않고 FAILED/LATE_CAPTURE로 처리."""
+    """A late remainder is preserved, and the following grid window stays in the same session."""
 
-    def test_delay_beyond_policy_skips_capture_and_fails_session(self, db_session, tmp_path) -> None:
+    def test_delay_beyond_policy_preserves_original_and_next_normal_window(self, db_session, tmp_path):
         config = _make_config(tmp_path)
-        session_pk, session_id, first_window_start = start_new_session(
+        session_pk, session_id, first = start_new_session(
             db_session, config, _utc(2026, 7, 15, 10, 0, 3)
-        )  # first_window_start == 10:00:10, window_end == 10:00:20
-
-        # 첫 sleep에서만 window_start보다 2초 늦게 깨어난 척한다 (window_end 전이지만
-        # 기본 정책(1.0초+epsilon)을 초과하는 지연). 이후 sleep은 정상적으로 요청한
-        # 시간만큼만 흘려보내 두 번째 Window는 정책 범위 안에서 캡처되게 한다.
+        )
         clock = _MutableClock(_utc(2026, 7, 15, 10, 0, 3))
-        sleep_calls = {"count": 0}
+        sleep_calls = 0
 
-        def sleep_late_once(seconds: float) -> None:
-            sleep_calls["count"] += 1
-            overshoot = 2.0 if sleep_calls["count"] == 1 else 0.0
-            clock.advance(seconds + overshoot)
+        def sleep_late_once(seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            clock.advance(seconds + (2 if sleep_calls == 1 else 0))
 
-        process = FakeCaptureProcess(
-            outcomes=[CaptureOutcome(completed_full_window=True, exit_code=-15)]
-        )
-        shutdown = GracefulShutdown()
+        process = _OverheadCaptureProcess(clock=clock, overhead_seconds=0)
+        assert run_capture_loop(
+            db_session, process, config, session_pk=session_pk, session_id=session_id,
+            first_window_start=first, shutdown=GracefulShutdown(), max_windows=2,
+            clock=clock.now, sleep=sleep_late_once,
+        ) == 2
 
-        windows_captured = run_capture_loop(
-            db_session, process, config,
-            session_pk=session_pk, session_id=session_id,
-            first_window_start=first_window_start,
-            shutdown=shutdown, max_windows=1,
-            clock=clock.now,
-            sleep=sleep_late_once,
-        )
+        assert process.calls == pytest.approx([8, 10])
+        assert db_session.execute(text("SELECT status FROM packet_capture_sessions WHERE id=:id"),
+                                  {"id": session_pk}).scalar() == "COMPLETED"
+        rows = db_session.execute(text(
+            "SELECT capture_session_id,window_start,status,error_code,file_name,"
+            "start_delay_seconds,captured_duration_seconds FROM packet_capture_segments ORDER BY window_start"
+        )).mappings().all()
+        assert len(rows) == 2 and all(row["capture_session_id"] == session_pk for row in rows)
+        partial, normal = rows
+        assert partial["window_start"] == "2026-07-15T10:00:10Z"
+        assert partial["status"] == "FAILED" and partial["error_code"] == "PARTIAL_CAPTURE"
+        assert partial["start_delay_seconds"] == 2 and partial["captured_duration_seconds"] == 8
+        assert (config.failed_dir / partial["file_name"]).exists()
+        assert not (config.ready_dir / partial["file_name"]).exists()
+        assert normal["window_start"] == "2026-07-15T10:00:20Z"
+        assert normal["status"] == "READY" and normal["error_code"] is None
+        assert normal["start_delay_seconds"] == 0 and normal["captured_duration_seconds"] == 10
 
-        # LATE_CAPTURE로 건너뛴 Window는 max_windows 카운트에 포함되지 않으므로,
-        # 다음 정수 경계에서 실제로 캡처된 Window 1개가 소진될 때까지 루프가 계속된다.
-        assert windows_captured == 1
-        assert process.outcomes == []
-
-        original_row = db_session.execute(
-            text("SELECT status FROM packet_capture_sessions WHERE id = :id"),
-            {"id": session_pk},
-        ).mappings().first()
-        assert original_row["status"] == "FAILED"
-
-        segments = db_session.execute(
-            text(
-                "SELECT window_start, status, error_code FROM packet_capture_segments "
-                "ORDER BY window_start"
-            )
-        ).fetchall()
-        assert len(segments) == 2
-        assert segments[0] == ("2026-07-15T10:00:10Z", "FAILED", "LATE_CAPTURE")
-        assert segments[1][1] == "READY"
-
-
-    def test_commit_delay_after_arming_boundary_still_records_late_capture(self, db_session, tmp_path, monkeypatch) -> None:
+    def test_commit_delay_after_arming_boundary_preserves_partial_original(self, db_session, tmp_path, monkeypatch) -> None:
         config = _make_config(tmp_path)
         clock = _MutableClock(_utc(2026, 7, 15, 10, 0, 19))
         commit = db_session.commit
@@ -982,9 +967,10 @@ class TestRunCaptureLoopLateCaptureWithinWindow:
         late = db_session.execute(text("SELECT window_start,status,error_code,file_name,start_delay_seconds "
                                         "FROM packet_capture_segments WHERE capture_session_id=:id"),
                                   {"id": source_pk}).mappings().one()
-        assert dict(source) == {"first_window_start": "2026-07-15T10:00:20Z", "status": "FAILED"}
+        assert dict(source) == {"first_window_start": "2026-07-15T10:00:20Z", "status": "COMPLETED"}
         assert late["window_start"] == "2026-07-15T10:00:20Z"
-        assert late["status"] == "FAILED" and late["error_code"] == "LATE_CAPTURE" and late["file_name"] is None
+        assert late["status"] == "FAILED" and late["error_code"] == "PARTIAL_CAPTURE"
+        assert (config.failed_dir / late["file_name"]).exists()
         assert late["start_delay_seconds"] == pytest.approx(1.254)
         assert len(process.calls) == 1
 
@@ -992,7 +978,7 @@ class TestRunCaptureLoopLateCaptureWithinWindow:
         config = _make_config(tmp_path)
         clock = _MutableClock(_utc(2026, 7, 15, 10, 0, 3))
         source_pk, source_id, first = start_new_session(db_session, config, clock.now(), clock=clock.now)
-        clock.advance(9)
+        clock.advance(19)
         close_session, create_session = repo.close_session, repo.create_session
 
         def delayed_close(*args, **kwargs):
@@ -1014,12 +1000,12 @@ class TestRunCaptureLoopLateCaptureWithinWindow:
         rows = db_session.execute(text("SELECT started_at,first_window_start,capture_gap_start,capture_gap_end,status "
                                        "FROM packet_capture_sessions ORDER BY id")).mappings().all()
         assert rows[0]["first_window_start"] == "2026-07-15T10:00:10Z" and rows[0]["status"] == "FAILED"
-        assert dict(rows[1]) == {"started_at": "2026-07-15T10:00:19Z", "first_window_start": "2026-07-15T10:00:30Z",
-                                "capture_gap_start": "2026-07-15T10:00:20Z", "capture_gap_end": "2026-07-15T10:00:30Z",
+        assert dict(rows[1]) == {"started_at": "2026-07-15T10:00:29Z", "first_window_start": "2026-07-15T10:00:40Z",
+                                "capture_gap_start": "2026-07-15T10:00:20Z", "capture_gap_end": "2026-07-15T10:00:40Z",
                                 "status": "COMPLETED"}
         segments = db_session.execute(text("SELECT window_start,status,error_code FROM packet_capture_segments "
                                            "ORDER BY window_start")).fetchall()
-        assert segments == [("2026-07-15T10:00:10Z", "FAILED", "LATE_CAPTURE"), ("2026-07-15T10:00:30Z", "READY", None)]
+        assert segments == [("2026-07-15T10:00:10Z", "FAILED", "LATE_CAPTURE"), ("2026-07-15T10:00:40Z", "READY", None)]
         assert len(process.calls) == 1
 
 

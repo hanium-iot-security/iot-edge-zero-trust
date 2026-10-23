@@ -315,9 +315,9 @@ def test_runner_applies_new_database_in_order(tmp_path: Path) -> None:
     result = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        assert result.applied_versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         assert result.baselined_versions == []
-        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         assert _table_exists(connection, "packet_capture_sessions")
         assert _table_exists(connection, "trust_score_history")
 
@@ -491,7 +491,7 @@ def test_packet_checkpoint_recovery_migration_applies_005_to_existing_004(
             ).fetchall()),
         }
     result = apply_migrations(db_path, MIGRATIONS_DIR)
-    assert result.applied_versions == [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    assert result.applied_versions == [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     with connect_database(db_path) as connection:
         after = {
             "checkpoints": tuple(connection.execute(
@@ -1033,8 +1033,8 @@ def test_runner_applies_002_and_003_to_existing_001_db_and_preserves_rows(
 
     with connect_database(db_path) as connection:
         assert result.baselined_versions == [1]
-        assert result.applied_versions == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        assert result.applied_versions == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         device = connection.execute(
             "SELECT device_id, status, trust_score FROM devices"
         ).fetchone()
@@ -1075,10 +1075,10 @@ def test_runner_skips_already_applied_migrations(tmp_path: Path) -> None:
     second = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert first.applied_versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        assert first.applied_versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         assert second.applied_versions == []
-        assert second.skipped_versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        assert second.skipped_versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
 
 
 def test_runner_sorts_migration_files_by_version(tmp_path: Path) -> None:
@@ -1213,8 +1213,8 @@ def test_failed_002_migration_can_be_retried_after_fix(tmp_path: Path) -> None:
     result = apply_migrations(db_path, migrations_dir)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        assert result.applied_versions == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         assert not _table_exists(connection, "retry_marker")
         assert _table_exists(connection, "packet_capture_sessions")
         assert "failed_retry_column" not in _column_names(
@@ -2212,8 +2212,8 @@ def test_phase4_migration_applies_003_to_existing_002_and_preserves_segments(
     result = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        assert result.applied_versions == [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         assert {
             "actual_capture_started_at",
             "capture_stop_requested_at",
@@ -2891,8 +2891,8 @@ def test_trust_score_compensation_migration_applies_004_to_existing_003(
     result = apply_migrations(db_path, MIGRATIONS_DIR)
 
     with connect_database(db_path) as connection:
-        assert result.applied_versions == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        assert result.applied_versions == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        assert _migration_versions(connection) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         assert _table_exists(connection, "trust_score_compensations")
         assert tuple(
             connection.execute(
@@ -2906,3 +2906,23 @@ def test_trust_score_compensation_migration_applies_004_to_existing_003(
         ) == history_before
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_confirmed_gap_migration_alone_preserves_pi_schema_and_rows(tmp_path):
+    from db.migration_runner import _apply_single_migration, discover_migrations
+
+    migrations = discover_migrations(MIGRATIONS_DIR)
+    baseline = tmp_path / "pi_baseline"
+    _write_project_migrations_subset(baseline, tuple(m.path.name for m in migrations if m.version <= 11))
+    path = tmp_path / "pi.db"
+    apply_migrations(path, baseline)
+    with connect_database(path) as connection:
+        connection.execute("INSERT INTO devices(device_id, status, trust_score) VALUES ('retained', 'normal', 80)")
+        before = dict(connection.execute("SELECT * FROM devices WHERE device_id='retained'").fetchone())
+        _apply_single_migration(connection, next(m for m in migrations if m.version == 16))
+        assert _migration_versions(connection) == list(range(1, 12)) + [16]
+        assert _table_exists(connection, "packet_detection_gaps")
+        assert not _table_exists(connection, "device_ai_policy_revisions")
+        assert not _table_exists(connection, "ai_stage_activations")
+        assert dict(connection.execute("SELECT * FROM devices WHERE device_id='retained'").fetchone()) == before
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []

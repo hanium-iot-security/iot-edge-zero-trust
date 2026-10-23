@@ -351,7 +351,7 @@ class MaintenanceRunner:
                 if failed:
                     raise MaintenanceHold("successor has a new failed capture segment requiring separate recovery")
                 last = self.core.check_prefix_drain(conn, operation_id)
-            if last.get("result") == "PREFIX_DRAINED_RECOVERY_REQUIRED":
+            if last.get("result") in ("PREFIX_DRAINED_RECOVERY_REQUIRED", "PREFIX_DRAINED_CONFIRMED_GAP"):
                 return last
             if last.get("result") != "WAIT":
                 raise MaintenanceHold(f"unexpected prefix drain result: {last.get('result')}")
@@ -406,8 +406,8 @@ class MaintenanceRunner:
                                                         timeout=verify_timeout)
                 except BaseException as exc:
                     progress = {"result": "HOLD", "reason": str(exc)}
-                return {"result": "PREFIX_DRAINED_RECOVERY_REQUIRED"
-                        if progress["result"] == "PREFIX_DRAINED_RECOVERY_REQUIRED" else "COMMITTED_HOLD",
+                return {"result": progress["result"]
+                        if progress["result"] in ("PREFIX_DRAINED_RECOVERY_REQUIRED", "PREFIX_DRAINED_CONFIRMED_GAP") else "COMMITTED_HOLD",
                         "operation_id": operation_id, "audit": audit, "verification": progress,
                         "reapplied": False}
             if isinstance(self.system, SystemOperations):
@@ -462,8 +462,8 @@ class MaintenanceRunner:
                                                     timeout=verify_timeout)
             except BaseException as exc:
                 progress = {"result": "HOLD", "reason": str(exc)}
-            return {"result": "PREFIX_DRAINED_RECOVERY_REQUIRED"
-                    if progress["result"] == "PREFIX_DRAINED_RECOVERY_REQUIRED" else "COMMITTED_HOLD",
+            return {"result": progress["result"]
+                    if progress["result"] in ("PREFIX_DRAINED_RECOVERY_REQUIRED", "PREFIX_DRAINED_CONFIRMED_GAP") else "COMMITTED_HOLD",
                     "operation_id": operation_id, "audit": result, "verification": progress}
 
     def prepare_stop(self, *, approved_by, reason, timeout=180):

@@ -301,6 +301,7 @@ def _last_segment_window_end(rows: Sequence[sqlite3.Row]) -> datetime | None:
 def _live_resume_blocking_reasons(
     rows: Sequence[sqlite3.Row], first_window_start: datetime,
     connection: sqlite3.Connection | None = None,
+    approved_gaps: set[int] | None = None,
 ) -> tuple[str, ...]:
     """Validate the complete observed RUNNING-session shape.
 
@@ -309,6 +310,8 @@ def _live_resume_blocking_reasons(
     not appear after that suffix has started.
     """
     expected = first_window_start
+    if approved_gaps is None:
+        approved_gaps = _approved_gaps(connection, rows) if connection is not None else set()
     ready_tail_started = False
     reasons: list[str] = []
     for row in rows:
@@ -323,7 +326,7 @@ def _live_resume_blocking_reasons(
 
         status = str(row["status"])
         feature_count = int(row["feature_count"])
-        approved_gap = connection is not None and _approved_gap(connection, row)
+        approved_gap = row['id'] in approved_gaps
         if approved_gap:
             if ready_tail_started:
                 reasons.append("TERMINAL_AFTER_READY_TAIL")
@@ -348,13 +351,19 @@ def _live_resume_blocking_reasons(
     return tuple(dict.fromkeys(reasons))
 
 
-def _approved_gap(connection: sqlite3.Connection, row: sqlite3.Row) -> bool:
-    """An existing exact audit is coverage evidence, never normal capture data."""
-    if row["status"] != "FAILED" or row["error_code"] != "PARTIAL_CAPTURE" or row["feature_count"] != 0:
-        return False
-    from edge.packet.segment_gap_recovery import approved_segment_gap
+def _approved_gaps(connection: sqlite3.Connection, rows: Sequence[sqlite3.Row]) -> set[int]:
+    """One batch proof for this readiness read, never normal capture data."""
+    from edge.packet.segment_gap_recovery import approved_segment_gaps
+    from edge.packet.confirmed_partial_capture import approved_partial_capture_gaps
 
-    return approved_segment_gap(connection, dict(row)) is not None
+    failed = [dict(row) for row in rows if row['status'] == 'FAILED'
+              and row['error_code'] == 'PARTIAL_CAPTURE' and row['feature_count'] == 0]
+    if not failed:
+        return set()
+    old = approved_segment_gaps(connection, failed)
+    partial = approved_partial_capture_gaps(connection, failed)
+    return {row['id'] for row, prior, current in zip(failed, old, partial)
+            if prior is not None or current is not None}
 
 
 def calculate_packet_feature_readiness(
@@ -385,6 +394,7 @@ def calculate_packet_feature_readiness(
     consumed_segment_ids: list[int] = []
     blocking_reasons: list[str] = []
     rows = _list_segment_feature_counts(connection, session_id)
+    approved_gaps = _approved_gaps(connection, rows)
     for index, row in enumerate(rows):
         start = parse_db_utc(row["window_start"], "window_start")
         if start < expected:
@@ -395,7 +405,7 @@ def calculate_packet_feature_readiness(
             break
         status = str(row["status"])
         count = int(row["feature_count"])
-        if not _approved_gap(connection, row) and (
+        if row['id'] not in approved_gaps and (
             status not in {"PROCESSED", "EMPTY"} or row["error_code"] is not None
         ):
             blocking_reasons.append("NON_TERMINAL_OR_ERROR")
@@ -429,7 +439,7 @@ def calculate_packet_feature_readiness(
         and len(consumed_segment_ids) == len(set(consumed_segment_ids))
         and not blocking_reasons
     )
-    live_resume_reasons = _live_resume_blocking_reasons(rows, first, connection)
+    live_resume_reasons = _live_resume_blocking_reasons(rows, first, connection, approved_gaps)
     return RecoverySessionReadiness(
         session_id,
         first,

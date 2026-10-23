@@ -14,6 +14,8 @@ Environment=GIT_CONFIG_COUNT=1
 Environment=GIT_CONFIG_KEY_0=safe.directory
 Environment=GIT_CONFIG_VALUE_0=/home/pi/iot-edge-zero-trust
 UMask=0077
+Nice=10
+IOSchedulingClass=idle
 ExecStart=/home/pi/iot-edge-zero-trust/venv/bin/python -m edge.maintenance.run_planned_maintenance resume --timeout 120 --verify-timeout 120 --artifact-dir output/planned-maintenance
 TimeoutStartSec=480
 # Failure/WAIT is logged and requires inspection; never loop automatic approvals.

@@ -263,12 +263,21 @@ def _interrupt_warnings(db, completion, observed_at):
     # existing buckets so a same-bucket return cannot join pre-gap anomalies.
     boundary = (completion["window_start"] or
                 _window(_utc(completion["completed_window_end"]) - timedelta(seconds=10)))
+    interrupt_ai_warnings(db, detector_name=completion["detector_name"], boundary=boundary,
+                          observed_at=observed_at, device_id=completion["device_id"])
+
+
+def interrupt_ai_warnings(db, *, detector_name, boundary, observed_at, device_id=None):
+    """Close pre-gap buckets in the caller's transaction without inventing a completion."""
+    _require_schema(db)
+    if detector_name not in _EVENT_TYPES:
+        raise ValueError("unknown AI detector")
     where = "detector_name=:detector AND closed=0 AND bucket_start<=:boundary"
-    params = {"detector": completion["detector_name"], "boundary": boundary,
-              "observed": observed_at}
-    if completion["device_id"] is not None:
+    params = {"detector": detector_name, "boundary": _window(boundary),
+              "observed": _stamp(observed_at)}
+    if device_id is not None:
         where += " AND device_id=:device"
-        params["device"] = completion["device_id"]
+        params["device"] = device_id
     _execute(db, """UPDATE ai_warning_aggregates SET closed=1,
         last_decision='INPUT_INTERRUPTED',updated_at=:observed WHERE """ + where, params)
 

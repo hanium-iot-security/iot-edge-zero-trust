@@ -145,6 +145,50 @@ def test_ready_holds_producer_without_consuming_raw_or_rewinding(prepared):
                                     BASE + timedelta(seconds=20))
 
 
+@pytest.mark.parametrize("range_offset", [0, 10], ids=["zero-range", "negative-range"])
+def test_ready_idle_cycle_does_not_request_writer_while_another_writer_is_active(
+    prepared, monkeypatch, range_offset,
+):
+    """A sealed READY wait must stay read-only even under real SQLite contention."""
+    from edge.orchestration import run_detection_orchestrator as runner
+
+    path, factory, operation = prepared
+    boundary = BASE + timedelta(seconds=10)
+    monkeypatch.setattr(runner, "settings", runner.settings.model_copy(
+        update={"packet_confirmed_gap_policy_enabled": True}))
+    if range_offset:
+        # The normal resolver clamps to cutoff. Inject only the unreachable
+        # negative-range edge; the READY seal and all six checkpoints stay real.
+        monkeypatch.setattr(runner, "resolve_cycle_range_start",
+                            lambda *_args, **_kwargs: boundary)
+        monkeypatch.setattr(runner, "resolve_cycle_cutoff",
+                            lambda *_args: boundary - timedelta(seconds=range_offset))
+    ai = RecordingPacketIF()
+    stages = (MqttFeatureRuleStage(), MqttMessageRuleStage(),
+              PacketFeatureReadyStage(PacketRuleDetectorStage(capture_policy=CapturePolicy())),
+              PacketFeatureReadyStage(ai))
+    registry = StageRegistry(tuple(ConfiguredStage(stage.detector_name, stage, True) for stage in stages))
+    with factory() as db:
+        db.execute(text("PRAGMA busy_timeout=0"))
+        db.commit()
+    with closing(sqlite3.connect(path)) as writer:
+        sealed = writer.execute(
+            "SELECT status,source_final_boundary FROM planned_maintenance_operations WHERE operation_id=?",
+            (operation,)).fetchone()
+        assert sealed == ("READY", utc(10))
+        assert writer.execute(
+            "SELECT COUNT(*),COUNT(DISTINCT last_completed_window_end),MIN(last_completed_window_end) "
+            "FROM detector_checkpoints").fetchone() == (6, 1, utc(10))
+        before = tuple(writer.iterdump())
+        writer.execute("BEGIN IMMEDIATE")
+        result = run_orchestration_cycle(session_factory=factory, registry=registry)
+        assert result.status == runner.CYCLE_SKIPPED_NO_NEW_WINDOW
+        assert result.range_start == boundary
+        assert result.cutoff == boundary - timedelta(seconds=range_offset)
+        assert tuple(writer.iterdump()) == before
+        assert ai.calls == []
+
+
 def test_resumed_producer_excludes_gap_but_keeps_raw_and_real_source_ids(prepared):
     path, factory, operation = prepared
     with closing(sqlite3.connect(path)) as conn:
