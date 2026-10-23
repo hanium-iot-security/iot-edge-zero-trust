@@ -1,6 +1,7 @@
 """Native SQLite backup contracts using invented databases and real WAL writes."""
 from contextlib import closing, contextmanager
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -372,3 +373,225 @@ def test_integrity_failure_does_not_publish_and_releases_source(tmp_path, monkey
         cli.online_backup(database, root)
     assert_sources_closed(sources)
     assert_no_checksum(root)
+
+
+def test_timing_emits_one_private_line_only_after_connections_close(tmp_path, monkeypatch, capsys):
+    database, root = tmp_path / "private-source.db", tmp_path / "private-backup"
+    make_database(database, rows=1)
+    original_connect, original_emit = sqlite3.connect, cli._emit_backup_timing
+    opened, emissions = [], []
+
+    def connect(*args, **kwargs):
+        conn = original_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    def emit(event):
+        assert len(opened) == 2
+        for conn in opened:
+            with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+                conn.execute("SELECT 1")
+        emissions.append(event)
+        original_emit(event)
+
+    monkeypatch.setattr(cli.sqlite3, "connect", connect)
+    monkeypatch.setattr(cli, "_emit_backup_timing", emit)
+    result = cli.online_backup(database, root)
+    captured = capsys.readouterr()
+    assert not captured.out
+    lines = captured.err.splitlines()
+    assert len(lines) == len(emissions) == 1
+    event = json.loads(lines[0])
+    assert event == emissions[0]
+    assert list(result) == ["backup_path", "backup_sha256"]
+    assert event["event"] == "online_backup_timing"
+    assert event["outcome"] == "success"
+    assert event["failed_phase"] is event["exception_class"] is None
+    assert event["timeout_seconds"] == 600
+    assert event["timing_scope"] == "backup_before_diagnostic_output"
+    assert event["started_at_utc"].endswith("+00:00")
+    assert list(event["phases_seconds"]) == [
+        "artifact_setup", "connection_open", "source_snapshot_pin", "copy",
+        "integrity_check", "foreign_key_check", "connection_close", "hash",
+        "checksum_publication"]
+    assert all(value >= 0 for value in event["phases_seconds"].values())
+    assert event["elapsed_seconds"] == pytest.approx(sum(event["phases_seconds"].values()), abs=1e-7)
+    assert str(database) not in lines[0] and str(root) not in lines[0]
+    backup = Path(result["backup_path"])
+    assert hashlib.sha256(backup.read_bytes()).hexdigest() == result["backup_sha256"]
+    assert backup.with_suffix(".db.sha256").read_text() == (
+        result["backup_sha256"] + "  database.backup.db\n")
+
+
+@pytest.mark.parametrize("failed_phase", ["copy", "checksum_publication"])
+def test_timing_failure_preserves_exact_exception_and_does_not_publish(
+        tmp_path, monkeypatch, capsys, sources, failed_phase):
+    database, root = tmp_path / "private-source.db", tmp_path / "private-backup"
+    make_database(database, rows=1)
+    failure = RuntimeError("private-path-and-credentials-must-not-be-logged")
+    original_connect, original_open = sqlite3.connect, Path.open
+
+    class FailingCopy(sqlite3.Connection):
+        def backup(self, *args, **kwargs):
+            raise failure
+
+    def connect(*args, **kwargs):
+        return original_connect(*args, **{**kwargs, "factory": FailingCopy})
+
+    def open_file(path, *args, **kwargs):
+        if path.suffix == ".sha256":
+            raise failure
+        return original_open(path, *args, **kwargs)
+
+    if failed_phase == "copy":
+        monkeypatch.setattr(cli.sqlite3, "connect", connect)
+    else:
+        monkeypatch.setattr(Path, "open", open_file)
+    with pytest.raises(RuntimeError) as raised:
+        cli.online_backup(database, root)
+    assert raised.value is failure
+    assert_sources_closed(sources)
+    assert_no_checksum(root)
+    captured = capsys.readouterr()
+    assert not captured.out and len(captured.err.splitlines()) == 1
+    event = json.loads(captured.err)
+    assert event["outcome"] == "failure"
+    assert event["failed_phase"] == failed_phase
+    assert event["exception_class"] == "RuntimeError"
+    assert str(database) not in captured.err and str(root) not in captured.err
+    assert str(failure) not in captured.err
+
+
+def test_timing_output_failure_cannot_replace_success_or_original_error(tmp_path, monkeypatch):
+    database = tmp_path / "source.db"
+    make_database(database, rows=1)
+    emissions = []
+
+    def broken_emit(event):
+        emissions.append(event["outcome"])
+        if event["outcome"] == "success":
+            raise OSError("diagnostic output failed")
+        raise RuntimeError("diagnostic output failed")
+
+    monkeypatch.setattr(cli, "_emit_backup_timing", broken_emit)
+    result = cli.online_backup(database, tmp_path / "good-backup")
+    assert list(result) == ["backup_path", "backup_sha256"]
+    assert Path(result["backup_path"]).with_suffix(".db.sha256").exists()
+    original = sqlite3.connect
+    failure = OSError("original copy failure")
+
+    class FailingCopy(sqlite3.Connection):
+        def backup(self, *args, **kwargs):
+            raise failure
+
+    def connect(*args, **kwargs):
+        return original(*args, **{**kwargs, "factory": FailingCopy})
+
+    monkeypatch.setattr(cli.sqlite3, "connect", connect)
+    with pytest.raises(OSError) as raised:
+        cli.online_backup(database, tmp_path / "failed-backup")
+    assert raised.value is failure
+    assert emissions == ["success", "failure"]
+    assert_no_checksum(tmp_path / "failed-backup")
+
+
+
+def test_timing_output_cancellation_still_interrupts_the_caller(tmp_path, monkeypatch):
+    database = tmp_path / "source.db"
+    make_database(database, rows=1)
+    cancellation = KeyboardInterrupt("cancel before caller continues")
+
+    def cancelled_emit(_event):
+        raise cancellation
+
+    monkeypatch.setattr(cli, "_emit_backup_timing", cancelled_emit)
+    with pytest.raises(KeyboardInterrupt) as raised:
+        cli.online_backup(database, tmp_path / "backup")
+    assert raised.value is cancellation
+
+
+def test_timing_attributes_distinct_operation_delays_without_intermediate_output(
+        tmp_path, monkeypatch, capsys):
+    database = tmp_path / "source.db"
+    make_database(database, rows=1)
+    clock = SimpleNamespace(now=0)
+    original_connect, original_mkdir = sqlite3.connect, Path.mkdir
+    original_open, original_digest = Path.open, hashlib.sha256
+    original_emit, emissions = cli._emit_backup_timing, []
+
+    class DelayedConnection(sqlite3.Connection):
+        def execute(self, statement, *args, **kwargs):
+            result = super().execute(statement, *args, **kwargs)
+            clock.now += {"SELECT COUNT(*) FROM sqlite_schema": .1,
+                          "PRAGMA integrity_check": .3,
+                          "PRAGMA foreign_key_check": .4}.get(statement, 0)
+            return result
+
+        def backup(self, *args, **kwargs):
+            assert not emissions
+            result = super().backup(*args, **kwargs)
+            clock.now += .2
+            return result
+
+        def close(self):
+            assert not emissions
+            super().close()
+            clock.now += .5
+
+    def connect(*args, **kwargs):
+        result = original_connect(*args, **{**kwargs, "factory": DelayedConnection})
+        clock.now += .6
+        return result
+
+    def mkdir(path, *args, **kwargs):
+        result = original_mkdir(path, *args, **kwargs)
+        clock.now += .05
+        return result
+
+    class DelayedDigest:
+        def __init__(self):
+            self.digest = original_digest()
+
+        def update(self, chunk):
+            self.digest.update(chunk)
+            clock.now += .7
+
+        def hexdigest(self):
+            return self.digest.hexdigest()
+
+    @contextmanager
+    def delayed_checksum(path, *args, **kwargs):
+        with original_open(path, *args, **kwargs) as stream:
+            class Writer:
+                def write(self, value):
+                    assert not emissions
+                    result = stream.write(value)
+                    clock.now += .8
+                    return result
+            yield Writer()
+        clock.now += .9
+
+    def open_file(path, *args, **kwargs):
+        if path.suffix == ".sha256":
+            return delayed_checksum(path, *args, **kwargs)
+        return original_open(path, *args, **kwargs)
+
+    def emit(event):
+        emissions.append(event)
+        original_emit(event)
+
+    monkeypatch.setattr(cli, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=lambda _: None))
+    monkeypatch.setattr(cli.sqlite3, "connect", connect)
+    monkeypatch.setattr(Path, "mkdir", mkdir)
+    monkeypatch.setattr(Path, "open", open_file)
+    monkeypatch.setattr(cli.hashlib, "sha256", DelayedDigest)
+    monkeypatch.setattr(cli, "_emit_backup_timing", emit)
+    result = cli.online_backup(database, tmp_path / "backup")
+    assert Path(result["backup_path"]).stat().st_size < 1024 * 1024
+    event = json.loads(capsys.readouterr().err)
+    assert len(emissions) == 1
+    assert event["phases_seconds"] == pytest.approx({
+        "artifact_setup": .1, "connection_open": 1.2, "source_snapshot_pin": .1,
+        "copy": .2, "integrity_check": .3, "foreign_key_check": .4,
+        "connection_close": 1.0, "hash": .7, "checksum_publication": 1.7})
+    assert event["elapsed_seconds"] == pytest.approx(5.7)

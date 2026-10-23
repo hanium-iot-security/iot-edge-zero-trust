@@ -155,12 +155,157 @@ def test_file_phases_preserve_wrapper_exit_fallback_and_single_sidecar_sync(
     assert result.process_wait_completed_at == (BASE + timedelta(seconds=10) if report_process_timing else None)
     assert result.phase_timings_seconds["pcap_validation_seconds"] == pytest.approx(0.1)
     assert result.phase_timings_seconds["sidecar_persist_seconds"] == pytest.approx(0.2)
+    sidecar_phases = {key: duration for key, duration in result.phase_timings_seconds.items()
+                      if key.startswith("sidecar_") and key != "sidecar_persist_seconds"}
+    assert len(sidecar_phases) == 7
+    assert sidecar_phases["sidecar_fsync_seconds"] == pytest.approx(0.2)
+    assert sum(sidecar_phases.values()) == pytest.approx(result.phase_timings_seconds["sidecar_persist_seconds"])
     assert result.phase_timings_seconds["pcap_publish_seconds"] == pytest.approx(0.4)
     assert result.captured_duration_seconds == 10 and result.start_delay_seconds == 0
     assert len(synced) == 1 and len(list(value.ready_dir.iterdir())) == 2
     sidecar = json.loads(result.diagnostics_path.read_text())
     assert sidecar["schema_version"] == "packet-capture-diagnostics-v1"
     assert "phase_timings_seconds" not in sidecar and "process_wait_completed_at" not in sidecar
+
+
+def test_sidecar_phases_split_delays_without_changing_bytes_or_durability_order(tmp_path, monkeypatch):
+    baseline_clock = Clock()
+    baseline_config = config(tmp_path / "baseline")
+    baseline = execute_capture_window(
+        Capture(baseline_clock), baseline_config, session_id=SESSION_ID,
+        window_start=BASE, window_end=BASE + timedelta(seconds=10),
+        capture_started_at=BASE, clock=baseline_clock.now, monotonic=baseline_clock.monotonic)
+    baseline_bytes = baseline.diagnostics_path.read_bytes()
+
+    clock = Clock()
+    value = config(tmp_path / "measured")
+    events = []
+    open_path, with_suffix = Path.open, Path.with_suffix
+    fsync, rename = capture_runtime.os.fsync, capture_runtime.os.replace
+
+    class TimedHandle:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            self.handle.__enter__()
+            return self
+
+        def write(self, text):
+            result = self.handle.write(text)
+            if text == "\n":
+                events.append("write")
+                clock.advance(0.3)
+            return result
+
+        def flush(self):
+            self.handle.flush()
+            events.append("flush")
+            clock.advance(0.4)
+
+        def fileno(self):
+            return self.handle.fileno()
+
+        def __exit__(self, *args):
+            result = self.handle.__exit__(*args)
+            events.append("close")
+            clock.advance(0.6)
+            return result
+
+    def slow_prepare(path, suffix):
+        result = with_suffix(path, suffix)
+        if path.name.endswith(".capture.json"):
+            events.append("prepare")
+            clock.advance(0.1)
+        return result
+
+    def slow_open(path, *args, **kwargs):
+        handle = open_path(path, *args, **kwargs)
+        if not path.name.endswith(".capture.json.tmp"):
+            return handle
+        events.append("open")
+        clock.advance(0.2)
+        return TimedHandle(handle)
+
+    def slow_fsync(fd):
+        fsync(fd)
+        events.append("fsync")
+        clock.advance(0.5)
+
+    def slow_rename(source, destination):
+        result = rename(source, destination)
+        if Path(source).name.endswith(".capture.json.tmp"):
+            events.append("sidecar_publish")
+            clock.advance(0.7)
+        elif Path(source).name.endswith(".pcap.tmp"):
+            events.append("pcap_publish")
+        return result
+
+    monkeypatch.setattr(Path, "with_suffix", slow_prepare)
+    monkeypatch.setattr(Path, "open", slow_open)
+    monkeypatch.setattr(capture_runtime.os, "fsync", slow_fsync)
+    monkeypatch.setattr(capture_runtime.os, "replace", slow_rename)
+    result = execute_capture_window(
+        Capture(clock), value, session_id=SESSION_ID,
+        window_start=BASE, window_end=BASE + timedelta(seconds=10),
+        capture_started_at=BASE, clock=clock.now, monotonic=clock.monotonic)
+
+    assert result.success and result.captured_duration_seconds == 10
+    expected = {
+        "sidecar_prepare_seconds": 0.1, "sidecar_open_seconds": 0.2,
+        "sidecar_serialize_write_seconds": 0.3, "sidecar_flush_seconds": 0.4,
+        "sidecar_fsync_seconds": 0.5, "sidecar_close_seconds": 0.6,
+        "sidecar_rename_seconds": 0.7,
+    }
+    assert {key: result.phase_timings_seconds[key] for key in expected} == pytest.approx(expected)
+    assert result.phase_timings_seconds["sidecar_persist_seconds"] == pytest.approx(sum(expected.values()))
+    assert events == ["prepare", "open", "write", "flush", "fsync", "close", "sidecar_publish", "pcap_publish"]
+    assert result.diagnostics_path.read_bytes() == baseline_bytes
+    metadata = json.loads(baseline_bytes)
+    assert metadata["schema_version"] == "packet-capture-diagnostics-v1"
+    assert not any(key.startswith("sidecar_") or key == "phase_timings_seconds" for key in metadata)
+    assert baseline_bytes.endswith(b"\n") and not baseline_bytes.endswith(b"\n\n")
+    assert len(list(value.ready_dir.iterdir())) == 2
+
+
+@pytest.mark.parametrize("failure_stage", ["fsync", "sidecar_publish"])
+def test_sidecar_phase_failure_never_reports_completion_or_publishes_ready(
+    db, tmp_path, monkeypatch, caplog, failure_stage,
+):
+    clock = Clock()
+    value = config(tmp_path)
+    pk, session_id, first = run_packet_capture.start_new_session(db, value, clock.now(), clock=clock.now)
+    fsync, rename = capture_runtime.os.fsync, capture_runtime.os.replace
+    sync_calls = []
+
+    def fail_sync(fd):
+        sync_calls.append(fd)
+        if failure_stage == "fsync":
+            raise OSError("fixture sidecar fsync failed")
+        return fsync(fd)
+
+    def fail_publish(source, destination):
+        if Path(source).name.endswith(".capture.json.tmp"):
+            raise OSError("fixture sidecar rename failed")
+        return rename(source, destination)
+
+    monkeypatch.setattr(capture_runtime.os, "fsync", fail_sync)
+    monkeypatch.setattr(capture_runtime.os, "replace", fail_publish)
+    caplog.set_level(logging.INFO, logger=run_packet_capture.__name__)
+    with pytest.raises(OSError, match="fixture sidecar"):
+        run_packet_capture.run_capture_loop(
+            db, Capture(clock), value, session_pk=pk, session_id=session_id,
+            first_window_start=first, shutdown=run_packet_capture.GracefulShutdown(),
+            max_windows=1, clock=clock.now, sleep=clock.advance, monotonic=clock.monotonic)
+
+    assert len(sync_calls) == 1
+    assert not list(value.ready_dir.glob("*.pcap"))
+    assert not list(value.ready_dir.glob("*.capture.json"))
+    assert len(list(value.incoming_dir.glob("*.pcap.tmp"))) == 1
+    assert db.execute(text("SELECT COUNT(*) FROM packet_capture_segments")).scalar() == 0
+    assert db.execute(text("SELECT status FROM packet_capture_sessions WHERE id=:pk"), {"pk": pk}).scalar() == "FAILED"
+    assert not any(record.getMessage().startswith(("READY segment 생성:", "FAILED segment 생성:"))
+                   for record in caplog.records)
 
 
 def test_ready_log_reports_separate_insert_and_committed_timings(db, tmp_path, monkeypatch, caplog):
@@ -190,6 +335,10 @@ def test_ready_log_reports_separate_insert_and_committed_timings(db, tmp_path, m
     timing = json.loads(logs[0].split(" timing=", 1)[1])
     assert timing["timing_seconds"]["db_insert_seconds"] == pytest.approx(0.3)
     assert timing["timing_seconds"]["db_commit_seconds"] == pytest.approx(0.4)
+    assert "sidecar_rename_seconds" in timing["timing_seconds"]
+    assert sum(duration for key, duration in timing["timing_seconds"].items()
+               if key.startswith("sidecar_") and key != "sidecar_persist_seconds") == pytest.approx(
+                   timing["timing_seconds"]["sidecar_persist_seconds"])
     assert timing["process_wait_completed_at"] == (BASE + timedelta(seconds=10)).isoformat()
     assert db.execute(text("SELECT COUNT(*) FROM packet_capture_segments WHERE status='READY'")).scalar() == 1
 
@@ -247,6 +396,7 @@ def test_late_warning_carries_previous_committed_window_without_hiding_loss(db, 
     previous = json.loads(logs[0].split(" previous_window_timing=", 1)[1])
     assert previous["session_id"] == source_id and previous["window_end"] == "2026-10-05T00:00:10Z"
     assert previous["timing_seconds"]["db_insert_seconds"] == pytest.approx(1.2)
+    assert "sidecar_rename_seconds" in previous["timing_seconds"]
     failed = db.execute(text("SELECT error_code,file_name,start_delay_seconds FROM packet_capture_segments WHERE status='FAILED'")).mappings().one()
     assert failed["error_code"] == "LATE_CAPTURE" and failed["file_name"] is None
     assert failed["start_delay_seconds"] == pytest.approx(1.2) and process.calls == 2
