@@ -17,7 +17,8 @@ UMask=0077
 Nice=10
 IOSchedulingClass=idle
 ExecStart=/home/pi/iot-edge-zero-trust/venv/bin/python -m edge.maintenance.run_planned_maintenance resume --timeout 120 --verify-timeout 120 --artifact-dir output/planned-maintenance
-TimeoutStartSec=480
+# Preflight 120 + backup 600 + verification 120 + service/lock handling 240.
+TimeoutStartSec=1080
 # Failure/WAIT is logged and requires inspection; never loop automatic approvals.
 Restart=no
 NoNewPrivileges=true

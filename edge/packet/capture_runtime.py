@@ -504,13 +504,31 @@ def execute_capture_window(
                 captured_duration_seconds=result.captured_duration_seconds,
             )
         temporary = path.with_suffix(path.suffix + ".tmp")
+        prepare_finished = monotonic()
         with temporary.open("w", encoding="utf-8") as handle:
+            open_finished = monotonic()
             json.dump(metadata, handle, ensure_ascii=True, sort_keys=True)
             handle.write("\n")
+            write_finished = monotonic()
             handle.flush()
+            flush_finished = monotonic()
             os.fsync(handle.fileno())
+            fsync_finished = monotonic()
+        close_finished = monotonic()
         os.replace(temporary, path)
-        phase_timings["sidecar_persist_seconds"] = monotonic() - persistence_started
+        persistence_finished = monotonic()
+        # Publish observations only after persistence completes. Missing timings
+        # are unobserved, not evidence of a zero-duration or successful phase.
+        phase_timings.update({
+            "sidecar_prepare_seconds": prepare_finished - persistence_started,
+            "sidecar_open_seconds": open_finished - prepare_finished,
+            "sidecar_serialize_write_seconds": write_finished - open_finished,
+            "sidecar_flush_seconds": flush_finished - write_finished,
+            "sidecar_fsync_seconds": fsync_finished - flush_finished,
+            "sidecar_close_seconds": close_finished - fsync_finished,
+            "sidecar_rename_seconds": persistence_finished - close_finished,
+            "sidecar_persist_seconds": persistence_finished - persistence_started,
+        })
         return replace(result, diagnostics_path=path,
                        process_wait_completed_at=outcome.process_wait_completed_at,
                        phase_timings_seconds=dict(phase_timings))

@@ -6,14 +6,16 @@ backup and integrity checks finish before the short checkpoint write transaction
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import sys
 import stat
 import signal
 import time
@@ -112,42 +114,142 @@ def connection(database, *, readonly=False):
         conn.close()
 
 
-def online_backup(database, artifact_root, *, timeout=120):
-    """Bounded SQLite snapshot, hash and integrity checks outside a write lock."""
-    root = artifact_root.resolve()
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    folder = root / str(uuid.uuid4())
-    folder.mkdir(mode=0o700)
-    backup = folder / "database.backup.db"
-    # Exclusive creation prevents replacing an existing artifact or symlink.
-    with backup.open("xb"):
-        pass
-    os.chmod(backup, 0o600)
-    deadline = time.monotonic() + timeout
+def _emit_backup_timing(event):
+    """Write one diagnostic line separately from the CLI result on stdout."""
+    sys.stderr.write(json.dumps(event, separators=(",", ":")) + "\n")
+    sys.stderr.flush()
+
+
+def online_backup(database, artifact_root, *, timeout=600):
+    """Copy, verify, hash and publish a snapshot within one finite budget."""
+    try:
+        timeout = float(timeout)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise MaintenanceHold("backup timeout must be finite positive seconds") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise MaintenanceHold("backup timeout must be finite positive seconds")
+    started = time.monotonic()
+    deadline = started + timeout
+    started_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    phase, phase_started = "artifact_setup", started
+    phases, failed_phase, body_error, exception_class = {}, None, None, None
+    outcome = "failure"
+
+    def advance(name):
+        nonlocal phase, phase_started
+        current = time.monotonic()
+        phases[phase] = round(current - phase_started, 9)
+        phase, phase_started = name, current
 
     def remaining(*_):
         if time.monotonic() >= deadline:
             raise MaintenanceHold("online backup or verification timed out")
         return 0
 
-    with connection(database, readonly=True) as source, sqlite3.connect(backup) as target:
-        source.backup(target, pages=256, progress=remaining, sleep=0.05)
-        target.set_progress_handler(remaining, 10000)
-        if target.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
-            raise MaintenanceHold("backup failed integrity check")
-        if target.execute("PRAGMA foreign_key_check").fetchall():
-            raise MaintenanceHold("backup failed foreign-key check")
-    digest = hashlib.sha256()
-    with backup.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+    def paced_copy(_status, pages_remaining, _total):
+        remaining()
+        if pages_remaining > 0:
+            time.sleep(0.02)
             remaining()
-            digest.update(chunk)
-    sha = digest.hexdigest()
-    with backup.with_suffix(".db.sha256").open("x", encoding="ascii") as stream:
-        os.chmod(backup.with_suffix(".db.sha256"), 0o600)
-        stream.write(f"{sha}  {backup.name}\n")
-    return {"backup_path": str(backup), "backup_sha256": sha}
 
+    try:
+        root = artifact_root.resolve()
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        folder = root / str(uuid.uuid4())
+        folder.mkdir(mode=0o700)
+        backup = folder / "database.backup.db"
+        # Exclusive creation prevents replacing an existing artifact or symlink.
+        with backup.open("xb"):
+            pass
+        os.chmod(backup, 0o600)
+        remaining()
+
+        advance("connection_open")
+        with connection(database, readonly=True) as source, closing(sqlite3.connect(backup)) as target:
+            try:
+                advance("source_snapshot_pin")
+                wal = source.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+                if wal:
+                    # A real read pins the WAL snapshot so concurrent commits cannot
+                    # restart each paced backup step. Closing source releases it.
+                    source.execute("BEGIN")
+                    source.execute("SELECT COUNT(*) FROM sqlite_schema").fetchone()
+                remaining()
+                advance("copy")
+                source.backup(target, pages=16 if wal else 256,
+                              progress=paced_copy if wal else remaining, sleep=0.05)
+                remaining()
+                advance("integrity_check")
+                target.set_progress_handler(remaining, 10000)
+                try:
+                    if target.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+                        raise MaintenanceHold("backup failed integrity check")
+                    remaining()
+                    advance("foreign_key_check")
+                    if target.execute("PRAGMA foreign_key_check").fetchall():
+                        raise MaintenanceHold("backup failed foreign-key check")
+                    remaining()
+                except sqlite3.OperationalError:
+                    # SQLite translates a raised progress-handler deadline to
+                    # "interrupted"; retain the maintenance timeout when that happens.
+                    remaining()
+                    raise
+            except BaseException as exc:
+                body_error, failed_phase = exc, phase
+                raise
+            finally:
+                advance("connection_close")
+        advance("hash")
+        digest = hashlib.sha256()
+        with backup.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                remaining()
+                digest.update(chunk)
+        sha = digest.hexdigest()
+        remaining()
+        advance("checksum_publication")
+        checksum = backup.with_suffix(".db.sha256")
+        created = False
+        try:
+            with checksum.open("x", encoding="ascii") as stream:
+                created = True
+                os.chmod(checksum, 0o600)
+                remaining()
+                stream.write(f"{sha}  {backup.name}\n")
+            remaining()
+        except BaseException:
+            # A failed publication must not leave a newly created success sidecar.
+            # An exclusive-open collision belongs to somebody else; preserve it.
+            if created:
+                checksum.unlink(missing_ok=True)
+            raise
+        outcome = "success"
+        return {"backup_path": str(backup), "backup_sha256": sha}
+    except BaseException as exc:
+        # Preserve the failing operation when connection cleanup succeeds; a
+        # replacement exception from cleanup belongs to the close phase instead.
+        if exc is not body_error:
+            failed_phase = phase
+        exception_class = type(exc).__name__
+        raise
+    finally:
+        # Resource cleanup has finished. This timing excludes diagnostic output:
+        # emitting the final line adds separate, best-effort stderr I/O.
+        try:
+            finished = time.monotonic()
+            phases[phase] = round(finished - phase_started, 9)
+            _emit_backup_timing({
+                "event": "online_backup_timing", "started_at_utc": started_at,
+                "elapsed_seconds": round(finished - started, 9),
+                "timeout_seconds": timeout, "outcome": outcome,
+                "failed_phase": failed_phase, "exception_class": exception_class,
+                "phases_seconds": phases,
+                "timing_scope": "backup_before_diagnostic_output",
+            })
+        except Exception:
+            # Ordinary diagnostic failures cannot replace a backup result or
+            # error. Cancellation signals must still stop the caller.
+            pass
 
 class MaintenanceRunner:
     def __init__(self, database, repository_root, *, system=None, core=None,

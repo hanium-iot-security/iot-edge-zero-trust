@@ -1,6 +1,7 @@
 """Operational sequencing with real migrated SQLite and fake systemd only."""
 from contextlib import contextmanager
 from datetime import timedelta
+import inspect
 import json
 from pathlib import Path
 import shlex
@@ -534,7 +535,10 @@ def test_actual_system_authentication_and_systemctl_are_bounded(monkeypatch):
 def test_boot_unit_never_powers_off_or_restarts_approval_loop():
     unit = Path("infra/systemd/planned-maintenance-resume.service").read_text()
     assert "User=root" in unit and "Restart=no" in unit
-    assert "--verify-timeout" in unit and "TimeoutStartSec=480" in unit
+    assert "--timeout 120 --verify-timeout 120" in unit
+    assert inspect.signature(cli.online_backup).parameters["timeout"].default == 600
+    # The additional 240 seconds cover bounded service and lock operations.
+    assert "TimeoutStartSec=1080" in unit
     assert "poweroff" not in unit and "reboot" not in unit
 
 

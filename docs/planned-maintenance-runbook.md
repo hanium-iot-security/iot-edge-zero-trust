@@ -99,6 +99,14 @@ sudo venv/bin/python -m edge.maintenance.run_planned_maintenance cancel \
 
 ## 선택적 부팅 연동
 
+온라인 백업의 기본 제한은 복사·무결성/FK 검사·SHA256 계산·체크섬 게시 전체를 합한 600초다. WAL에서는 읽기 스냅샷을 고정한 뒤 16페이지마다 남은 페이지가 있을 때만 20ms 양보하며, 다른 Journal 모드는 기존 빠른 복사를 유지하고 모드를 변경하지 않는다. 실패하거나 제한을 넘으면 승인을 소비하지 않고 새 성공 체크섬을 남기지 않으며 자동 재시도하지 않는다. CLI의 준비 대기 옵션(--timeout)과 재개 후 진행 검증 옵션(--verify-timeout)은 별도 제한이다.
+
+백업은 연결을 닫은 뒤 stderr에 `event=online_backup_timing`인 JSON 한 줄을 남긴다. stdout의 CLI 결과와 `backup_path`·`backup_sha256` 반환 계약은 유지한다. `phases_seconds`는 `artifact_setup`, `connection_open`, `source_snapshot_pin`, `copy`, `integrity_check`, `foreign_key_check`, `connection_close`, `hash`, `checksum_publication`을 초 단위 monotonic 시간으로 구분한다. `outcome`, `failed_phase`, `exception_class`로 성공과 실패 위치를 확인하며 경로·예외 메시지·원본 자료는 출력하지 않는다.
+
+실패 전 관측한 단계만 포함하므로 누락된 값은 0초나 성공을 뜻하지 않는다. `elapsed_seconds`와 600초 예산은 이 마지막 진단 출력 시간을 포함하지 않으며, 출력에는 별도 stderr I/O가 추가된다. 일반 출력 오류는 백업 결과를 바꾸지 않고 취소 신호는 전파한다. 단계별 시간만으로 수집 지연의 인과관계나 성능 개선을 확정하지 않는다.
+
+부팅 Unit의 TimeoutStartSec=1080은 준비 120초·백업 600초·진행 검증 120초와 추가 240초를 포함한다. 추가 시간은 Orchestrator 정지 최대 80초(명령 35·활성 확인 10·종료 결과 확인 35), 재시작 35초, 공유 Lock 네 개 대기 60초, 시간 동기화 확인 10초, SQLite 쓰기 Lock 대기 5초 및 여유 50초로 산정했다. 저장장치 I/O와 각 SQLite 단계는 협력적으로 제한을 확인하므로 Unit 제한이 바깥 경계를 제공한다.
+
 CLI와 실제 Pi 검증을 완료한 후 `infra/systemd/planned-maintenance-resume.service`를 설치·활성화한다. 단순 `After=` 대신 명령이 시간 동기화·새 Session·Feature 준비 상태를 직접 검사한다. 실패하면 Journal에 남기고 자동 반복하지 않는다. 운영 설정 경로가 다르면 Unit 경로부터 수정한다. 전체 Unit을 설치했다고 실장비 검증이 완료된 것은 아니다.
 
 부팅 재개 Unit은 `Nice=10`, `IOSchedulingClass=idle`로 온라인 백업·무결성 검사의 CPU·저장장치 경합을 줄인다. 이는 Capture 지연 방지를 보장하지 않으며, 새 FAILED Segment 확인과 기존 재개 검증·중단 조건은 그대로 적용한다.

@@ -166,12 +166,16 @@ Window 2026-07-15T00:00:20Z~2026-07-15T00:00:30Z는 캡처 시작 전에 만료�
 | tcpdump 시작·stderr 수집 준비 | `spawn_seconds`, `stderr_setup_seconds` |
 | Window 대기·종료 처리·stderr 마무리 | `capture_wait_seconds`, `termination_wait_seconds`, `stderr_drain_seconds` |
 | PCAP 검증·기존 sidecar 저장·PCAP 이동 | `pcap_validation_seconds`, `sidecar_persist_seconds`, `pcap_publish_seconds` |
+| Sidecar 준비·열기·직렬화/쓰기 | `sidecar_prepare_seconds`, `sidecar_open_seconds`, `sidecar_serialize_write_seconds` |
+| Sidecar flush·파일 fsync·닫기·rename | `sidecar_flush_seconds`, `sidecar_fsync_seconds`, `sidecar_close_seconds`, `sidecar_rename_seconds` |
 | Segment INSERT·DB commit | `db_insert_seconds`, `db_commit_seconds` |
 
 `process_wait_completed_at`은 프로세스 `wait()` 완료 직후, stderr 마무리 전의 UTC
 관측 시각이다. 진단용으로만 사용하며, 기존 DB의 `capture_process_exited_at`은
 stderr 마무리를 포함한 Wrapper 반환 관측 시각을 유지한다. Sidecar 스키마·추가
 파일 쓰기·fsync 횟수·Capture 적격 기준과 FAILED 판정은 바뀌지 않는다.
+
+Sidecar 세부 7항목의 합은 기존 `sidecar_persist_seconds`다. 준비 항목은 메타데이터 생성과 임시 경로 준비를 포함한다. 파일 저장·rename이 모두 끝난 경우에만 세부 시간을 공개하며, 실패로 누락된 항목은 0초나 성공으로 해석하지 않는다. 측정 경계 사이의 스케줄링 대기도 포함하므로 `sidecar_fsync_seconds`만으로 저장장치 자체의 처리 시간이라고 단정하지 않는다. 파일 내용·flush/fsync 횟수·공개 순서는 유지한다.
 
 Runtime은 직전 commit 완료 Window의 계측값 하나만 메모리에 보관한다.
 `LATE_CAPTURE` 로그의 `previous_window_timing`을 보면 직전 INSERT·commit 등에서
