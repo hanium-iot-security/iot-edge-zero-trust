@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import closing
 from dataclasses import asdict
 from datetime import timedelta
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,7 @@ SOURCE = "packet_feature_logs"
 CONFIRM = "APPLY-PACKET-PAIR-LIVE-RESUME:"
 REPLAY_CONFIRM = "APPLY-PACKET-PAIR-BOUNDED-REPLAY:"
 COMPLETE_STATUSES = {"COMPLETE", "REPLAY_COMPLETE"}
+CONTINUATION_SCHEMA = "packet-checkpoint-pair-capture-continuation-v1"
 
 
 def confirmation_prefix(plan):
@@ -104,6 +106,9 @@ def _load_pair(path):
         raise Error("failed-target-session approval must be boolean")
     if allow_failed_target and plan["mode"] != core.BOUNDED_REPLAY_MODE:
         raise Error("failed-target prefix approval requires bounded replay")
+    allow_capture_appends = plan.get("allow_capture_appends", False)
+    if type(allow_capture_appends) is not bool:
+        raise Error("capture append approval must be boolean")
     children = plan.get("children", [])
     if [child.get("detector") for child in children] != list(DETECTORS):
         raise Error("paired detectors must be Rule then IF")
@@ -116,7 +121,9 @@ def _load_pair(path):
                     "current_session_id", "target_session_id", "approved_by", "reason", "locks", "mode"):
             if signed[key] != plan[key]:
                 raise Error("child approval binding mismatch")
-        if (signed["detector_name"] != child["detector"] or signed["source_table"] != SOURCE
+        if (type(signed.get("allow_capture_appends", False)) is not bool
+                or signed.get("allow_capture_appends", False) != allow_capture_appends
+                or signed["detector_name"] != child["detector"] or signed["source_table"] != SOURCE
                 or type(signed.get("allow_failed_current_session")) is not bool
                 or signed["allow_failed_current_session"] != allow_failed
                 or type(signed.get("allow_failed_target_session", False)) is not bool
@@ -140,7 +147,7 @@ def _load_pair(path):
 
 def inspect_pair(*, db_path, repository_root, current_session_id, target_session_id,
                  approved_by, reason, plan_output, allow_failed_current_session=False,
-                 allow_failed_target_session=False, mode=core.LIVE_RESUME_MODE):
+                 allow_failed_target_session=False, allow_capture_appends=False, mode=core.LIVE_RESUME_MODE):
     if mode not in (core.LIVE_RESUME_MODE, core.BOUNDED_REPLAY_MODE):
         raise Error("unsupported paired recovery mode")
     if type(allow_failed_current_session) is not bool:
@@ -176,6 +183,7 @@ def inspect_pair(*, db_path, repository_root, current_session_id, target_session
                 approved_by=approved_by, reason=reason, lock_entries=entries, mode=mode,
                 allow_failed_current_session=allow_failed_current_session,
                 allow_failed_target_session=allow_failed_target_session,
+                allow_capture_appends=allow_capture_appends,
             ), generated_at=core._utc_now().replace(microsecond=0))
             children.append({"detector": name, "child_operation_id": str(uuid.uuid5(pair_id, name)), "plan": signed})
     first = children[0]["plan"]
@@ -192,6 +200,8 @@ def inspect_pair(*, db_path, repository_root, current_session_id, target_session
                "current_session_id", "target_session_id", "approved_by", "reason", "locks", "mode",
                "allow_failed_current_session")}
     payload["allow_failed_target_session"] = allow_failed_target_session
+    if allow_capture_appends:
+        payload["allow_capture_appends"] = True
     if mode == core.BOUNDED_REPLAY_MODE:
         payload["bounded_replay"] = first["bounded_replay"]
         if allow_failed_target_session:
@@ -305,31 +315,7 @@ def _validate_audit(db, plan, child, audit, checkpoint, group, readiness):
             raise Error("checkpoint source ID not owned by processed target range")
 
 
-def _states(db, plan, group):
-    core.require_migration_005(db)
-    target = repository.get_capture_session(db, plan["target_session_id"])
-    running = repository.list_running_capture_sessions(db)
-    readiness = repository.calculate_packet_feature_readiness(db, plan["target_session_id"])
-    if plan["mode"] == core.BOUNDED_REPLAY_MODE:
-        allow_failed_target = plan.get("allow_failed_target_session", False)
-        evidence = core._bounded_replay_evidence(
-            db, plan["target_session_id"], allow_failed_target_session=allow_failed_target)
-        expected_status = "FAILED" if allow_failed_target else "COMPLETED"
-        if (target is None or target["status"] != expected_status or len(running) > 1
-                or readiness is None
-                or (not allow_failed_target and not readiness.full_ready)
-                or readiness.packet_feature_ready_through != parse_db_utc(plan["bounded_replay"]["replay_end"])
-                or evidence != plan["bounded_replay"]
-                or allow_failed_target and evidence.get("failed_target_tail") != plan.get("failed_target_tail")
-                or target["first_window_start"] != plan["boundary"]
-                or any(target[key] != value for key, value in plan["target_identity"].items())):
-            raise Error("bounded replay target or fixed input changed")
-    elif (target is None or target["status"] != "RUNNING" or target["ended_at"] is not None or
-            target["first_window_start"] != plan["boundary"] or _target_failed(db, plan["target_session_id"]) or
-            any(target[key] != value for key, value in plan["target_identity"].items()) or
-            len(running) != 1 or running[0]["session_id"] != plan["target_session_id"] or
-            readiness is None or readiness.live_resume_blocking_reasons):
-        raise Error("live target changed or contains failed/unready input")
+def _child_states(db, plan, group, readiness):
     states, checkpoints = {}, {}
     for child in plan["children"]:
         name = child["detector"]
@@ -362,6 +348,167 @@ def _states(db, plan, group):
     if states["packet_if"] == "APPLIED" and states["packet_rule"] != "APPLIED":
         raise Error("IF applied without this pair's Rule audit")
     return states, checkpoints, readiness
+
+
+def _states(db, plan, group, *, continuation_capture=None, expected_restart_capture=None):
+    core.require_migration_005(db)
+    target = repository.get_capture_session(db, plan["target_session_id"])
+    running = repository.list_running_capture_sessions(db)
+    readiness = repository.calculate_packet_feature_readiness(db, plan["target_session_id"])
+    applied = None
+    expected_evidence = plan.get("bounded_replay")
+    if continuation_capture is not None or expected_restart_capture is not None:
+        _require_continuation_plan(plan)
+        if readiness is None:
+            raise Error("bounded replay target readiness missing")
+        applied = _child_states(db, plan, group, readiness)
+        if any(value != "APPLIED" for value in applied[0].values()):
+            raise Error("Capture continuation requires both original validated child audits")
+        actual = _observed_restart_capture(db, plan,
+            continuation_capture["session_id"] if continuation_capture is not None else expected_restart_capture)
+        if continuation_capture is not None and actual != continuation_capture:
+            raise Error("Capture continuation full identity changed")
+        expected_evidence = dict(plan["bounded_replay"], later_running_session=actual)
+    if plan["mode"] == core.BOUNDED_REPLAY_MODE:
+        allow_failed_target = plan.get("allow_failed_target_session", False)
+        evidence = core._bounded_replay_evidence(
+            db, plan["target_session_id"], allow_failed_target_session=allow_failed_target)
+        expected_status = "FAILED" if allow_failed_target else "COMPLETED"
+        if (target is None or target["status"] != expected_status or len(running) > 1
+                or readiness is None
+                or (not allow_failed_target and not readiness.full_ready)
+                or readiness.packet_feature_ready_through != parse_db_utc(plan["bounded_replay"]["replay_end"])
+                or evidence != expected_evidence
+                or allow_failed_target and evidence.get("failed_target_tail") != plan.get("failed_target_tail")
+                or target["first_window_start"] != plan["boundary"]
+                or any(target[key] != value for key, value in plan["target_identity"].items())):
+            raise Error("bounded replay target or fixed input changed")
+    elif (target is None or target["status"] != "RUNNING" or target["ended_at"] is not None or
+            target["first_window_start"] != plan["boundary"] or _target_failed(db, plan["target_session_id"]) or
+            any(target[key] != value for key, value in plan["target_identity"].items()) or
+            len(running) != 1 or running[0]["session_id"] != plan["target_session_id"] or
+            readiness is None or readiness.live_resume_blocking_reasons):
+        raise Error("live target changed or contains failed/unready input")
+    return applied if applied is not None else _child_states(db, plan, group, readiness)
+
+
+def _require_continuation_plan(plan):
+    if (plan["mode"] != core.BOUNDED_REPLAY_MODE or not plan.get("can_execute")
+            or plan["bounded_replay"].get("later_running_session") is not None):
+        raise Error("Capture continuation requires an original bounded plan without RUNNING Capture")
+
+
+def _observed_restart_capture(db, plan, expected_capture_session_id):
+    try:
+        if str(uuid.UUID(expected_capture_session_id)) != expected_capture_session_id:
+            raise ValueError
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise Error("reviewed expected Capture UUID is required") from exc
+    running = repository.list_running_capture_sessions(db)
+    if len(running) != 1 or running[0]["session_id"] != expected_capture_session_id:
+        raise Error("expected Capture is not the unique actual RUNNING session")
+    capture = dict(repository.get_capture_session(db, expected_capture_session_id))
+    target = plan["bounded_replay"]["target_identity"]
+    minimum = (plan.get("failed_target_tail") or {}).get("window_end") or plan["bounded_replay"]["replay_end"]
+    first = require_utc_window_boundary(parse_db_utc(capture["first_window_start"]), "restart Capture first boundary")
+    started = parse_db_utc(capture["started_at"], "restart Capture start")
+    if (capture["id"] <= target["id"] or capture["ended_at"] is not None
+            or capture["capture_interface"] != target["capture_interface"]
+            or first < parse_db_utc(minimum) or started > first
+            or started < parse_db_utc(target["ended_at"])):
+        raise Error("restart Capture chronology, interface or window changed")
+    later = db.execute("SELECT id,first_window_start,ended_at FROM packet_capture_sessions WHERE id>? AND session_id<>?",
+                       (target["id"], expected_capture_session_id))
+    for row in later:
+        if (row["id"] >= capture["id"] or parse_db_utc(row["first_window_start"]) >= first
+                or row["ended_at"] is None or parse_db_utc(row["ended_at"]) > started):
+            raise Error("restart Capture is out of actual later session order")
+    return capture
+
+
+def _audit_sha256(db, plan):
+    result = {}
+    for child in plan["children"]:
+        row = repository.get_recovery_audit(db, child["child_operation_id"])
+        if row is None:
+            raise Error("Capture continuation requires both original validated child audits")
+        result[child["detector"]] = hashlib.sha256(json.dumps(dict(row), sort_keys=True,
+            separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+    return result
+
+
+def _status_context(plan_file, db_path, artifact_dir):
+    path, plan = _load_pair(plan_file)
+    database = core.require_plan_database_path(plan, db_path)
+    group = _group(plan, artifact_dir)
+    _intent(plan, group)
+    runtime = _runtime_observation()
+    _same_boot(plan, runtime)
+    _require_configured_locks(plan, database)
+    if core.inspect_repository_state(plan["repository_root"]) != plan["repository_state"]:
+        raise Error("repository state changed from paired approval")
+    checked = verify_database_readonly(database)
+    if checked.integrity_check != "ok" or checked.foreign_key_violations:
+        raise Error("live database integrity failed")
+    return path, plan, database, group, runtime
+
+
+def _continuation_binding(path, plan, database, group):
+    return {"pair_id": plan["pair_id"], "pair_plan_sha256": plan["plan_sha256"],
+        "pair_plan_file_sha256": core.file_sha256(path), "pair_group": str(group),
+        "pair_intent_sha256": core.file_sha256(group / "intent.json"),
+        "database_path": str(database), "repository_root": plan["repository_root"],
+        "repository_commit": plan["repository_commit"], "locks": plan["locks"],
+        "bounded_replay": plan["bounded_replay"]}
+
+
+def _require_restart_runtime(runtime):
+    if runtime.get("clock_synchronized") is not True or runtime["services"].get("packet-capture.service") is not True:
+        raise Error("restart Capture service or synchronized clock unconfirmed")
+
+
+def record_capture_continuation(*, plan_file, db_path, artifact_dir, expected_capture_session_id,
+                                approved_by, reason, receipt_output):
+    """Record an observed restart identity; no DB update or execution approval."""
+    if not approved_by.strip() or not reason.strip():
+        raise Error("continuation approval principal and reason are required")
+    path, plan, database, group, runtime = _status_context(plan_file, db_path, artifact_dir)
+    _require_continuation_plan(plan)
+    _require_restart_runtime(runtime)
+    output = core.validate_generated_paths(repository_root=Path(plan["repository_root"]),
+        plan_output=Path(receipt_output))["plan_output"]
+    if output.exists():
+        raise Error("Capture continuation receipt output must be new")
+    with closing(_read_db(database)) as db:
+        _states(db, plan, group, expected_restart_capture=expected_capture_session_id)
+        capture = _observed_restart_capture(db, plan, expected_capture_session_id)
+        audits = _audit_sha256(db, plan)
+    latest = _runtime_observation()
+    _same_boot(plan, latest)
+    _require_restart_runtime(latest)
+    with closing(_read_db(database)) as db:
+        if _observed_restart_capture(db, plan, expected_capture_session_id) != capture:
+            raise Error("Capture changed while recording continuation")
+    receipt = core.attach_plan_sha256(dict(_continuation_binding(path, plan, database, group),
+        receipt_schema_version=CONTINUATION_SCHEMA, approved_by=approved_by, reason=reason,
+        runtime=runtime, child_audit_sha256=audits, capture_session_identity=capture),
+        generated_at=core._utc_now().replace(microsecond=0))
+    core._write_json_atomically(output, receipt)
+    return receipt
+
+
+def _load_capture_continuation(receipt_file, path, plan, database, group, runtime, expected_capture_session_id):
+    _, receipt = core._load_plan(receipt_file)
+    _require_continuation_plan(plan)
+    expected = _continuation_binding(path, plan, database, group)
+    if (receipt.get("receipt_schema_version") != CONTINUATION_SCHEMA
+            or any(receipt.get(key) != value for key, value in expected.items())
+            or not receipt.get("approved_by") or not receipt.get("reason")
+            or receipt.get("capture_session_identity", {}).get("session_id") != expected_capture_session_id):
+        raise Error("Capture continuation receipt or reviewed UUID binding changed")
+    _same_boot(plan, receipt["runtime"])
+    _require_restart_runtime(runtime)
+    return receipt
 
 
 def _require_target_quality(db, plan, end):
@@ -469,21 +616,18 @@ def execute_pair(*, plan_file, db_path, artifact_dir, confirm, confirm_skip_proc
         return result
 
 
-def status_pair(*, plan_file, db_path, artifact_dir):
-    _, plan = _load_pair(plan_file)
-    database = core.require_plan_database_path(plan, db_path)
-    group = _group(plan, artifact_dir)
-    _intent(plan, group)
-    runtime = _runtime_observation()
-    _same_boot(plan, runtime)
-    _require_configured_locks(plan, database)
-    if core.inspect_repository_state(plan["repository_root"]) != plan["repository_state"]:
-        raise Error("repository state changed from paired approval")
-    checked = verify_database_readonly(database)
-    if checked.integrity_check != "ok" or checked.foreign_key_violations:
-        raise Error("live database integrity failed")
+def status_pair(*, plan_file, db_path, artifact_dir, capture_continuation_file=None,
+                expected_capture_session_id=None):
+    if (capture_continuation_file is None) != (expected_capture_session_id is None):
+        raise Error("Capture continuation receipt and reviewed expected UUID must be supplied together")
+    path, plan, database, group, runtime = _status_context(plan_file, db_path, artifact_dir)
+    continuation = (_load_capture_continuation(capture_continuation_file, path, plan, database, group,
+        runtime, expected_capture_session_id) if capture_continuation_file is not None else None)
     with closing(_read_db(database)) as db:
-        states, checkpoints, readiness = _states(db, plan, group)
+        states, checkpoints, readiness = _states(db, plan, group,
+            continuation_capture=continuation["capture_session_identity"] if continuation is not None else None)
+        if continuation is not None and _audit_sha256(db, plan) != continuation["child_audit_sha256"]:
+            raise Error("Capture continuation original audit SHA changed")
         result = _result(plan, states)
         if not all(value == "APPLIED" for value in states.values()):
             return result
@@ -528,6 +672,13 @@ def status_pair(*, plan_file, db_path, artifact_dir):
                                 for name in mqtt_names))
             latest_runtime = _runtime_observation()
             _same_boot(plan, latest_runtime)
+            if continuation is not None:
+                _require_restart_runtime(latest_runtime)
+                with closing(_read_db(database)) as fresh:
+                    if _observed_restart_capture(fresh, plan, expected_capture_session_id) != continuation["capture_session_identity"]:
+                        raise Error("Capture continuation changed during status observation")
+                result["capture_continuation_sha256"] = continuation["plan_sha256"]
+                result["capture_session_identity"] = continuation["capture_session_identity"]
             active = all(observed.get("clock_synchronized") is True
                          and all(observed["services"].get(name) is True for name in SERVICES)
                          and all(name in observed["enabled"] and name in observed["required"] for name in DETECTORS)

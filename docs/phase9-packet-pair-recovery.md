@@ -265,3 +265,44 @@ SHA와 감사 원문은 보존하며, 실행 재검증에서만 기본값을 비
 Orchestrator 79개 통과, pair 115개 통과를 확인했다. 실패 구간의 입력 존재·연속성·
 원본 변경·SHA·CAS·옵션 변조와 부분 적용 후 IF만 재개하는 경로를 검사했다.
 이 기록은 운영 DB의 실제 복구 완료 기록이 아니다.
+
+## 유지보수 재시작 뒤 읽기 전용 상태 확인
+
+서비스 정지·감사 분류·복귀를 포함한 실행 순서는
+[계획 정비 중 Rule·IF 복구](phase9-packet-pair-maintenance.md)를 따른다.
+
+원래 `bounded-replay` 계획의 `later_running_session`이 `null`이고 두 child의 실제 감사가
+이미 적용된 경우에만, 재시작된 Capture를 별도 continuation receipt로 묶을 수 있다.
+기존 계획·intent·감사 원문은 변경하지 않는다. 기본 `status`는 기존 입력 전체 일치
+조건을 유지하므로 새 RUNNING Session이 생기면 계속 거부한다.
+
+```sh
+python -m edge.detection.run_packet_checkpoint_pair_recovery record-capture-continuation \
+  --plan-file /srv/iot/recovery/pair-plan.json \
+  --db-path /srv/iot/data/iot_security.db --artifact-dir /srv/iot/recovery/artifacts \
+  --expected-capture-session-id <REVIEWED_NEW_CAPTURE_UUID> \
+  --approved-by <ADMIN> --reason '<REVIEWED_RESTART_REASON>' \
+  --receipt-output /srv/iot/recovery/capture-continuation.json
+
+python -m edge.detection.run_packet_checkpoint_pair_recovery status \
+  --plan-file /srv/iot/recovery/pair-plan.json \
+  --db-path /srv/iot/data/iot_security.db --artifact-dir /srv/iot/recovery/artifacts \
+  --capture-continuation-file /srv/iot/recovery/capture-continuation.json \
+  --expected-capture-session-id <REVIEWED_NEW_CAPTURE_UUID>
+```
+
+기록 명령은 운영 DB를 읽기 전용으로 열고 새 receipt 파일 하나만 만든다. Caller가
+전체 Session 행을 공급할 수 없으며, 명시한 UUID가 실제 DB의 유일한 RUNNING Session일
+때 그 전체 행을 기록한다. 동일 Boot·source Git 상태·Stage/CapturePolicy·실제 잠금
+설정, 원래 pair/intent SHA, 두 전체 감사 SHA와 기존 백업 검사를 바인딩한다. 새로운
+Capture의 interface·시작 시각·10초 첫 경계·Session 순서가 종료된 대상 뒤여야 한다.
+이미 RUNNING Capture를 고정했던 계획이나 감사 0개·부분 적용·불확실한 감사는 이
+경로로 전환할 수 없다. Receipt 출력의 부모·Git ignore 조건과 새 파일 조건은 계획과 같다.
+
+이 두 옵션은 `status`에만 있다. `execute`/`resume`는 receipt를 받지 않으며 기존
+Capture 변경 거부 조건을 유지한다. Status는 종료된 대상의 전체 prefix/feature 해시,
+실패 tail, 원본 및 감사·백업을 다시 확인하고 receipt의 새 Capture 전체 행도 대조한다.
+미처리 Trust·필수 MQTT·실제 마지막 Feature ID와 `replay_end` 조건이 남아 있으면
+`APPLIED_PENDING_PROGRESS`이며, 실제 처리된 뒤에만 `REPLAY_COMPLETE`가 된다.
+Receipt 생성과 replay 완료 모두 새로운 손실·OFF 구간의 skip 승인이나 현재 Capture의
+실시간 완료가 아니다. 다른 Session으로 다시 바뀌면 자동 채택하지 않고 거부한다.

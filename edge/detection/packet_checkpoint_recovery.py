@@ -21,6 +21,7 @@ from typing import Callable, ContextManager, Iterator, Mapping, Sequence
 
 from backend.app.config import Settings
 from edge.detection import packet_checkpoint_recovery_repository as recovery_repository
+from edge.detection.packet_checkpoint_capture_evidence import capture_evidence
 from edge.detection import run_packet_ai_detector, run_packet_rule_detector
 from edge.detection.phase4_time import format_db_utc, parse_db_utc
 from edge.features import run_packet_feature_extractor
@@ -346,7 +347,10 @@ def build_recovery_plan(
     mode: str = GAP_RECOVERY_MODE,
     allow_failed_current_session: bool = False,
     allow_failed_target_session: bool = False,
+    allow_capture_appends: bool = False,
 ) -> dict[str, object]:
+    if type(allow_capture_appends) is not bool or (allow_capture_appends and mode not in (LIVE_RESUME_MODE, BOUNDED_REPLAY_MODE)):
+        raise PacketCheckpointRecoveryError("capture append approval requires a boolean and a live or bounded mode")
     if type(allow_failed_target_session) is not bool:
         raise PacketCheckpointRecoveryError("failed-target-session approval must be boolean")
     if mode not in RECOVERY_MODES:
@@ -580,6 +584,7 @@ def build_recovery_plan(
     return {
         "plan_schema_version": PLAN_SCHEMA_VERSION,
         "mode": mode,
+        **({"allow_capture_appends": True} if allow_capture_appends else {}),
         "allow_failed_current_session": allow_failed_current_session,
         "failed_current_tail": failed_tail_evidence,
         "allow_failed_target_session": allow_failed_target_session,
@@ -765,6 +770,7 @@ def inspect_packet_checkpoint_recovery(
     mode: str = GAP_RECOVERY_MODE,
     allow_failed_current_session: bool = False,
     allow_failed_target_session: bool = False,
+    allow_capture_appends: bool = False,
     orchestrator_lock_path: Path | None = None,
     manual_lock_path: Path | None = None,
     extractor_lock_path: Path | None = None,
@@ -810,6 +816,7 @@ def inspect_packet_checkpoint_recovery(
             mode=mode,
             allow_failed_current_session=allow_failed_current_session,
             allow_failed_target_session=allow_failed_target_session,
+            allow_capture_appends=allow_capture_appends,
         )
 
     plan = attach_plan_sha256(
@@ -892,6 +899,7 @@ def _rebuild_execute_plan(
         mode=str(plan.get("mode", GAP_RECOVERY_MODE)),
         allow_failed_current_session=plan.get("allow_failed_current_session") is True,
         allow_failed_target_session=plan.get("allow_failed_target_session", False),
+        allow_capture_appends=plan.get("allow_capture_appends", False),
     )
 
 
@@ -1021,6 +1029,16 @@ def _execute_locked_recovery(
             raise PacketCheckpointRecoveryError(
                 "live database failed integrity or foreign-key checks"
             )
+        evidence = None
+        if plan.get("allow_capture_appends", False):
+            connection.execute("BEGIN")
+            try:
+                _require_same_canonical_plan(plan, _rebuild_execute_plan(
+                    connection, plan=plan, repository_state=repository_state,
+                    database=database, locks=locks))
+                evidence = capture_evidence(connection, plan)
+            finally:
+                connection.execute("ROLLBACK")
         data_version_before = int(connection.execute("PRAGMA data_version").fetchone()[0])
         operation_dir.mkdir()
         try:
@@ -1044,18 +1062,30 @@ def _execute_locked_recovery(
             )
             raise
         data_version_after = int(connection.execute("PRAGMA data_version").fetchone()[0])
-        if data_version_after != data_version_before:
+        if evidence is None and data_version_after != data_version_before:
             raise PacketCheckpointRecoveryError("database changed during backup")
+
+        if evidence is not None:
+            with sqlite3.connect(backup_path.as_uri() + "?mode=ro", uri=True) as snapshot:
+                snapshot.row_factory = sqlite3.Row
+                snapshot.execute("PRAGMA query_only=ON")
+                snapshot.execute("BEGIN")
+                if capture_evidence(snapshot, plan, baseline=evidence) != evidence:
+                    raise PacketCheckpointRecoveryError("recovery evidence changed in backup")
+                # Rows captured in the backup are now part of its immutable prefix.
+                evidence = capture_evidence(snapshot, plan)
 
         try:
             connection.execute("BEGIN IMMEDIATE")
             transaction_data_version = int(
                 connection.execute("PRAGMA data_version").fetchone()[0]
             )
-            if transaction_data_version != data_version_after:
+            if evidence is None and transaction_data_version != data_version_after:
                 raise PacketCheckpointRecoveryError(
                     "database changed after backup before transaction"
                 )
+            if evidence is not None and capture_evidence(connection, plan, baseline=evidence) != evidence:
+                raise PacketCheckpointRecoveryError("recovery evidence changed before mutation")
             current_plan_path, transaction_plan = _load_plan(plan_path)
             if current_plan_path != plan_path or transaction_plan != plan:
                 raise PacketCheckpointRecoveryError("plan file changed before mutation")

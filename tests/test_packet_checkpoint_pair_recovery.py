@@ -1127,3 +1127,208 @@ def test_existing_default_bounded_pair_without_new_optional_fields_remains_execu
     assert _execute(f)["operation_status"] == "APPLIED_PENDING_PROGRESS"
     _finish_replay(f)
     assert pair.status_pair(**_kwargs(f))["operation_status"] == "REPLAY_COMPLETE"
+
+
+def _restart_capture(fixture, *, first=None, interface="eth-target"):
+    capture = str(uuid.uuid4())
+    first = first or TARGET_FIRST + timedelta(seconds=30)
+    with sqlite3.connect(fixture["database"]) as db:
+        _insert_capture_session(db, session_id=capture, capture_interface=interface,
+            first_window_start=first, started_at=first-timedelta(seconds=1), status="RUNNING")
+    return capture
+
+
+def _record_continuation(fixture, capture, **kwargs):
+    return pair.record_capture_continuation(**_kwargs(fixture), expected_capture_session_id=capture,
+        approved_by="admin-fixture", reason="reviewed actual Capture after maintenance restart",
+        receipt_output=fixture["output"].with_name("capture-continuation.json"), **kwargs)
+
+
+def test_restart_default_status_preserves_original_fixed_capture_guard(replay_fixture):
+    f = replay_fixture
+    _execute(f)
+    _finish_replay(f)
+    assert f["plan"]["bounded_replay"]["later_running_session"] is None
+    assert pair.status_pair(**_kwargs(f))["operation_status"] == "REPLAY_COMPLETE"
+    _restart_capture(f)
+    with pytest.raises(pair.Error, match="bounded replay target or fixed input changed"):
+        pair.status_pair(**_kwargs(f))
+
+
+def test_capture_continuation_allows_readonly_terminal_status_without_rewriting_plan(replay_fixture):
+    f = replay_fixture
+    _execute(f)
+    _finish_replay(f)
+    capture = _restart_capture(f)
+    plan_before = f["output"].read_bytes()
+    audits_before = _audits(f)
+    receipt = _record_continuation(f, capture)
+    result = pair.status_pair(**_kwargs(f),
+        capture_continuation_file=f["output"].with_name("capture-continuation.json"),
+        expected_capture_session_id=capture)
+    assert receipt["capture_session_identity"]["session_id"] == capture
+    assert result["operation_status"] == "REPLAY_COMPLETE"
+    assert result["live_recovery_complete"] is False
+    assert f["output"].read_bytes() == plan_before and _audits(f) == audits_before
+
+
+def _continued_status(fixture, capture):
+    return pair.status_pair(**_kwargs(fixture),
+        capture_continuation_file=fixture["output"].with_name("capture-continuation.json"),
+        expected_capture_session_id=capture)
+
+
+def test_capture_continuation_is_readonly_and_keeps_trust_pending_until_actual_drain(replay_fixture):
+    f = replay_fixture
+    _execute(f)
+    _finish_replay(f, trust_pending=True)
+    capture = _restart_capture(f)
+    before = f["database"].read_bytes()
+    group = f["artifacts"] / f["plan"]["pair_id"]
+    intent = (group / "intent.json").read_bytes()
+    receipt = _record_continuation(f, capture)
+    assert f["database"].read_bytes() == before and (group / "intent.json").read_bytes() == intent
+    assert _continued_status(f, capture)["operation_status"] == "APPLIED_PENDING_PROGRESS"
+    assert f["database"].read_bytes() == before
+    _finish_replay(f)
+    result = _continued_status(f, capture)
+    assert result["operation_status"] == "REPLAY_COMPLETE"
+    assert result["capture_continuation_sha256"] == receipt["plan_sha256"]
+    assert result["live_recovery_complete"] is False and len(_audits(f)) == 2
+    for call in (lambda: _execute(f), lambda: _execute(f, resume=True)):
+        with pytest.raises(pair.Error, match="bounded replay target or fixed input changed"):
+            call()
+    assert len(_audits(f)) == 2
+
+
+@pytest.mark.parametrize("count", [0, 1])
+def test_capture_continuation_rejects_zero_or_partial_real_audits(replay_fixture, monkeypatch, count):
+    f = replay_fixture
+    original = core._execute_locked_recovery
+    def fail(**prepared):
+        if count and prepared["plan"]["detector_name"] == "packet_rule":
+            return original(**prepared)
+        raise pair.Error("fixture stops before this COMMIT")
+    monkeypatch.setattr(core, "_execute_locked_recovery", fail)
+    _execute(f)
+    capture = _restart_capture(f)
+    with pytest.raises(pair.Error, match="both original validated child audits"):
+        _record_continuation(f, capture)
+    assert len(_audits(f)) == count
+    assert not f["output"].with_name("capture-continuation.json").exists()
+
+
+@pytest.mark.parametrize("mutation", ["wrong_uuid", "multiple", "early", "unaligned", "interface", "later_closed"])
+def test_capture_continuation_requires_reviewed_actual_capture_order(replay_fixture, mutation):
+    f = replay_fixture
+    _execute(f)
+    capture = _restart_capture(f,
+        first=TARGET_FIRST + timedelta(seconds=10 if mutation == "early" else 31 if mutation == "unaligned" else 30),
+        interface="wrong-interface" if mutation == "interface" else "eth-target")
+    if mutation == "multiple":
+        _restart_capture(f)
+    elif mutation == "later_closed":
+        with sqlite3.connect(f["database"]) as db:
+            _insert_capture_session(db, session_id=str(uuid.uuid4()), capture_interface="eth-target",
+                first_window_start=TARGET_FIRST + timedelta(seconds=40), status="COMPLETED")
+    with pytest.raises((pair.Error, ValueError)):
+        _record_continuation(f, str(uuid.uuid4()) if mutation == "wrong_uuid" else capture)
+    assert not f["output"].with_name("capture-continuation.json").exists()
+    assert len(_audits(f)) == 2
+
+
+@pytest.mark.parametrize("mutation", ["identity", "closed", "prefix", "source", "audit", "boot", "config", "lock", "repo"])
+def test_capture_continuation_rejects_mutation_after_receipt(replay_fixture, monkeypatch, mutation):
+    f = replay_fixture
+    _execute(f)
+    _finish_replay(f)
+    capture = _restart_capture(f)
+    _record_continuation(f, capture)
+    if mutation in {"identity", "closed", "prefix", "source", "audit"}:
+        with sqlite3.connect(f["database"]) as db:
+            if mutation == "identity":
+                db.execute("UPDATE packet_capture_sessions SET updated_at='2026-08-06 12:00:00' WHERE session_id=?", (capture,))
+            elif mutation == "closed":
+                db.execute("UPDATE packet_capture_sessions SET status='COMPLETED',ended_at=? WHERE session_id=?", (_db_utc(TARGET_FIRST + timedelta(seconds=40)),capture))
+            elif mutation == "prefix":
+                db.execute("UPDATE packet_feature_logs SET total_bytes=61 WHERE id=2")
+            elif mutation == "source":
+                db.execute("UPDATE packet_capture_sessions SET status='FAILED' WHERE session_id=?",(CURRENT_SESSION,))
+            else:
+                db.execute("UPDATE packet_checkpoint_recoveries SET reason='changed' WHERE detector_name='packet_rule'")
+    elif mutation == "boot":
+        f["runtime"]["boot_id"] = str(uuid.uuid4())
+    elif mutation == "config":
+        f["runtime"]["required"].append("mqtt_message_rule")
+    elif mutation == "lock":
+        monkeypatch.setattr(pair.settings, "orchestrator_lock_path", str(f["database"].with_name("changed.lock")))
+    else:
+        (f["root"] / "tracked.txt").write_text("changed")
+    with pytest.raises(pair.Error):
+        _continued_status(f, capture)
+    assert len(_audits(f)) == 2
+
+
+@pytest.mark.parametrize("field", ["capture_session_identity", "child_audit_sha256", "runtime", "bounded_replay", "pair_intent_sha256"])
+def test_capture_continuation_resigned_receipt_does_not_override_actual_evidence(replay_fixture, field):
+    f = replay_fixture
+    _execute(f)
+    _finish_replay(f)
+    capture = _restart_capture(f)
+    receipt = _record_continuation(f, capture)
+    if field == "capture_session_identity":receipt[field]["created_at"] = "fabricated"
+    elif field == "child_audit_sha256":receipt[field]["packet_rule"] = "0"*64
+    elif field == "runtime":receipt[field]["boot_id"] = str(uuid.uuid4())
+    elif field == "bounded_replay":receipt[field]["input_sha256"] = "0"*64
+    else:receipt[field] = "0"*64
+    core._write_json_atomically(f["output"].with_name("capture-continuation.json"),
+        core.attach_plan_sha256(receipt, generated_at=f["clock"][0]))
+    with pytest.raises(pair.Error):
+        _continued_status(f, capture)
+
+
+def test_capture_continuation_still_preserves_failed_target_tail(failed_target_replay_fixture):
+    f = failed_target_replay_fixture
+    _execute(f)
+    _finish_replay(f)
+    capture = _restart_capture(f)
+    _record_continuation(f, capture)
+    assert _continued_status(f, capture)["operation_status"] == "REPLAY_COMPLETE"
+    with sqlite3.connect(f["database"]) as db:
+        db.execute("UPDATE packet_capture_segments SET error_message='changed tail' WHERE id=?",(f["target_tail_id"],))
+    with pytest.raises(pair.Error, match="bounded replay target or fixed input changed"):
+        _continued_status(f, capture)
+
+
+def test_capture_continuation_never_rebinds_an_original_running_plan(replay_fixture):
+    f = replay_fixture
+    capture = _restart_capture(f)
+    output = f["output"].with_name("original-running-bounded.json")
+    plan = pair.inspect_pair(db_path=f["database"],repository_root=f["root"],current_session_id=CURRENT_SESSION,
+        target_session_id=TARGET_SESSION,approved_by="admin-fixture",reason="original running identity",
+        plan_output=output,mode=core.BOUNDED_REPLAY_MODE)
+    f.update(output=output,plan=plan)
+    _execute(f)
+    with pytest.raises(pair.Error, match="without RUNNING Capture"):
+        _record_continuation(f,capture)
+
+
+def test_capture_continuation_cli_is_status_only_and_requires_reviewed_uuid(replay_fixture, capsys):
+    f = replay_fixture
+    _execute(f)
+    _finish_replay(f)
+    capture = _restart_capture(f)
+    common=["--plan-file",str(f["output"]),"--db-path",str(f["database"]),"--artifact-dir",str(f["artifacts"])]
+    receipt=f["output"].with_name("capture-continuation.json")
+    assert cli.main(["record-capture-continuation",*common,"--expected-capture-session-id",capture,
+        "--approved-by","admin-fixture","--reason","reviewed restart","--receipt-output",str(receipt)]) == 0
+    capsys.readouterr()
+    flags=["--capture-continuation-file",str(receipt),"--expected-capture-session-id",capture]
+    assert cli.main(["status",*common,*flags]) == 0
+    assert json.loads(capsys.readouterr().out)["operation_status"] == "REPLAY_COMPLETE"
+    assert cli.main(["status",*common,"--capture-continuation-file",str(receipt)]) == 3
+    capsys.readouterr()
+    for command in ("execute","resume"):
+        with pytest.raises(SystemExit):
+            cli.main([command,*common,*flags,"--confirm",pair.confirmation_prefix(f["plan"])+f["plan"]["plan_sha256"]])
+    assert len(_audits(f)) == 2
