@@ -149,3 +149,31 @@
     }
   }
 }
+.pagination.pagination--numbered {
+  flex-wrap: wrap;
+  gap: 10px;
+
+  .page-numbers {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 4px;
+
+    .page-number {
+      flex: none;
+      min-width: 38px;
+      padding: 8px 10px;
+
+      &[aria-current="page"] {
+        border-color: var(--color-slate-700);
+        background: var(--color-slate-700);
+        color: #ffffff;
+      }
+    }
+  }
+
+  .page-info {
+    order: 1;
+    flex-basis: 100%;
+  }
+}

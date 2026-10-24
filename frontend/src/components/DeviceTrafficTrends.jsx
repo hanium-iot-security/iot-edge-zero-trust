@@ -243,6 +243,8 @@ function MetricsChart({ data, lines, title, unit, isPacket }) {
               dataKey={line.key}
               name={line.label}
               stroke={line.color}
+              strokeDasharray={line.strokeDasharray ?? "none"}
+              legendType="plainline"
               strokeWidth={2}
               dot={false}
               connectNulls={false}
@@ -251,6 +253,11 @@ function MetricsChart({ data, lines, title, unit, isPacket }) {
           ))}
         </LineChart>
       </ResponsiveContainer>
+      {lines.length > 1 && (
+        <small className="traffic-trends-help">
+          평균은 실선, 최대·최소는 점선입니다. 값이 같으면 같은 위치에 겹쳐 표시됩니다.
+        </small>
+      )}
       {isPacket && (
         <small className="traffic-trends-help">
           실제 수집시간 기준 전송률입니다. 10초로 나눈 명목 전송률나 패킷 AI 입력값으로 해석하지 않습니다.
@@ -535,11 +542,11 @@ export default function DeviceTrafficTrends() {
               <MetricsChart data={chart} title="MQTT 메시지 발행 수" unit="건 / 10초" lines={[{ key: "publish_count", label: "발행 수", color: "#2563eb" }]} />
               <MetricsChart data={chart} title="MQTT 메시지 크기" unit="B" lines={[
                 { key: "avg_payload_size", label: "평균", color: "#16a34a" },
-                { key: "max_payload_size", label: "최대", color: "#ef4444" },
+                { key: "max_payload_size", label: "최대", color: "#ef4444", strokeDasharray: "6 4" },
               ]} />
               <MetricsChart data={chart} title="MQTT 메시지 간격" unit="초 (s)" lines={[
                 { key: "avg_message_interval", label: "평균", color: "#9333ea" },
-                { key: "min_message_interval", label: "최소", color: "#f97316" },
+                { key: "min_message_interval", label: "최소", color: "#f97316", strokeDasharray: "6 4" },
               ]} />
               <p className="traffic-trends-qualification">메시지 1건 분석 구간의 간격 5.0초는 기존 대체값 계약이며 실측 간격으로 해석하지 않습니다.</p>
             </div>

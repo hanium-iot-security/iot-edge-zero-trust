@@ -7,6 +7,8 @@ export default function Pagination({
   pageSize,
   onPrevious,
   onNext,
+  onPageChange,
+  ariaLabel = "페이지 이동",
   disabled = false,
 }) {
   const safeCurrentPage =
@@ -43,10 +45,16 @@ export default function Pagination({
           safeTotal
         );
 
+  const firstPage = Math.max(1, Math.min(safeCurrentPage - 2, safeTotalPages - 4));
+  const pageNumbers = Array.from(
+    { length: Math.min(5, safeTotalPages) },
+    (_, index) => firstPage + index
+  );
+
   return (
     <nav
-      className="pagination"
-      aria-label="페이지 이동"
+      className={onPageChange ? "pagination pagination--numbered" : "pagination"}
+      aria-label={ariaLabel}
     >
       <button
         type="button"
@@ -59,6 +67,24 @@ export default function Pagination({
       >
         이전
       </button>
+
+      {onPageChange && (
+        <div className="page-numbers">
+          {pageNumbers.map((page) => (
+            <button
+              key={page}
+              type="button"
+              className="page-button page-number"
+              aria-label={`${page} 페이지`}
+              aria-current={page === safeCurrentPage ? "page" : undefined}
+              disabled={disabled}
+              onClick={() => onPageChange(page)}
+            >
+              {page}
+            </button>
+          ))}
+        </div>
+      )}
 
       <div className="page-info">
         <strong>
