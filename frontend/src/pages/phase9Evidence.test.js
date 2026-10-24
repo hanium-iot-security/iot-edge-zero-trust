@@ -1,4 +1,5 @@
 import * as uiText from "../utils/uiText.js";
+import * as runtimeStatus from "../utils/runtimeStatus.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -20,6 +21,7 @@ async function page(name, exports, states = {}, directory = "pages") {
     ...Object.fromEntries(importedNames.map((name) => [name, name])),
     ...mqttTimestamp,
     ...uiText,
+    ...runtimeStatus,
     useState: (initial) => [Object.hasOwn(states, state) ? states[state++] : (state++, typeof initial === "function" ? initial() : initial), () => {}],
     useRef: (initial) => ({ current: initial }),
     useMemo: (callback) => callback(),
@@ -172,4 +174,111 @@ test("evidence labels leave original values and nested JSON intact; MQTT keys st
   const mqttRendered = [...nodes(JsonViewer({ data: mqtt }))];
   assert.deepEqual(mqttRendered.filter((node) => node.type === "dt").map(text), Object.keys(mqtt));
   assert.deepEqual(mqttRendered.filter((node) => node.type === "dd").map(text), ["esp32_02", "2345", "11729"]);
+});
+
+
+test("summary status labels are Korean while numbers and unknown identifiers remain intact", async () => {
+  const { SummaryCard } = await page("SummaryCard", ["SummaryCard"], {}, "components");
+  for (const [value, label] of [["RUNNING", "실행 중"], ["RESPONSE", "응답 수신"], ["ONLINE", "최근 수신"], [0, "0"], ["model-v2", "model-v2"]]) {
+    const card = SummaryCard({ title: "상태", value });
+    const displayed = [...nodes(card)].find((node) => node.props.className === "card-value");
+    assert.equal(text(displayed), label);
+  }
+});
+
+test("dashboard summaries require fresh observations, not successful API responses or observe settings", () => {
+  const data = { status: "RUNNING", freshness: "FRESH", observed_at: observedAt, max_age_seconds: 45, trust_ai_mode: "OBSERVE" };
+  const now = Date.parse(observedAt);
+  assert.equal(runtimeStatus.observationState(data, { now }).status, "RUNNING");
+  for (const [patch, options] of [
+    [{ freshness: "STALE" }, {}], [{ observed_at: null }, {}], [{ max_age_seconds: null }, {}],
+    [{ observed_at: "invalid" }, {}], [{}, { failed: true }], [{}, { now: now + 46_000 }], [{}, { now: now - 1 }],
+  ]) {
+    assert.equal(runtimeStatus.observationState({ ...data, ...patch }, { now, ...options }).status, "UNKNOWN");
+  }
+  assert.equal(data.status, "RUNNING");
+  assert.equal(data.freshness, "FRESH");
+  const firewall = { status: "MATCH", observed_at: observedAt, max_age_seconds: 15 };
+  assert.equal(runtimeStatus.observationState(firewall, { now, requireFreshness: false }).status, "MATCH");
+  assert.equal(runtimeStatus.observationState(firewall, { now: now + 16_000, requireFreshness: false }).status, "UNKNOWN");
+});
+
+test("capture evidence labels distinguish processed, missing and unknown API observations", async () => {
+  const { CaptureEvidence } = await page("DeviceTrafficTrends", ["CaptureEvidence"], {}, "components");
+  const items = [{ observation: "PROCESSED" }, { observation: "MISSING" }, { segment_status: "EMPTY" }, { segment_status: "READY" }, { observation: "FAILED" }, {}];
+  const rendered = text(CaptureEvidence({ data: { items } }));
+  assert.match(rendered, /처리 완료 1/);
+  assert.match(rendered, /수집 자료 누락 1/);
+  assert.match(rendered, /패킷 없음 1/);
+  assert.match(rendered, /수집 실패 1/);
+  assert.match(rendered, /대기 1/);
+  assert.match(rendered, /미확인 1/);
+});
+
+test("Packet trend request includes only complete 10-second windows at the period end", async () => {
+  const { packetTrendRequestParams } = await page("DeviceTrafficTrends", ["packetTrendRequestParams"], {}, "components");
+  const query = { device_id: "esp32_01", direction: "INBOUND", from: "2026-10-24T00:52:00Z", to: "2026-10-24T01:52:00Z", limit: 500, offset: 0 };
+  const actual = packetTrendRequestParams(query);
+  assert.equal(actual.to, "2026-10-24T01:51:50.000Z");
+  assert.equal(Date.parse(actual.to) + 10_000, Date.parse(query.to));
+  for (const key of ["device_id", "direction", "from", "limit", "offset"]) assert.equal(actual[key], query[key]);
+  assert.equal(query.to, "2026-10-24T01:52:00Z", "display period and capture evidence retain the original end");
+});
+
+test("MQTT summary never converts missing counts or empty observations to zero", async () => {
+  const { mqttMessageTotal } = await page("DeviceTrafficTrends", ["mqttMessageTotal"], {}, "components");
+  assert.equal(mqttMessageTotal([{ publish_count: 0 }]), 0);
+  assert.equal(mqttMessageTotal([{ publish_count: 3 }, { publish_count: 2 }]), 5);
+  for (const rows of [[], [{}], [{ publish_count: null }], [{ publish_count: "" }], [{ publish_count: -1 }], [{ publish_count: 3 }, {}]]) {
+    assert.equal(mqttMessageTotal(rows), null);
+  }
+});
+
+
+test("compact runtime overview keeps latest device results and retains all evidence in closed details", async () => {
+  const { RuntimeOverview, latestCompletionRows } = await page("GatewayStatus", ["RuntimeOverview", "latestCompletionRows"]);
+  const old = { device_id: "esp32_01", detector_name: "packet_if", completed_window_end: observedAt, evidence_status: "HISTORICAL", freshness: "STALE", inference_count: 0, input_count: 0 };
+  const latest = { ...old, completed_window_end: "2026-10-15T07:00:10Z", evidence_status: "CURRENT", freshness: "FRESH", inference_count: 1, input_count: 2, normal_count: 1, anomaly_count: 0 };
+  const globalHistory = { ...old, device_id: null };
+  const second = { ...latest, device_id: "pico_01", inference_count: null, normal_count: null };
+  const completions = [old, latest, globalHistory, second];
+  const original = JSON.stringify(completions);
+  const rows = latestCompletionRows(completions);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0], latest);
+  const view = RuntimeOverview({ runtimeItems: [{ name: "AI Runtime", status: "RUNNING", freshness: "FRESH", observed_at: observedAt }], completionItems: completions, runtimeData: { completions }, runtimeUpdatedAt: observedAt, now: Date.parse(observedAt) });
+  const table = [...nodes(view)].find((node) => node.type === "table");
+  const body = [...nodes(table)].find((node) => node.type === "tbody");
+  const renderedRows = [...nodes(body)].filter((node) => node.type === "tr");
+  assert.equal(renderedRows.length, 2);
+  assert.match(text(renderedRows[0]), /esp32_01.*패킷 AI.*1 \/ 2/);
+  assert.match(text(renderedRows[1]), /측정 불가 \/ 2/);
+  const details = [...nodes(view)].filter((node) => node.type === "details");
+  assert.ok(details.every((node) => !node.props.open));
+  const diagnosis = details.find((node) => node.props.className?.includes("diagnostics"));
+  assert.equal([...nodes(diagnosis)].filter((node) => node.type?.name === "CompletionCard").length, completions.length);
+  assert.equal([...nodes(diagnosis)].find((node) => node.type === "pre").children[0], JSON.stringify({ completions }, null, 2));
+  assert.equal(JSON.stringify(completions), original);
+});
+
+test("collapsing runtime detail never hides current stage failures, stopped engines or stale evidence", async () => {
+  const { RuntimeOverview, runtimeIssues } = await page("GatewayStatus", ["RuntimeOverview", "runtimeIssues"]);
+  function* visible(node) {
+    if (Array.isArray(node)) { for (const child of node) yield* visible(child); }
+    else if (node && typeof node === "object") {
+      yield node;
+      yield* visible(node.type === "details" && !node.props.open ? node.children[0] : node.children);
+    }
+  }
+  const engine = { name: "AI Runtime", status: "RUNNING", freshness: "FRESH" };
+  const failure = { name: "packet_if", status: "FAILED", freshness: "FRESH", enabled: true, error_code: "MODEL_LOAD_FAILED" };
+  const disabled = { name: "mqtt_if", status: "DISABLED", freshness: "FRESH", enabled: false };
+  assert.equal(runtimeIssues([engine, disabled]).length, 0, "intentionally disabled stages are not failures");
+  for (const items of [[engine, failure, disabled], [{ ...engine, status: "STOPPED" }], [{ ...engine, status: "UNKNOWN", freshness: "STALE" }]]) {
+    const view = RuntimeOverview({ runtimeItems: items, completionItems: [], runtimeData: {}, runtimeUpdatedAt: observedAt, now: Date.parse(observedAt) });
+    assert.ok([...visible(view)].some((node) => node.props.role === "alert"), "attention state must remain outside collapsed details");
+  }
+  const view = RuntimeOverview({ runtimeItems: [engine, failure], completionItems: [], runtimeData: {}, runtimeUpdatedAt: observedAt, now: Date.parse(observedAt) });
+  const alert = [...visible(view)].find((node) => node.props.role === "alert");
+  assert.match(text(alert), /패킷 AI.*실패.*MODEL_LOAD_FAILED/);
 });

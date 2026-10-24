@@ -606,6 +606,127 @@ function extractCompletionItems(data, runtimeFreshness, now = Date.now()) {
   });
 }
 
+function runtimeDisplayName(name) {
+  const names = {
+    "AI Runtime": "탐지 엔진", mqtt_feature_rule: "MQTT 통계 규칙",
+    mqtt_message_rule: "MQTT 메시지 규칙", mqtt_if: "MQTT AI",
+    packet_rule: "패킷 규칙", packet_if: "패킷 AI",
+  };
+  return Object.hasOwn(names, name) ? names[name] : displayValue(name);
+}
+
+// The overview keeps the latest window per device and detector. Every original
+// completion, including records without a device, remains in diagnostics.
+function latestCompletionRows(items) {
+  const rows = new Map();
+  for (const item of items) {
+    if (item.device_id == null || !String(item.device_id).trim()) continue;
+    const key = JSON.stringify([item.device_id, item.detector_name]);
+    const previous = rows.get(key);
+    const timestamp = Date.parse(item.completed_window_end);
+    const previousTime = Date.parse(previous?.completed_window_end);
+    if (!previous || (Number.isFinite(timestamp) && (!Number.isFinite(previousTime) || timestamp > previousTime)) ||
+        (timestamp === previousTime && item.evidence_status === "CURRENT" && previous.evidence_status !== "CURRENT")) {
+      rows.set(key, item);
+    }
+  }
+  return [...rows.values()].sort((a, b) =>
+    String(a.device_id).localeCompare(String(b.device_id)) ||
+    String(a.detector_name).localeCompare(String(b.detector_name)));
+}
+
+function runtimeIssues(items) {
+  return items.filter((item, index) => {
+    if (item.freshness !== "FRESH") return false;
+    const status = getRuntimeField(item, "actual");
+    if (item.error_code || ["ERROR", "FAILED", "UNHEALTHY", "CRASHED", "DEGRADED"].includes(status)) return true;
+    return (index === 0 || item.enabled === true) && ["OFF", "DISABLED", "STOPPED", "UNKNOWN"].includes(status);
+  });
+}
+
+function RuntimeOverview({ runtimeItems, completionItems, runtimeData, runtimeError, runtimeUpdatedAt, now }) {
+  const actualStatus = runtimeItems[0]?.status ?? "UNKNOWN";
+  const freshness = runtimeItems[0]?.freshness ?? "MISSING";
+  const rows = latestCompletionRows(completionItems);
+  const issues = runtimeIssues(runtimeItems);
+
+  return (
+    <>
+      <div className="ai-runtime-overview-grid">
+        <SummaryCard title="실제 실행 상태" value={actualStatus}
+          description="탐지 엔진의 현재 관측 상태"
+          status={actualStatus === "STOPPED" ? "warning" : runtimeTheme(actualStatus)} />
+        <SummaryCard title="관측 정보 최신 여부" value={uiLabel(freshness)}
+          description={`관측 시각: ${formatKST(runtimeItems[0]?.observed_at)}`}
+          status={freshness === "FRESH" ? "normal" : freshness === "API_ERROR" ? "danger" : "warning"} />
+      </div>
+      <p className="ai-runtime-fetch-note">
+        실행 정보 조회: {runtimeError ? "조회 실패" : "응답 수신"} · 최근 응답 {formatElapsedTime(runtimeUpdatedAt, now)}
+      </p>
+
+      {actualStatus === "UNKNOWN" && (
+        <p className="ai-runtime-attention" role="alert">
+          최신 실행 상태를 확인할 수 없습니다. 이전 관측과 완료 기록은 현재 실행을 보장하지 않습니다.
+        </p>
+      )}
+      {issues.length > 0 && (
+        <div className="ai-runtime-attention" role="alert">
+          <strong>확인이 필요한 실행 상태</strong>
+          <ul>{issues.map((item, index) => (
+            <li key={`${item.name}-${index}`}>
+              {runtimeDisplayName(item.name)}: {uiLabel(item.status)}{item.error_code ? ` · ${item.error_code}` : ""}
+            </li>
+          ))}</ul>
+        </div>
+      )}
+
+      <div className="ai-completion-heading">
+        <h3>기기별 최근 AI 분석</h3>
+        <span>{rows.length}개 분석 결과</span>
+      </div>
+      <p className="ai-runtime-note">분석 완료 기록과 현재 실행 상태는 별개입니다. 추론 횟수와 판정 결과를 함께 확인하세요.</p>
+      {rows.length ? (
+        <div className="ai-completion-table-scroll">
+          <table className="ai-completion-table" aria-label="기기별 최근 AI 분석">
+            <thead><tr>
+              <th scope="col">기기</th><th scope="col">분석기</th><th scope="col">최근 분석 완료 구간 (KST)</th>
+              <th scope="col">추론 / 입력</th><th scope="col">정상 / 이상</th><th scope="col">완료 근거 상태</th>
+            </tr></thead>
+            <tbody>{rows.map((item) => (
+              <tr key={JSON.stringify([item.device_id, item.detector_name])}>
+                <td>{displayValue(item.device_id)}</td><td>{runtimeDisplayName(item.detector_name)}</td>
+                <td>{formatKST(item.completed_window_end)}</td>
+                <td>{formatInteger(item.inference_count)} / {formatInteger(item.input_count)}</td>
+                <td>{formatInteger(item.normal_count)} / {formatInteger(item.anomaly_count)}</td>
+                <td><StatusBadge status={item.evidence_status === "CURRENT" && item.freshness === "FRESH" ? "info" : "warning"}
+                  label={`${uiLabel(item.evidence_status)} / ${uiLabel(item.freshness)}`} size="small" /></td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      ) : <p className="ai-runtime-note">기기별 분석 완료 근거를 아직 확인할 수 없습니다. 실행 중 표시만으로 추론 완료를 판단하지 않습니다.</p>}
+
+      <details className="ai-runtime-raw ai-runtime-details">
+        <summary>처리 단계 상세 · {runtimeItems.length}개 항목</summary>
+        <div className="ai-runtime-grid">
+          {runtimeItems.map((item, index) => <RuntimeCard key={`${item.name}-${index}`} item={item} index={index} />)}
+        </div>
+      </details>
+      <details className="ai-runtime-raw ai-runtime-diagnostics">
+        <summary>진단 정보 · 완료 기록 {completionItems.length}건과 원본 응답</summary>
+        <p className="ai-runtime-note">모델, 분석 제외 사유와 기기명이 없는 과거 기록을 포함한 전체 완료 근거입니다.</p>
+        <div className="ai-runtime-grid">
+          {completionItems.map((item, index) => <CompletionCard key={`${item.run_id}-${item.detector_name}-${index}`} item={item} />)}
+        </div>
+        <details className="ai-runtime-raw">
+          <summary>실행 상태 원본 응답 확인</summary>
+          <pre>{JSON.stringify(runtimeData, null, 2)}</pre>
+        </details>
+      </details>
+    </>
+  );
+}
+
 /* =========================================================
    Gateway Status Page
 ========================================================= */
@@ -869,9 +990,6 @@ export default function GatewayStatus() {
     [runtimeData, runtimeItems, now]
   );
 
-  const actualRuntimeStatus = runtimeItems[0]?.status ?? "UNKNOWN";
-  const actualRuntimeKnown = actualRuntimeStatus !== "UNKNOWN";
-
   /* ---------------------------------------------------------
      Actions
   --------------------------------------------------------- */
@@ -928,144 +1046,6 @@ export default function GatewayStatus() {
           </div>
         </div>
       )}
-
-      {/* =====================================================
-          Phase 9 - AI Runtime Status
-      ===================================================== */}
-
-      <section className="panel">
-        <div className="panel-header">
-          <div>
-            <h2>AI 실행 상태</h2>
-            <p className="panel-description">
-              Desired 설정과 Actual 실행 상태를 구분합니다.
-              AI 정책이 OBSERVE라고 해서 추론 엔진의 실행이
-              확인된 것은 아닙니다.
-            </p>
-          </div>
-
-          <button
-            type="button"
-            className="button button-ghost"
-            onClick={loadRuntimeStatus}
-            disabled={runtimeLoading}
-          >
-            실행 상태 새로고침
-          </button>
-        </div>
-
-        {runtimeError && (
-          <div
-            className="page-warning-banner"
-            role="alert"
-          >
-            <div>
-              <strong>AI 실행 상태 조회 실패</strong>
-              <p>
-                {runtimeError}
-                {runtimeData
-                  ? " 마지막으로 받은 데이터가 표시됩니다."
-                  : ""}
-              </p>
-            </div>
-          </div>
-        )}
-
-        {runtimeLoading && !runtimeData ? (
-          <LoadingState
-            title="AI 실행 상태를 확인하는 중입니다."
-            compact
-          />
-        ) : !runtimeData ? (
-          <EmptyState
-            title="AI 실행 상태를 확인할 수 없습니다."
-            description="실행 상태 조회 API 연결 및 서비스 상태를 확인해 주세요."
-            compact
-          />
-        ) : (
-          <>
-            <div className="summary-card-grid">
-              <SummaryCard
-                title="Runtime API"
-                value={
-                  runtimeError ? "ERROR" : "RESPONSE"
-                }
-                description={
-                  runtimeError
-                    ? "최근 갱신에 실패했습니다."
-                    : "실행 상태 API 응답을 수신했습니다."
-                }
-                status={
-                  runtimeError ? "danger" : "normal"
-                }
-              />
-
-              <SummaryCard
-                title="Actual 상태 확인"
-                value={
-                  actualRuntimeStatus
-                }
-                description={
-                  `관측 신선도: ${runtimeItems[0]?.freshness ?? "MISSING"}`
-                }
-                status={
-                  runtimeTheme(actualRuntimeStatus)
-                }
-              />
-
-              <SummaryCard
-                title="마지막 API 응답"
-                value={formatElapsedTime(runtimeUpdatedAt, now)}
-                description={formatKST(runtimeUpdatedAt)}
-              />
-            </div>
-
-            <div className="ai-runtime-grid">
-              {runtimeItems.map((item, index) => (
-                <RuntimeCard
-                  key={
-                    String(
-                      firstDefined(item, [
-                        "runtime_name",
-                        "name",
-                        "component",
-                      ]) ?? index
-                    ) + index
-                  }
-                  item={item}
-                  index={index}
-                />
-              ))}
-            </div>
-
-            {!actualRuntimeKnown && (
-              <p className="ai-runtime-note">
-                최신 실행 상태를 확인할 수 없습니다. 마지막 관측과
-                추론 완료 근거는 현재 정상 실행을 보장하지 않습니다.
-              </p>
-            )}
-
-            {completionItems.length > 0 && (
-              <>
-                <h3>최근 추론 완료 근거</h3>
-                <p className="ai-runtime-note">완료 기록과 현재 실행 상태는 별개입니다.</p>
-                <div className="ai-runtime-grid">
-                  {completionItems.map((item, index) => (
-                    <CompletionCard key={`${item.run_id}-${item.detector_name}-${index}`} item={item} />
-                  ))}
-                </div>
-              </>
-            )}
-
-            <details className="ai-runtime-raw">
-              <summary>실행 상태 원본 응답 확인</summary>
-              <pre>
-                {JSON.stringify(runtimeData, null, 2)}
-              </pre>
-            </details>
-          </>
-        )}
-      </section>
 
       {/* =====================================================
           Gateway Metrics - 기존 기능 유지
@@ -1162,7 +1142,7 @@ export default function GatewayStatus() {
                 수집 주기 {COLLECTION_INTERVAL_SECONDS}초 ×{" "}
                 {ONLINE_THRESHOLD_MULTIPLIER}배인{" "}
                 {ONLINE_THRESHOLD_SECONDS}초 이내에 Metric이
-                수집되면 ONLINE으로 표시합니다.
+                수집되면 ‘최근 수신’으로 표시합니다.
               </p>
             </div>
 
@@ -1304,6 +1284,65 @@ export default function GatewayStatus() {
           </section>
         </>
       )}
+
+      {/* =====================================================
+          Phase 9 - AI Runtime Status
+      ===================================================== */}
+
+      <section className="panel ai-runtime-panel" aria-label="AI 실행 상태">
+        <div className="panel-header">
+          <div>
+            <h2>AI 실행 상태</h2>
+            <p className="panel-description">
+              실행 설정과 실제 실행 상태를 구분합니다.
+              AI 정책이 관찰 모드여도 추론 엔진의 실행이 확인된 것은 아닙니다.
+            </p>
+          </div>
+
+          <button
+            type="button"
+            className="button button-ghost"
+            onClick={loadRuntimeStatus}
+            disabled={runtimeLoading}
+          >
+            실행 상태 새로고침
+          </button>
+        </div>
+
+        {runtimeError && (
+          <div
+            className="page-warning-banner"
+            role="alert"
+          >
+            <div>
+              <strong>AI 실행 상태 조회 실패</strong>
+              <p>
+                {runtimeError}
+                {runtimeData
+                  ? " 마지막으로 받은 데이터가 표시됩니다."
+                  : ""}
+              </p>
+            </div>
+          </div>
+        )}
+
+        {runtimeLoading && !runtimeData ? (
+          <LoadingState
+            title="AI 실행 상태를 확인하는 중입니다."
+            compact
+          />
+        ) : !runtimeData ? (
+          <EmptyState
+            title="AI 실행 상태를 확인할 수 없습니다."
+            description="실행 상태 조회 API 연결 및 서비스 상태를 확인해 주세요."
+            compact
+          />
+        ) : (
+          <RuntimeOverview runtimeItems={runtimeItems} completionItems={completionItems}
+            runtimeData={runtimeData} runtimeError={runtimeError} runtimeUpdatedAt={runtimeUpdatedAt} now={now} />
+        )}
+      </section>
+
     </div>
   );
 }

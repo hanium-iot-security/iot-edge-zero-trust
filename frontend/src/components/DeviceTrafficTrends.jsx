@@ -18,6 +18,7 @@ import {
   getPacketCaptureWindows,
 } from "../api/api";
 import DateTimePicker from "./DateTimePicker";
+import SummaryCard from "./SummaryCard";
 import "../styles/components/DeviceTrafficTrends.scss";
 
 // Phase 9 P9-07: 한 기기와 고정 기간을 대상으로 한 조회. 서버 한 페이지는 최대 500건.
@@ -86,6 +87,11 @@ function unpackList(data, label) {
   if (!Array.isArray(root?.items)) throw new Error(`${label}: items 배열이 없는 응답입니다.`);
   const n = numberOrNull(root.total);
   return { items: root.items, total: n, totalKnown: n !== null };
+}
+
+// Packet API uses an inclusive window_start upper bound; show only complete 10-second windows.
+function packetTrendRequestParams(params) {
+  return { ...params, to: new Date(Date.parse(params.to) - WINDOW_SECONDS * 1000).toISOString() };
 }
 
 async function loadPaged({ request, params, signal, label }) {
@@ -170,6 +176,14 @@ function normalizePacketRow(item) {
   };
 }
 
+function mqttMessageTotal(rows) {
+  if (!rows.length) return null;
+  const counts = rows.map((row) => numberOrNull(row.publish_count));
+  return counts.every((value) => value !== null && value >= 0)
+    ? counts.reduce((total, value) => total + value, 0)
+    : null;
+}
+
 function normalizeMqttRow(item) {
   return {
     ...item,
@@ -247,15 +261,16 @@ function MetricsChart({ data, lines, title, unit, isPacket }) {
 }
 
 function CaptureEvidence({ data, loading, error, missingSession }) {
-  const list = data?.items ?? [];
+  const list = useMemo(() => data?.items ?? [], [data]);
   const found = useMemo(() => {
-    const summary = { failed: 0, empty: 0, pending: 0, completed: 0, other: 0 };
+    const summary = { failed: 0, empty: 0, pending: 0, completed: 0, missing: 0, other: 0 };
     list.forEach((item) => {
-      const status = String(item?.segment_status ?? item?.capture_status ?? item?.status ?? "").toUpperCase();
+      const status = String(item?.observation ?? item?.segment_status ?? item?.capture_status ?? item?.status ?? "").toUpperCase();
       if (status === "FAILED") summary.failed += 1;
       else if (status === "EMPTY") summary.empty += 1;
-      else if (status === "PENDING" || status === "PROCESSING") summary.pending += 1;
-      else if (status === "COMPLETED") summary.completed += 1;
+      else if (status === "PENDING" || status === "PROCESSING" || status === "READY") summary.pending += 1;
+      else if (status === "PROCESSED") summary.completed += 1;
+      else if (status === "MISSING") summary.missing += 1;
       else summary.other += 1;
     });
     return summary;
@@ -273,7 +288,7 @@ function CaptureEvidence({ data, loading, error, missingSession }) {
         <p role="status">수집 근거를 아직 조회하지 않았습니다.</p>
       ) : (
         <p>
-          수신 {list.length}건 · COMPLETED {found.completed} · EMPTY {found.empty} · FAILED {found.failed} · 대기 {found.pending} · 기타 {found.other}
+          조회 {list.length}건 · 처리 완료 {found.completed} · 패킷 없음 {found.empty} · 수집 자료 누락 {found.missing} · 수집 실패 {found.failed} · 대기 {found.pending} · 미확인 {found.other}
           {data?.incomplete ? " · 일부 메타만 확인됨" : ""}
         </p>
       )}
@@ -364,7 +379,8 @@ export default function DeviceTrafficTrends() {
     (async () => {
       const { tab: kind, token: _token, ...params } = criteria;
       try {
-        const request = kind === "mqtt" ? getFeatureLogs : getPacketFeatureLogs;
+        const request = kind === "mqtt" ? getFeatureLogs
+          : (pageParams, options) => getPacketFeatureLogs(packetTrendRequestParams(pageParams), options);
         const query = kind === "mqtt"
           ? { device_id: params.device_id, from: params.from, to: params.to }
           : { device_id: params.device_id, from: params.from, to: params.to, direction: params.direction };
@@ -485,6 +501,17 @@ export default function DeviceTrafficTrends() {
       {error && <p className="traffic-trends-error" role="alert">조회 실패: {error} (0건으로 간주하지 않습니다.)</p>}
       {!loading && result && (
         <>
+          <div className="summary-card-grid" aria-label="선택 기기 통신 요약">
+            <SummaryCard title="조회한 분석 구간" value={formatNumber(result.rows.length, 0)} description={`${result.criteria.device_id} · ${result.kind === "mqtt" ? "MQTT" : "패킷"} · 아래 선택 기간의 조회 행 기준`} />
+            {result.kind === "mqtt" ? (
+              <SummaryCard title="MQTT 메시지 합계" value={formatNumber(mqttMessageTotal(result.rows), 0)} unavailable={mqttMessageTotal(result.rows) === null} description="조회한 분석 구간의 발행 수 합계 · 전체 누적 건수 아님" />
+            ) : (
+              <>
+                <SummaryCard title="분석 가능한 구간" value={formatNumber(result.rows.length - excluded, 0)} description="수집 품질이 확인된 조회 행" status={result.rows.length > excluded ? "normal" : "unknown"} />
+                <SummaryCard title="분석 제외·품질 미확인" value={formatNumber(excluded, 0)} description="제외·실패·품질 미확인 구간은 그래프에서 연결하지 않습니다" status={excluded > 0 ? "warning" : "default"} />
+              </>
+            )}
+          </div>
           <div className="traffic-trends-summary">
             <span>대상: <strong>{result.criteria.device_id}</strong></span>
             <span>구간: {kstFull(result.criteria.from)} ~ {kstFull(result.criteria.to)}</span>

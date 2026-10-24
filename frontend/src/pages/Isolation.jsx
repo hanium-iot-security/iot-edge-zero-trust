@@ -1,4 +1,5 @@
 import { uiLabel } from "../utils/uiText";
+import { observationState } from "../utils/runtimeStatus";
 import { useCallback, useEffect, useMemo, useRef, useState, } from "react";
 import { createFirewallReleaseRequest, createFirewallScopeExtensionRequest, createPacketPairRecoveryPlan, getPacketPairRecoveryPlan, verifyPacketPairRecoveryPlan, getFirewallRuntimeStatus, executeRecovery, getDeviceDetail, getFirewallReleaseRequest, getFirewallRules, getIsolatedDevices, getIsolationHistory, getRecoveryHistory, recoveryPreflight, } from "../api/api";
 import DataTable from "../components/DataTable";
@@ -461,7 +462,13 @@ function Phase9RuntimePanel() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [updatedAt, setUpdatedAt] = useState("");
+  const [now, setNow] = useState(Date.now);
   const seq = useRef(0);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   const refresh = useCallback(async (signal) => {
     const id = ++seq.current;
@@ -496,6 +503,9 @@ function Phase9RuntimePanel() {
     };
   }, [refresh]);
 
+  const observation = observationState(runtime, { failed: Boolean(error), now, requireFreshness: false });
+  const verified = observation.status === "MATCH";
+
   return (
     <section className="panel phase9-runtime-panel">
       <div className="panel-header">
@@ -510,9 +520,24 @@ function Phase9RuntimePanel() {
       {error && <p className="inline-error" role="alert">{error}{runtime ? " · 이전 조회 데이터를 표시합니다." : ""}</p>}
       {runtime ? (
         <>
+          <div className="health-grid">
+            <div className="health-item">
+              <span>실제 규칙 검증</span>
+              <StatusBadge status={verified ? "normal" : observation.status === "MISMATCH" ? "danger" : "unknown"} label={uiLabel(observation.status)} />
+            </div>
+            <div className="health-item"><span>관측 정보</span><strong>{uiLabel(observation.freshness)}</strong></div>
+            <div className="health-item"><span>방화벽 관측 시각</span><strong>{formatKST(runtime.observed_at)}</strong></div>
+          </div>
+          {(!verified || runtime.warning_count > 0 || runtime.waiting_count > 0) && (
+            <p className="inline-error" role="alert">
+              {!verified ? "실제 방화벽 규칙의 최신 일치 상태가 확인되지 않았습니다. " : ""}
+              {runtime.warning_count > 0 ? `경고 ${runtime.warning_count}건. ` : ""}
+              {runtime.waiting_count > 0 ? `적용 확인 대기 ${runtime.waiting_count}건.` : ""}
+            </p>
+          )}
           <p className="text-muted">최근 조회: {formatKST(updatedAt)} {error ? "(최신 상태 아님)" : ""}</p>
-          <details className="phase9-json-details" open>
-            <summary>실제 방화벽 원본 응답</summary>
+          <details className="phase9-json-details">
+            <summary>상세 정보 보기 · 실제 방화벽 원본 응답</summary>
             <pre>{JSON.stringify(runtime, null, 2)}</pre>
           </details>
         </>
@@ -1758,11 +1783,9 @@ export default function Isolation() {
           </div>
         </div>)}
 
-      <Phase9RuntimePanel />
-
       {!loading &&
             !error && (<section className="summary-card-grid" aria-label="격리 상태 요약">
-            <SummaryCard title="현재 격리" value={formatNumber(isolationSummary.isolated)} description="신뢰 상태가 isolated인 기기" status="isolated"/>
+            <SummaryCard title="현재 격리" value={formatNumber(isolationSummary.isolated)} description="신뢰 상태가 격리인 기기" status="isolated"/>
 
             <SummaryCard title="방화벽 적용" value={formatNumber(isolationSummary.applied)} description="실제 네트워크 차단 완료" status="normal"/>
 
@@ -1817,6 +1840,8 @@ export default function Isolation() {
         }} onRowClick={openRecoveryDetail}/>
         </div>
       </section>
+
+      <Phase9RuntimePanel />
 
       {/* =====================================================
             Isolation History

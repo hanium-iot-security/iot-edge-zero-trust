@@ -125,6 +125,16 @@
      API HEALTH
      ======================================== */
 
+  .phase9-json-details {
+    padding: 14px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background: var(--color-slate-50);
+
+    summary { cursor: pointer; font-size: 13px; font-weight: 700; }
+    pre { max-height: 350px; overflow: auto; font-size: 12px; line-height: 1.6; }
+  }
+
   .health-grid {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));

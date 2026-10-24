@@ -1464,7 +1464,7 @@ export default function Events() {
 
             <SummaryCard
 
-              title="Capture Gap"
+              title="수집 공백"
 
               value={formatNumber(
 

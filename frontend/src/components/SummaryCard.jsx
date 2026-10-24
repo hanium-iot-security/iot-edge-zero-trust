@@ -1,3 +1,4 @@
+import { uiLabel } from "../utils/uiText";
 import "../styles/components/SummaryCard.scss";
 
 function normalizeStatus(status) {
@@ -70,7 +71,7 @@ export default function SummaryCard({
       {unavailable ? (
         <span className="card-unavailable">{unavailableText}</span>
       ) : (
-        <strong className="card-value">{value ?? "-"}</strong>
+        <strong className="card-value">{typeof value === "string" ? uiLabel(value) : value ?? "-"}</strong>
       )}
       {description && <p className="description">{description}</p>}
       {(footer || updatedLabel) && (
