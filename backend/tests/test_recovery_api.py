@@ -569,7 +569,13 @@ def test_post_commit_json_audit_failure_records_actual_state_and_backup(
     def fail_success_log(path: Path, payload: dict[str, object]) -> None:
         if payload.get("result") == "SUCCESS":
             raise OSError("forced json audit failure")
-        original_write_json_log(path, payload)
+        # A stale core artifact must not replace the backend's fresh DB read.
+        stale_payload = dict(payload)
+        stale_payload["devices"] = [{
+            "device_id": "esp32_01",
+            "current": {"status": "isolated", "trust_score": 20},
+        }]
+        original_write_json_log(path, stale_payload)
 
     monkeypatch.setattr(baseline_recovery, "_write_json_log", fail_success_log)
 
@@ -577,7 +583,8 @@ def test_post_commit_json_audit_failure_records_actual_state_and_backup(
 
     assert response.status_code == 500
     detail = response.json()["detail"]
-    assert detail["failure_code"] == "BASELINE_RECOVERY_CORE_FAILED"
+    assert detail["result"] == "FAILED"
+    assert detail["failure_code"] == "BASELINE_RECOVERY_COMMITTED_UNVERIFIED"
     assert detail["after_status"] == "normal"
     assert detail["after_trust_score"] == 100
     assert detail["backup_reference"].startswith("baseline-recovery-")
@@ -587,11 +594,118 @@ def test_post_commit_json_audit_failure_records_actual_state_and_backup(
 
     history = client.get("/api/recovery/history", headers=ADMIN_HEADERS)
     assert history.status_code == 200
+    assert history.json()["total"] == 1
     item = history.json()["items"][0]
+    assert item["result"] == "FAILED"
+    assert item["failure_code"] == "BASELINE_RECOVERY_COMMITTED_UNVERIFIED"
     assert item["after_status"] == "normal"
     assert item["after_trust_score"] == 100
     assert item["backup_reference"] == detail["backup_reference"]
     assert item["backup_sha256"] == detail["backup_sha256"]
+
+
+def test_post_commit_health_failure_preserves_actual_state_in_api_and_core_history(
+    api_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, db_path, artifact_dir = api_client
+    original_verify = baseline_recovery._verify_database_path
+    live_health_checks = 0
+
+    def fail_post_commit_health(path: Path):
+        nonlocal live_health_checks
+        if path == db_path:
+            live_health_checks += 1
+            if live_health_checks == 2:
+                assert _device_state(db_path) == ("normal", 100)
+                return "forced post-commit health failure", []
+        return original_verify(path)
+
+    monkeypatch.setattr(baseline_recovery, "_verify_database_path", fail_post_commit_health)
+
+    response = _post_execute(client)
+
+    assert response.status_code == 500
+    detail = response.json()["detail"]
+    assert live_health_checks == 2
+    assert detail["result"] == "FAILED"
+    assert detail["failure_code"] == "BASELINE_RECOVERY_COMMITTED_UNVERIFIED"
+    assert detail["before_status"] == "isolated"
+    assert detail["before_trust_score"] == 20
+    assert detail["after_status"] == "normal"
+    assert detail["after_trust_score"] == 100
+    assert detail["backup_reference"]
+    assert detail["backup_sha256"]
+    assert _device_state(db_path) == ("normal", 100)
+
+    core_path = next(artifact_dir.glob("baseline-recovery-*.json"))
+    core_audit = json.loads(core_path.read_text(encoding="utf-8"))
+    assert core_audit["database_committed"] is True
+    assert core_audit["failure_code"] == "BASELINE_RECOVERY_COMMITTED_UNVERIFIED"
+    assert core_audit["devices"][0]["current"] == {"status": "normal", "trust_score": 100}
+    history = client.get("/api/recovery/history", headers=ADMIN_HEADERS).json()
+    assert history["total"] == 1
+    assert history["items"][0]["failure_code"] == detail["failure_code"]
+    assert history["items"][0]["after_trust_score"] == 100
+
+    # A core-only artifact must retain the same committed-state distinction.
+    next(artifact_dir.glob("recovery-command-*.json")).unlink()
+    history = client.get("/api/recovery/history", headers=ADMIN_HEADERS).json()
+    assert history["total"] == 1
+    item = history["items"][0]
+    assert item["result"] == "FAILED"
+    assert item["failure_code"] == detail["failure_code"]
+    assert item["after_status"] == "normal"
+    assert item["after_trust_score"] == 100
+    assert item["backup_reference"] == detail["backup_reference"]
+    assert item["backup_sha256"] == detail["backup_sha256"]
+
+
+def test_committed_core_history_keeps_current_state_when_previous_is_missing() -> None:
+    item = recovery_command_service._normalize_baseline_audit(
+        {
+            "operation_id": "20261024T000000Z-committed",
+            "result": "FAILED",
+            "database_committed": True,
+            "failure_code": "BASELINE_RECOVERY_COMMITTED_UNVERIFIED",
+            "devices": [{
+                "device_id": "esp32_01",
+                "current": {"status": "normal", "trust_score": 100},
+            }],
+            "audit": {"preflight": {"current_status": "isolated", "current_trust_score": 20}},
+        },
+        log_reference="baseline-recovery-20261024T000000Z-committed.json",
+    )
+
+    assert item["before_status"] == "isolated"
+    assert item["before_trust_score"] == 20
+    assert item["after_status"] == "normal"
+    assert item["after_trust_score"] == 100
+    assert item["failure_code"] == "BASELINE_RECOVERY_COMMITTED_UNVERIFIED"
+
+
+def test_database_recovery_lock_contention_is_hold_without_losing_release_evidence(
+    api_client,
+) -> None:
+    client, db_path, artifact_dir = api_client
+    command_lock = db_path.resolve().with_suffix(db_path.suffix + ".baseline-recovery.lock")
+
+    with baseline_recovery.single_instance_lock(command_lock):
+        response = _post_execute(client)
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["result"] == "HOLD"
+    assert detail["failure_code"] == "RECOVERY_IN_PROGRESS"
+    assert detail["firewall_release_status"] == "VERIFIED_RELEASED"
+    assert detail["after_status"] == "isolated"
+    assert detail["after_trust_score"] == 20
+    assert _device_state(db_path) == ("isolated", 20)
+    assert not list(artifact_dir.glob("baseline-recovery-*.db"))
+    history = client.get("/api/recovery/history", headers=ADMIN_HEADERS).json()
+    assert history["total"] == 1
+    assert history["items"][0]["failure_code"] == "RECOVERY_IN_PROGRESS"
+    assert history["items"][0]["firewall_release_status"] == "VERIFIED_RELEASED"
 
 
 def test_concurrent_recovery_request_is_blocked_while_first_is_in_flight(

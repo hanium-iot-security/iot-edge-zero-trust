@@ -26,8 +26,10 @@ from backend.app.security import RecoveryAdminContext
 from edge.packet.pcap_naming import format_utc_iso
 from edge.trust.baseline_recovery import (
     CONFIRMATION,
+    BaselineRecoveryCommittedError,
     BaselineRecoveryError,
     BaselineRecoveryHoldError,
+    BaselineRecoveryInProgressError,
     execute_baseline_recovery,
     inspect_baseline_recovery,
 )
@@ -247,6 +249,19 @@ def execute_recovery_command(
             db.rollback()
             after = _device_snapshot(db, device_id)
             backup = _backup_artifact_metadata(artifacts, operation_id)
+            if isinstance(exc, BaselineRecoveryInProgressError):
+                failure_code = "RECOVERY_IN_PROGRESS"
+                firewall_release_status = _firewall_release_status(preflight)
+            elif isinstance(exc, BaselineRecoveryHoldError):
+                failure_code = "FIREWALL_RUNTIME_UNVERIFIED"
+                firewall_release_status = "NOT_VERIFIED"
+            else:
+                failure_code = (
+                    "BASELINE_RECOVERY_COMMITTED_UNVERIFIED"
+                    if isinstance(exc, BaselineRecoveryCommittedError)
+                    else "BASELINE_RECOVERY_CORE_FAILED"
+                )
+                firewall_release_status = _firewall_release_status(preflight)
             payload = _write_command_audit(
                 artifacts,
                 operation_id=operation_id,
@@ -256,11 +271,10 @@ def execute_recovery_command(
                 approved_by=admin.principal,
                 requested_at=requested_at,
                 result="HOLD" if isinstance(exc, BaselineRecoveryHoldError) else "FAILED",
-                failure_code=("FIREWALL_RUNTIME_UNVERIFIED" if isinstance(exc, BaselineRecoveryHoldError)
-                              else "BASELINE_RECOVERY_CORE_FAILED"),
+                failure_code=failure_code,
                 failure_reason=str(exc),
                 preflight=preflight,
-                firewall_release_status=("NOT_VERIFIED" if isinstance(exc, BaselineRecoveryHoldError) else None),
+                firewall_release_status=firewall_release_status,
                 after_status=after.get("status"),
                 after_trust_score=after.get("trust_score"),
                 backup_reference=backup["backup_reference"],
@@ -621,7 +635,8 @@ def _normalize_baseline_audit(
             "status": audit["preflight"].get("current_status"),
             "trust_score": audit["preflight"].get("current_trust_score"),
         }
-        after = before
+        if not after and not payload.get("database_committed"):
+            after = before
     item = {
         "operation_id": operation_id,
         "result": str(payload.get("result") or "FAILED"),
@@ -638,7 +653,13 @@ def _normalize_baseline_audit(
         or _firewall_release_status(audit.get("preflight")),
         "backup_reference": _basename(payload.get("backup_path")),
         "backup_sha256": payload.get("backup_sha256"),
-        "failure_code": None if payload.get("result") == "SUCCESS" else "BASELINE_RECOVERY_FAILED",
+        "failure_code": (
+            None if payload.get("result") == "SUCCESS"
+            else payload.get("failure_code") or (
+                "BASELINE_RECOVERY_COMMITTED_UNVERIFIED"
+                if payload.get("database_committed") else "BASELINE_RECOVERY_FAILED"
+            )
+        ),
         "failure_reason": payload.get("error"),
         "log_reference": log_reference,
     }
