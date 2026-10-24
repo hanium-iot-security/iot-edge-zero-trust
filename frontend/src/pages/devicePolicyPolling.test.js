@@ -15,16 +15,16 @@ import * as firewallRuleSelection from "../utils/firewallRuleSelection.js";
 // FRONTEND_REGRESSION_REF=<commit> runs these assertions against historical source.
 const repository = fileURLToPath(new URL("../../../", import.meta.url));
 const compiledPages = new Map();
-async function pageCode(name) {
+async function pageCode(name, folder = "pages") {
   const revision = process.env.FRONTEND_REGRESSION_REF;
-  const key = `${revision || "working-tree"}:${name}`;
+  const key = `${revision || "working-tree"}:${folder}:${name}`;
   if (!compiledPages.has(key)) {
     const source = revision
-      ? execFileSync("git", ["show", `${revision}:frontend/src/pages/${name}.jsx`], {
+      ? execFileSync("git", ["show", `${revision}:frontend/src/${folder}/${name}.jsx`], {
           cwd: repository,
           encoding: "utf8",
         })
-      : await readFile(new URL(`./${name}.jsx`, import.meta.url), "utf8");
+      : await readFile(new URL(`../${folder}/${name}.jsx`, import.meta.url), "utf8");
     const importedNames = [];
     for (const match of source.matchAll(
       /^import\s+(?:\{([\s\S]*?)\}|(\w+))\s+from\s+["'][^"']+["'];/gm,
@@ -235,7 +235,7 @@ function deviceServer(clock) {
       getDevices: async () => ({ items: [sensor], total: 1 }),
       getFirewallRules: async () => ({ items: [] }),
       getDeviceDetail: async () => sensor,
-      getTrustScoreHistory: async () => ({ items: [] }),
+      getTrustScoreHistory: async () => ({ items: [], total: 0 }),
       getDevicePolicy: async () => {
         if (failure) { const error = failure; failure = null; throw error; }
         if (pending && Date.parse(pending.effective_from) <= clock.now) { current = pending; pending = null; }
@@ -359,7 +359,7 @@ test("delayed policy refresh for device A cannot overwrite device B draft or nex
     getDevices: async () => ({ items: [a, b], total: 2 }),
     getFirewallRules: async () => ({ items: [] }),
     getDeviceDetail: async (id) => id === a.device_id ? a : b,
-    getTrustScoreHistory: async () => ({ items: [] }),
+    getTrustScoreHistory: async () => ({ items: [], total: 0 }),
     getDevicePolicy: async (id) => id === a.device_id && delayA
       ? stale.promise
       : { current: policy(1, id === a.device_id ? 5120 : 9100), latest_revision: 1 },
@@ -395,7 +395,7 @@ test("closed device A refresh error cannot clear device B loading state or show 
     getDevices: async () => ({ items: [a, b], total: 2 }),
     getFirewallRules: async () => ({ items: [] }),
     getDeviceDetail: async (id) => id === a.device_id ? a : b,
-    getTrustScoreHistory: async () => ({ items: [] }),
+    getTrustScoreHistory: async () => ({ items: [], total: 0 }),
     getDevicePolicy: async (id) => id === b.device_id ? current.promise
       : delayA ? stale.promise : { current: policy(1), latest_revision: 1 },
   });
@@ -734,4 +734,223 @@ test("unknown capture eligibility stays unconfirmed while failed or excluded row
     assert.equal(packetQualityBadge(app).status, "degraded");
   }
   app.cleanup();
+});
+
+
+function trustRows(total, deviceId = sensor.device_id) {
+  return Array.from({ length: total }, (_, index) => ({
+    id: total - index, device_id: deviceId, previous_score: 80, new_score: 60,
+    actual_delta: -20, calculated_delta: -20, capped_delta: -20,
+    representative_event_ids: [total - index], policy_version: `history-${total - index}`,
+  }));
+}
+function trustPager(app) {
+  return app.find((node) => node.type === "Pagination" && node.props.ariaLabel === "신뢰점수 이력 페이지 이동");
+}
+function trustItems(app) {
+  return app.nodes().filter((node) => node.type === "article" && node.props.className === "history-item");
+}
+function historyServer(total) {
+  const server = deviceServer(createClock());
+  const calls = [];
+  const otherCalls = [];
+  for (const name of ["getDeviceDetail", "getDevicePolicy", "getFirewallRules"]) {
+    const original = server.api[name];
+    server.api[name] = (...args) => { otherCalls.push(name); return original(...args); };
+  }
+  server.api.getTrustScoreHistory = async (deviceId, params, options) => {
+    calls.push({ deviceId, ...params, signal: options?.signal });
+    return { device_id: deviceId, items: trustRows(total, deviceId).slice(params.offset, params.offset + params.limit), total };
+  };
+  return { ...server, calls, otherCalls };
+}
+
+test("trust history uses server pages of five and preserves policy inputs without detail refetches", async () => {
+  const server = historyServer(12);
+  const app = await componentHarness("Devices", server.api);
+  try {
+    await openSensor(app);
+    assert.equal(server.calls[0].limit, 5);
+    assert.equal(trustItems(app).length, 5);
+    assert.equal(trustPager(app).props.total, 12);
+    assert.equal(trustPager(app).props.totalPages, 3);
+    await app.change("rule-key", "retain-key");
+    await app.change("rule-payload_size_max", "6200");
+    await app.change("rule-reason", "retain unsaved reason");
+    const otherCalls = server.otherCalls.length;
+    await app.act(() => trustPager(app).props.onPageChange(2));
+    assert.equal(trustItems(app).length, 5);
+    assert.equal(trustPager(app).props.currentPage, 2);
+    await app.act(() => trustPager(app).props.onNext());
+    assert.equal(trustItems(app).length, 2);
+    assert.equal(trustPager(app).props.currentPage, 3);
+    assert.deepEqual(server.calls.map(({ limit, offset }) => [limit, offset]), [[5, 0], [5, 5], [5, 10]]);
+    assert.equal(server.otherCalls.length, otherCalls);
+    assert.equal(app.input("rule-key").props.value, "retain-key");
+    assert.equal(app.input("rule-payload_size_max").props.value, "6200");
+    assert.equal(app.input("rule-reason").props.value, "retain unsaved reason");
+    await app.act(() => selectedDetail(app).props.onClose());
+    await openSensor(app);
+    assert.equal(server.calls.at(-1).offset, 0);
+    assert.equal(trustPager(app).props.currentPage, 1);
+  } finally { app.cleanup(); }
+});
+
+test("trust history reaches beyond fifty records and retries only the failed page without stale rows", async () => {
+  const server = historyServer(57);
+  const original = server.api.getTrustScoreHistory;
+  let fail = true;
+  server.api.getTrustScoreHistory = async (...args) => {
+    const result = await original(...args);
+    if (args[1].offset === 55 && fail) { fail = false; throw new Error("history page unavailable"); }
+    return result;
+  };
+  const app = await componentHarness("Devices", server.api);
+  try {
+    await openSensor(app);
+    await app.change("rule-key", "retain-on-retry");
+    const otherCalls = server.otherCalls.length;
+    await app.act(() => trustPager(app).props.onPageChange(12));
+    assert.equal(trustItems(app).length, 0, "failed page must not display previous page rows");
+    const error = app.find((node) => node.type === "ErrorState" && node.props.message === "history page unavailable");
+    await app.act(() => error.props.onRetry());
+    assert.equal(trustItems(app).length, 2);
+    assert.equal(trustPager(app).props.total, 57);
+    assert.equal(trustPager(app).props.currentPage, 12);
+    assert.deepEqual(server.calls.map(({ offset }) => offset), [0, 55, 55]);
+    assert.equal(server.otherCalls.length, otherCalls);
+    assert.equal(app.input("rule-key").props.value, "retain-on-retry");
+  } finally { app.cleanup(); }
+});
+
+test("trust history cancels a pending page on close and discards it after another device opens", async () => {
+  const server = historyServer(12);
+  const second = { ...sensor, device_id: "sensor_B" };
+  server.api.getDevices = async () => ({ items: [sensor, second], total: 2 });
+  server.api.getDeviceDetail = async (id) => id === second.device_id ? second : sensor;
+  const stale = deferred();
+  const original = server.api.getTrustScoreHistory;
+  server.api.getTrustScoreHistory = async (...args) => {
+    const result = await original(...args);
+    return args[0] === sensor.device_id && args[1].offset === 5 ? stale.promise : result;
+  };
+  const app = await componentHarness("Devices", server.api);
+  try {
+    await openSensor(app);
+    await app.act(() => trustPager(app).props.onPageChange(2));
+    assert.equal(trustItems(app).length, 0, "pending page cannot relabel old rows");
+    const oldRequest = server.calls.at(-1);
+    await app.act(() => selectedDetail(app).props.onClose());
+    assert.equal(oldRequest.signal.aborted, true);
+    await openDevice(app, second.device_id);
+    stale.resolve({ device_id: sensor.device_id, items: trustRows(5), total: 999 });
+    await app.settle();
+    assert.equal(trustPager(app).props.total, 12);
+    assert.equal(trustPager(app).props.currentPage, 1);
+    assert.equal(trustItems(app).length, 5);
+    assert.equal(selectedDetail(app).props.title, "sensor_B 상세 상태");
+  } finally { app.cleanup(); }
+});
+
+test("trust history ignores a late previous page for the same device", async () => {
+  const server = historyServer(12);
+  const stale = deferred();
+  const original = server.api.getTrustScoreHistory;
+  server.api.getTrustScoreHistory = async (...args) => {
+    const result = await original(...args);
+    return args[1].offset === 5 ? stale.promise : result;
+  };
+  const app = await componentHarness("Devices", server.api);
+  try {
+    await openSensor(app);
+    const changePage = trustPager(app).props.onPageChange;
+    await app.act(() => changePage(2));
+    const previousRequest = server.calls.at(-1);
+    await app.act(() => changePage(3));
+    assert.equal(previousRequest.signal.aborted, true);
+    assert.equal(trustPager(app).props.currentPage, 3);
+    assert.equal(trustItems(app).length, 2);
+    stale.resolve({ device_id: sensor.device_id, items: trustRows(5), total: 999 });
+    await app.settle();
+    assert.equal(trustPager(app).props.currentPage, 3);
+    assert.equal(trustPager(app).props.total, 12);
+    assert.equal(trustItems(app).length, 2);
+  } finally { app.cleanup(); }
+});
+
+test("trust history empty response shows no pager and rejects a mismatched device payload", async () => {
+  const server = historyServer(0);
+  const app = await componentHarness("Devices", server.api);
+  try {
+    await openSensor(app);
+    assert.equal(trustItems(app).length, 0);
+    assert.equal(app.nodes().some((node) => node.type === "Pagination" && node.props.ariaLabel === "신뢰점수 이력 페이지 이동"), false);
+    assert.ok(app.nodes().some((node) => node.type === "EmptyState" && node.props.title === "신뢰점수 변화 이력이 없습니다."));
+    await app.act(() => selectedDetail(app).props.onClose());
+    server.api.getTrustScoreHistory = async () => ({ device_id: "another-device", items: trustRows(1), total: 1 });
+    // The harness captures API bindings, so reopen with a separate component for changed transport.
+  } finally { app.cleanup(); }
+  const mismatched = await componentHarness("Devices", server.api);
+  try {
+    await openSensor(mismatched);
+    assert.equal(trustItems(mismatched).length, 0);
+    assert.ok(mismatched.nodes().some((node) => node.type === "ErrorState" && node.props.message.includes("이력")));
+  } finally { mismatched.cleanup(); }
+});
+
+async function paginationTree(props) {
+  const { code } = await pageCode("Pagination", "components");
+  const scope = { jsx: (type, properties, ...children) => ({ type, props: properties || {}, children }) };
+  runInNewContext(code, scope);
+  return scope.Component(props);
+}
+function treeNodes(root) {
+  if (Array.isArray(root)) return root.flatMap(treeNodes);
+  if (!root || typeof root !== "object") return [];
+  return [root, ...treeNodes(root.children)];
+}
+
+test("numbered pagination renders a bounded window, current-page semantics, and unchanged default controls", async () => {
+  const visited = [];
+  const props = { currentPage: 12, totalPages: 12, total: 57, pageSize: 5,
+    onPrevious() {}, onNext() {}, onPageChange: (page) => visited.push(page), ariaLabel: "신뢰점수 이력 페이지 이동" };
+  const root = await paginationTree(props);
+  assert.equal(root.props["aria-label"], props.ariaLabel);
+  const numbers = treeNodes(root).filter((node) => node.type === "button" && node.props["aria-label"]?.endsWith("페이지"));
+  assert.deepEqual(Array.from(numbers, (node) => Number(node.children[0])), [8, 9, 10, 11, 12]);
+  assert.equal(numbers.at(-1).props["aria-current"], "page");
+  numbers[0].props.onClick();
+  assert.deepEqual(visited, [8]);
+  const defaultRoot = await paginationTree({ ...props, currentPage: 1, onPageChange: undefined, ariaLabel: undefined });
+  const defaultButtons = treeNodes(defaultRoot).filter((node) => node.type === "button");
+  assert.equal(defaultRoot.props["aria-label"], "페이지 이동");
+  assert.equal(defaultButtons.length, 2);
+  assert.equal(defaultButtons[0].props.disabled, true);
+  assert.equal(defaultButtons[1].props.disabled, false);
+  const disabledRoot = await paginationTree({ ...props, disabled: true });
+  assert.ok(treeNodes(disabledRoot).filter((node) => node.type === "button").every((node) => node.props.disabled));
+});
+
+
+test("trust history settles after same-device first-page detail error retry", async () => {
+  const server = historyServer(12);
+  let failDetail = true;
+  server.api.getDeviceDetail = async () => {
+    if (failDetail) { failDetail = false; throw new Error("temporary detail outage"); }
+    return sensor;
+  };
+  const app = await componentHarness("Devices", server.api);
+  try {
+    await openSensor(app);
+    assert.equal(trustItems(app).length, 5);
+    assert.equal(server.calls.length, 1);
+    const error = app.find((node) => node.type === "ErrorState" && node.props.message === "temporary detail outage");
+    await app.act(() => error.props.onRetry());
+    assert.equal(trustItems(app).length, 5, "detail retry must finish reloading the first history page");
+    assert.equal(server.calls.length, 2);
+    assert.deepEqual(server.calls.map(({ limit, offset }) => [limit, offset]), [[5, 0], [5, 0]]);
+    assert.equal(trustPager(app).props.currentPage, 1);
+    assert.equal(app.nodes().some((node) => node.type === "LoadingState" && node.props.title === "Trust 이력 조회 중"), false);
+    assert.equal(app.nodes().some((node) => node.type === "ErrorState" && node.props.message === "temporary detail outage"), false);
+  } finally { app.cleanup(); }
 });

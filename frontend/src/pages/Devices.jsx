@@ -42,6 +42,7 @@ import {
 import "../styles/pages/Devices.scss";
 
 const LIMIT = 20;
+const TRUST_HISTORY_LIMIT = 5;
 const POLLING_MS = 10000;
 const PROFILE = "periodic-sensor-v1";
 const DEVICE_TYPES = ["SENSOR", "CAMERA", "ACTUATOR", "OTHER"];
@@ -927,6 +928,9 @@ export default function Devices() {
   const [trustHistory, setTrustHistory] = useState([]);
   const [trustLoading, setTrustLoading] = useState(false);
   const [trustError, setTrustError] = useState("");
+  const [trustTotal, setTrustTotal] = useState(0);
+  const [trustOffset, setTrustOffset] = useState(0);
+  const [trustRetry, setTrustRetry] = useState(0);
 
   const [policyInfo, setPolicyInfo] = useState(EMPTY_POLICY);
   const [policyLoading, setPolicyLoading] = useState(false);
@@ -1024,6 +1028,37 @@ export default function Devices() {
   useEffect(() => {
     return () => detailControllerRef.current?.abort();
   }, []);
+
+  const trustDeviceId = selectedDevice?.device_id;
+  useEffect(() => {
+    if (!trustDeviceId) return undefined;
+    const controller = new AbortController();
+    setTrustLoading(true);
+    setTrustError("");
+    setTrustHistory([]);
+    getTrustScoreHistory(
+      trustDeviceId,
+      { limit: TRUST_HISTORY_LIMIT, offset: trustOffset },
+      { signal: controller.signal }
+    ).then((data) => {
+      if (controller.signal.aborted) return;
+      if (!Array.isArray(data?.items) || !Number.isInteger(data?.total) ||
+          data.total < data.items.length || data.items.length > TRUST_HISTORY_LIMIT ||
+          (data.device_id != null && data.device_id !== trustDeviceId) ||
+          data.items.some((item) => item.device_id != null && item.device_id !== trustDeviceId)) {
+        throw new Error("신뢰점수 이력 응답이 올바르지 않습니다.");
+      }
+      setTrustHistory(data.items);
+      setTrustTotal(data.total);
+    }).catch((err) => {
+      if (!controller.signal.aborted) {
+        setTrustError(err?.message || "Trust 이력 조회 실패");
+      }
+    }).finally(() => {
+      if (!controller.signal.aborted) setTrustLoading(false);
+    });
+    return () => controller.abort();
+  }, [trustDeviceId, trustOffset, trustRetry]);
 
   const firewallMap = useMemo(
     () => getCurrentFirewallRuleMap(firewallRules),
@@ -1156,6 +1191,16 @@ export default function Devices() {
     }
   }, [applyPolicyResponse]);
 
+  function changeTrustPage(page) {
+    const pages = Math.max(1, Math.ceil(trustTotal / TRUST_HISTORY_LIMIT));
+    const nextOffset = (Math.min(pages, Math.max(1, page)) - 1) * TRUST_HISTORY_LIMIT;
+    if (nextOffset === trustOffset) return;
+    setTrustHistory([]);
+    setTrustLoading(true);
+    setTrustError("");
+    setTrustOffset(nextOffset);
+  }
+
   async function openDetail(device) {
     if (!device?.device_id || policySaving) return;
 
@@ -1169,6 +1214,9 @@ export default function Devices() {
     setDetailLoading(true);
     setDetailError("");
     setTrustHistory([]);
+    setTrustTotal(0);
+    setTrustOffset(0);
+    setTrustRetry((value) => value + 1);
     setTrustLoading(true);
     setTrustError("");
     setPolicyInfo(EMPTY_POLICY);
@@ -1187,10 +1235,6 @@ export default function Devices() {
         { device_id: deviceId, limit: 100, offset: 0 },
         { signal: controller.signal }
       ),
-      getTrustScoreHistory(
-        deviceId, { limit: 50, offset: 0 },
-        { signal: controller.signal }
-      ),
       getDevicePolicy(deviceId, { signal: controller.signal }),
     ]);
 
@@ -1198,7 +1242,7 @@ export default function Devices() {
       return;
     }
 
-    const [detail, firewall, history, rulePolicy] = results;
+    const [detail, firewall, rulePolicy] = results;
     let latestDevice = device;
 
     if (detail.status === "fulfilled") {
@@ -1225,14 +1269,6 @@ export default function Devices() {
 
     setSelectedDevice(latestDevice);
 
-    if (history.status === "fulfilled") {
-      setTrustHistory(
-        Array.isArray(history.value?.items) ? history.value.items : []
-      );
-    } else {
-      setTrustError(history.reason?.message || "Trust 이력 조회 실패");
-    }
-
     if (rulePolicy.status === "fulfilled") {
       const data = normalizePolicy(rulePolicy.value);
       applyPolicyResponse(data, latestDevice, false);
@@ -1241,7 +1277,6 @@ export default function Devices() {
     }
 
     setDetailLoading(false);
-    setTrustLoading(false);
     setPolicyLoading(false);
   }
 
@@ -1257,6 +1292,8 @@ export default function Devices() {
     setPolicyWriteError("");
     setPolicyMessage("");
     setTrustHistory([]);
+    setTrustTotal(0);
+    setTrustOffset(0);
   }
 
   function registrationField(key, value) {
@@ -2241,7 +2278,7 @@ export default function Devices() {
               ) : trustError ? (
                 <ErrorState
                   message={trustError}
-                  onRetry={() => openDetail(selectedDevice)}
+                  onRetry={() => setTrustRetry((value) => value + 1)}
                   compact
                 />
               ) : trustHistory.length === 0 ? (
@@ -2281,6 +2318,18 @@ export default function Devices() {
                     </article>
                   ))}
                 </div>
+              )}
+              {!trustLoading && !trustError && trustTotal > 0 && trustHistory.length > 0 && (
+                <Pagination
+                  currentPage={Math.floor(trustOffset / TRUST_HISTORY_LIMIT) + 1}
+                  totalPages={Math.max(1, Math.ceil(trustTotal / TRUST_HISTORY_LIMIT))}
+                  total={trustTotal}
+                  pageSize={TRUST_HISTORY_LIMIT}
+                  ariaLabel="신뢰점수 이력 페이지 이동"
+                  onPageChange={changeTrustPage}
+                  onPrevious={() => changeTrustPage(Math.floor(trustOffset / TRUST_HISTORY_LIMIT))}
+                  onNext={() => changeTrustPage(Math.floor(trustOffset / TRUST_HISTORY_LIMIT) + 2)}
+                />
               )}
             </section>
           </div>
