@@ -1,6 +1,7 @@
 """Read each AI Cycle's registration, mode history and approval in one snapshot."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 import sqlite3
@@ -38,14 +39,33 @@ class AIRuntimeSelector:
 def load_ai_runtime_selector(db: Session, *, stage_name: str, source_table: str,
                              model_version: str, bundle_sha256: str,
                              cycle_range_start: datetime) -> AIRuntimeSelector:
-    # SQLite's legacy driver does not BEGIN for SELECT, even inside db.begin().
-    # Start before the first lookup so 007, 012, 015 and CP share one snapshot.
     connection = db.connection()
     raw = connection.connection.driver_connection
     if not isinstance(raw, sqlite3.Connection):
         raise AIRuntimePolicyError("AI_POLICY_SCHEMA_UNAVAILABLE", "AI policy requires SQLite")
-    if not raw.in_transaction:
-        connection.exec_driver_sql("BEGIN")
+    # Legacy SQLite SELECTs do not begin a physical transaction. An owned
+    # outermost savepoint keeps 007, 012, 015 and CP consistent, then releases
+    # the read snapshot before inference and the caller's later writes.
+    # Use the Connection so pending ORM changes are not flushed by a Session
+    # savepoint. A preexisting physical transaction remains the caller's own.
+    owns_snapshot = not raw.in_transaction
+    try:
+        with connection.begin_nested() if owns_snapshot else nullcontext():
+            return _load_snapshot(
+                db, stage_name=stage_name, source_table=source_table,
+                model_version=model_version, bundle_sha256=bundle_sha256,
+                cycle_range_start=cycle_range_start)
+    except BaseException:
+        # ROLLBACK TO leaves an outermost SQLite savepoint active. End only
+        # our read transaction even if the caller catches the lookup failure.
+        if owns_snapshot and raw.in_transaction:
+            connection.exec_driver_sql("ROLLBACK")
+        raise
+
+
+def _load_snapshot(db: Session, *, stage_name: str, source_table: str,
+                   model_version: str, bundle_sha256: str,
+                   cycle_range_start: datetime) -> AIRuntimeSelector:
     receipt = get_stage_activation(db, stage_name, model_version, bundle_sha256)
     activation_from = require_window_start(parse_db_utc(receipt["boundary"]))
     row = checkpoints.get_detector_checkpoint(db, detector_name=stage_name,

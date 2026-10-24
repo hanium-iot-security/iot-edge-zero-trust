@@ -5,7 +5,8 @@ import sqlite3
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import event, text
+from sqlalchemy import Column, String, event, text
+from sqlalchemy.orm import declarative_base
 
 from backend.app.config import Settings
 from backend.app.schemas.ai_runtime_schema import RuntimeStage
@@ -178,6 +179,66 @@ def test_physical_snapshot_survives_ai_change_between_registration_and_ai_reads(
             assert decision(load(db), T1).infer
     finally:
         event.remove(engine, "after_cursor_execute", concurrent_write)
+
+
+@pytest.mark.parametrize("existing_transaction", [None, "read", "write"])
+def test_selector_preserves_transaction_ownership_and_later_rollback(approved, existing_transaction):
+    with pytest.raises(RuntimeError, match="rollback the Stage"):
+        with approved.begin() as db:
+            connection = db.connection()
+            raw = connection.connection.driver_connection
+            if existing_transaction == "read":
+                connection.exec_driver_sql("BEGIN")
+            elif existing_transaction == "write":
+                revision(db)
+            assert raw.in_transaction is (existing_transaction is not None)
+            load(db)
+            assert db.in_transaction()
+            assert raw.in_transaction is (existing_transaction is not None)
+            revision(db, number=2 if existing_transaction == "write" else 1, effective=T1)
+            cp(db, T1)
+            raise RuntimeError("rollback the Stage")
+    with approved() as db:
+        assert db.execute(text("SELECT COUNT(*) FROM device_ai_policy_revisions")).scalar_one() == 0
+        assert db.execute(text("SELECT last_completed_window_end FROM detector_checkpoints "
+                               "WHERE detector_name='mqtt_if'")).scalar_one() == stamp(T0)
+
+
+def test_selector_does_not_flush_pending_orm_changes(approved):
+    class PendingDevice(declarative_base()):
+        __tablename__ = "devices"
+        device_id = Column(String, primary_key=True)
+        ip_address = Column(String)
+
+    with approved() as db:
+        pending = PendingDevice(device_id="pending", ip_address="192.0.2.9")
+        db.add(pending)
+        raw = db.connection().connection.driver_connection
+        assert not raw.in_transaction
+        load(db)
+        assert pending in db.new
+        assert not raw.in_transaction
+        assert db.execute(text("SELECT COUNT(*) FROM devices WHERE device_id='pending'")).scalar_one() == 0
+        db.rollback()
+
+
+@pytest.mark.parametrize("existing_transaction", [False, True])
+def test_caught_selector_failure_releases_only_owned_snapshot(approved, existing_transaction):
+    with pytest.raises(RuntimeError, match="rollback after handled failure"):
+        with approved.begin() as db:
+            raw = db.connection().connection.driver_connection
+            if existing_transaction:
+                revision(db)
+            with pytest.raises(AiStageActivationError):
+                load(db, bundle_sha256="b" * 64)
+            assert db.in_transaction()
+            assert raw.in_transaction is existing_transaction
+            cp(db, T1)
+            raise RuntimeError("rollback after handled failure")
+    with approved() as db:
+        assert db.execute(text("SELECT COUNT(*) FROM device_ai_policy_revisions")).scalar_one() == 0
+        assert db.execute(text("SELECT last_completed_window_end FROM detector_checkpoints "
+                               "WHERE detector_name='mqtt_if'")).scalar_one() == stamp(T0)
 
 
 @pytest.mark.parametrize("stage", [MqttIsolationForestStage, PacketIsolationForestStage])
