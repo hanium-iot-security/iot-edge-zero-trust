@@ -29,8 +29,9 @@ from edge.phase5.verified_collection_contract import (
 
 PACKET_IF_DATASET_VERSION_V1 = "packet-if-dataset-v1"
 PACKET_IF_DATASET_VERSION_V2 = "packet-if-dataset-v2"
+PACKET_IF_DATASET_VERSION_V3 = "packet-if-dataset-v3"
 SUPPORTED_PACKET_IF_DATASET_VERSIONS = frozenset(
-    {PACKET_IF_DATASET_VERSION_V1, PACKET_IF_DATASET_VERSION_V2}
+    {PACKET_IF_DATASET_VERSION_V1, PACKET_IF_DATASET_VERSION_V2, PACKET_IF_DATASET_VERSION_V3}
 )
 
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")

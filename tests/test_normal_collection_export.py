@@ -4,6 +4,7 @@ import csv
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import hashlib
+import io
 import json
 from pathlib import Path
 import socket
@@ -473,3 +474,187 @@ def test_output_preparation_error_preserves_source_and_existing_parent_file(pack
     assert report["status"] == "HOLD"
     assert len(report["hold_reasons"]) == 1 and report["hold_reasons"][0].startswith("preflight:")
     assert tree_hashes(tmp_path) == before
+
+
+def mqtt_publish(payload, topic=b"iot/pico_01/sensor"):
+    body = len(topic).to_bytes(2, "big") + topic + payload
+    remaining, encoded = len(body), bytearray()
+    while True:
+        value, remaining = remaining % 128, remaining // 128
+        encoded.append(value | (128 if remaining else 0))
+        if not remaining:
+            return b"\x30" + bytes(encoded) + body
+
+
+def wire_jitter_package(root, failure=None):
+    """A synthetic 8 → 2 → 5 s arrival recovery, unrelated to the observed 2.825 s case."""
+    arrivals = [1, 9, 11, 16]
+    if failure == "edge_short":
+        arrivals = [1, 3, 11, 16]
+    elif failure == "long_gap":
+        arrivals = [1, 12, 14, 19]
+    elif failure == "unrecovered":
+        arrivals = [1, 7.5, 9.5, 16]
+    elif failure == "repeated_short":
+        arrivals = [1, 8, 10, 12]
+    elif failure == "no_short":
+        arrivals = [1, 6, 11, 16]
+    with closing(sqlite3.connect(root / "after.db")) as db:
+        db.row_factory = sqlite3.Row
+        rows = [dict(row) for row in db.execute("SELECT * FROM mqtt_logs WHERE device_id='pico_01' ORDER BY id")]
+        for index, row in enumerate(rows):
+            row["received_at"] = utc(START + timedelta(seconds=arrivals[index]))
+            db.execute("UPDATE mqtt_logs SET received_at=? WHERE id=?", (row["received_at"], row["id"]))
+        if failure == "missing_row":
+            db.execute("DELETE FROM mqtt_logs WHERE id=?", (rows[1]["id"],))
+        for index in range(2):
+            selected = [row for row, instant in zip(rows, arrivals) if index*10 <= instant < (index+1)*10]
+            moments = [instant for instant in arrivals if index*10 <= instant < (index+1)*10]
+            intervals = [b-a for a, b in zip(moments, moments[1:])] or [5]
+            db.execute("UPDATE feature_logs SET publish_count=?,avg_payload_size=?,max_payload_size=?,"
+                       "avg_message_interval=?,min_message_interval=? WHERE device_id='pico_01' AND window_start=?",
+                       (len(selected), sum(row["payload_size"] for row in selected)/len(selected),
+                        max(row["payload_size"] for row in selected), sum(intervals)/len(intervals), min(intervals),
+                        utc(START + timedelta(seconds=index*10))))
+        if failure == "duplicate_row":
+            source = rows[1]
+            insert(db, "mqtt_logs", **{key: source[key] for key in source if key != "id"})
+        if failure in ("restart", "sender_burst"):
+            value = json.loads(rows[1]["payload"])
+            value["uptime_ms"] = 0 if failure == "restart" else 102000
+            # Replace this synthetic input record; never weaken the production raw-payload update trigger.
+            rows[1].update(payload=json.dumps(value), payload_raw=json.dumps(value).encode())
+            rows[1]["payload_size"] = len(rows[1]["payload_raw"])
+            db.execute("DELETE FROM mqtt_logs WHERE id=?", (rows[1]["id"],))
+            insert(db, "mqtt_logs", **rows[1])
+        db.commit()
+    manifest = json.loads((root / "manifest.json").read_text())
+    sequence = 0xFFFFFFCE if failure == "tcp_wrap" else 1000
+    frames = []
+    for index, (row, instant) in enumerate(zip(rows, arrivals)):
+        body = mqtt_publish(row["payload_raw"])
+        if failure == "payload_mismatch" and index == 1:
+            body = body[:-1] + b"!"
+        if failure == "coalesced" and index == 1:
+            body += body
+        if failure == "missing_frame" and index == 1:
+            sequence += len(body)
+            continue
+        flags = dpkt.tcp.TH_ACK | (dpkt.tcp.TH_FIN if failure == "control" and index == 1 else 0)
+        parts = [body]
+        if failure in ("fragmented", "body_stall") and index == 1:
+            parts = [body[:12], body[12:]]
+        part_seq = sequence
+        for part_index, part in enumerate(parts):
+            tcp = dpkt.tcp.TCP(sport=40000 if failure != "different_flow" or index != 2 else 40001,
+                              dport=1883, seq=part_seq, flags=flags,
+                              win=0 if failure == "zero_window" and index == 1 else 8192, data=part)
+            ip = dpkt.ip.IP(src=socket.inet_aton(IPS["pico_01"]), dst=socket.inet_aton("192.168.0.2"), p=6, data=tcp)
+            ip.len = len(ip)
+            frame = bytes(dpkt.ethernet.Ethernet(src=b"\x00"*6, dst=b"\x01"*6,
+                                               type=dpkt.ethernet.ETH_TYPE_IP, data=ip))
+            stamp = instant - (1.5 if failure == "receiver_delay" and index == 1 else .002)
+            if len(parts) > 1 and part_index == 0:
+                stamp -= 2 if failure == "body_stall" else .5
+            frames.append((stamp, frame))
+            part_seq += len(part)
+        if failure == "duplicate_bytes" and index == 1:
+            frames.append((stamp + .001, frame))
+        sequence = (sequence + len(body) + (1 if failure == "byte_hole" and index == 1 else 0)) & 0xFFFFFFFF
+    for index, artifact in enumerate(manifest["capture_artifacts"]):
+        stream = io.BytesIO()
+        writer = dpkt.pcap.Writer(stream)
+        for stamp, frame in sorted(frames):
+            if index*10 <= stamp < (index+1)*10:
+                writer.writepkt(frame, ts=START.timestamp()+stamp)
+        path = root / artifact["pcap_path"]
+        path.write_bytes(stream.getvalue())
+        artifact["pcap_sha256"] = digest(path)
+    if failure == "invalid_pcap":
+        path = root / manifest["capture_artifacts"][0]["pcap_path"]
+        path.write_bytes(b"not a capture")
+        manifest["capture_artifacts"][0]["pcap_sha256"] = digest(path)
+    if failure == "truncated_pcap":
+        path = root / manifest["capture_artifacts"][0]["pcap_path"]
+        path.write_bytes(path.read_bytes() + b"\x00\x01")
+        manifest["capture_artifacts"][0]["pcap_sha256"] = digest(path)
+    save_manifest(root, manifest)
+    strict = export_normal_collection(root)
+    # Preserve a strict source HOLD and its identity; source-specific malformed cases are rejected by derived QC.
+    manifest["status"] = "HOLD"
+    manifest["collection_issues"] = []
+    manifest["qc_report"] = "qc-report.json"
+    save_manifest(root, manifest)
+    if failure == "no_short":
+        strict["status"] = "HOLD"
+        strict["hold_reasons"] = ["mqtt:pico_01:reception_gap_or_burst"]
+        (root / "qc-report.json").write_text(json.dumps(strict))
+    return strict
+
+
+@pytest.mark.parametrize("fragmentation", [None, "fragmented"])
+def test_wire_jitter_reqc_requires_direct_bytes_and_preserves_strict_hold(package, tmp_path, fragmentation):
+    strict = wire_jitter_package(package, fragmentation)
+    assert strict["status"] == "HOLD" and strict["hold_reasons"] == ["mqtt:pico_01:reception_gap_or_burst"]
+    before = tree_hashes(package)
+    report = export_normal_collection(package, output_dir=tmp_path / "wire-qc",
+                                      reception_policy="pico-p0-wire-jitter-v1")
+    assert report["status"] == "PASS", report
+    assert report["reception_policy"] == "pico-p0-wire-jitter-v1"
+    assert report["source_manifest_status"] == "HOLD"
+    assert report["source_qc"]["sha256"] == digest(package / "qc-report.json")
+    evidence = report["reception_jitter"]
+    assert evidence["physical_cause"] == "UNDETERMINED"
+    assert evidence["reception_intervals_seconds"] == [8, 2, 5]
+    assert len(evidence["samples"]) == 4 and len(evidence["pcaps"]) == 2
+    assert report["training_approved"] is False and report["whole_capture_session_approved"] is False
+    assert tree_hashes(package) == before
+
+
+@pytest.mark.parametrize("failure", ["missing_row", "duplicate_row", "restart", "sender_burst",
+    "edge_short", "long_gap", "unrecovered", "no_short", "payload_mismatch", "coalesced",
+    "missing_frame", "different_flow", "control", "zero_window", "duplicate_bytes", "byte_hole",
+    "receiver_delay", "invalid_pcap", "truncated_pcap", "body_stall", "repeated_short"])
+def test_wire_jitter_rejects_content_and_transport_evidence_defects(package, tmp_path, failure):
+    wire_jitter_package(package, failure)
+    before = tree_hashes(package)
+    report = export_normal_collection(package, output_dir=tmp_path / "wire-qc",
+                                      reception_policy="pico-p0-wire-jitter-v1")
+    assert report["status"] == "HOLD" and report["hold_reasons"], report
+    assert tree_hashes(package) == before
+
+
+def test_wire_jitter_preserves_contiguous_tcp_bytes_across_sequence_wrap(package, tmp_path):
+    wire_jitter_package(package, "tcp_wrap")
+    before = tree_hashes(package)
+    report = export_normal_collection(package, output_dir=tmp_path / "wrapped-review",
+                                      reception_policy="pico-p0-wire-jitter-v1")
+    assert report["status"] == "PASS", report
+    assert report["reception_jitter"]["status"] == "VERIFIED_SINGLE_RECOVERY"
+    assert tree_hashes(package) == before
+
+
+@pytest.mark.parametrize("failure", ["in_place", "source_qc_missing", "source_qc_scope", "source_qc_reason",
+                                    "source_qc_approval", "source_qc_issues", "unknown_policy", "pico_p1"])
+def test_wire_jitter_policy_and_original_hold_link_are_required(package, tmp_path, failure):
+    wire_jitter_package(package)
+    path = package / "qc-report.json"
+    qc = json.loads(path.read_text())
+    if failure == "source_qc_missing":
+        path.unlink()
+    elif failure.startswith("source_qc_"):
+        if failure == "source_qc_scope":
+            qc["run_id"] = str(uuid4())
+        elif failure == "source_qc_reason":
+            qc["hold_reasons"].append("capture:failed")
+        elif failure == "source_qc_approval":
+            qc["training_approved"] = True
+        else:
+            qc["collection_issues"] = ["unsafe"]
+        path.write_text(json.dumps(qc))
+    before = tree_hashes(package)
+    report = export_normal_collection(package, output_dir=None if failure == "in_place" else tmp_path / "wire-qc",
+        qc_profiles={"pico_01": "P1"} if failure == "pico_p1" else None,
+        reception_policy="unknown" if failure == "unknown_policy" else "pico-p0-wire-jitter-v1")
+    assert report["status"] == "HOLD" and report["hold_reasons"], report
+    assert tree_hashes(package) == before

@@ -25,6 +25,7 @@ from ai.packet_if_contract import (
 )
 from ai.packet_if_phase5_manifest import (
     PACKET_IF_DATASET_VERSION_V2,
+    PACKET_IF_DATASET_VERSION_V3,
     SUPPORTED_PACKET_IF_DATASET_VERSIONS,
     PacketIFRunManifestReference,
     assert_run_manifest_complete,
@@ -138,8 +139,9 @@ class PacketIFDatasetManifest:
             session.normal_policy_version
             for session in self.sessions
             if session.normal_policy_version is not None
+            and (self.dataset_version != PACKET_IF_DATASET_VERSION_V3 or session.traffic_label == NORMAL_LABEL)
         }
-        if self.dataset_version == PACKET_IF_DATASET_VERSION_V2:
+        if self.dataset_version in {PACKET_IF_DATASET_VERSION_V2, PACKET_IF_DATASET_VERSION_V3}:
             if len(versions) != 1:
                 raise ValueError(
                     "Packet IF Dataset v2 must contain exactly one "
@@ -189,6 +191,11 @@ def load_packet_if_dataset(
             "packet dataset SHA256 mismatch: "
             f"expected={manifest.dataset_sha256}, actual={actual_sha256}"
         )
+
+    if manifest.dataset_version == PACKET_IF_DATASET_VERSION_V3:
+        from ai.packet_if_bounded import validate_bounded_packet_export
+        validate_bounded_packet_export(dataset_path, manifest_path,
+                                      json.loads(manifest_path.read_text(encoding="utf-8")))
 
     session_sha256s = session_data_sha256s(dataset_path)
     frame = pd.read_csv(dataset_path)
@@ -287,7 +294,7 @@ def load_packet_if_manifest(
         sessions=sessions,
         db_snapshot_sha256=db_snapshot_sha256,
     )
-    if dataset_version == PACKET_IF_DATASET_VERSION_V2:
+    if dataset_version in {PACKET_IF_DATASET_VERSION_V2, PACKET_IF_DATASET_VERSION_V3}:
         _validate_run_manifest_references(path, manifest)
     return manifest
 
@@ -458,7 +465,8 @@ def _parse_session_spec(
         )
 
     status = _required_non_empty_string(payload, "status")
-    if status != "COMPLETED":
+    if status != "COMPLETED" and not (dataset_version == PACKET_IF_DATASET_VERSION_V3
+                                      and traffic_label == NORMAL_LABEL and status == "FAILED"):
         raise ValueError(
             f"packet dataset session must be COMPLETED: {session_id}"
         )
@@ -513,7 +521,16 @@ def _parse_session_spec(
     )
 
     phase5_fields: dict[str, Any] = {}
-    if dataset_version == PACKET_IF_DATASET_VERSION_V2:
+    if dataset_version == PACKET_IF_DATASET_VERSION_V3:
+        phase5_fields = {
+            "source_capture_group_id": require_canonical_uuid4(payload.get("source_capture_group_id"), "source_capture_group_id"),
+            "normal_policy_version": require_non_empty_string(payload.get("normal_policy_version"), "normal_policy_version"),
+            "included_device_ids": normalize_device_ids(payload.get("included_device_ids"), "included_device_ids"),
+            "target_source_ip": normalize_optional_ipv4(payload.get("target_source_ip"), "target_source_ip"),
+        }
+    if dataset_version == PACKET_IF_DATASET_VERSION_V2 or (
+        dataset_version == PACKET_IF_DATASET_VERSION_V3 and traffic_label == ATTACK_LABEL
+    ):
         run_manifest_payload = payload.get("run_manifest_ref")
         if not isinstance(run_manifest_payload, dict):
             raise ValueError("run_manifest_ref must be a JSON object")
@@ -588,6 +605,18 @@ def _validate_manifest_sessions(
 
     if dataset_version == PACKET_IF_DATASET_VERSION_V2:
         _validate_phase5_manifest_sessions(sessions)
+    elif dataset_version == PACKET_IF_DATASET_VERSION_V3:
+        attacks = tuple(spec for spec in sessions if spec.traffic_label == ATTACK_LABEL)
+        if attacks:
+            _validate_phase5_manifest_sessions(attacks)
+        groups = {}
+        for spec in sessions:
+            previous = groups.setdefault(spec.source_capture_group_id, spec.split)
+            if previous != spec.split:
+                raise ValueError("source_capture_group_id must not cross Dataset splits")
+        normal_versions = {spec.normal_policy_version for spec in sessions if spec.traffic_label == NORMAL_LABEL}
+        if normal_versions != {"packet-bounded-normal-v1"}:
+            raise ValueError("Dataset v3 requires the bounded normal policy")
 
     split_values = {spec.split for spec in sessions}
     if external_holdout and split_values != {TEST_SPLIT}:
@@ -634,7 +663,7 @@ def _validate_manifest_sessions(
             raise ValueError(
                 f"normal session must not have target_device_id: {spec.session_id}"
             )
-        if dataset_version == PACKET_IF_DATASET_VERSION_V2:
+        if dataset_version in {PACKET_IF_DATASET_VERSION_V2, PACKET_IF_DATASET_VERSION_V3}:
             if spec.traffic_label == ATTACK_LABEL and not spec.target_source_ip:
                 raise ValueError(
                     "attack session must specify target_source_ip: "
@@ -666,7 +695,7 @@ def _validate_manifest_sessions(
                 "attack target_device_id is missing from session devices: "
                 f"{spec.session_id}"
             )
-        if dataset_version == PACKET_IF_DATASET_VERSION_V2:
+        if dataset_version in {PACKET_IF_DATASET_VERSION_V2, PACKET_IF_DATASET_VERSION_V3}:
             _validate_phase5_session_devices(spec)
 
 
@@ -762,6 +791,8 @@ def _validate_run_manifest_references(
     for spec in manifest.sessions:
         reference = spec.run_manifest_ref
         if reference is None:
+            if manifest.dataset_version == PACKET_IF_DATASET_VERSION_V3 and spec.traffic_label == NORMAL_LABEL:
+                continue
             raise ValueError("run_manifest_ref is required for Dataset v2")
         run_manifest_path = (base_directory / reference.relative_path).resolve()
         if base_directory not in run_manifest_path.parents:
@@ -832,7 +863,9 @@ def _validate_dataset_rows(
     ids = frame["packet_feature_log_id"]
     if ids.isna().any():
         raise ValueError("packet_feature_log_id must not be null")
-    if ids.duplicated().any():
+    duplicate_ids = (frame.duplicated(subset=["session_id", "packet_feature_log_id"])
+                     if manifest.dataset_version == PACKET_IF_DATASET_VERSION_V3 else ids.duplicated())
+    if duplicate_ids.any():
         raise ValueError("packet dataset contains duplicate packet_feature_log_id values")
     for value in ids:
         if (

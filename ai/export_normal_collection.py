@@ -23,6 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from ai.packet_if_contract import transform_packet_feature_row
+from ai.pico_reception_qc import STRICT_POLICY, WIRE_JITTER_POLICY, verify_reception_jitter
 from edge.detection.phase4_time import parse_db_utc
 from edge.maintenance.processing import dataset_maintenance_windows, overlaps_maintenance
 from edge.packet.capture_policy import CaptureEligibilitySegment, CapturePolicy, is_capture_eligible
@@ -125,8 +126,10 @@ def _bounded(rows, predicate, report, label, reject_outside=False):
     return selected
 
 
-def _metadata(manifest, *, allow_completed=False):
+def _metadata(manifest, *, allow_completed=False, allow_reception_hold=False):
     states = ("RAW_CAPTURED", "CANDIDATE_QC_PASSED") if allow_completed else ("RAW_CAPTURED",)
+    if allow_reception_hold:
+        states += ("HOLD",)
     _require(manifest["schema_version"] == SCHEMA_VERSION and manifest["status"] in states,
              "candidate_schema_or_state")
     _require(manifest["training_approved"] is False
@@ -195,7 +198,7 @@ def _qc_profiles(profiles, ids):
     return {device_id: mqtt_qc_policy(profiles.get(device_id, "P0")) for device_id in ids}
 
 
-def _mqtt_qc(raw, features, ids, start, end, report, profiles=None):
+def _mqtt_qc(raw, features, ids, start, end, report, profiles=None, verified_jitter=False):
     policies = _qc_profiles(profiles, ids)
     report["qc_policy"] = policies
     grouped = defaultdict(list)
@@ -232,7 +235,9 @@ def _mqtt_qc(raw, features, ids, start, end, report, profiles=None):
                      "sender_cadence")
             times = [_time(row["received_at"]) for row in rows]
             reception_low, reception_high = policy["reception_gap_seconds"]
-            _require(all(reception_low <= (b-a).total_seconds() <= reception_high
+            allow_short = device_id == "pico_01" and verified_jitter
+            _require(all(0 < (b-a).total_seconds() <= reception_high
+                         and (allow_short or (b-a).total_seconds() >= reception_low)
                          for a, b in zip(times, times[1:])), "reception_gap_or_burst")
             cursor = start
             while cursor < end:
@@ -243,7 +248,8 @@ def _mqtt_qc(raw, features, ids, start, end, report, profiles=None):
             _require((times[0]-start).total_seconds() <= policy["edge_gap_seconds"]
                      and (end-times[-1]).total_seconds() <= policy["edge_gap_seconds"], "edge_reception_gap")
             if device_id == "pico_01":
-                verify_pico(rows, mode="gateway", payload_max=5120, min_samples=2)
+                verify_pico(rows, mode="gateway", payload_max=5120, min_samples=2,
+                            check_reception_cadence=not verified_jitter)
             report["mqtt_devices"][device_id] = {"samples": len(rows), "first_seq": sequences[0],
                 "last_seq": sequences[-1], "uptime_seconds_range": [uptimes[0], uptimes[-1]],
                 "payload_bytes_range": [min(row["payload_size"] for row in rows),
@@ -373,7 +379,25 @@ def _new_output_dir(root: Path, output_dir: Path) -> Path:
     return path
 
 
-def export_normal_collection(package_dir: Path, *, output_dir: Path | None = None, qc_profiles=None) -> dict:
+def _source_reception_hold(root, manifest):
+    _require(manifest.get("status") == "HOLD" and manifest.get("collection_issues", []) == [],
+             "reception_policy_requires_clean_source_hold")
+    path = _path(root, "qc-report.json")
+    before = _hash(path)
+    source = json.loads(path.read_text(encoding="utf-8"))
+    keys = ("run_id", "start_utc", "end_utc", "capture_session_pk", "source_capture_group_id", "code_commit")
+    _require(isinstance(source, dict) and source.get("schema_version") == SCHEMA_VERSION
+             and all(source.get(key) == manifest.get(key) for key in keys)
+             and source.get("status") == "HOLD"
+             and source.get("hold_reasons") == ["mqtt:pico_01:reception_gap_or_burst"]
+             and source.get("training_approved") is False and source.get("whole_capture_session_approved") is False
+             and source.get("collection_issues", []) == [], "source_reception_hold_mismatch")
+    _require(_hash(path) == before, "source_qc_changed_during_read")
+    return {"path": "qc-report.json", "sha256": before, "status": "HOLD", "hold_reasons": source["hold_reasons"]}
+
+
+def export_normal_collection(package_dir: Path, *, output_dir: Path | None = None, qc_profiles=None,
+                             reception_policy=STRICT_POLICY) -> dict:
     root = Path(package_dir).resolve()
     report = {"schema_version": SCHEMA_VERSION, "status": "HOLD", "training_approved": False,
               "whole_capture_session_approved": False, "provenance_status": "UNCONFIRMED",
@@ -385,8 +409,15 @@ def export_normal_collection(package_dir: Path, *, output_dir: Path | None = Non
     # Decide where writes are permitted before QC can create any output files.
     # A completed package must never be overwritten by a repeated export.
     try:
+        _require(reception_policy in (STRICT_POLICY, WIRE_JITTER_POLICY), "unknown_reception_policy")
         manifest = json.loads(_path(root, "manifest.json").read_text(encoding="utf-8"))
         _require(isinstance(manifest, dict), "invalid_manifest")
+        if reception_policy != STRICT_POLICY:
+            _require(output_dir is not None, "reception_policy_requires_external_output")
+            _require("pico_01" in manifest.get("included_device_ids", [])
+                     and (qc_profiles or {}).get("pico_01", "P0") == "P0", "reception_policy_requires_pico_p0")
+            report.update(reception_policy=reception_policy, source_manifest_status=manifest.get("status"),
+                          source_qc=_source_reception_hold(root, manifest))
         if output_dir is None:
             _require(manifest.get("status") == "RAW_CAPTURED", "in_place_requires_raw_captured")
             destination = root
@@ -398,7 +429,8 @@ def export_normal_collection(package_dir: Path, *, output_dir: Path | None = Non
         return report
     raw, features, packets, events = [], [], [], []
     try:
-        start, end, ids = _metadata(manifest, allow_completed=output_dir is not None)
+        start, end, ids = _metadata(manifest, allow_completed=output_dir is not None,
+                                   allow_reception_hold=reception_policy == WIRE_JITTER_POLICY)
         report.update({key: manifest[key] for key in ("run_id", "start_utc", "end_utc",
                        "capture_session_pk", "source_capture_group_id", "code_commit")})
         _require(manifest["snapshot"]["path"] == "after.db", "snapshot_name")
@@ -442,9 +474,28 @@ def export_normal_collection(package_dir: Path, *, output_dir: Path | None = Non
                 "approved_maintenance_interval_overlap",
             ))
             _stage(report, "policies", lambda: _policies(db, manifest, start, end))
-            _stage(report, "mqtt", lambda: _mqtt_qc(raw, features, ids, start, end, report, qc_profiles))
+            if reception_policy == STRICT_POLICY:
+                _stage(report, "mqtt", lambda: _mqtt_qc(raw, features, ids, start, end, report, qc_profiles))
             _stage(report, "capture", lambda: _capture_qc(root, manifest, session, segments, packets, start, end, report))
+            if reception_policy == WIRE_JITTER_POLICY:
+                def check_jitter():
+                    _require(not any(reason.startswith("capture") for reason in report["hold_reasons"]),
+                             "jitter_capture_checks_failed")
+                    pcaps = [(item["segment_id"], item["pcap_path"],
+                              _verified(root, item["pcap_path"], item["pcap_sha256"]), item["pcap_sha256"])
+                             for item in manifest["capture_artifacts"]]
+                    report["reception_jitter"] = verify_reception_jitter(
+                        [row for row in raw if row["device_id"] == "pico_01"],
+                        run_id=manifest["run_id"], source_capture_group_id=manifest["source_capture_group_id"],
+                        device_ip=next(row["ip_address"] for row in manifest["devices"] if row["device_id"] == "pico_01"),
+                        pcaps=pcaps)
+                _stage(report, "reception_jitter", check_jitter)
+                _stage(report, "mqtt", lambda: _mqtt_qc(raw, features, ids, start, end, report, qc_profiles,
+                                                       verified_jitter="reception_jitter" in report))
         _require(_hash(snapshot) == manifest["snapshot"]["sha256"], "snapshot_changed_during_export")
+        if reception_policy == WIRE_JITTER_POLICY:
+            _require(_hash(_path(root, "qc-report.json")) == report["source_qc"]["sha256"],
+                     "source_qc_changed_during_export")
         provenance = manifest["firmware_provenance"]
         _require(isinstance(provenance, dict) and provenance.get("status") in ("UNCONFIRMED", "CONFIRMED"),
                  "invalid_firmware_provenance")
@@ -481,11 +532,13 @@ def main(argv=None) -> int:
     parser.add_argument("--output-dir", type=Path, help="New directory outside the source package for read-only re-QC")
     parser.add_argument("--qc-profile", action="append", default=[], metavar="DEVICE_ID=PROFILE",
                         help="MQTT QC Profile for one device (P0 default, P1 for a 4-6 s ESP32 schedule)")
+    parser.add_argument("--reception-policy", choices=(STRICT_POLICY, WIRE_JITTER_POLICY), default=STRICT_POLICY)
     args = parser.parse_args(argv)
     profiles = dict(item.split("=", 1) for item in args.qc_profile if "=" in item)
     if len(profiles) != len(args.qc_profile):
         parser.error("--qc-profile must look like DEVICE_ID=PROFILE")
-    report = export_normal_collection(args.package_dir, output_dir=args.output_dir, qc_profiles=profiles)
+    report = export_normal_collection(args.package_dir, output_dir=args.output_dir, qc_profiles=profiles,
+                                      reception_policy=args.reception_policy)
     print(f"Candidate content QC: {report['status']}; training_approved=false; whole_session_approved=false")
     if report["hold_reasons"]:
         print("Hold reasons: " + "; ".join(report["hold_reasons"]))

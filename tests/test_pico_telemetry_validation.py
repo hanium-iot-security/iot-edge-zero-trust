@@ -74,6 +74,29 @@ def test_valid_continuous_capture_has_content_summary_without_provenance_claim(v
     assert result["registration_policy_trust_firewall_verified_by_this_tool"] is False
 
 
+def test_explicit_reception_opt_out_preserves_sender_content_and_upper_gap_checks(verifier):
+    rows = _records("gateway", count=4)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for row, instant in zip(rows, (1, 9, 11, 16)):
+        row["received_at"] = (start + timedelta(seconds=instant)).isoformat()
+    with pytest.raises(ValueError, match="reception"):
+        _verify(verifier, rows, "gateway")
+    assert verifier.verify(rows, mode="gateway", payload_max=5120, min_samples=2,
+                           check_reception_cadence=False)["status"] == "CAPTURED_CONTENT_CHECKS_PASSED"
+    for kind in ("nonpositive", "upper", "sender", "sensor"):
+        changed = [dict(row) for row in rows]
+        if kind == "nonpositive":
+            changed[2]["received_at"] = changed[1]["received_at"]
+        elif kind == "upper":
+            changed[3]["received_at"] = (start + timedelta(seconds=22)).isoformat()
+        else:
+            _change_payload(changed, "gateway", "uptime_ms" if kind == "sender" else "humidity_pct",
+                            6000 if kind == "sender" else 101)
+        with pytest.raises(ValueError):
+            verifier.verify(changed, mode="gateway", payload_max=5120, min_samples=2,
+                            check_reception_cadence=False)
+
+
 @pytest.mark.parametrize("field", ["raw_t", "raw_h", "raw_p"])
 def test_every_sensor_proof_row_requires_all_raw_channels(verifier, field):
     rows = _records()

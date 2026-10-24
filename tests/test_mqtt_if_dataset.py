@@ -122,6 +122,25 @@ def _edit_json(root, reference, change):
     reference.update(_ref(path, root))
 
 
+@pytest.mark.parametrize("location", ["admission", "reviewed_run", "qc"])
+def test_dataset_rejects_unrequested_reception_policy(tmp_path, location):
+    path = _write_dataset(tmp_path)
+    spec = _read_json(path)
+    group = spec["groups"][0]
+    if location == "admission":
+        _edit_json(tmp_path, group["admission_report"],
+                   lambda report: report.update(reception_policy="pico-p0-wire-jitter-v1"))
+    elif location == "reviewed_run":
+        _edit_json(tmp_path, group["admission_report"],
+                   lambda report: report["runs"][0].update(reception_policy="pico-p0-wire-jitter-v1"))
+    else:
+        _edit_json(tmp_path, group["runs"][0]["qc_report"],
+                   lambda qc: qc.update(reception_policy="pico-p0-wire-jitter-v1"))
+    _write_json(path, spec)
+    with pytest.raises(ValueError, match="reception_policy_link"):
+        load_mqtt_if_dataset(path)
+
+
 def _edit_csv(root, reference, change):
     path = root / reference["path"]
     with path.open(encoding="utf-8", newline="") as handle:
@@ -239,7 +258,9 @@ def test_rejects_same_run_in_another_capture_group(tmp_path):
         load_mqtt_if_dataset(path)
 
 
-def test_real_export_and_admission_outputs_load_without_mutating_sources(tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_reception_review", [False, True])
+def test_real_export_and_admission_outputs_load_without_mutating_sources(tmp_path, monkeypatch,
+                                                                       with_reception_review):
     from tests import test_normal_collection_export as base
 
     groups = []
@@ -249,6 +270,9 @@ def test_real_export_and_admission_outputs_load_without_mutating_sources(tmp_pat
         start = START + timedelta(days=index)
         monkeypatch.setattr(base, "START", start)
         package = base.package.__wrapped__(root)
+        if with_reception_review and role == "calibration":
+            strict = base.wire_jitter_package(package)
+            assert strict["hold_reasons"] == ["mqtt:pico_01:reception_gap_or_burst"]
         source = _read_json(package / "manifest.json")
         shutil.copy(package / "after.db", root / "final.db")
         with closing(sqlite3.connect(root / "final.db")) as db:
@@ -260,6 +284,10 @@ def test_real_export_and_admission_outputs_load_without_mutating_sources(tmp_pat
                    "final_snapshot": {"path": "final.db", "sha256": _ref(root / "final.db", tmp_path)["sha256"]},
                    "device_specs": _device_specs(start),
                    "slots": [{"collection_slot_id": role + "-1", "run_id": source["run_id"], "split": split}]}
+        if with_reception_review and role == "calibration":
+            request.update(schema_version="normal-admission-request-v2",
+                           reception_policy="pico-p0-wire-jitter-v1")
+            request["runs"][0]["source_qc_sha256"] = _ref(package / "qc-report.json", tmp_path)["sha256"]
         _write_json(root / "request.json", request)
         output = tmp_path / role / "review"
         report = review_admission(root, root / "request.json", output)
@@ -276,3 +304,122 @@ def test_real_export_and_admission_outputs_load_without_mutating_sources(tmp_pat
     assert [len(result.rows[role]) for role in ROLE_SPLITS] == [6, 6, 6]
     assert base.tree_hashes(tmp_path) == before
     assert result.provenance["training_approved"] is False
+    if with_reception_review:
+        # Even a same-Run QC with unchanged counts/evidence must be the exact reviewed file.
+        entry = groups[1]["runs"][0]["qc_report"]
+        _edit_json(tmp_path, entry,
+                   lambda qc: qc["qc_policy"]["pico_01"].update(reception_gap_seconds=[0.0, 999.0]))
+        _write_json(path, _dataset_spec(groups))
+        with pytest.raises(ValueError, match="derived_qc_checksum"):
+            load_mqtt_if_dataset(path)
+
+
+
+def _terminal_dataset(tmp_path):
+    path = _write_dataset(tmp_path)
+    spec = _read_json(path)
+    group = spec["groups"][1]
+    source = _read_json(tmp_path / group["runs"][0]["manifest"]["path"])
+    start = datetime.fromisoformat(source["start_utc"].replace("Z", "+00:00"))
+    terminal = {"policy": "failed-after-selected-range-v1", "capture_session_pk": source["capture_session_pk"],
+                "source_capture_group_id": source["source_capture_group_id"], "status": "FAILED",
+                "ended_at": _utc(start + timedelta(seconds=320))}
+    _edit_json(tmp_path, group["admission_request"], lambda value: value.update(
+        schema_version="normal-admission-request-v3", reception_policy="strict-v1", terminal_source=terminal))
+    _edit_json(tmp_path, group["admission_report"], lambda value: value.update(
+        terminal_source=terminal, whole_session={"session_status": "FAILED", "whole_session_eligible": False,
+        "session_ended_at": terminal["ended_at"], "ineligible_segments": [{"segment_id": 99,
+        "window_start": _utc(start + timedelta(seconds=300)), "window_end": _utc(start + timedelta(seconds=310)),
+        "status": "FAILED", "error_code": "PARTIAL_CAPTURE"}]}))
+    _write_json(path, spec)
+    return path
+
+
+def test_terminal_failed_dataset_retains_explicit_contract_provenance(tmp_path):
+    path = _terminal_dataset(tmp_path)
+    result = load_mqtt_if_dataset(path)
+    assert len(result.rows["calibration"]) == 24
+    assert result.provenance["groups"][1]["terminal_source"]["status"] == "FAILED"
+    assert result.provenance["training_approved"] is False
+
+
+@pytest.mark.parametrize("change", ["completed", "running", "whole_eligible", "changed_end", "missing_end",
+    "missing_contract", "wrong_identity", "early_end", "overlap", "empty_failures", "old_schema",
+    "contract_tamper", "unknown_policy"])
+def test_terminal_failed_dataset_rejects_changed_contract_or_scope(tmp_path, change):
+    path = _terminal_dataset(tmp_path)
+    spec = _read_json(path)
+    group = spec["groups"][1]
+    def alter(report):
+        whole = report["whole_session"]
+        if change in ("completed", "running"):
+            whole["session_status"] = change.upper()
+        elif change == "whole_eligible":
+            whole["whole_session_eligible"] = True
+        elif change == "changed_end":
+            whole["session_ended_at"] = "2026-10-05T00:05:21Z"
+        elif change == "missing_end":
+            whole.pop("session_ended_at")
+        elif change == "missing_contract":
+            report.pop("terminal_source")
+        elif change == "wrong_identity":
+            report["capture_group"]["source_capture_group_id"] = str(uuid4())
+        elif change == "overlap":
+            whole["ineligible_segments"][0].update(window_start="2026-10-05T00:00:00Z",window_end="2026-10-05T00:00:10Z")
+        elif change == "empty_failures":
+            whole["ineligible_segments"] = []
+        elif change == "contract_tamper":
+            report["terminal_source"]["ended_at"] = "2026-10-05T00:05:21Z"
+    if change in ("old_schema", "early_end", "unknown_policy"):
+        def alter_request(request):
+            if change == "old_schema":
+                request["schema_version"] = "normal-admission-request-v1"
+                request.pop("terminal_source")
+                request.pop("reception_policy")
+            elif change == "early_end":
+                request["terminal_source"]["ended_at"] = "2026-10-05T00:00:10Z"
+            else:
+                request["terminal_source"]["policy"] = "anything"
+        _edit_json(tmp_path, group["admission_request"], alter_request)
+    else:
+        _edit_json(tmp_path, group["admission_report"], alter)
+    _write_json(path, spec)
+    with pytest.raises(ValueError):
+        load_mqtt_if_dataset(path)
+
+
+
+def test_real_terminal_v3_export_admission_and_dataset_keep_sources_unchanged(tmp_path, monkeypatch):
+    from tests import test_normal_admission as cases
+    from tests import test_normal_collection_export as base
+
+    groups = []
+    for index, (role, split) in enumerate(ROLE_SPLITS.items()):
+        root = tmp_path / role / "source"
+        root.mkdir(parents=True)
+        start = START + timedelta(days=index)
+        monkeypatch.setattr(base, "START", start)
+        monkeypatch.setattr(cases, "START", start)
+        package = base.package.__wrapped__(root)
+        case = cases.case.__wrapped__(package, root)
+        request = cases._terminal_request(case, package, wire=role == "calibration")
+        request["slots"][0].update(collection_slot_id=role + "-terminal", split=split)
+        _write_json(root / "request.json", request)
+        before = base.tree_hashes(root)
+        report = case.review()
+        assert report["status"] == "PASS", report
+        assert base.tree_hashes(root) == before
+        output = case.out / "review"
+        groups.append({"role": role, "admission_request": _ref(root / "request.json", tmp_path),
+                       "admission_report": _ref(output / "admission-report.json", tmp_path),
+                       "runs": [{"manifest": _ref(package / "manifest.json", tmp_path),
+                                 "qc_report": _ref(output / "qc/run-01/qc-report.json", tmp_path),
+                                 "mqtt_features": _ref(output / "qc/run-01/mqtt-features.csv", tmp_path)}]})
+    path = tmp_path / "dataset.json"
+    _write_json(path, _dataset_spec(groups))
+    before = base.tree_hashes(tmp_path)
+    result = load_mqtt_if_dataset(path)
+    assert [len(result.rows[role]) for role in ROLE_SPLITS] == [6, 6, 6]
+    assert all(group["terminal_source"]["status"] == "FAILED" for group in result.provenance["groups"])
+    assert result.provenance["training_approved"] is False
+    assert base.tree_hashes(tmp_path) == before
