@@ -724,6 +724,7 @@ export default function Isolation() {
         const previous = mainRequestRef.current;
         if (!isManualRefresh &&
             previous.controller &&
+            !previous.controller.signal.aborted &&
             previous.key === requestKey) {
             return;
         }
@@ -840,6 +841,7 @@ export default function Isolation() {
     }, [loadData]);
     useEffect(() => () => {
         mainRequestRef.current.controller?.abort();
+        mainRequestRef.current.controller = null;
     }, []);
     /* =========================================================
        Current Firewall Mapping
