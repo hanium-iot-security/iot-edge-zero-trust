@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import importlib
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
+import os
 from pathlib import Path
 import sqlite3
 import threading
+import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -651,6 +656,8 @@ def test_execute_recovers_two_isolated_devices_and_creates_verified_artifacts(
 
     assert result["mode"] == "execute"
     assert result["result"] == "SUCCESS"
+    assert result["pre_integrity_check"] == "ok"
+    assert result["pre_foreign_key_violations"] == []
     assert result["integrity_check"] == "ok"
     assert result["foreign_key_violations"] == []
     assert result["devices"] == [
@@ -725,7 +732,7 @@ def test_execute_reports_json_log_failure_after_commit_and_preserves_backup(
 
     monkeypatch.setattr(core, "_write_json_log", fail_json_log)
 
-    with pytest.raises(core.BaselineRecoveryError, match="JSON Log 저장 실패"):
+    with pytest.raises(core.BaselineRecoveryCommittedError, match="JSON Log 저장 실패"):
         core.execute_baseline_recovery(
             db_path=db_path,
             device_ids=["esp32_01"],
@@ -954,8 +961,334 @@ def test_backup_failure_keeps_database_unchanged(
     assert _device_rows(db_path) == before
 
 
-@pytest.mark.parametrize("slow_stage", ["backup", "sha256", "backup_integrity"])
-def test_capture_and_mqtt_writers_commit_during_backup_validation(
+@pytest.mark.parametrize("page_size", [4096, 65536])
+def test_paced_backup_pins_readonly_snapshot_while_independent_writer_commits(tmp_path, monkeypatch, page_size):
+    core = _load_core()
+    database, backup = tmp_path / "source.db", tmp_path / "backup.db"
+    real_connect = sqlite3.connect
+    sample_count = math.ceil(5 * 1024 * 1024 / page_size)
+    with closing(real_connect(database)) as connection:
+        connection.execute(f"PRAGMA page_size={page_size}")
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        connection.execute("CREATE TABLE samples(payload BLOB)")
+        connection.executemany("INSERT INTO samples VALUES (?)", [(b"x" * (page_size - 200),)] * sample_count)
+        connection.execute("CREATE TABLE generation(value INTEGER)")
+        connection.execute("INSERT INTO generation VALUES (0)")
+        connection.commit()
+        pages = connection.execute("PRAGMA page_count").fetchone()[0]
+    sources, progress, sleeps, sync_pages, lifecycle = [], [], [], [], []
+    descriptors = []
+
+    class SnapshotConnection(sqlite3.Connection):
+        def backup(self, target, **kwargs):
+            assert self.in_transaction
+            assert self.execute("PRAGMA query_only").fetchone()[0] == 1
+            # The URI must enforce read-only access even without query_only.
+            self.execute("PRAGMA query_only=OFF")
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                self.execute("UPDATE generation SET value=999")
+            self.execute("PRAGMA query_only=ON")
+            original_progress = kwargs["progress"]
+
+            def observe(status, remaining, total):
+                progress.append((status, remaining, total))
+                result = original_progress(status, remaining, total)
+                if len(progress) == 1:
+                    # Repeated BUSY notifications report no newly copied pages.
+                    for _ in range(40):
+                        original_progress(5, remaining, total)  # SQLITE_BUSY (also on Python 3.10)
+                return result
+
+            return super().backup(target, **{**kwargs, "progress": observe})
+
+        def close(self):
+            super().close()
+            lifecycle.append("source_closed")
+
+    class DestinationConnection(sqlite3.Connection):
+        def close(self):
+            super().close()
+            lifecycle.append("destination_closed")
+
+    def open_destination(path, flags, mode):
+        assert path == backup
+        assert flags == os.O_RDWR | os.O_CREAT | os.O_EXCL
+        assert mode == 0o600
+        fd = os.open(path, flags, mode)
+        descriptors.append(fd)
+        lifecycle.append("fd_opened")
+        return fd
+
+    def sync_destination(fd):
+        assert descriptors == [fd]
+        assert lifecycle[-1] == "destination_connected"
+        os.fsync(fd)
+        sync_pages.append(progress[-1][2] - progress[-1][1])
+
+    def close_destination(fd):
+        assert lifecycle[-1] == "destination_closed"
+        os.close(fd)
+        lifecycle.append("fd_closed")
+
+    monkeypatch.setattr(core, "os", SimpleNamespace(
+        open=open_destination, fsync=sync_destination, close=close_destination,
+        O_RDWR=os.O_RDWR, O_CREAT=os.O_CREAT, O_EXCL=os.O_EXCL,
+    ))
+
+    def connect(path, **kwargs):
+        if kwargs.get("uri"):
+            assert str(path).endswith("?mode=ro")
+            connection = real_connect(path, **{**kwargs, "factory": SnapshotConnection})
+            sources.append(connection)
+            return connection
+        assert lifecycle == ["fd_opened"]
+        connection = real_connect(path, **{**kwargs, "factory": DestinationConnection})
+        lifecycle.append("destination_connected")
+        return connection
+
+    def commit_generation():
+        with closing(real_connect(database, timeout=0)) as connection:
+            connection.execute("UPDATE generation SET value=value+1")
+            connection.execute("INSERT INTO samples VALUES (?)", (b"later",))
+            connection.commit()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        def yield_to_writer(delay):
+            if len(sleeps) == len(progress):
+                return
+            sleeps.append(delay)
+            assert len(sleeps) <= math.ceil(pages / 16) - 1, "backup restarted after a writer commit"
+            pool.submit(commit_generation).result(timeout=2)
+
+        monkeypatch.setattr(core.sqlite3, "connect", connect)
+        monkeypatch.setattr(core, "time", SimpleNamespace(monotonic=time.monotonic, sleep=yield_to_writer))
+        core._create_backup(database, backup)
+
+    sync_interval = 2 * 1024 * 1024 // page_size
+    assert sync_pages == list(range(sync_interval, pages, sync_interval)) + [pages]
+    assert lifecycle == ["fd_opened", "destination_connected", "destination_closed", "fd_closed", "source_closed"]
+    with pytest.raises(OSError):
+        os.fstat(descriptors[0])
+    assert len(sleeps) == math.ceil(pages / 16) - 1
+    assert len(sleeps) >= 5 and set(sleeps) == {0.02}
+    assert [row[1] for row in progress] == sorted((row[1] for row in progress), reverse=True)
+    with closing(real_connect(backup)) as connection:
+        assert connection.execute("SELECT value FROM generation").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM samples").fetchone() == (sample_count,)
+        assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    with closing(real_connect(database)) as connection:
+        assert connection.execute("SELECT value FROM generation").fetchone() == (len(sleeps),)
+        assert connection.execute("SELECT COUNT(*) FROM samples").fetchone() == (sample_count + len(sleeps),)
+        assert connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone() == (0, 0, 0)
+    for source in sources:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            source.execute("SELECT 1")
+
+
+@pytest.mark.parametrize("stage", ["before_copy", "during_copy", "during_sync", "after_copy"])
+def test_backup_deadline_releases_snapshot_without_reset(db_path, tmp_path, monkeypatch, stage):
+    core = _load_core()
+    before = _device_rows(db_path)
+    clock = SimpleNamespace(now=0)
+    real_connect = sqlite3.connect
+    sources = []
+
+    class TimedConnection(sqlite3.Connection):
+        def execute(self, statement, *args, **kwargs):
+            result = super().execute(statement, *args, **kwargs)
+            if stage == "before_copy" and statement == "SELECT COUNT(*) FROM sqlite_schema":
+                clock.now = 600
+            return result
+
+        def backup(self, target, **kwargs):
+            result = super().backup(target, **kwargs)
+            if stage == "after_copy":
+                clock.now = 600
+            return result
+
+    def connect(path, **kwargs):
+        if kwargs.get("uri"):
+            connection = real_connect(path, **{**kwargs, "factory": TimedConnection})
+            sources.append(connection)
+            return connection
+        return real_connect(path, **kwargs)
+
+    def expire_during_copy(_delay):
+        if stage == "during_copy":
+            clock.now = 600
+
+    real_fsync = os.fsync
+
+    def expire_during_sync(fd):
+        real_fsync(fd)
+        if stage == "during_sync":
+            clock.now = 600
+
+    monkeypatch.setattr(core.os, "fsync", expire_during_sync)
+    monkeypatch.setattr(core.sqlite3, "connect", connect)
+    monkeypatch.setattr(core, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=expire_during_copy))
+    with pytest.raises(core.BaselineRecoveryError, match="backup timed out"):
+        core.execute_baseline_recovery(
+            db_path=db_path, device_ids=["esp32_01"], expected_trust_scores={"esp32_01": 20},
+            artifact_dir=tmp_path / "artifacts", confirm=core.CONFIRMATION,
+        )
+    assert _device_rows(db_path) == before
+    report = json.loads(next((tmp_path / "artifacts").glob("*.json")).read_text(encoding="utf-8"))
+    assert report["result"] == "FAILED" and report["backup_sha256"] is None
+    assert bool(list((tmp_path / "artifacts").glob("*.db"))) is (stage != "before_copy")
+    for source in sources:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            source.execute("SELECT 1")
+    with closing(real_connect(db_path, timeout=0)) as connection:
+        assert connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone() == (0, 0, 0)
+
+
+def test_busy_backup_progress_obeys_deadline_without_restarting(db_path, tmp_path, monkeypatch):
+    core = _load_core()
+    before = _device_rows(db_path)
+    real_connect = sqlite3.connect
+    clock = SimpleNamespace(now=0)
+    blockers, sources, statuses, attempts = [], [], [], []
+
+    class BusyConnection(sqlite3.Connection):
+        def backup(self, target, **kwargs):
+            attempts.append(1)
+            original_progress = kwargs["progress"]
+
+            def observe(status, remaining, total):
+                statuses.append(status)
+                clock.now += 300
+                return original_progress(status, remaining, total)
+
+            return super().backup(target, **{**kwargs, "progress": observe})
+
+    def connect(path, **kwargs):
+        if kwargs.get("uri"):
+            connection = real_connect(path, **{**kwargs, "factory": BusyConnection})
+            sources.append(connection)
+            return connection
+        connection = real_connect(path, **kwargs)
+        if Path(path).name.startswith("baseline-recovery-") and Path(path).parent == tmp_path / "artifacts":
+            blocker = real_connect(path, isolation_level=None, timeout=0)
+            blocker.execute("BEGIN EXCLUSIVE")
+            blockers.append(blocker)
+        return connection
+
+    monkeypatch.setattr(core.sqlite3, "connect", connect)
+    monkeypatch.setattr(core, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=lambda _: None))
+    try:
+        with pytest.raises(core.BaselineRecoveryError, match="backup timed out"):
+            core.execute_baseline_recovery(
+                db_path=db_path, device_ids=["esp32_01"], expected_trust_scores={"esp32_01": 20},
+                artifact_dir=tmp_path / "artifacts", confirm=core.CONFIRMATION,
+            )
+    finally:
+        for blocker in blockers:
+            blocker.close()
+    assert attempts == [1] and 5 in statuses  # SQLITE_BUSY
+    assert _device_rows(db_path) == before
+    for source in sources:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            source.execute("SELECT 1")
+
+
+
+@pytest.mark.parametrize("failure_stage", ["connect", "sync"])
+def test_backup_fd_closes_after_destination_on_failure(db_path, tmp_path, monkeypatch, failure_stage):
+    core = _load_core()
+    before = _device_rows(db_path)
+    real_connect = sqlite3.connect
+    if failure_stage == "sync":
+        with closing(real_connect(db_path)) as connection:
+            connection.execute("CREATE TABLE backup_padding(payload BLOB)")
+            connection.executemany("INSERT INTO backup_padding VALUES (?)", [(b"x" * 3900,)] * 1024)
+            connection.commit()
+    real_open, real_close = os.open, os.close
+    descriptors, events = [], []
+
+    class DestinationConnection(sqlite3.Connection):
+        def close(self):
+            super().close()
+            events.append("destination_closed")
+
+    def connect(path, **kwargs):
+        if Path(str(path)).suffix == ".db" and Path(str(path)).parent == tmp_path / "artifacts":
+            if failure_stage == "connect":
+                raise sqlite3.OperationalError("forced destination connect failure")
+            return real_connect(path, **{**kwargs, "factory": DestinationConnection})
+        return real_connect(path, **kwargs)
+
+    def open_destination(path, flags, mode):
+        fd = real_open(path, flags, mode)
+        descriptors.append(fd)
+        return fd
+
+    def fail_sync(fd):
+        assert descriptors == [fd]
+        raise OSError("forced destination fsync failure")
+
+    def close_destination(fd):
+        if failure_stage == "sync":
+            assert events == ["destination_closed"]
+        real_close(fd)
+        events.append("fd_closed")
+
+    monkeypatch.setattr(core.sqlite3, "connect", connect)
+    monkeypatch.setattr(core, "os", SimpleNamespace(
+        open=open_destination, fsync=fail_sync, close=close_destination,
+        O_RDWR=os.O_RDWR, O_CREAT=os.O_CREAT, O_EXCL=os.O_EXCL, replace=os.replace,
+    ))
+    monkeypatch.setattr(core, "time", SimpleNamespace(monotonic=time.monotonic, sleep=lambda _: None))
+    with pytest.raises(core.BaselineRecoveryError, match=f"forced destination {failure_stage if failure_stage == 'connect' else 'fsync'} failure"):
+        core.execute_baseline_recovery(
+            db_path=db_path, device_ids=["esp32_01"], expected_trust_scores={"esp32_01": 20},
+            artifact_dir=tmp_path / "artifacts", confirm=core.CONFIRMATION,
+        )
+    assert _device_rows(db_path) == before
+    report = json.loads(next((tmp_path / "artifacts").glob("*.json")).read_text(encoding="utf-8"))
+    assert report["result"] == "FAILED" and report["backup_sha256"] is None
+    assert Path(report["backup_path"]).is_file()
+    assert events[-1] == "fd_closed"
+    with pytest.raises(OSError):
+        os.fstat(descriptors[0])
+    with closing(real_connect(db_path, timeout=0)) as connection:
+        assert connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone() == (0, 0, 0)
+
+
+def test_backup_exclusive_create_preserves_existing_artifact(db_path, tmp_path):
+    core = _load_core()
+    backup = tmp_path / "existing.db"
+    with closing(sqlite3.connect(backup)) as connection:
+        connection.execute("CREATE TABLE existing_evidence(value TEXT)")
+        connection.execute("INSERT INTO existing_evidence VALUES ('preserve me')")
+        connection.commit()
+    before = backup.read_bytes()
+    with pytest.raises(FileExistsError):
+        core._create_backup(db_path, backup)
+    assert backup.read_bytes() == before
+
+
+def test_non_wal_backup_refuses_without_creating_backup_or_changing_source(db_path, tmp_path):
+    core = _load_core()
+    with closing(sqlite3.connect(db_path)) as connection:
+        assert connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+    before = db_path.read_bytes()
+    with pytest.raises(core.BaselineRecoveryError, match="requires WAL"):
+        core.execute_baseline_recovery(
+            db_path=db_path, device_ids=["esp32_01"], expected_trust_scores={"esp32_01": 20},
+            artifact_dir=tmp_path / "artifacts", confirm=core.CONFIRMATION,
+        )
+    assert db_path.read_bytes() == before
+    assert not list((tmp_path / "artifacts").glob("*.db"))
+    with closing(sqlite3.connect(db_path)) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+    report = json.loads(next((tmp_path / "artifacts").glob("*.json")).read_text(encoding="utf-8"))
+    assert report["result"] == "FAILED" and report["backup_path"] is None
+
+
+@pytest.mark.parametrize("slow_stage", ["backup", "sha256", "backup_integrity", "live_pre_integrity", "live_post_integrity"])
+def test_capture_and_mqtt_writers_commit_during_long_recovery_work(
     db_path: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -994,23 +1327,41 @@ def test_capture_and_mqtt_writers_commit_during_backup_validation(
             connection.commit()
         writer_finished.set()
 
-    hook_name = {
-        "backup": "_create_backup",
-        "sha256": "_file_sha256",
-        "backup_integrity": "_verify_database_path",
+    hook_name, selected_call = {
+        "backup": ("_create_backup", 1),
+        "sha256": ("_file_sha256", 1),
+        "backup_integrity": ("_verify_database_connection", 1),
+        "live_pre_integrity": ("_verify_database_connection", 2),
+        "live_post_integrity": ("_verify_database_connection", 3),
     }[slow_stage]
     original = getattr(core, hook_name)
+    calls = 0
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(commit_capture_and_message)
 
-        def slow_stage_with_concurrent_writer(*args):
-            # The operation deliberately cannot finish until the independent
-            # Capture/Subscriber writer commits. No timing/sleep race is needed.
+        def wait_for_writer():
+            # The operation cannot finish until the independent writer commits.
             if not stage_entered.is_set():
                 stage_entered.set()
                 future.result(timeout=2)
                 assert writer_finished.is_set()
+            return 0
+
+        def slow_stage_with_concurrent_writer(*args):
+            nonlocal calls
+            calls += 1
+            if calls != selected_call:
+                return original(*args)
+            if hook_name == "_verify_database_connection":
+                # Probe during the actual full scan, with its read lock active.
+                # Migration configures WAL, as on the operating database.
+                args[0].set_progress_handler(wait_for_writer, 100)
+                try:
+                    return original(*args)
+                finally:
+                    args[0].set_progress_handler(None, 0)
+            wait_for_writer()
             return original(*args)
 
         monkeypatch.setattr(core, hook_name, slow_stage_with_concurrent_writer)
@@ -1027,6 +1378,58 @@ def test_capture_and_mqtt_writers_commit_during_backup_validation(
                  "SELECT status,trust_score FROM devices WHERE device_id='esp32_01'") == [
         ("isolated", 20),
     ]
+
+
+@pytest.mark.parametrize("failure_stage", ["pre", "post"])
+@pytest.mark.parametrize("failure_kind", ["integrity", "foreign_key"])
+def test_full_health_failure_distinguishes_unmodified_and_committed_state(
+    db_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str, failure_kind: str,
+) -> None:
+    core = _load_core()
+    original = core._verify_database_path
+    live_checks = 0
+
+    def fail_selected_health(path):
+        nonlocal live_checks
+        if path == db_path:
+            live_checks += 1
+            if live_checks == (1 if failure_stage == "pre" else 2):
+                return ("forced integrity failure", []) if failure_kind == "integrity" else ("ok", [("events", 1, "devices", 0)])
+        return original(path)
+
+    monkeypatch.setattr(core, "_verify_database_path", fail_selected_health)
+    error_type = core.BaselineRecoveryError if failure_stage == "pre" else core.BaselineRecoveryCommittedError
+    with pytest.raises(error_type, match="실행 전" if failure_stage == "pre" else "Commit 후"):
+        core.execute_baseline_recovery(
+            db_path=db_path, device_ids=["esp32_01"], expected_trust_scores={"esp32_01": 20},
+            artifact_dir=tmp_path / "artifacts", confirm=core.CONFIRMATION,
+        )
+    expected = ("isolated", 20) if failure_stage == "pre" else ("normal", 100)
+    assert _rows(db_path, "SELECT status,trust_score FROM devices WHERE device_id='esp32_01'") == [expected]
+    report = json.loads(next((tmp_path / "artifacts").glob("*.json")).read_text(encoding="utf-8"))
+    assert report["result"] == "FAILED"
+    assert report.get("database_committed", False) is (failure_stage == "post")
+    assert report["backup_sha256"] == _sha256(Path(report["backup_path"]))
+    if failure_stage == "post":
+        assert report["failure_code"] == "BASELINE_RECOVERY_COMMITTED_UNVERIFIED"
+        assert report["devices"][0]["current"] == {"status": "normal", "trust_score": 100}
+        # A failed post-check does not authorize blindly repeating the reset.
+        with pytest.raises(core.BaselineRecoveryError, match="isolated"):
+            core.execute_baseline_recovery(
+                db_path=db_path, device_ids=["esp32_01"], expected_trust_scores={"esp32_01": 20},
+                artifact_dir=tmp_path / "retry", confirm=core.CONFIRMATION,
+            )
+        assert not (tmp_path / "retry").exists()
+
+
+def test_recovery_columns_do_not_participate_in_foreign_keys(db_path: Path) -> None:
+    with sqlite3.connect(db_path) as connection:
+        tables = [row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+        for table in tables:
+            for foreign_key in connection.execute("SELECT * FROM pragma_foreign_key_list(?)", (table,)):
+                assert not (table == "devices" and foreign_key[3] in {"status", "trust_score"})
+                assert not (foreign_key[2] == "devices" and foreign_key[4] in {"status", "trust_score"})
 
 
 @pytest.mark.parametrize("change", ["ip", "score", "status", "event", "rule", "release"])
@@ -1163,6 +1566,24 @@ def test_conditional_update_mismatch_rolls_back_all_devices(
             confirm="RESET-TO-NORMAL-100",
         )
 
+    assert _device_rows(db_path) == before
+
+
+def test_update_changing_target_identity_rolls_back_all_devices(db_path: Path, tmp_path: Path) -> None:
+    core = _load_core()
+    before = _device_rows(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TRIGGER change_target_ip AFTER UPDATE OF status ON devices "
+            "WHEN NEW.device_id = 'esp32_02' BEGIN "
+            "UPDATE devices SET ip_address='192.168.0.99' WHERE device_id='esp32_02'; END"
+        )
+    with pytest.raises(core.BaselineRecoveryError, match="IP가 변경"):
+        core.execute_baseline_recovery(
+            db_path=db_path, device_ids=["esp32_01", "esp32_02"],
+            expected_trust_scores={"esp32_01": 20, "esp32_02": 40},
+            artifact_dir=tmp_path / "artifacts", confirm=core.CONFIRMATION,
+        )
     assert _device_rows(db_path) == before
 
 

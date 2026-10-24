@@ -253,7 +253,8 @@ def test_worker_lock_is_acquired_before_db_write_lock(recovery_env, monkeypatch)
     real_lock = baseline_recovery.single_instance_lock
 
     def entered_lock(*args, **kwargs):
-        entered.set()
+        if args[0] == Path(settings.firewall_lock_path):
+            entered.set()
         return real_lock(*args, **kwargs)
 
     monkeypatch.setattr(baseline_recovery, "single_instance_lock", entered_lock)
@@ -272,37 +273,176 @@ def test_worker_lock_is_acquired_before_db_write_lock(recovery_env, monkeypatch)
     assert state(database) == ("isolated", 20)
 
 
-def test_firewall_lock_covers_backup_and_db_lock_covers_final_verification(recovery_env, monkeypatch):
+@pytest.mark.parametrize("stage", ["backup", "sha256", "backup_health", "live_pre_health", "live_post_health", "audit"])
+def test_long_work_allows_observer_but_serializes_recovery_commands(recovery_env, monkeypatch, stage):
     database, _, runner, tmp_path = recovery_env
     capture_firewall_runtime_snapshot(runner, snapshot_path=settings.firewall_runtime_snapshot_path)
-    original = baseline_recovery._create_backup
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{database.as_posix()}")
+    monkeypatch.setattr(run_firewall_runtime_snapshot, "WrapperIptablesRunner", lambda _: runner)
+    monkeypatch.setattr(run_firewall_runtime_snapshot, "current_boot_id",
+                        lambda: "11111111-1111-4111-8111-111111111111")
+    hook_name, selected_call = {
+        "backup": ("_create_backup", 1),
+        "sha256": ("_file_sha256", 1),
+        "backup_health": ("_verify_database_connection", 1),
+        "live_pre_health": ("_verify_database_connection", 2),
+        "live_post_health": ("_verify_database_connection", 3),
+        "audit": ("_write_json_log", 1),
+    }[stage]
+    original = getattr(baseline_recovery, hook_name)
+    calls = 0
+    probed = False
 
-    def probe_locks(database_path, backup):
-        with pytest.raises(RuntimeLockError):
-            with single_instance_lock(Path(settings.firewall_lock_path)):
-                pytest.fail("Worker must not enter Recovery transaction")
-        with pytest.raises(baseline_recovery.BaselineRecoveryHoldError, match="lock"):
-            recover(database, tmp_path / "second-recovery")
-        with sqlite3.connect(database, timeout=0) as other:
-            other.execute("BEGIN IMMEDIATE")
-            other.rollback()
-        original(database_path, backup)
+    def probe(*args):
+        nonlocal calls, probed
+        calls += 1
+        if calls == selected_call:
+            probed = True
+            # Exercise the real Observer entry point, including its firewall
+            # lock and snapshot publication, while Recovery is still running.
+            assert run_firewall_runtime_snapshot.run_once() is True
+            before = state(database)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(recover, database.parent / "." / database.name,
+                                     tmp_path / "second-recovery")
+                with pytest.raises(baseline_recovery.BaselineRecoveryInProgressError, match="command lock"):
+                    future.result(timeout=2)
+            assert state(database) == before
+            assert not (tmp_path / "second-recovery").exists()
+        return original(*args)
 
-    monkeypatch.setattr(baseline_recovery, "_create_backup", probe_locks)
-    original_verify = baseline_recovery._verify_database_connection
+    monkeypatch.setattr(baseline_recovery, hook_name, probe)
+    assert recover(database, tmp_path / "artifacts")["result"] == "SUCCESS"
+    assert probed
+    # A completed command must also release its dedicated lock.
+    with single_instance_lock(database.with_suffix(database.suffix + ".baseline-recovery.lock")):
+        pass
 
-    def probe_final_lock(connection):
-        if connection.in_transaction:
+
+def test_final_target_transaction_holds_firewall_and_writer_locks(recovery_env, monkeypatch):
+    database, _, runner, tmp_path = recovery_env
+    capture_firewall_runtime_snapshot(runner, snapshot_path=settings.firewall_runtime_snapshot_path)
+    original = baseline_recovery._require_runtime_released
+    calls = 0
+    transaction_trace = []
+
+    def check_locks(connection, devices):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            connection.set_trace_callback(transaction_trace.append)
+        if calls > 1:  # Initial preflight is an unlocked read transaction.
+            assert connection.in_transaction
             with pytest.raises(RuntimeLockError):
                 with single_instance_lock(Path(settings.firewall_lock_path)):
-                    pytest.fail("Worker must not enter Recovery transaction")
+                    pytest.fail("Worker must not enter the final Recovery transaction")
             with sqlite3.connect(database, timeout=0) as other:
                 with pytest.raises(sqlite3.OperationalError, match="locked"):
                     other.execute("BEGIN IMMEDIATE")
-        return original_verify(connection)
+        result = original(connection, devices)
+        transaction_trace.append("runtime-verified")
+        return result
 
-    monkeypatch.setattr(baseline_recovery, "_verify_database_connection", probe_final_lock)
+    original_health = baseline_recovery._verify_database_connection
+
+    def no_full_scan_in_write_transaction(connection):
+        assert not connection.in_transaction
+        return original_health(connection)
+
+    monkeypatch.setattr(baseline_recovery, "_require_runtime_released", check_locks)
+    monkeypatch.setattr(baseline_recovery, "_verify_database_connection", no_full_scan_in_write_transaction)
     assert recover(database, tmp_path / "artifacts")["result"] == "SUCCESS"
+    assert calls == 3
+    commit_index = transaction_trace.index("COMMIT")
+    assert transaction_trace[commit_index - 1] == "runtime-verified"
+
+
+@pytest.mark.parametrize("cycle_stage", ["before_backup", "after_backup"])
+def test_apply_release_cycle_with_fresh_snapshot_invalidates_recovery_backup(recovery_env, monkeypatch, cycle_stage):
+    database, _, runner, tmp_path = recovery_env
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    capture_firewall_runtime_snapshot(runner, snapshot_path=settings.firewall_runtime_snapshot_path, observed_at=now)
+    original = baseline_recovery._create_backup
+
+    def cycle():
+        rule_id = _seed_rule(database, "APPLIED", now - timedelta(seconds=2))
+        with sqlite3.connect(database) as db:
+            db.execute("UPDATE firewall_rules SET status='REMOVED',released_at=? WHERE id=?",
+                       ((now - timedelta(seconds=1)).isoformat(), rule_id))
+        capture_firewall_runtime_snapshot(runner, snapshot_path=settings.firewall_runtime_snapshot_path, observed_at=now)
+        # All ordinary current-state/runtime gates pass: the activity equality
+        # guard alone must reject this unseen apply/release cycle.
+        with sqlite3.connect(database) as db:
+            db.row_factory = sqlite3.Row
+            devices = baseline_recovery._require_recovery_ready(db, {DEVICE: 20})
+            assert baseline_recovery._require_runtime_released(db, devices)[DEVICE]["passed"]
+
+    def intervening_cycle(*args):
+        if cycle_stage == "before_backup":
+            cycle()
+        original(*args)
+        if cycle_stage == "after_backup":
+            cycle()
+
+    monkeypatch.setattr(baseline_recovery, "_create_backup", intervening_cycle)
+    with pytest.raises(baseline_recovery.BaselineRecoveryHoldError, match="activity changed"):
+        recover(database, tmp_path / "artifacts")
+    assert state(database) == ("isolated", 20)
+    assert list((tmp_path / "artifacts").glob("*.db"))
+
+
+def test_snapshot_expiring_after_update_rolls_back_device_reset(recovery_env, monkeypatch):
+    database, _, runner, tmp_path = recovery_env
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    capture_firewall_runtime_snapshot(runner, snapshot_path=settings.firewall_runtime_snapshot_path, observed_at=now)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+
+    Clock.current = now
+    original = baseline_recovery._require_recovered_device_state
+
+    def expire_after_update(devices, device_ids):
+        original(devices, device_ids)
+        Clock.current = now + timedelta(seconds=30)
+
+    monkeypatch.setattr(firewall_runtime_snapshot, "datetime", Clock)
+    monkeypatch.setattr(baseline_recovery, "_require_recovered_device_state", expire_after_update)
+    with pytest.raises(baseline_recovery.BaselineRecoveryHoldError, match="stale"):
+        recover(database, tmp_path / "artifacts")
+    assert state(database) == ("isolated", 20)
+
+
+def test_observer_refresh_after_long_backup_supplies_new_runtime_proof(recovery_env, monkeypatch):
+    database, _, runner, tmp_path = recovery_env
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    capture_firewall_runtime_snapshot(runner, snapshot_path=settings.firewall_runtime_snapshot_path, observed_at=now)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+
+    Clock.current = now
+    monkeypatch.setattr(firewall_runtime_snapshot, "datetime", Clock)
+    monkeypatch.setattr(run_firewall_runtime_snapshot, "datetime", Clock)
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{database.as_posix()}")
+    monkeypatch.setattr(run_firewall_runtime_snapshot, "WrapperIptablesRunner", lambda _: runner)
+    monkeypatch.setattr(run_firewall_runtime_snapshot, "current_boot_id",
+                        lambda: "11111111-1111-4111-8111-111111111111")
+    original = baseline_recovery._create_backup
+
+    def long_backup(*args):
+        original(*args)
+        Clock.current = now + timedelta(seconds=30)
+        assert run_firewall_runtime_snapshot.run_once() is True
+
+    monkeypatch.setattr(baseline_recovery, "_create_backup", long_backup)
+    result = recover(database, tmp_path / "artifacts")
+    assert result["runtime_firewall_check"][DEVICE]["observed_at"] == Clock.current.strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert state(database) == ("normal", 100)
 
 
 def test_snapshot_expiring_during_backup_rolls_back_device_reset(recovery_env, monkeypatch):

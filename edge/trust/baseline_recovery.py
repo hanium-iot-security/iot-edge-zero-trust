@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import shlex
 import sqlite3
+import time
 from uuid import uuid4
 
 from backend.app.config import settings
@@ -28,6 +29,14 @@ class BaselineRecoveryError(RuntimeError):
 
 class BaselineRecoveryHoldError(BaselineRecoveryError):
     """Runtime evidence or exclusive access is unavailable; keep isolation."""
+
+
+class BaselineRecoveryInProgressError(BaselineRecoveryHoldError):
+    """Another baseline recovery command owns this database."""
+
+
+class BaselineRecoveryCommittedError(BaselineRecoveryError):
+    """The reset committed, but post-commit verification or audit failed."""
 
 
 def parse_device_expectations(
@@ -244,7 +253,34 @@ def execute_baseline_recovery(
     if not database.is_file():
         raise BaselineRecoveryError(f"Database가 존재하지 않습니다: {database}")
 
-    operation_id = operation_id or _new_operation_id()
+    # This command lock is distinct from the Worker/Observer lock and remains
+    # held through post-commit verification and audit publication.
+    with ExitStack() as command_locks:
+        return _execute_baseline_recovery(
+            database=database, artifacts=artifacts, device_ids=device_ids,
+            targets=targets, command_locks=command_locks,
+            operation_id=operation_id or _new_operation_id(), reason=reason,
+            requested_by=requested_by, approved_by=approved_by,
+            requested_at=requested_at, firewall_release_status=firewall_release_status,
+            preflight=preflight,
+        )
+
+
+def _execute_baseline_recovery(
+    *,
+    database: Path,
+    artifacts: Path,
+    device_ids: Sequence[str],
+    targets: Mapping[str, int],
+    command_locks: ExitStack,
+    operation_id: str,
+    reason: str | None,
+    requested_by: str | None,
+    approved_by: str | None,
+    requested_at: str | None,
+    firewall_release_status: str | None,
+    preflight: Mapping[str, object] | None,
+) -> dict[str, object]:
     backup_path = artifacts / f"baseline-recovery-{operation_id}.db"
     log_path = artifacts / f"baseline-recovery-{operation_id}.json"
     backup_sha256: str | None = None
@@ -256,20 +292,20 @@ def execute_baseline_recovery(
     locks = ExitStack()
 
     try:
-        # Same order as Worker: firewall lock first, then SQLite write lock.
-        # Only the observer invokes OS commands; Recovery reads a JSON file.
-        lock_settings = settings.model_copy(update={"database_url": f"sqlite:///{database}"})
         try:
-            locks.enter_context(single_instance_lock(
-                firewall_lock_path(lock_settings), wait_seconds=settings.firewall_lock_wait_seconds,
+            command_locks.enter_context(single_instance_lock(
+                database.with_suffix(database.suffix + ".baseline-recovery.lock"),
             ))
-        except (RuntimeLockError, OSError) as exc:
-            raise BaselineRecoveryHoldError(f"Runtime firewall lock unavailable: {exc}") from exc
+        except RuntimeLockError as exc:
+            raise BaselineRecoveryInProgressError(f"Baseline recovery command lock busy: {exc}") from exc
+        except OSError as exc:
+            raise BaselineRecoveryHoldError(f"Baseline recovery command lock unavailable: {exc}") from exc
         # A read snapshot rejects an ineligible request before any artifact is
         # created. Release it before online backup/validation: Capture must be
         # able to commit its segment and launch the next Window during that I/O.
         connection.execute("BEGIN")
         previous_devices = _require_recovery_ready(connection, targets)
+        previous_runtime_devices = _runtime_verification_devices(connection, previous_devices)
         _require_runtime_released(connection, previous_devices)
         connection.rollback()
 
@@ -299,10 +335,36 @@ def execute_baseline_recovery(
             backup_connection.execute("PRAGMA query_only = ON")
             backup_devices = _require_recovery_ready(backup_connection, targets)
             _require_same_device_identity(previous_devices, backup_devices)
+            backup_runtime_devices = _runtime_verification_devices(backup_connection, backup_devices)
+            if backup_runtime_devices != previous_runtime_devices:
+                raise BaselineRecoveryHoldError("Runtime firewall activity changed during recovery backup")
 
+        # Full health scans may take seconds on the live DB. Keep both the
+        # SQLite writer slot and the Observer's firewall lock available here.
+        # This is a pre-reset health check, not validation of the later write
+        # transaction; the full post-commit check below remains necessary.
+        integrity_check, foreign_key_violations = _verify_database_path(database)
+        if integrity_check != "ok" or foreign_key_violations:
+            raise BaselineRecoveryError(
+                "실행 전 Database 검증 실패: "
+                f"integrity_check={integrity_check}, "
+                f"foreign_key_violations={foreign_key_violations}"
+            )
+
+        # Same order as Worker: firewall lock first, then SQLite write lock.
+        # Only the observer invokes OS commands; Recovery reads a JSON file.
+        lock_settings = settings.model_copy(update={"database_url": f"sqlite:///{database}"})
+        try:
+            locks.enter_context(single_instance_lock(
+                firewall_lock_path(lock_settings), wait_seconds=settings.firewall_lock_wait_seconds,
+            ))
+        except (RuntimeLockError, OSError) as exc:
+            raise BaselineRecoveryHoldError(f"Runtime firewall lock unavailable: {exc}") from exc
         connection.execute("BEGIN IMMEDIATE")
         current_devices = _require_recovery_ready(connection, targets)
         _require_same_device_identity(previous_devices, current_devices)
+        if _runtime_verification_devices(connection, current_devices) != backup_runtime_devices:
+            raise BaselineRecoveryHoldError("Runtime firewall activity changed after recovery backup")
         _require_runtime_released(connection, current_devices)
 
         for device_id in device_ids:
@@ -324,17 +386,10 @@ def execute_baseline_recovery(
 
         recovered_devices = _fetch_target_devices(connection, device_ids)
         _require_recovered_device_state(recovered_devices, device_ids)
-        integrity_check, foreign_key_violations = _verify_database_connection(
-            connection
-        )
-        if integrity_check != "ok" or foreign_key_violations:
-            raise BaselineRecoveryError(
-                "실행 후 Database 검증 실패: "
-                f"integrity_check={integrity_check}, "
-                f"foreign_key_violations={foreign_key_violations}"
-            )
-        # Validation may outlive the snapshot TTL. Recheck immediately
-        # before commit while Worker and DB writers remain excluded.
+        _require_same_device_identity(current_devices, recovered_devices)
+        # Only target checks belong in this short write transaction. A full
+        # DB scan here would block Capture and prevent Observer TTL refresh.
+        # Recheck immediately before commit; expired evidence still rolls back.
         runtime_check = _require_runtime_released(connection, current_devices)
         connection.commit()
     except Exception as exc:
@@ -349,11 +404,14 @@ def execute_baseline_recovery(
             device_ids=device_ids,
             error=str(exc),
             result="HOLD" if isinstance(exc, BaselineRecoveryHoldError) else "FAILED",
+            failure_code="RECOVERY_IN_PROGRESS" if isinstance(exc, BaselineRecoveryInProgressError) else None,
             reason=reason,
             requested_by=requested_by,
             approved_by=approved_by,
             requested_at=requested_at,
-            firewall_release_status="NOT_VERIFIED" if isinstance(exc, BaselineRecoveryHoldError) else firewall_release_status,
+            firewall_release_status=("NOT_VERIFIED" if isinstance(exc, BaselineRecoveryHoldError)
+                                     and not isinstance(exc, BaselineRecoveryInProgressError)
+                                     else firewall_release_status),
             preflight=preflight,
         )
         if isinstance(exc, BaselineRecoveryError):
@@ -389,6 +447,8 @@ def execute_baseline_recovery(
             backup_sha256=backup_sha256,
             device_ids=device_ids,
             error=str(exc),
+            database_committed=True,
+            previous_devices=previous_devices,
             reason=reason,
             requested_by=requested_by,
             approved_by=approved_by,
@@ -396,9 +456,7 @@ def execute_baseline_recovery(
             firewall_release_status=firewall_release_status,
             preflight=preflight,
         )
-        if isinstance(exc, BaselineRecoveryError):
-            raise
-        raise BaselineRecoveryError(f"Commit 후 검증 실패: {exc}") from exc
+        raise BaselineRecoveryCommittedError(f"Commit 후 검증 실패; DB 변경은 Commit되었습니다: {exc}") from exc
 
     assert previous_devices is not None
     device_changes = [
@@ -423,6 +481,8 @@ def execute_baseline_recovery(
         "backup_foreign_key_violations": [
             list(row) for row in backup_foreign_keys
         ],
+        "pre_integrity_check": integrity_check,
+        "pre_foreign_key_violations": [list(row) for row in foreign_key_violations],
         "integrity_check": post_integrity,
         "foreign_key_violations": [list(row) for row in post_foreign_keys],
         "devices": device_changes,
@@ -450,8 +510,17 @@ def execute_baseline_recovery(
         )
     try:
         _write_json_log(log_path, report)
-    except OSError as exc:
-        raise BaselineRecoveryError(
+    except Exception as exc:
+        _write_failure_log_if_possible(
+            log_path=log_path, operation_id=operation_id, database=database,
+            backup_path=backup_path, backup_sha256=backup_sha256,
+            device_ids=device_ids, error=str(exc), database_committed=True,
+            previous_devices=previous_devices, reason=reason,
+            requested_by=requested_by, approved_by=approved_by,
+            requested_at=requested_at, firewall_release_status=firewall_release_status,
+            preflight=preflight,
+        )
+        raise BaselineRecoveryCommittedError(
             "JSON Log 저장 실패; DB 변경은 Commit되었으므로 Backup을 보존하고 "
             f"Pilot을 중단해야 합니다: backup_path={backup_path}, error={exc}"
         ) from exc
@@ -474,8 +543,53 @@ def _new_operation_id() -> str:
 
 
 def _create_backup(database: Path, backup_path: Path) -> None:
-    with sqlite3.connect(database) as source, sqlite3.connect(backup_path) as backup:
-        source.backup(backup)
+    """Pace and periodically sync a fixed WAL snapshot."""
+    deadline = time.monotonic() + 600
+    synced_pages = 0
+
+    def require_time_remaining() -> None:
+        if time.monotonic() >= deadline:
+            raise BaselineRecoveryError("Online backup timed out after 600 seconds")
+
+    def paced_copy(status: int, pages_remaining: int, total_pages: int) -> None:
+        nonlocal synced_pages
+        require_time_remaining()
+        if status in (sqlite3.SQLITE_OK, sqlite3.SQLITE_DONE):
+            copied_pages = total_pages - pages_remaining
+            unsynced_bytes = (copied_pages - synced_pages) * page_size
+            # Count copied bytes, not callbacks: BUSY/LOCKED can repeat with
+            # unchanged counters. This schedules flushes, not a kernel Dirty bound.
+            if unsynced_bytes >= 2 * 1024 * 1024 or (pages_remaining == 0 and unsynced_bytes > 0):
+                os.fsync(backup_fd)
+                require_time_remaining()
+                synced_pages = copied_pages
+        if pages_remaining > 0:
+            time.sleep(0.02)
+            require_time_remaining()
+
+    with closing(sqlite3.connect(
+        database.as_uri() + "?mode=ro", uri=True, isolation_level=None, timeout=5,
+    )) as source:
+        source.execute("PRAGMA query_only = ON")
+        if source.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+            raise BaselineRecoveryError("Live baseline recovery backup requires WAL journal mode")
+        # A real read pins one snapshot; otherwise concurrent commits can
+        # restart every paced backup step. Closing source releases retained WAL.
+        source.execute("BEGIN")
+        source.execute("SELECT COUNT(*) FROM sqlite_schema").fetchone()
+        page_size = source.execute("PRAGMA page_size").fetchone()[0]
+        require_time_remaining()
+        # Closing any fd for this file can drop the process's POSIX SQLite locks.
+        # Keep one sync-only fd open from before destination connect until close.
+        backup_fd = os.open(backup_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with closing(sqlite3.connect(backup_path)) as backup:
+                source.backup(backup, pages=16, progress=paced_copy, sleep=0.05)
+                require_time_remaining()
+        finally:
+            os.close(backup_fd)
+        require_time_remaining()
+    require_time_remaining()
 
 
 def _file_sha256(path: Path) -> str:
@@ -501,7 +615,7 @@ def _verify_database_path(
     database: Path,
 ) -> tuple[str, list[tuple[object, ...]]]:
     with sqlite3.connect(database) as connection:
-        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA query_only = ON")
         return _verify_database_connection(connection)
 
 
@@ -534,6 +648,9 @@ def _write_failure_log_if_possible(
     device_ids: Sequence[str],
     error: str,
     result: str = "FAILED",
+    failure_code: str | None = None,
+    database_committed: bool = False,
+    previous_devices: Mapping[str, sqlite3.Row] | None = None,
     reason: str | None = None,
     requested_by: str | None = None,
     approved_by: str | None = None,
@@ -554,6 +671,32 @@ def _write_failure_log_if_possible(
         "error": error,
         "log_path": str(log_path),
     }
+    if failure_code is not None:
+        failure_report["failure_code"] = failure_code
+    if database_committed:
+        failure_report["database_committed"] = True
+        failure_report["failure_code"] = "BASELINE_RECOVERY_COMMITTED_UNVERIFIED"
+        try:
+            with sqlite3.connect(database) as observed_connection:
+                observed_connection.row_factory = sqlite3.Row
+                observed_connection.execute("PRAGMA query_only = ON")
+                observed_devices = _fetch_target_devices(observed_connection, device_ids)
+            failure_report["devices"] = [
+                {
+                    "device_id": device_id,
+                    "previous": {
+                        "status": previous_devices[device_id]["status"],
+                        "trust_score": int(previous_devices[device_id]["trust_score"]),
+                    } if previous_devices and device_id in previous_devices else {},
+                    "current": {
+                        "status": observed_devices[device_id]["status"],
+                        "trust_score": int(observed_devices[device_id]["trust_score"]),
+                    } if device_id in observed_devices else {},
+                }
+                for device_id in device_ids
+            ]
+        except sqlite3.DatabaseError as exc:
+            failure_report["device_state_read_error"] = str(exc)
     if any(
         value is not None
         for value in (
@@ -575,7 +718,7 @@ def _write_failure_log_if_possible(
         )
     try:
         _write_json_log(log_path, failure_report)
-    except OSError:
+    except Exception:
         return
 
 
