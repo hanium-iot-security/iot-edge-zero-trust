@@ -470,6 +470,89 @@ test("Dashboard StrictMode effect cleanup remount starts fresh request and disca
   assert.equal(requests[2].signal.aborted, true);
 });
 
+// Replay the actual mount cleanup/setup while transport is still pending.
+// The fake clock measures the unwanted polling delay without sleeping.
+for (const settlement of ["cancellation", "late response"]) {
+  test("Isolation StrictMode restarts canceled initial history at 0 ms: " + settlement, async () => {
+    const clock = createClock();
+    const startedAt = clock.now;
+    const requests = [];
+    const api = {
+      getIsolationHistory: (_params, { signal }) => new Promise((resolve, reject) => {
+        requests.push({ signal, resolve, reject });
+      }),
+      getIsolatedDevices: async () => ({ items: [] }),
+      getFirewallRules: async () => ({ items: [] }),
+    };
+    const app = await componentHarness("Isolation", api, clock);
+    const table = () => app.find((node) => node.type === "DataTable" && node.props.tableLabel === "격리 이력");
+    const result = (id) => ({
+      items: [{ id, device_id: sensor.device_id, action: "ISOLATE", trust_score: 20,
+        reason: "test isolation", created_at: "2026-10-12T00:00:00Z" }],
+      total: 1,
+    });
+    try {
+      assert.equal(requests.length, 1);
+      await app.strictReplay();
+      assert.equal(requests[0].signal.aborted, true);
+      // On the broken component, let its next poll run to expose the 10,000 ms baseline.
+      if (requests.length === 1) await app.advance(10_000);
+      assert.equal(clock.now - startedAt, 0, "initial history must restart immediately, without waiting for a 10,000 ms poll");
+      assert.equal(requests.length, 2);
+      assert.equal(requests[1].signal.aborted, false);
+      if (settlement === "cancellation") {
+        requests[0].reject(Object.assign(new Error("canceled"), { isCanceled: true }));
+        await app.settle();
+        assert.equal(table().props.loading, true, "old cancellation must not clear the new request's loading state");
+        assert.equal(table().props.error, "");
+      }
+      requests[1].resolve(result(22));
+      await app.settle();
+      assert.equal(table().props.rows[0].id, 22);
+      assert.equal(table().props.loading, false);
+      if (settlement === "late response") {
+        requests[0].resolve(result(11));
+        await app.settle();
+        assert.equal(table().props.rows[0].id, 22, "old transport response cannot overwrite remounted history");
+      }
+      await app.advance(10_000);
+      assert.equal(requests.length, 3, "normal polling must continue after initial history loads");
+    } finally {
+      app.cleanup();
+    }
+    assert.equal(requests.at(-1).signal.aborted, true, "unmount must cancel the current request");
+  });
+}
+
+test("Isolation leaves a slow live history request running across the 10-second poll", async () => {
+  const clock = createClock();
+  const requests = [];
+  const app = await componentHarness("Isolation", {
+    getIsolationHistory: (_params, { signal }) => new Promise((resolve) => {
+      requests.push({ signal });
+      clock.window.setTimeout(() => resolve({
+        items: [{ id: 22, device_id: sensor.device_id, action: "ISOLATE" }], total: 1,
+      }), 12_000);
+    }),
+    getIsolatedDevices: async () => ({ items: [] }),
+    getFirewallRules: async () => ({ items: [] }),
+  }, clock);
+  try {
+    await app.advance(10_000);
+    assert.equal(requests.length, 1, "a poll must not duplicate a live request");
+    assert.equal(requests[0].signal.aborted, false);
+    await app.advance(2_000);
+    const table = app.find((node) => node.type === "DataTable" && node.props.tableLabel === "격리 이력");
+    assert.equal(table.props.rows[0].id, 22);
+    assert.equal(table.props.loading, false);
+    await app.advance(8_000);
+    assert.equal(requests.length, 2, "polling resumes after the live request finishes");
+  } finally {
+    app.cleanup();
+  }
+  assert.equal(requests.at(-1).signal.aborted, true);
+});
+
 test("Isolation refresh preserves release target ID then sequentially releases wide and FAILED MQTT scopes", async () => {
   const clock = createClock();
   const device = { ...sensor, trust_score: 20, status: "isolated" };
