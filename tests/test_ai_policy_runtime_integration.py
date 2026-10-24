@@ -153,6 +153,82 @@ def run(runtime, start, end):
     return result.stage_results[0]
 
 
+def _stage_outputs(runtime):
+    with runtime.sessions() as db:
+        return {
+            table: db.execute(text(f"SELECT * FROM {table}")).all()
+            for table in ("detector_checkpoints", "detection_events", "ai_device_completions",
+                          "ai_warning_keys", "ai_warning_aggregates", "ai_warning_events",
+                          "ai_runtime_snapshot")
+        }
+
+
+@pytest.mark.parametrize("fail_after_stage", [False, True])
+def test_parallel_writer_during_inference_preserves_atomic_stage(runtime, monkeypatch, fail_after_stage):
+    change_mode(runtime, "OBSERVE", 1, -5)
+    activate(runtime)
+    source(runtime, 0)
+    with closing(sqlite3.connect(runtime.path)) as writer:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    before = _stage_outputs(runtime)
+    delegate = getattr(runtime.stage, "delegate", runtime.stage)
+    original_score = delegate.artifact.model.decision_function
+    writer_commits = []
+
+    def score(matrix):
+        # A separate collection writer commits after the policy snapshot has
+        # been read. Closing it rules out an outstanding writer-lock timeout.
+        assert not writer_commits
+        with closing(sqlite3.connect(runtime.path, timeout=0)) as writer, writer:
+            writer.execute("UPDATE devices SET last_seen_at=? WHERE device_id='esp32_01'",
+                           (stamp(at(1)),))
+        writer_commits.append(True)
+        scores = original_score(matrix)
+        # The success regression must first write a normal completion. The
+        # injected failure also creates an event to verify its atomic rollback.
+        return scores if fail_after_stage else scores * 0 + 2.0
+
+    monkeypatch.setattr(delegate.artifact.model, "decision_function", score)
+    completed = runtime.publisher.stage_completed
+
+    def fail_after_writes(db, result):
+        completed(db, result)
+        assert read_ai_completions(db)[0]["anomaly_count"] == 1
+        assert db.execute(text("SELECT COUNT(*) FROM detection_events")).scalar_one() == 1
+        assert db.execute(text("SELECT last_completed_window_end FROM detector_checkpoints "
+                               "WHERE detector_name=:name"), {"name": runtime.kind}).scalar_one() == stamp(at(10))
+        raise RuntimeError("injected failure after all Stage writes")
+
+    if fail_after_stage:
+        monkeypatch.setattr(runtime.publisher, "stage_completed", fail_after_writes)
+    try:
+        if fail_after_stage:
+            with pytest.raises(RuntimeError, match="injected failure after all Stage writes"):
+                run(runtime, 0, 10)
+            assert _stage_outputs(runtime) == before
+        else:
+            result = run(runtime, 0, 10)
+            assert result.created_event_count == 0
+            with runtime.sessions() as db:
+                (completion,) = read_ai_completions(db)
+                assert (completion["inference_count"], completion["normal_count"],
+                        completion["anomaly_count"]) == (1, 1, 0)
+                assert completion["ai_revision"] == 2 and completion["ai_mode"] == "OBSERVE"
+                assert completion["completed_window_end"] == stamp(at(10))
+                assert db.execute(text("SELECT last_completed_window_end FROM detector_checkpoints "
+                                       "WHERE detector_name=:name"), {"name": runtime.kind}).scalar_one() == stamp(at(10))
+                assert db.execute(text("SELECT COUNT(*) FROM detection_events")).scalar_one() == 0
+    except Exception:
+        # On the broken implementation, retain proof that the exact completion
+        # write failure rolled back detector state before re-raising it as RED.
+        assert _stage_outputs(runtime) == before
+        raise
+    finally:
+        assert writer_commits == [True]
+        with closing(sqlite3.connect(runtime.path)) as observer:
+            assert observer.execute("SELECT last_seen_at FROM devices WHERE device_id='esp32_01'").fetchone()[0] == stamp(at(1))
+
+
 def test_stored_off_observe_off_replay_uses_original_windows(runtime):
     change_mode(runtime, "OBSERVE", 1, 5)
     change_mode(runtime, "OFF", 2, 15)
