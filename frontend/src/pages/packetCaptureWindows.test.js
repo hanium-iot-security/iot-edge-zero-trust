@@ -86,6 +86,25 @@ function windows() {
   }));
 }
 
+test("capture windows derive display coverage from original duration without changing eligibility", async () => {
+  const items = windows().slice(0, 5);
+  items[0] = { ...items[0], captured_duration_seconds: 9.923846 };
+  items[1] = { ...items[1], captured_duration_seconds: 8.5, capture_eligible: false };
+  items[2] = { ...items[2], captured_duration_seconds: null, capture_eligible: null };
+  items[3] = { ...items[3], captured_duration_seconds: 0, capture_eligible: false };
+  items[4] = { ...items[4], coverage_ratio: 0.95, captured_duration_seconds: 8 };
+  const app = await captureHarness({ items, total: items.length });
+  const cells = app.rows().map((row) => row.children.map(app.text));
+  assert.equal(cells[0][4], "99.2%");
+  assert.equal(cells[1][4], "85%");
+  assert.equal(cells[1][5], "제외");
+  assert.equal(cells[2][4], "계산 불가");
+  assert.equal(cells[2][5], "-");
+  assert.equal(cells[3][4], "0%");
+  assert.equal(cells[4][4], "95%");
+  assert.equal(items[0].coverage_ratio, undefined, "original API evidence stays unchanged");
+});
+
 const identifiers = (app) => app.rows().map((row) => app.text(row.children[0]));
 
 test("120-second response is paged locally without repeating rows or refetching", async () => {

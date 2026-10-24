@@ -1,4 +1,5 @@
 import { uiLabel } from "../utils/uiText";
+import { observationState } from "../utils/runtimeStatus";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -857,6 +858,11 @@ export default function Dashboard() {
   const [health, setHealth] = useState(null);
   const [aiWarnings, setAiWarnings] = useState([]);
   const [runtime, setRuntime] = useState(null);
+  const [observationNow, setObservationNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = window.setInterval(() => setObservationNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
   const [captureWindows, setCaptureWindows] = useState([]);
   const [captureContext, setCaptureContext] = useState(null);
 
@@ -2060,6 +2066,22 @@ export default function Dashboard() {
 
 
 
+  const runtimeView = observationState(runtime, {
+    failed: sourceState.runtime?.status === "error", now: observationNow,
+  });
+  const latestCompletion = (Array.isArray(runtime?.completions) ? runtime.completions : [])
+    .map((item) => item.completed_window_end)
+    .filter((value) => value && Number.isFinite(Date.parse(value)))
+    .sort((a, b) => Date.parse(b) - Date.parse(a))[0];
+  const captureQuality = captureWindows.reduce((counts, item) => {
+    const observation = item.observation ?? item.capture_status ?? item.segment_status ?? item.status;
+    if (observation === "FAILED" || item.segment_status === "FAILED") counts.failed += 1;
+    else if (item.capture_eligible === true) counts.eligible += 1;
+    else if (item.capture_eligible === false || observation === "MISSING") counts.excluded += 1;
+    else counts.unknown += 1;
+    return counts;
+  }, { eligible: 0, excluded: 0, failed: 0, unknown: 0 });
+
   return (
 
     <div className="dashboard-page">
@@ -2542,11 +2564,12 @@ export default function Dashboard() {
                   updatedAt={sourceUpdatedAt("aiWarnings")}
                 />
                 <SummaryCard
-                  title="AI 실행 상태 조회"
-                  value={!sourceHasSuccess("runtime") ? null : "조회됨"}
+                  title="AI 실제 실행 상태"
+                  value={runtimeView.status}
                   unavailable={!sourceHasSuccess("runtime")}
-                  description="API 조회 성공은 추론 실행 확인이 아닙니다"
-                  stale={sourceIsStale("runtime")}
+                  description={`관측 정보: ${!sourceHasSuccess("runtime") && sourceState.runtime?.status !== "error" ? "조회 중" : uiLabel(runtimeView.freshness)} · 설정과 실제 실행은 별개입니다`}
+                  status={["RUNNING", "ACTIVE", "HEALTHY", "READY"].includes(runtimeView.status) ? "normal" : ["FAILED", "ERROR", "CRASHED", "UNHEALTHY"].includes(runtimeView.status) ? "danger" : "unknown"}
+                  stale={sourceIsStale("runtime") || runtimeView.freshness === "STALE"}
                   updatedAt={sourceUpdatedAt("runtime")}
                 />
                 <SummaryCard
@@ -2560,7 +2583,7 @@ export default function Dashboard() {
               </div>
               <SourceStateNotice state={sourceState.aiWarnings} label="AI 경고" />
               <SourceStateNotice state={sourceState.runtime} label="AI 실행 상태" />
-              <SourceStateNotice state={sourceState.captureWindows} label="Capture Window" />
+              <SourceStateNotice state={sourceState.captureWindows} label="패킷 수집 구간" />
               {sourceState.captureWindows?.status === "skipped" && (
                 <p className="text-muted" role="status" style={{ marginTop: 10 }}>
                   수집 구간 조회 대기: 최근 패킷 분석 지표에 실제 수집 세션 ID와
@@ -2577,12 +2600,20 @@ export default function Dashboard() {
               )}
               <div className="health-grid" style={{ marginTop: 12 }}>
                 <div className="health-item">
-                  <span>실행 상태 원본 상태 (설정·실행 확인용)</span>
-                  <strong style={{ overflowWrap: "anywhere", whiteSpace: "pre-wrap" }}>
-                    {sourceHasSuccess("runtime")
-                      ? JSON.stringify(runtime, null, 2)
-                      : "확인 불가"}
-                  </strong>
+                  <span>실행 상태 관측 시각</span>
+                  <strong>{sourceHasSuccess("runtime") ? formatKST(runtime?.observed_at) : "확인 불가"}</strong>
+                </div>
+                <div className="health-item">
+                  <span>최근 추론 완료 구간 · 과거 완료 근거</span>
+                  <strong>{sourceHasSuccess("runtime") && latestCompletion ? formatKST(latestCompletion) : "완료 근거 확인 불가"}</strong>
+                </div>
+                <div className="health-item">
+                  <span>수집 품질 · 위 조회 범위 기준</span>
+                  <strong>{sourceHasSuccess("captureWindows")
+                    ? captureWindows.length
+                      ? `분석 가능 ${captureQuality.eligible} · 제외·미수집 ${captureQuality.excluded} · 실패 ${captureQuality.failed} · 미확인 ${captureQuality.unknown}`
+                      : "조회된 수집 구간 없음 · 정상 수집 여부 확인 불가"
+                    : "확인 불가"}</strong>
                 </div>
                 <div className="health-item">
                   <span>최근 AI 경고</span>
@@ -2590,13 +2621,17 @@ export default function Dashboard() {
                     {sourceHasSuccess("aiWarnings")
                       ? aiWarnings.length
                         ? aiWarnings.map((item, index) =>
-                            String(item.event_type ?? item.warning_type ?? item.id ?? `경고 ${index + 1}`)
+                            uiLabel(item.event_type ?? item.warning_type ?? item.id ?? `경고 ${index + 1}`)
                           ).join(", ")
                         : "조회된 경고 없음"
                       : "확인 불가"}
                   </strong>
                 </div>
               </div>
+              <details className="phase9-json-details" style={{ marginTop: 12 }}>
+                <summary>상세 정보 보기 · 실행 상태와 수집 구간 원본</summary>
+                <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{JSON.stringify({ runtime, capture_windows: captureWindows }, null, 2)}</pre>
+              </details>
             </section>
 
             <section className="status-grid">

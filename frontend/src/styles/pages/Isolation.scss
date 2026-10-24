@@ -319,6 +319,32 @@
     min-width: 0;
   }
 
+  .phase9-runtime-panel {
+    .health-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+      gap: 12px;
+    }
+
+    .health-item {
+      min-width: 0;
+      padding: 14px;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      background: var(--color-slate-50);
+
+      > span:first-child {
+        display: block;
+        margin-bottom: 8px;
+        color: var(--color-slate-500);
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      strong { overflow-wrap: anywhere; }
+    }
+  }
+
   .phase9-admin-section {
     padding-top: 16px;
     border-top: 1px solid var(--border-color);

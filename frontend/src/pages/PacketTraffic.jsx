@@ -343,6 +343,17 @@ function captureWindowObservation(item) {
   return normalized === "READY" ? "PENDING" : normalized;
 }
 
+// The capture API exposes duration, while the feature API also exposes coverage_ratio.
+// This is display-only; capture_eligible remains the authoritative API decision.
+function captureWindowCoverage(item) {
+  const ratio = captureWindowField(item, "coverage_ratio");
+  if (ratio !== null) return ratio;
+  const duration = captureWindowField(item, "captured_duration_seconds");
+  return typeof duration === "number" && Number.isFinite(duration) && duration >= 0 && duration <= 10
+    ? duration / 10
+    : null;
+}
+
 function captureWindowDisplay(value) {
   if (value === null || value === undefined || value === "") return "-";
   if (typeof value === "boolean") return value ? "예" : "아니요";
@@ -498,7 +509,7 @@ function PacketCaptureWindows({ featureRows = [] }) {
         <div>
           <h2>패킷 수집 구간</h2>
           <p className="panel-description">
-            수집 구간의 상태와 수집 시간 충족률를 표시합니다. 수집 공백은 AI 추론 실패와 다르며,
+            수집 구간의 상태와 수집 시간 충족률을 표시합니다. 수집 공백은 AI 추론 실패와 다르며,
             수집 품질 저하만으로 공격 또는 격리를 의미하지 않습니다.
           </p>
         </div>
@@ -560,14 +571,14 @@ function PacketCaptureWindows({ featureRows = [] }) {
           <EmptyState title="표시할 수집 구간이 없습니다." description="조회 결과가 없거나 상태 필터와 일치하지 않습니다." compact />
         ) : (
           <div className="table-scroll">
-            <table className="packet-window-table">
+            <table className="packet-window-table" aria-label="패킷 수집 구간 상세">
               <thead><tr>
-                <th>분석 구간 / 수집 세션</th><th>시작</th><th>종료</th><th>상태</th><th>수집 시간 충족률</th><th>분석 가능</th><th>제외·오류 사유</th>
+                <th>수집 구간 / 세션 ID</th><th>시작 (KST)</th><th>종료 (KST)</th><th>상태</th><th>수집 시간 충족률</th><th>분석 가능</th><th>제외·오류 사유</th>
               </tr></thead>
               <tbody>{visibleItems.map((item, index) => {
                 const id = captureWindowField(item, "segment_id", "id", "window_id", "capture_window_id", "capture_session_id", "session_id");
                 const status = captureWindowObservation(item);
-                const coverage = captureWindowField(item, "coverage_ratio");
+                const coverage = captureWindowCoverage(item);
                 const eligible = captureWindowField(item, "capture_eligible", "eligible");
                 const reason = captureWindowField(item, "capture_exclusion_reason", "exclusion_reason", "segment_error_code", "error_code", "last_error");
                 return (
@@ -586,11 +597,14 @@ function PacketCaptureWindows({ featureRows = [] }) {
           </div>
         )}
         {lastUpdated && (
+          <p className="packet-capture-note">수집 시간 충족률은 실제 수집시간 ÷ 10초로 표시합니다. 분석 가능 여부는 API의 수집 품질 판정을 따릅니다.</p>
+        )}
+        {lastUpdated && (
           <div className="packet-capture-footer">
             <span>마지막 조회: {formatKST(lastUpdated)}</span>
             <div className="packet-capture-pagination">
               <button type="button" className="button button-secondary" disabled={loading || offset === 0} onClick={() => setOffset((n) => Math.max(0, n - pageSize))}>이전</button>
-              <span>시작 위치 {total ? offset + 1 : 0} · 전체 {formatNumber(total, 0)}건</span>
+              <span>{total ? offset + 1 : 0}–{Math.min(offset + pageSize, total)} / 총 {formatNumber(total, 0)}건</span>
               <button type="button" className="button button-secondary" disabled={loading || !hasNext} onClick={() => setOffset((n) => n + pageSize)}>다음</button>
             </div>
           </div>
@@ -1621,7 +1635,6 @@ export default function PacketTraffic() {
 
       />
 
-      <DeviceTrafficTrends />
 
       {pollWarning && (
 
@@ -1840,6 +1853,8 @@ export default function PacketTraffic() {
           </section>
 
         )}
+
+      <DeviceTrafficTrends />
 
       <PacketCaptureWindows featureRows={packetFeatures} />
 

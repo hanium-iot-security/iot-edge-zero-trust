@@ -1,4 +1,5 @@
 import * as uiText from "../utils/uiText.js";
+import * as runtimePresentation from "../utils/runtimeStatus.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
@@ -131,6 +132,7 @@ async function componentHarness(name, api, clock = createClock()) {
       /^(get|create|execute|recovery)/.test(importedName) ? async () => ({ items: [] }) : importedName])),
     ...mqttTimestamp,
     ...uiText,
+    ...runtimePresentation,
     ...firewallRuleSelection,
     ...api,
     ...hooks,

@@ -1,6 +1,8 @@
 // Display labels only. API values, stored evidence and command payloads stay unchanged.
 const labels = {
-  UNKNOWN: "확인 불가", NO_DATA: "자료 없음", API_ERROR: "조회 실패",
+  UNKNOWN: "확인 불가", NO_DATA: "자료 없음", "NO DATA": "자료 없음", API_ERROR: "조회 실패",
+  RESPONSE: "응답 수신", MATCH: "규칙 일치", MISMATCH: "규칙 불일치",
+  PARTIAL: "부분 수집", UNINSPECTED: "미검사", EXCLUDED: "분석 제외",
   ONLINE: "최근 수신", OFFLINE: "장기 미수신", STALE: "정보 갱신 지연", FRESH: "최신",
   PENDING: "대기", APPLIED: "규칙 적용", REMOVED: "규칙 제거", FAILED: "실패",
   PROCESSED: "수집 처리 완료", CAPTURED: "수집 완료", COMPLETED: "완료",
