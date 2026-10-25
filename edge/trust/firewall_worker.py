@@ -7,7 +7,8 @@ iptables는 DB처럼 Rollback할 수 없으므로 "먼저 PENDING을 남기고 �
 
 적용·확인·삭제·Reconciliation은 모두 `build_match_args()`가 만드는 동일한 Match
 Specification(Source IP, 승인된 Scope, Comment, DROP)을 사용합니다. 기존 Scope는
-TCP 목적지 Port 1883이며, 관리자 승인 Scope는 Pi INPUT의 모든 IPv4 트래픽입니다.
+TCP 목적지 Port 1883이며, 명시적 관리자 요청 또는 운영자 자동 확장 설정으로
+승인된 Scope는 Pi INPUT의 모든 IPv4 트래픽입니다.
 서로 다른 Specification을 쓰면 "적용은 됐는데 확인·삭제가 안 되는" 상태가 생깁니다.
 
 DROP Rule은 `-I INPUT 1`로 Chain 맨 앞에 넣습니다. 뒤에 붙이면 선행 ACCEPT Rule에서
@@ -107,8 +108,11 @@ class FirewallPolicy:
     command_timeout_seconds: float = 10.0
     retry_delay_seconds: int = 30
     batch_size: int = 20
+    # Global rollout authority; wide rows still bind the current device revision.
+    auto_scope: str = MQTT_IPV4_TCP_1883
 
     def __post_init__(self) -> None:
+        row_scope({"scope": self.auto_scope})
         if self.command_timeout_seconds <= 0:
             raise ValueError("command_timeout_seconds must be positive")
         if self.retry_delay_seconds < 0:

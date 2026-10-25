@@ -21,7 +21,10 @@ from backend.app.config import Settings, settings
 from backend.app.database import SessionLocal
 from edge.runtime_lock import RuntimeLockError, resolve_lock_path, single_instance_lock
 from edge.trust import firewall_repository
-from edge.trust.firewall_scope import MQTT_IPV4_TCP_1883
+from edge.trust.automatic_scope_extension import (
+    queue_automatic_scope_extensions, require_automatic_scope_schema,
+)
+from edge.trust.firewall_scope import MQTT_IPV4_TCP_1883, PI_INPUT_IPV4_ALL
 from edge.trust.firewall_worker import (
     FirewallPolicy,
     FirewallValidationError,
@@ -90,6 +93,7 @@ def load_firewall_policy(app_settings: Settings = settings) -> FirewallPolicy:
         command_timeout_seconds=app_settings.firewall_command_timeout_seconds,
         retry_delay_seconds=app_settings.firewall_retry_delay_seconds,
         batch_size=app_settings.firewall_worker_batch_size,
+        auto_scope=app_settings.firewall_auto_scope,
     )
 
 
@@ -117,6 +121,7 @@ def run_worker_cycle(
     with_reconcile: bool,
 ) -> tuple[PendingCycleResult, ReconcileResult | None]:
     """Release requests, Reconciliation(선택), PENDING Batch를 처리하는 한 Cycle입니다."""
+    require_automatic_scope_schema(db, policy=policy)
     release_result = process_pending_release_requests(
         db,
         runner=runner,
@@ -152,6 +157,14 @@ def run_worker_cycle(
             len(pending_result.transient_failed),
             len(pending_result.validation_failed),
         )
+    # Queue only after ordinary application, within the remaining batch budget.
+    # New wide rows are applied by the existing Worker on a subsequent cycle.
+    queued = queue_automatic_scope_extensions(
+        db, policy=policy, now=now,
+        limit=policy.batch_size - pending_result.processed_count,
+    )
+    if queued:
+        logger.info("Automatic Pi INPUT IPv4 extensions queued (rule_ids=%s)", queued)
     return pending_result, reconcile_result
 
 
@@ -219,6 +232,13 @@ def run_worker_loop(
 
 def _print_dry_run(db: Session, *, policy: FirewallPolicy, now: datetime) -> None:
     """실행 예정 Wrapper 명령과 그 결과로 만들어질 iptables Rule을 함께 보여줍니다."""
+    require_automatic_scope_schema(db, policy=policy)
+    if policy.auto_scope == PI_INPUT_IPV4_ALL:
+        print(
+            "FIREWALL_AUTO_SCOPE=PI_INPUT_IPV4_ALL: automatic expansion will queue "
+            "a separate wide rule for eligible APPLIED MQTT sources, once per source. "
+            "Queued rules apply on a subsequent Worker cycle; dry-run creates no rows."
+        )
     planned = plan_pending_rules(db, policy=policy, now=now)
     if not planned:
         print("실행 대기 중인 PENDING Rule이 없습니다.")
