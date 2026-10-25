@@ -734,10 +734,12 @@ Isolation History는 Trust 정책상 격리 결정을 표현합니다. 실제 �
 
 Migration 011의 두 scope는 `MQTT_IPV4_TCP_1883`(Pi INPUT의 TCP 1883)와
 `PI_INPUT_IPV4_ALL`(같은 source IPv4의 Pi INPUT 전체 프로토콜·포트)입니다.
-자동 격리는 기존 MQTT 1883을 유지하며 기존 ID의 범위를 확대하지 않습니다.
-관리자 확장은 이미 `isolated`인 기기의 `APPLIED` MQTT 규칙에서 새 광역 행을 만드는
-첫 경로만 구현했습니다. 운영 Pi migration/배포는 미적용 상태이며 실제 차단·DHCP/재부팅은
-미검증입니다. 자동 신규 광역 격리 정책·광역 확장 승인 Frontend는 후속 미완료 범위입니다.
+기본 자동 격리는 MQTT 1883이며 기존 ID의 범위를 변경하지 않습니다.
+운영자 설정 `FIREWALL_AUTO_SCOPE=PI_INPUT_IPV4_ALL`에서는 현재 ACTIVE 정책과 동일 IP의
+`isolated` 기기에 적용된 MQTT 원본에서 별도 광역 규칙을 한 번 자동 예약합니다.
+같은 원본의 FAILED·REMOVED 광역 이력도 재생성을 막습니다. 관리자 확장 API와 정확한
+ID별 해제는 유지하며 광역 승인 Frontend는 아직 없습니다. 2026/10/25~26 Pi 코드 적용·
+실물 차단·해제 결과와 미실행 범위는 [최신 검증 기록](phase9-pi-input-isolation-validation-20261026.md)을 참고합니다.
 
 ### GET /api/firewall-rules
 GET /api/firewall-runtime-status

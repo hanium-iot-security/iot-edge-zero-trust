@@ -1,6 +1,6 @@
 # Phase 9 Pi 입력 격리
 
-이 변경은 이미 격리된 기기의 적용된 MQTT 차단을 관리자가 Pi IPv4 입력 전체 차단으로 확장하는 첫 경로를 추가한다. 운영 DB 마이그레이션, 실제 장비 차단, 서비스 배포와 재부팅 검증은 이 문서 작성 시 실행하지 않았다.
+운영자가 전체 범위를 설정하면 격리된 기기의 Pi IPv4 입력을 모든 포트·프로토콜에서 차단한다. 기존 관리자 확장 API와 정확한 규칙별 해제도 유지한다. 2026/10/25~26 코드 적용·실물 차단과 해제 결과는 [최신 검증 기록](phase9-pi-input-isolation-validation-20261026.md)에 정리했다. 아래의 10/9~11 설치 준비·미배포 설명은 날짜가 명시된 당시 기록이다.
 
 ## 범위와 기존 동작
 
@@ -9,7 +9,11 @@
 | `MQTT_IPV4_TCP_1883` | 해당 IPv4에서 Pi INPUT으로 들어오는 TCP 1883 | `tcp` / `1883` |
 | `PI_INPUT_IPV4_ALL` | 해당 IPv4에서 Pi INPUT으로 들어오는 모든 IPv4 프로토콜·포트 | `NULL` / `NULL` |
 
-자동 Trust 격리의 신규 규칙은 계속 MQTT 1883이다. 배포나 마이그레이션으로 기존 행 또는 ID의 차단 범위를 넓히지 않는다. 광역 차단도 Pi INPUT에 한정된다. 다른 호스트 간 통신, FORWARD와 IPv6는 이 범위에 포함되지 않는다. 정상 기기에 광역 자동 격리를 선택하는 정책 연결은 후속 범위다.
+`FIREWALL_AUTO_SCOPE`의 기본값 `MQTT_IPV4_TCP_1883`은 기존 MQTT 격리를 유지한다. 운영자가 `PI_INPUT_IPV4_ALL`을 설정하면 Worker가 현재 ACTIVE 정책·동일 IPv4·isolated 상태의 APPLIED MQTT 원본에서 별도 광역 PENDING 행을 생성한다. 원본 행의 범위와 Trust 판단 기준은 바꾸지 않는다. 해제를 먼저 처리하고 남은 배치 한도에서 확장을 예약하며, 새 규칙은 이후 cycle에서 재검증하여 적용한다.
+
+자동 확장은 `system:firewall-worker`, 운영 설정을 나타내는 reason, 현재 정책 revision, UUID4와 원본 ID를 기록한다. 같은 원본에 광역 이력이 하나라도 있으면 FAILED·REMOVED를 포함해 자동 재생성하지 않는다. 감사 해제 이후 별도 관리자 요청으로 재확장할 수 있다. 명시적 ALL 설정은 완전한 migration 011 스키마가 없으면 실패하며 dry-run은 행을 생성하지 않는다.
+
+광역 차단은 해당 source IPv4의 Pi INPUT에 한정된다. 다른 호스트 간 통신, FORWARD와 IPv6는 이 범위에 포함되지 않는다. 보호된 관리자·라우터·Pi 주소에는 적용하지 않는다. 다음 Worker cycle에서 적용하므로 Trust의 isolated 전이와 광역 규칙 적용 사이에는 대기 시간이 있다. 운영 화면의 APPLIED/runtime 관측으로 실제 적용을 확인한다.
 
 관리 API는 새 `PENDING` 행만 승인한다. 해당 응답의 `runtime_verified=false`는 실제 방화벽 적용 확인 전임을 뜻한다. Worker는 이후 별도의 적용·정확한 규칙 확인을 수행한다. 새 광역 규칙이 확인되기 전에 원본 MQTT 규칙을 제거하지 않으며, 확인 이후에도 자동 제거하지 않는다.
 
@@ -56,6 +60,8 @@ Runner는 003과 같은 FK 재구성 경로로 011 전체를 한 트랜잭션에
 `request_id`는 소문자 정규 UUID4다. 동일 principal/source/device/IP/revision/scope/reason의 재요청은 기존 행의 ID를 반환한다. FAILED 또는 REMOVED 이후에도 새 규칙을 삽입하지 않는다. 바인딩이 달라지면 409 `REQUEST_ID_BINDING_MISMATCH`다. 응답은 신규·재요청 모두 201이며 `created`/`replayed`로 구분한다. 응답이 유실되면 동일 UUID와 동일 요청으로 재조회하고, 새 UUID를 만들어 반복 차단하지 않는다.
 
 ## 정확한 해제와 부분 실패
+
+정상 복구는 현재 IP뿐 아니라 대상 기기의 미해결 FAILED 규칙에 남은 과거 source IP도 검사한다. 해당 주소들에서 다른 기기 소유 행과 처리된 해제 요청까지 포함한 마지막 방화벽 활동 이후의 runtime 관측을 요구한다. 과거 REMOVED 규칙의 주소를 영구적으로 묶지는 않는다.
 
 해제 API는 기존 `POST /api/firewall-rules/{rule_id}/release-requests`이며 확인 문자열은 `RELEASE-FIREWALL-RULE-{rule_id}`다. 각 scope의 ID를 따로 해제한다. 같은 IP의 다른 scope 규칙은 보존한다.
 
