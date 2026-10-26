@@ -769,14 +769,27 @@ def _fetch_target_devices(
 def _runtime_verification_devices(
     connection: sqlite3.Connection, devices: Mapping[str, sqlite3.Row],
 ) -> dict[str, dict[str, object]]:
-    """Bind runtime proof to all attempts for the Device or its current IP."""
+    """Bind runtime proof and freshness to every current/unresolved source IP."""
     result = {}
     for device_id, device in devices.items():
+        # FAILED can mean the OS inserted a rule before its response was lost.
+        # Include other devices' activity at these addresses until exact release
+        # transitions our FAILED rules to REMOVED and allows independent reuse.
+        failed_source_ips = sorted({
+            str(row["source_ip"]) for row in connection.execute(
+                "SELECT DISTINCT source_ip FROM firewall_rules "
+                "WHERE device_id = ? AND status = 'FAILED'", (device_id,),
+            ).fetchall()
+            if row["source_ip"] != device["ip_address"]
+        })
+        checked_ips = [device["ip_address"], *failed_source_ips]
+        ip_placeholders = ", ".join("?" for _ in checked_ips)
+        parameters = (device_id, *checked_ips)
         values = []
         rules = connection.execute(
             "SELECT last_attempted_at, applied_at, released_at, updated_at "
-            "FROM firewall_rules WHERE device_id = ? OR source_ip = ?",
-            (device_id, device["ip_address"]),
+            f"FROM firewall_rules WHERE device_id = ? OR source_ip IN ({ip_placeholders})",
+            parameters,
         ).fetchall()
         for rule in rules:
             attempts = [rule[key] for key in ("last_attempted_at", "applied_at", "released_at") if rule[key]]
@@ -784,8 +797,9 @@ def _runtime_verification_devices(
         requests = connection.execute(
             "SELECT request.processed_at FROM firewall_release_requests AS request "
             "JOIN firewall_rules AS rule ON rule.id = request.firewall_rule_id "
-            "WHERE (rule.device_id = ? OR rule.source_ip = ?) AND request.processed_at IS NOT NULL",
-            (device_id, device["ip_address"]),
+            f"WHERE (rule.device_id = ? OR rule.source_ip IN ({ip_placeholders})) "
+            "AND request.processed_at IS NOT NULL",
+            parameters,
         ).fetchall()
         values.extend(row[0] for row in requests)
         try:
@@ -798,16 +812,29 @@ def _runtime_verification_devices(
             raise BaselineRecoveryError("Runtime firewall attempt timestamp is invalid") from exc
         result[device_id] = {
             "device_id": device_id, "ip_address": device["ip_address"],
+            "failed_rule_source_ips": failed_source_ips,
             "last_firewall_activity_at": latest.isoformat() if latest else None,
         }
     return result
 
 
 def _verify_runtime_firewall(device: Mapping[str, object]) -> dict[str, object]:
-    return verify_firewall_runtime_snapshot(
+    verification = verify_firewall_runtime_snapshot(
         device, snapshot_path=settings.firewall_runtime_snapshot_path,
         max_age_seconds=settings.firewall_runtime_snapshot_max_age_seconds,
     )
+    if not verification.get("available") or not verification.get("passed"):
+        return verification
+    for source_ip in device.get("failed_rule_source_ips", []):
+        historical = verify_firewall_runtime_snapshot(
+            {**device, "ip_address": source_ip},
+            snapshot_path=settings.firewall_runtime_snapshot_path,
+            max_age_seconds=settings.firewall_runtime_snapshot_max_age_seconds,
+        )
+        if not historical.get("available") or not historical.get("passed"):
+            return historical
+        verification["details"] += " " + historical["details"]
+    return verification
 
 
 def _require_runtime_released(

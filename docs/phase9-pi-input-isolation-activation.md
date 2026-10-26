@@ -1,6 +1,10 @@
 # Pi IPv4 INPUT 격리 운영 활성화 준비
 
-이 문서는 Pi 접근 격리 설치 명령 검토용이다. 이번 활성화의 보호 설정 설치·운영 DB migration·host 방화벽 변경·실물 펌웨어 업로드·재부팅은 아직 실행하지 않았다. 코드·API만 적용한 결과는 아래 운영 기준과 구분한다. 10/9 임시 namespace 시험과 DB 사본 검증은 [기존 문서의 Historical 기록](phase9-pi-input-isolation.md)을 참고한다.
+아래 설치 준비·미실행 설명은 2026/10/11 당시 기록이다. 2026/10/25의 새 운영 조회에서 migration 011은 `2026-10-12 04:19:40` 적용 기록과 완전한 scope 열을 가지고 있었고 보호 파일·특권 Wrapper도 이미 설치되어 있었다. 따라서 과거의 미설치 상태를 현재 설치 필요 작업으로 해석하지 않는다.
+
+2026/10/25~26에는 최신 develop과 Pi의 기존 변경을 비교해 런타임 다섯 파일의 필요한 차이만 적용하고 `FIREWALL_AUTO_SCOPE=PI_INPUT_IPV4_ALL`을 명시했다. Worker와 API만 정상 재시작했다. Capture·Subscriber·Orchestrator는 기존 PID/InvocationID를 유지했다. 새 migration·Wrapper·sudoers·보호 파일 설치나 Pi 재부팅은 실행하지 않았다. [최신 실물 검증·운영 복구 기록](phase9-pi-input-isolation-validation-20261026.md)을 먼저 확인한다.
+
+10/9 임시 namespace 시험과 DB 사본 검증은 [기존 문서의 Historical 기록](phase9-pi-input-isolation.md)을 참고한다.
 
 2026/10/11 로컬 승인 준비에서 API·repository·worker·recovery·migration·wrapper·snapshot 회귀 **242개**, 프론트 **13개**(광역/legacy/missing 응답의 shared React render 계약 3개 포함)가 통과했다. 19개 업무 테이블 집합 보존을 추가한 기존 migration 시험도 재실행해 통과했다. Vite production build, 새 helper/test 정적 검사와 `git diff --check`가 통과했다. 임시 로컬 DB·가짜 Worker·dry-run 및 로컬 화면 빌드의 결과이며 운영 설치·차단 완료를 인증하지 않는다.
 
