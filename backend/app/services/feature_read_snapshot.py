@@ -10,7 +10,7 @@ SQLITE_MAX_ID = 2**63 - 1
 
 @contextmanager
 def feature_read_snapshot(db, table: str, requested: int | None):
-    if table not in ("feature_logs", "packet_feature_logs"):
+    if table not in ("feature_logs", "packet_feature_logs", "mqtt_logs"):
         raise ValueError("unsupported Feature table")
     if requested is not None and (type(requested) is not int or not 0 <= requested <= SQLITE_MAX_ID):
         raise ValueError("snapshot_max_id must be a nonnegative SQLite integer")

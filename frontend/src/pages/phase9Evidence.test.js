@@ -7,6 +7,7 @@ import { runInNewContext } from "node:vm";
 import { transformWithOxc } from "vite";
 import * as mqttTimestamp from "../utils/mqttTimestamp.js";
 import { featureTime } from "../utils/trafficQuery.js";
+import * as rawMqttTraffic from "../utils/rawMqttTraffic.js";
 
 // Render the production JSX and field readers with fixed API response fixtures.
 async function page(name, exports, states = {}, directory = "pages") {
@@ -21,6 +22,7 @@ async function page(name, exports, states = {}, directory = "pages") {
   const scope = {
     ...Object.fromEntries(importedNames.map((name) => [name, name])),
     ...mqttTimestamp,
+    ...rawMqttTraffic,
     ...uiText,
     ...runtimeStatus,
     featureTime,
@@ -33,7 +35,7 @@ async function page(name, exports, states = {}, directory = "pages") {
     jsx: (type, props, ...children) => ({ type, props: props || {}, children }),
     Fragment: "Fragment", Date, console, AbortController,
   };
-  runInNewContext(code.replace(`export default function ${name}`, `function ${name}`) +
+  runInNewContext(code.replace(`export default function ${name}`, `function ${name}`).replace(/\bexport\s*\{[^}]*\};?/g, "") +
     `\nglobalThis.subject = {${exports.join(",")}};`, scope);
   return scope.subject;
 }
@@ -238,59 +240,53 @@ test("MQTT summary never converts missing counts or empty observations to zero",
 });
 
 
-test("MQTT charts distinguish coincident series without moving values", async () => {
+test("MQTT basic charts use one raw series and preserve ten-second publish counts", async () => {
   const rows = ["2026-10-24T00:00:00Z", "2026-10-24T00:00:10Z"].map((window_start) => ({
     device_id: "esp32_02", window_start, publish_count: 2,
-    avg_payload_size: 128, max_payload_size: 128, avg_message_interval: 5, min_message_interval: 5,
+    avg_payload_size: 999, max_payload_size: 999, avg_message_interval: 5, min_message_interval: 5,
   }));
-  const original = JSON.stringify(rows);
+  const rawRows = [
+    { id: 1, device_id: "esp32_02", received_at: rows[0].window_start, payload_size: 0 },
+    { id: 2, device_id: "esp32_02", received_at: "2026-10-24T00:00:07.125Z", payload_size: 128 },
+  ];
+  const original = JSON.stringify({ rows, rawRows });
   const criteria = { device_id: "esp32_02", from: rows[0].window_start, to: "2026-10-24T00:00:20Z" };
   const subject = await page("DeviceTrafficTrends", ["DeviceTrafficTrends", "MetricsChart"], {
-    0: ["esp32_02"], 2: "esp32_02", 10: { kind: "mqtt", rows, total: 2, criteria },
+    0: ["esp32_02"], 2: "esp32_02", 10: { kind: "mqtt", rows, total: 2, criteria, raw: { rows: rawRows, total: 2, sourceSpanCount: 2, incomplete: false, timestampUnavailableCount: 0 } },
   }, "components");
-  const charts = [...nodes(subject.DeviceTrafficTrends())].filter((node) => node.type === subject.MetricsChart);
+  const view = subject.DeviceTrafficTrends();
+  const charts = [...nodes(view)].filter((node) => node.type === subject.MetricsChart);
   assert.equal(charts.length, 3);
-  for (const [index, keys] of [[1, ["avg_payload_size", "max_payload_size"]], [2, ["avg_message_interval", "min_message_interval"]]]) {
+  for (const [index, key] of [[0, "publish_count"], [1, "payload_size"], [2, "message_interval_seconds"]]) {
     const rendered = subject.MetricsChart(charts[index].props);
     const series = [...nodes(rendered)].filter((node) => node.type === "Line");
-    assert.deepEqual(series.map((node) => node.props.dataKey), keys);
-    assert.equal(series[0].props.strokeDasharray, "none", "average remains solid underneath");
-    assert.equal(series[1].props.strokeDasharray, "6 4", "top series exposes the coincident average through its gaps");
-    assert.ok(series.every((node) => node.props.legendType === "plainline"), "legend must show the actual dash pattern");
-    const plot = [...nodes(rendered)].find((node) => node.type === "LineChart").props.data;
-    for (const row of plot) {
-      assert.equal(row[keys[0]], row[keys[1]], "equal measurements must stay equal");
-      assert.equal(row[keys[0]], rows[0][keys[0]]);
-    }
-    assert.match(text(rendered), /평균은 실선/);
-    assert.match(text(rendered), /값이 같으면 같은 위치/);
+    assert.equal(series.length, 1);
+    assert.equal(series[0].props.dataKey, key);
+    assert.equal(series[0].props.connectNulls, false);
+    const axis = [...nodes(rendered)].find((node) => node.type === "XAxis");
+    assert.equal(axis.props.type, "number");
+    assert.equal(JSON.stringify(axis.props.domain), JSON.stringify([Date.parse(criteria.from), Date.parse(criteria.to)]));
   }
-  assert.doesNotMatch(text(subject.MetricsChart(charts[0].props)), /평균은 실선/);
-  assert.equal(JSON.stringify(rows), original, "chart presentation must not mutate API measurements");
+  assert.deepEqual(Array.from(charts[0].props.data, row => row.publish_count), [2, 2]);
+  assert.deepEqual(Array.from(charts[1].props.data, row => row.payload_size), [0, 128]);
+  assert.deepEqual(Array.from(charts[2].props.data, row => row.message_interval_seconds), [null, 7.125]);
+  assert.doesNotMatch(text(view), /평균은 실선|기존 대체값|최대·최소/);
+  assert.equal(JSON.stringify({ rows, rawRows }), original);
 });
 
-test("MQTT chart data preserves nulls, zeroes and gaps between observed windows", async () => {
-  const { chartRows, MetricsChart } = await page("DeviceTrafficTrends", ["chartRows", "MetricsChart"], {}, "components");
-  const rows = [
-    { window_start: "2026-10-24T00:00:00Z", avg_payload_size: 0, max_payload_size: 0, avg_message_interval: 0, min_message_interval: 0 },
-    { window_start: "2026-10-24T00:00:10Z", avg_payload_size: null, max_payload_size: 128, avg_message_interval: "" },
-    { window_start: "2026-10-24T00:00:40Z", avg_payload_size: 100, max_payload_size: 120, avg_message_interval: 5, min_message_interval: 4.98 },
-  ];
-  const plot = chartRows(rows, "mqtt");
-  assert.equal(plot.length, 4);
-  for (const key of ["avg_payload_size", "max_payload_size", "avg_message_interval", "min_message_interval"]) assert.equal(plot[0][key], 0);
-  assert.equal(plot[1].avg_payload_size, null);
-  assert.equal(plot[1].avg_message_interval, null);
-  assert.equal(plot[1].min_message_interval, null);
-  assert.equal(plot[1].max_payload_size, 128);
-  assert.equal(plot[2].__gap, true);
-  assert.equal(plot[2].window_start, null);
-  assert.equal(plot[3].avg_payload_size, 100);
-  assert.equal(plot[3].max_payload_size, 120);
-  assert.equal(plot[3].avg_message_interval, 5);
-  assert.equal(plot[3].min_message_interval, 4.98);
-  const rendered = MetricsChart({ data: plot, lines: [{ key: "avg_payload_size", label: "평균" }, { key: "max_payload_size", label: "최대" }] });
-  assert.ok([...nodes(rendered)].filter((node) => node.type === "Line").every((node) => node.props.connectNulls === false));
+test("missing raw data is unavailable and never replaced with feature averages", async () => {
+  const criteria = { device_id: "esp32_02", from: "2026-10-24T00:00:00Z", to: "2026-10-24T00:00:20Z" };
+  const subject = await page("DeviceTrafficTrends", ["DeviceTrafficTrends", "MetricsChart"], {
+    0: ["esp32_02"], 2: "esp32_02", 10: { kind: "mqtt", rows: [{ window_start: criteria.from, publish_count: 1, avg_payload_size: 128, avg_message_interval: 5 }], total: 1, criteria,
+      raw: { rows: [], total: null, incomplete: true, timestampUnavailableCount: null, warning: "MQTT 원본 조회 실패: offline" } },
+  }, "components");
+  const view = subject.DeviceTrafficTrends();
+  const charts = [...nodes(view)].filter((node) => node.type === subject.MetricsChart);
+  assert.equal(charts[0].props.data[0].publish_count, 1);
+  assert.equal(charts[1].props.data.length, 0);
+  assert.equal(charts[2].props.data.length, 0);
+  assert.match(text(view), /원본 조회 실패: offline/);
+  assert.match(text(view), /간격은 표시하지 않습니다/);
 });
 
 test("compact runtime overview keeps latest device results and retains all evidence in closed details", async () => {

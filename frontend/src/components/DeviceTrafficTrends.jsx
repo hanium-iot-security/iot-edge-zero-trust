@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { assertTrafficRowsMatchQuery, featureTime } from "../utils/trafficQuery";
+import { loadRawMqttLogs, rawMqttChartRows } from "../utils/rawMqttTraffic";
 import {
   CartesianGrid,
   Legend,
@@ -13,6 +14,7 @@ import {
 } from "recharts";
 import {
   getDevices,
+  getMqttLogs,
   getFeatureLogs,
   getPacketFeatureLogs,
   getPacketCaptureWindows,
@@ -48,7 +50,7 @@ const kstInputToISO = (value) => {
 };
 const kstTime = (value) => {
   if (!value) return "-";
-  const d = new Date(featureTime(value));
+  const d = new Date(typeof value === "number" ? value : featureTime(value));
   if (Number.isNaN(d.getTime())) return "-";
   return new Intl.DateTimeFormat("ko-KR", {
     timeZone: "Asia/Seoul",
@@ -62,7 +64,7 @@ const kstTime = (value) => {
 };
 const kstFull = (value) => {
   if (!value) return "-";
-  const d = new Date(featureTime(value));
+  const d = new Date(typeof value === "number" ? value : featureTime(value));
   if (Number.isNaN(d.getTime())) return "-";
   return new Intl.DateTimeFormat("ko-KR", {
     timeZone: "Asia/Seoul",
@@ -86,7 +88,7 @@ function unpackList(data, label) {
   if (Array.isArray(root)) return { items: root, total: root.length, totalKnown: false };
   if (!Array.isArray(root?.items)) throw new Error(`${label}: items 배열이 없는 응답입니다.`);
   const n = numberOrNull(root.total);
-  return { items: root.items, total: n, totalKnown: n !== null };
+  return { items: root.items, total: n, totalKnown: n !== null, snapshot: root.snapshot_max_id };
 }
 
 // Packet API uses an inclusive window_start upper bound; show only complete 10-second windows.
@@ -102,12 +104,13 @@ async function loadPaged({ request, params, signal, label }) {
   let warning = "";
   let pages = 0;
   let missingTotal = false;
+  let snapshot = null;
 
   while (!signal.aborted && offset < MAX_ROWS) {
     let result;
     try {
       result = unpackList(
-        await request({ ...params, limit: PAGE_SIZE, offset }, { signal }),
+        await request({ ...params, limit: PAGE_SIZE, offset, ...(snapshot === null ? {} : { snapshot_max_id: snapshot }) }, { signal }),
         label
       );
     } catch (err) {
@@ -119,6 +122,12 @@ async function loadPaged({ request, params, signal, label }) {
     }
 
     assertTrafficRowsMatchQuery(result.items, params);
+    if (pages && (result.snapshot !== snapshot || (total !== null && result.total !== total))) {
+      incomplete = true;
+      warning = `${label} 조회 스냅샷 또는 전체 건수가 변경되어 페이지 연결을 중단했습니다.`;
+      break;
+    }
+    if (!pages && Number.isSafeInteger(result.snapshot) && result.snapshot >= 0) snapshot = result.snapshot;
     pages += 1;
     if (result.totalKnown) total = result.total;
     else missingTotal = true;
@@ -149,15 +158,17 @@ async function loadPaged({ request, params, signal, label }) {
     warning = [warning, `${label} 응답에 total이 없어 전체 건수를 검증할 수 없습니다.`].filter(Boolean).join(" ");
   }
 
-  // 데이터가 조회 중에 추가되면 offset 방식의 중복/누락 가능성이 있습니다.
-  // snapshot_max_id API가 제공되지 않았으므로 '완전한 스냅샷'임을 보장하지 않습니다.
+  if (snapshot === null) {
+    incomplete = true;
+    warning = [warning, `${label} 스냅샷 ID가 없어 조회 중 추가된 행의 영향을 검증할 수 없습니다.`].filter(Boolean).join(" ");
+  }
   const rows = [...byId.values()].sort((a, b) => {
     const at = featureTime(a?.window_start);
     const bt = featureTime(b?.window_start);
     const order = (Number.isFinite(at) ? at : Infinity) - (Number.isFinite(bt) ? bt : Infinity);
     return order || String(a?.id ?? "").localeCompare(String(b?.id ?? ""), undefined, { numeric: true });
   });
-  return { rows, total, incomplete, warning, rawCount: offset, pages };
+  return { rows, total, incomplete, warning, rawCount: offset, pages, snapshot };
 }
 
 function normalizePacketRow(item) {
@@ -169,6 +180,7 @@ function normalizePacketRow(item) {
   return {
     ...item,
     chartTime: kstTime(item?.window_start),
+    timestamp: featureTime(item?.window_start),
     qualityOk,
     packets_per_second: pps,
     bytes_per_second: bps,
@@ -188,11 +200,8 @@ function normalizeMqttRow(item) {
   return {
     ...item,
     chartTime: kstTime(item?.window_start),
+    timestamp: featureTime(item?.window_start),
     publish_count: numberOrNull(item?.publish_count),
-    avg_payload_size: numberOrNull(item?.avg_payload_size),
-    max_payload_size: numberOrNull(item?.max_payload_size),
-    avg_message_interval: numberOrNull(item?.avg_message_interval),
-    min_message_interval: numberOrNull(item?.min_message_interval),
   };
 }
 
@@ -210,7 +219,7 @@ function chartRows(rows, kind) {
     const gap = last && Number.isFinite(currentTime) && Number.isFinite(lastTime) &&
       currentTime - lastTime > WINDOW_SECONDS * 1500;
     if (last && (changedSession || gap || (kind === "packet" && !last.qualityOk))) {
-      plot.push({ chartTime: "구간 단절", window_start: null, __gap: true });
+      plot.push({ chartTime: "구간 단절", timestamp: lastTime + WINDOW_SECONDS * 1000, window_start: null, __gap: true });
     }
     plot.push(row);
     last = row;
@@ -218,7 +227,7 @@ function chartRows(rows, kind) {
   return plot;
 }
 
-function MetricsChart({ data, lines, title, unit, isPacket }) {
+function MetricsChart({ data, lines, title, unit, isPacket, range }) {
   return (
     <div className="traffic-trends-chart">
       <div className="traffic-trends-chart-title">
@@ -227,13 +236,13 @@ function MetricsChart({ data, lines, title, unit, isPacket }) {
       <ResponsiveContainer width="100%" height={260}>
         <LineChart data={data} margin={{ top: 12, right: 20, left: 0, bottom: 12 }}>
           <CartesianGrid strokeDasharray="3 3" />
-          <XAxis dataKey="chartTime" minTickGap={32} tick={{ fontSize: 10 }} />
+          <XAxis dataKey="timestamp" type="number" scale="time" domain={range ? [featureTime(range.from), featureTime(range.to)] : ["dataMin", "dataMax"]} tickFormatter={kstTime} minTickGap={32} tick={{ fontSize: 10 }} allowDataOverflow />
           <YAxis tick={{ fontSize: 11 }} width={55} />
           <Tooltip
             labelFormatter={(_label, payload) =>
-              payload?.[0]?.payload?.__gap ? "미수집/수집 세션 변경" : kstFull(payload?.[0]?.payload?.window_start)
+              payload?.[0]?.payload?.__gap ? "미수집/수집 세션 변경" : kstFull(payload?.[0]?.payload?.received_at ?? payload?.[0]?.payload?.window_start)
             }
-            formatter={(value, name) => [formatNumber(value), name]}
+            formatter={(value, name) => [formatNumber(value, 6), name]}
           />
           <Legend />
           {lines.map((line) => (
@@ -246,18 +255,13 @@ function MetricsChart({ data, lines, title, unit, isPacket }) {
               strokeDasharray={line.strokeDasharray ?? "none"}
               legendType="plainline"
               strokeWidth={2}
-              dot={false}
+              dot={line.dot ?? false}
               connectNulls={false}
               isAnimationActive={false}
             />
           ))}
         </LineChart>
       </ResponsiveContainer>
-      {lines.length > 1 && (
-        <small className="traffic-trends-help">
-          평균은 실선, 최대·최소는 점선입니다. 값이 같으면 같은 위치에 겹쳐 표시됩니다.
-        </small>
-      )}
       {isPacket && (
         <small className="traffic-trends-help">
           실제 수집시간 기준 전송률입니다. 10초로 나눈 명목 전송률나 패킷 AI 입력값으로 해석하지 않습니다.
@@ -391,8 +395,25 @@ export default function DeviceTrafficTrends() {
         const query = kind === "mqtt"
           ? { device_id: params.device_id, from: params.from, to: params.to }
           : { device_id: params.device_id, from: params.from, to: params.to, direction: params.direction };
-        const data = await loadPaged({ request, params: query, signal: controller.signal, label: kind === "mqtt" ? "MQTT" : "Packet" });
-        if (active()) setResult({ ...data, kind, criteria });
+        if (kind === "mqtt") {
+          const [features, raw] = await Promise.allSettled([
+            loadPaged({ request, params: query, signal: controller.signal, label: "MQTT 발행 수" }),
+            loadRawMqttLogs({ request: getMqttLogs, params: query, signal: controller.signal }),
+          ]);
+          if (features.status === "rejected" && raw.status === "rejected") {
+            throw new Error(`발행 수: ${features.reason?.message} / 원본: ${raw.reason?.message}`);
+          }
+          const data = features.status === "fulfilled" ? features.value : {
+            rows: [], total: null, incomplete: true, warning: `발행 수 조회 실패: ${features.reason?.message}`,
+          };
+          const rawData = raw.status === "fulfilled" ? raw.value : {
+            rows: [], total: null, incomplete: true, warning: `MQTT 원본 조회 실패: ${raw.reason?.message}`, timestampUnavailableCount: null,
+          };
+          if (active()) setResult({ ...data, raw: rawData, kind, criteria });
+        } else {
+          const data = await loadPaged({ request, params: query, signal: controller.signal, label: "Packet" });
+          if (active()) setResult({ ...data, kind, criteria });
+        }
       } catch (err) {
         if (active()) setError(err?.message || "통신 추이 조회에 실패했습니다.");
       } finally {
@@ -450,6 +471,7 @@ export default function DeviceTrafficTrends() {
   }, [result, captureSession]);
 
   const chart = useMemo(() => result ? chartRows(result.rows, result.kind) : [], [result]);
+  const rawChart = useMemo(() => result?.kind === "mqtt" ? rawMqttChartRows(result.raw ?? { incomplete: true }) : [], [result]);
   const excluded = useMemo(() => result?.kind === "packet"
     ? result.rows.filter((row) => !normalizePacketRow(row).qualityOk).length
     : 0,
@@ -532,28 +554,38 @@ export default function DeviceTrafficTrends() {
             </p>
           )}
           <p className="traffic-trends-qualification">
-            from/to는 고정하고 ID 중복을 제거한 후 분석 구간 시각순으로 표시했습니다.
-            다만 백엔드 snapshot_max_id가 제공되지 않은 offset 조회이므로 조회 중 데이터 추가 시 완전한 스냅샷을 보장하지 않습니다.
+            시작 포함·종료 제외의 고정 기간을 KST로 표시합니다. 발행 수는 기존 10초 분석 구간의 값이며 크기·간격은 수신 원본을 사용합니다.
+            각 조회는 첫 페이지의 snapshot_max_id를 유지합니다. 그래프의 시간축은 같은 선택 기간입니다.
           </p>
-          {result.rows.length === 0 ? (
+          {result.kind === "mqtt" && (
+            <>
+              <p className="traffic-trends-qualification">
+                원본 조회 {result.raw?.rows.length ?? 0}건 / 시각 확인 원본 {result.raw?.total ?? "미확인"}건 · 연속성 확인 범위 {result.raw?.sourceSpanCount ?? "미확인"}건 · 기기 스냅샷의 시각 미확인 원본 {result.raw?.timestampUnavailableCount ?? "미확인"}건.
+                원본의 JSON·Topic 유효 여부로 메시지를 제외하지 않습니다.
+              </p>
+              {result.raw?.warning && <p role="alert" className="traffic-trends-error">{result.raw.warning} {result.raw.incomplete ? "일부 원본만으로 전체 기간을 판단하지 마세요. 간격은 표시하지 않습니다." : ""}</p>}
+            </>
+          )}
+          {result.rows.length === 0 && (result.kind !== "mqtt" || !result.raw?.rows.length) ? (
             <div className="traffic-trends-empty">분석 지표 행이 없습니다. 무통신이나 정상 상태로 단정할 수 없습니다.</div>
           ) : result.kind === "mqtt" ? (
             <div className="traffic-trends-charts">
-              <MetricsChart data={chart} title="MQTT 메시지 발행 수" unit="건 / 10초" lines={[{ key: "publish_count", label: "발행 수", color: "#2563eb" }]} />
-              <MetricsChart data={chart} title="MQTT 메시지 크기" unit="B" lines={[
-                { key: "avg_payload_size", label: "평균", color: "#16a34a" },
-                { key: "max_payload_size", label: "최대", color: "#ef4444", strokeDasharray: "6 4" },
+              <MetricsChart range={result.criteria} data={chart} title="MQTT 메시지 발행 수" unit="건 / 10초" lines={[{ key: "publish_count", label: "발행 수", color: "#2563eb" }]} />
+              <MetricsChart range={result.criteria} data={rawChart} title="MQTT 메시지 크기" unit="B / 메시지" lines={[
+                { key: "payload_size", label: "수신 원본 크기", color: "#16a34a", dot: { r: 2 } },
               ]} />
-              <MetricsChart data={chart} title="MQTT 메시지 간격" unit="초 (s)" lines={[
-                { key: "avg_message_interval", label: "평균", color: "#9333ea" },
-                { key: "min_message_interval", label: "최소", color: "#f97316", strokeDasharray: "6 4" },
+              <MetricsChart range={result.criteria} data={rawChart} title="MQTT 메시지 간격" unit="초 (s)" lines={[
+                { key: "message_interval_seconds", label: "연속 수신 간격", color: "#9333ea", dot: { r: 2 } },
               ]} />
-              <p className="traffic-trends-qualification">메시지 1건 분석 구간의 간격 5.0초는 기존 대체값 계약이며 실측 간격으로 해석하지 않습니다.</p>
+              <p className="traffic-trends-qualification">
+                크기는 저장된 payload_size의 원본 바이트 수입니다. 간격은 같은 기기의 연속 received_at 차이이며 기간 내 첫 메시지는 선행 원본을 조회하지 않아 값이 없습니다.
+                페이지가 불완전하거나 선택한 메시지 사이의 원본 연속성을 확인할 수 없으면 간격을 표시하지 않습니다. 원본 부재는 무통신이나 수집 완료의 증거가 아닙니다.
+              </p>
             </div>
           ) : (
             <div className="traffic-trends-charts">
-              <MetricsChart isPacket data={chart} title="실제 초당 패킷 수" unit="pps" lines={[{ key: "packets_per_second", label: "실제 PPS", color: "#2563eb" }]} />
-              <MetricsChart isPacket data={chart} title="실제 초당 전송량" unit="B/s" lines={[{ key: "bytes_per_second", label: "실제 B/s", color: "#16a34a" }]} />
+              <MetricsChart range={result.criteria} isPacket data={chart} title="실제 초당 패킷 수" unit="pps" lines={[{ key: "packets_per_second", label: "실제 PPS", color: "#2563eb" }]} />
+              <MetricsChart range={result.criteria} isPacket data={chart} title="실제 초당 전송량" unit="B/s" lines={[{ key: "bytes_per_second", label: "실제 B/s", color: "#16a34a" }]} />
               <p className="traffic-trends-qualification">분석 제외·FAILED·품질 미확인 분석 구간는 수치를 연결하지 않습니다. 수집 세션 변화와 10초 초과 공백도 선을 끊습니다.</p>
             </div>
           )}
