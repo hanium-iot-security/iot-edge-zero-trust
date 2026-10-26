@@ -1,3 +1,4 @@
+import * as eventScoreEffect from "../utils/eventScoreEffect.js";
 import * as uiText from "../utils/uiText.js";
 import * as runtimeStatus from "../utils/runtimeStatus.js";
 import assert from "node:assert/strict";
@@ -24,6 +25,7 @@ async function page(name, exports, states = {}, directory = "pages") {
     ...mqttTimestamp,
     ...rawMqttTraffic,
     ...uiText,
+    ...eventScoreEffect,
     ...runtimeStatus,
     featureTime,
     useSearchParams: () => [new URLSearchParams()],

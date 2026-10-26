@@ -1,3 +1,4 @@
+import { formatScoreDelta, formatActualScoreDelta, getScoreEffectDescription, getAppliedStatus, getProcessingReasonLabel } from "../utils/eventScoreEffect";
 import { uiLabel } from "../utils/uiText";
 import { observationState } from "../utils/runtimeStatus";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -198,28 +199,6 @@ function formatNumber(value, maximumFractionDigits = 0) {
     maximumFractionDigits,
 
   });
-
-}
-
-
-
-function formatScoreDelta(value) {
-
-  if (value === null || value === undefined || value === "") {
-
-    return "-";
-
-  }
-
-  const number = Number(value);
-
-  if (!Number.isFinite(number)) {
-
-    return "-";
-
-  }
-
-  return number > 0 ? `+${number}` : String(number);
 
 }
 
@@ -1863,79 +1842,37 @@ export default function Dashboard() {
     },
 
     {
-
-      key: "score_delta",
-
-      header: "정책상 점수 변화량",
-
+      key: "actual_score_delta",
+      header: "실제 점수 변화량",
       align: "right",
-
-      width: 90,
-
-      render: (value) => (
-
-        <span className={Number(value) < 0 ? "delta-negative" : ""}>
-
-          {formatScoreDelta(value)}
-
+      width: 110,
+      render: (value, event) => (
+        <span
+          className={typeof value === "number" && value < 0 ? "delta-negative" : ""}
+          title={`정책상 점수 변화량 ${formatScoreDelta(event.policy_score_delta ?? event.score_delta)} · ${getScoreEffectDescription(event)}`}
+        >
+          {formatActualScoreDelta(event)}
         </span>
-
       ),
-
     },
-
     {
-
       key: "applied_to_score",
-
       header: "신뢰점수 반영",
-
       width: 120,
-
-      render: (value, event) => {
-
-        const captureGap = event.processing_reason === "CAPTURE_GAP_UNSCORED";
-
-        return (
-
-          <StatusBadge
-
-            status={
-
-              captureGap
-
-                ? "degraded"
-
-                : normalizeBoolean(value)
-
-                  ? "scored"
-
-                  : "unscored"
-
-            }
-
-            label={
-
-              captureGap
-
-                ? "Capture Gap"
-
-                : normalizeBoolean(value)
-
-                  ? "반영"
-
-                  : "미반영"
-
-            }
-
-            size="small"
-
-          />
-
-        );
-
+      render: (_, event) => {
+        const applied = getAppliedStatus(event);
+        return <StatusBadge status={applied.status} label={applied.label} size="small" />;
       },
-
+    },
+    {
+      key: "processing_reason",
+      header: "처리 결과",
+      width: 230,
+      render: (value) => (
+        <span className={value === "CAPTURE_GAP_UNSCORED" ? "reason-warning" : ""} title={value || ""}>
+          {getProcessingReasonLabel(value)}
+        </span>
+      ),
     },
 
     {
@@ -3234,7 +3171,7 @@ export default function Dashboard() {
 
                     rowKey="id"
 
-                    minWidth={1100}
+                    minWidth={1200}
 
                     tableLabel="최근 탐지 이벤트"
 

@@ -1,3 +1,4 @@
+import * as eventScoreEffect from "../utils/eventScoreEffect.js";
 import * as uiText from "../utils/uiText.js";
 import * as runtimePresentation from "../utils/runtimeStatus.js";
 import assert from "node:assert/strict";
@@ -132,6 +133,7 @@ async function componentHarness(name, api, clock = createClock()) {
       /^(get|create|execute|recovery)/.test(importedName) ? async () => ({ items: [] }) : importedName])),
     ...mqttTimestamp,
     ...uiText,
+    ...eventScoreEffect,
     ...runtimePresentation,
     ...firewallRuleSelection,
     ...api,
