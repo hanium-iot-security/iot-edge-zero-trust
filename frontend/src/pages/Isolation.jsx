@@ -296,7 +296,19 @@ function getRecoveryResult(data) {
         .trim()
         .toUpperCase();
 }
-function getRecoveryUiStatus(device, releaseRequest, preflight) {
+function getRecoveryUiStatus(device, releaseRequest, preflight, recoveryResult = null, verification = null) {
+    if (getRecoveryResult(recoveryResult) === "SUCCESS") {
+        const confirmed = verification?.status === "checked" && device?.status === "normal" &&
+            Number(device.trust_score) === 100 && String(device.firewall_status).toUpperCase() === "REMOVED";
+        const checking = verification?.status === "checking";
+        return {
+            status: confirmed ? "normal" : checking ? "pending" : "warning",
+            label: confirmed ? "복구 완료" : checking ? "복구 후 확인 중" : "복구 후 확인 필요",
+            description: confirmed
+                ? "정상·100점과 남은 차단 규칙이 없음을 서버에서 확인했습니다."
+                : "복구 성공 응답 이후의 현재 상태를 확인하는 단계입니다. 같은 복구 요청을 다시 보내지 않습니다.",
+        };
+    }
     if (!device) {
         return {
             status: "unknown",
@@ -1158,7 +1170,7 @@ export default function Isolation() {
         setSelectedIsolatedDevice(null);
         resetRecoveryFormState();
     }
-    const verifyRecoveryTargetState = useCallback(async (deviceId, message) => {
+    const verifyRecoveryTargetState = useCallback(async (deviceId, message, expectRecovered = false) => {
         if (!deviceId) {
             return;
         }
@@ -1196,6 +1208,11 @@ export default function Isolation() {
                 : [];
             const latestRule = getCurrentFirewallRuleMap(rules).get(deviceId) ??
                 null;
+            await loadData(true);
+            if (generation !==
+                recoveryModalGenerationRef.current) {
+                return;
+            }
             if (nextDevice &&
                 String(nextDevice.device_id) === String(deviceId)) {
                 setSelectedIsolatedDevice((current) => {
@@ -1219,22 +1236,27 @@ export default function Isolation() {
                     };
                 });
             }
-            await loadData(true);
-            if (generation !==
-                recoveryModalGenerationRef.current) {
-                return;
-            }
             const anyVerified = deviceResult.status ===
                 "fulfilled" ||
                 firewallResult.status ===
                     "fulfilled";
+            const totalRules = firewallResult.value?.total;
+            const recoveredVerified = nextDevice?.device_id === deviceId &&
+                nextDevice.status === "normal" &&
+                Number(nextDevice?.trust_score) === 100 &&
+                firewallResult.status === "fulfilled" &&
+                Array.isArray(firewallResult.value?.items) &&
+                Number.isSafeInteger(totalRules) && totalRules >= 0 && totalRules === rules.length &&
+                rules.every((rule) => String(rule.status).toUpperCase() === "REMOVED");
             setOutcomeVerification({
-                status: anyVerified
-                    ? "checked"
-                    : "failed",
-                message: anyVerified
-                    ? "서버 상태를 다시 조회했습니다. 현재 신뢰점수·방화벽 상태를 확인한 뒤 창을 닫고 다시 열어 다음 작업을 진행해 주세요."
-                    : "서버 상태 재조회에도 실패했습니다. 결과를 단정하지 말고 잠시 후 다시 확인해 주세요.",
+                status: (expectRecovered ? recoveredVerified : anyVerified) ? "checked" : "failed",
+                message: expectRecovered
+                    ? recoveredVerified
+                        ? "서버에서 정상·100점과 남은 차단 규칙이 없음을 확인했습니다."
+                        : "복구 성공 응답은 받았지만 현재 정상·100점과 전체 차단 해제를 모두 확인하지 못했습니다. 복구를 다시 실행하지 말고 현재 상태를 확인해 주세요."
+                    : anyVerified
+                        ? "서버 상태를 다시 조회했습니다. 현재 신뢰점수·방화벽 상태를 확인한 뒤 창을 닫고 다시 열어 다음 작업을 진행해 주세요."
+                        : "서버 상태 재조회에도 실패했습니다. 결과를 단정하지 말고 잠시 후 다시 확인해 주세요.",
             });
         }
         catch (err) {
@@ -1297,7 +1319,7 @@ export default function Isolation() {
             setRecoveryHistory([]);
             setRecoveryHistoryError(err instanceof Error
                 ? err.message
-                : "복구 이력를 불러오지 못했습니다.");
+                : "복구 이력을 불러오지 못했습니다.");
         }
         finally {
             if (generation ===
@@ -1435,7 +1457,7 @@ export default function Isolation() {
         if (String(device.firewall_status ||
             "").toUpperCase() !==
             "REMOVED") {
-            setPreflightError("방화벽 규칙이 제거 상태로 기록된 뒤 사전 점검를 실행할 수 있습니다.");
+            setPreflightError("방화벽 규칙이 제거 상태로 기록된 뒤 사전 점검을 실행할 수 있습니다.");
             return;
         }
         const targetDeviceId = device.device_id;
@@ -1484,13 +1506,16 @@ export default function Isolation() {
        Recovery Execute
        ========================================================= */
     async function handleExecuteRecovery() {
+        if (recoveryExecuting || getRecoveryResult(recoveryResult) === "SUCCESS" || hasUncertainOutcome) {
+            return;
+        }
         const device = selectedIsolatedDevice;
         if (!device?.device_id) {
             return;
         }
         if (!preflight ||
             !getPreflightCanExecute(preflight)) {
-            setRecoveryError("먼저 복구 사전 점검를 통과해야 합니다.");
+            setRecoveryError("먼저 복구 사전 점검을 통과해야 합니다.");
             return;
         }
         const runtimeStatus = getRuntimeReleaseStatus(preflight);
@@ -1539,7 +1564,11 @@ export default function Isolation() {
             });
             setRecoveryResult(response);
             await loadRecoveryHistory(targetDeviceId, adminKey);
-            await loadData(true);
+            if (getRecoveryResult(response) === "SUCCESS") {
+                await verifyRecoveryTargetState(targetDeviceId, "복구 성공 응답을 받아 현재 기기와 남은 차단 규칙을 확인하고 있습니다.", true);
+            } else {
+                await loadData(true);
+            }
         }
         catch (err) {
             if (generation !==
@@ -1716,7 +1745,7 @@ export default function Isolation() {
     /* =========================================================
        Recovery Derived State
        ========================================================= */
-    const selectedRecoveryStatus = getRecoveryUiStatus(selectedIsolatedDevice, releaseRequest, preflight);
+    const selectedRecoveryStatus = getRecoveryUiStatus(selectedIsolatedDevice, releaseRequest, preflight, recoveryResult, outcomeVerification);
     const releaseRequestStatus = normalizeReleaseRequestStatus(releaseRequest?.status);
     const selectedRule = selectedIsolatedDevice
         ?.firewall_rule ??
@@ -1744,6 +1773,7 @@ export default function Isolation() {
         !hasUncertainOutcome;
     const runtimeReleaseStatus = getRuntimeReleaseStatus(preflight);
     const canRunRecovery = Boolean(preflight) &&
+        getRecoveryResult(recoveryResult) !== "SUCCESS" &&
         getPreflightCanExecute(preflight) &&
         runtimeReleaseStatus ===
             "VERIFIED_RELEASED" &&
@@ -2126,7 +2156,7 @@ export default function Isolation() {
 
                 <div>
                   <dt>
-                    검증 신뢰점수
+                    사전 점검 시점 점수
                   </dt>
 
                   <dd>
@@ -2236,7 +2266,6 @@ export default function Isolation() {
                 </dl>
               </section>)}
 
-            <Phase9ScopeExtension key={`${selectedIsolatedDevice.device_id}-${selectedRule?.id ?? "none"}`} rule={selectedRule} adminKey={adminKey} />
 
             {/* ===============================================
                 Step 1 - Firewall Release
@@ -2366,7 +2395,7 @@ export default function Isolation() {
                 </dl>)}
 
               {isReleasePolling && (<p className="command-note">
-                  차단 해제 요청는 서버에서 계속 처리됩니다. 이 창을 닫아도 서버 작업이 취소된 것으로 간주하지 않습니다.
+                  차단 해제 요청은 서버에서 계속 처리됩니다. 이 창을 닫아도 서버 작업이 취소된 것으로 간주하지 않습니다.
                 </p>)}
             </section>
 
@@ -2687,19 +2716,16 @@ export default function Isolation() {
                 </div>)}
             </section>
 
-            <Phase9PacketPairRecovery key={selectedIsolatedDevice.device_id} adminKey={adminKey} deviceId={selectedIsolatedDevice.device_id} />
 
             {/* ===============================================
                 Recovery History
                 =============================================== */}
 
-            <section className="detail-section">
-              <h3>
-                복구 이력
-              </h3>
+            <details key={selectedIsolatedDevice.device_id} className="detail-section recovery-history">
+              <summary>복구 이력</summary>
 
               {recoveryHistoryLoading ? (<p className="text-muted">
-                  복구 이력를 불러오는 중입니다.
+                  복구 이력을 불러오는 중입니다.
                 </p>) : recoveryHistoryError ? (<p className="inline-error" role="alert">
                   {recoveryHistoryError}
                 </p>) : recoveryHistory.length ===
@@ -2727,7 +2753,7 @@ export default function Isolation() {
                         </small>
                       </article>))}
                 </div>)}
-            </section>
+            </details>
           </div>)}
       </DetailModal>
 
@@ -2913,3 +2939,5 @@ export default function Isolation() {
       </DetailModal>
     </div>);
 }
+
+export { Phase9ScopeExtension, Phase9PacketPairRecovery };

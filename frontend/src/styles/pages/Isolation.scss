@@ -257,6 +257,19 @@
   /* =========================================================
      Recovery History
      ========================================================= */
+  .recovery-history {
+    > summary {
+      cursor: pointer;
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--color-slate-950);
+    }
+
+    &[open] > summary {
+      margin-bottom: 12px;
+    }
+  }
+
   .history-list {
     display: flex;
     flex-direction: column;

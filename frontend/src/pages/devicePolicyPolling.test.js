@@ -42,7 +42,7 @@ async function pageCode(name, folder = "pages") {
     );
     compiledPages.set(key, {
       importedNames,
-      code: result.code.replace(`export default function ${name}`, `function ${name}`) +
+      code: result.code.replace(`export default function ${name}`, `function ${name}`).replace(/\bexport\s*\{[^}]*\};?/g, "") +
         `\nglobalThis.Component = ${name};`,
     });
   }
