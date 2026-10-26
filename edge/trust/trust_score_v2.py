@@ -97,7 +97,8 @@ def resolve_ai_mode(ai_mode: str | None = None) -> str:
     mode = settings.trust_ai_mode if ai_mode is None else ai_mode
     if mode not in ("enforce", "observe"):
         raise ValueError("trust_ai_mode must be 'enforce' or 'observe'")
-    return mode
+    # A caller may opt into stricter observation, never weaken the global guard.
+    return "observe" if settings.trust_ai_mode == "observe" else mode
 
 
 def apply_trust_score_v2_until(
@@ -180,12 +181,13 @@ def apply_trust_score_v2_until(
                     )
                     if current_exclusion is not None:
                         reason = current_exclusion
-            _mark_events(
+            observed_ai_event_count += _mark_events(
                 db,
                 [event],
                 reason,
                 cutoff,
                 [],
+                ai_mode=mode,
             )
             processed_event_count += 1
             continue
@@ -195,12 +197,16 @@ def apply_trust_score_v2_until(
         processed_event_count += len(group)
         device_id = group[0]["device_id"]
         if not device_id:
-            _mark_events(db, group, PROCESSING_UNMAPPED_DEVICE, cutoff, [])
+            observed_ai_event_count += _mark_events(
+                db, group, PROCESSING_UNMAPPED_DEVICE, cutoff, [], ai_mode=mode,
+            )
             continue
 
         device = _fetch_device(db, str(device_id))
         if device is None:
-            _mark_events(db, group, PROCESSING_UNMAPPED_DEVICE, cutoff, [])
+            observed_ai_event_count += _mark_events(
+                db, group, PROCESSING_UNMAPPED_DEVICE, cutoff, [], ai_mode=mode,
+            )
             continue
         if resolver is not None:
             window_start, _ = _group_window(group)
@@ -215,39 +221,49 @@ def apply_trust_score_v2_until(
                     if registration_status == "PENDING"
                     else PROCESSING_DISABLED_AT_WINDOW
                 )
-                _mark_events(db, group, reason, cutoff, [])
+                observed_ai_event_count += _mark_events(
+                    db, group, reason, cutoff, [], ai_mode=mode,
+                )
                 continue
             if resolution.reason != POLICY_AVAILABLE:
-                _mark_events(db, group, resolution.reason, cutoff, [])
+                observed_ai_event_count += _mark_events(
+                    db, group, resolution.reason, cutoff, [], ai_mode=mode,
+                )
                 continue
             exclusion = resolver.automatic_response_exclusion(
                 str(device_id), response_time
             )
             if exclusion is not None:
-                _mark_events(db, group, exclusion, cutoff, [])
+                observed_ai_event_count += _mark_events(
+                    db, group, exclusion, cutoff, [], ai_mode=mode,
+                )
                 continue
         if device["status"] == ISOLATED_STATUS:
-            _mark_events(db, group, PROCESSING_ALREADY_ISOLATED, cutoff, [])
+            observed_ai_event_count += _mark_events(
+                db, group, PROCESSING_ALREADY_ISOLATED, cutoff, [], ai_mode=mode,
+            )
             continue
 
         invalid_type_events, invalid_family_events, valid_group = _partition_policy_events(
             group
         )
         if invalid_type_events:
-            _mark_events(
+            observed_ai_event_count += _mark_events(
                 db,
                 invalid_type_events,
                 PROCESSING_UNMAPPED_EVENT_TYPE,
                 cutoff,
                 [],
+                ai_mode=mode,
             )
         if invalid_family_events:
-            _mark_events(
+            observed_ai_event_count += _mark_events(
                 db,
                 invalid_family_events,
                 PROCESSING_INVALID_INCIDENT_FAMILY,
                 cutoff,
                 [],
+                ai_mode=mode,
             )
         if not valid_group:
             continue
@@ -264,7 +280,9 @@ def apply_trust_score_v2_until(
                 if phase9_ai_modes[int(event["id"])] == verdict
             ]
             if excluded:
-                _mark_events(db, excluded, reason, cutoff, [])
+                observed_ai_event_count += _mark_events(
+                    db, excluded, reason, cutoff, [], ai_mode=mode,
+                )
                 excluded_ids = {int(event["id"]) for event in excluded}
                 valid_group = [
                     event for event in valid_group
@@ -276,8 +294,7 @@ def apply_trust_score_v2_until(
         if mode == "observe" or "OBSERVE" in phase9_ai_modes.values():
             observed = [
                 event for event in valid_group
-                if event["detector_type"] == "AI" and event["event_type"] in AI_EVENT_TYPES
-                and (mode == "observe" or phase9_ai_modes[int(event["id"])] == "OBSERVE")
+                if _is_observe_event(event, mode)
             ]
             for event in observed:
                 _record_ai_observation(db, event, cutoff)
@@ -289,7 +306,9 @@ def apply_trust_score_v2_until(
 
         selected = _select_representative_events(valid_group)
         if not selected:
-            _mark_events(db, valid_group, PROCESSING_NO_SCORE_EVENT, cutoff, [])
+            observed_ai_event_count += _mark_events(
+                db, valid_group, PROCESSING_NO_SCORE_EVENT, cutoff, [], ai_mode=mode,
+            )
             continue
 
         previous_score = int(device["trust_score"])
@@ -329,7 +348,9 @@ def apply_trust_score_v2_until(
             representative_event_ids=representative_ids,
         )
         created_history_count += 1
-        _mark_events(db, valid_group, PROCESSING_APPLIED, cutoff, representative_ids)
+        observed_ai_event_count += _mark_events(
+            db, valid_group, PROCESSING_APPLIED, cutoff, representative_ids, ai_mode=mode,
+        )
 
         isolation_history_id: int | None = None
         firewall_rule_id: int | None = None
@@ -396,9 +417,18 @@ def apply_trust_score_v2_until(
     )
 
 
+def _is_ai_event(event: dict[str, Any]) -> bool:
+    # A mislabeled AI event must not become a Rule penalty in observation mode.
+    return event["detector_type"] == "AI" or event["event_type"] in AI_EVENT_TYPES
+
+
+def _is_observe_event(event: dict[str, Any], mode: str) -> bool:
+    return _is_ai_event(event) and (mode == "observe" or _phase9_ai_mode(event) == "OBSERVE")
+
+
 def _phase9_ai_mode(event: dict[str, Any]) -> str | None:
     """Validate MQTT/Packet AI evidence; absent or complete NULL pairs are legacy."""
-    if event["detector_type"] != "AI" or event["event_type"] not in AI_EVENT_TYPES:
+    if not _is_ai_event(event):
         return None
     try:
         evidence = json.loads(event.get("evidence_json") or "{}")
@@ -431,12 +461,15 @@ def _phase9_ai_mode(event: dict[str, Any]) -> str | None:
     return selected[1] if selected is not None else None
 
 
-def _record_ai_observation(db: Session, event: dict[str, Any], cutoff: datetime) -> None:
+def _record_ai_observation(
+    db: Session, event: dict[str, Any], cutoff: datetime,
+    *, reason: str = PROCESSING_AI_OBSERVATION,
+) -> None:
     """Complete an AI event without creating score/isolating side effects.
 
-    Keep detector/model evidence and the original candidate penalty. The event's
-    displayed delta is zero so existing consumers do not present a -15 penalty
-    for an observation. Scoring policies and detector dedupe keys stay unchanged.
+    Keep detector/model evidence and the raw candidate penalty intact. Actual
+    impact belongs to the completed decision, not the detector's score_delta.
+    Early exclusions retain their reason while recording the same observe policy.
     """
     raw_evidence = event.get("evidence_json")
     try:
@@ -446,7 +479,10 @@ def _record_ai_observation(db: Session, event: dict[str, Any], cutoff: datetime)
     if not isinstance(evidence, dict):
         evidence = {"original_evidence": raw_evidence}
     if "trust_decision" in evidence:
-        evidence["original_trust_decision"] = evidence["trust_decision"]
+        backup_key = "original_trust_decision"
+        while backup_key in evidence:
+            backup_key = "_" + backup_key
+        evidence[backup_key] = evidence["trust_decision"]
     evidence["trust_decision"] = {
         "ai_mode": "observe",
         "policy_version": AI_OBSERVATION_POLICY_VERSION,
@@ -462,7 +498,6 @@ def _record_ai_observation(db: Session, event: dict[str, Any], cutoff: datetime)
             SET processed_at = :processed_at,
                 processing_reason = :reason,
                 applied_to_score = 0,
-                score_delta = 0,
                 evidence_json = :evidence_json,
                 evidence_schema_version = COALESCE(evidence_schema_version, 1)
             WHERE id = :id AND processed_at IS NULL
@@ -471,7 +506,7 @@ def _record_ai_observation(db: Session, event: dict[str, Any], cutoff: datetime)
         {
             "id": event["id"],
             "processed_at": format_db_utc(cutoff),
-            "reason": PROCESSING_AI_OBSERVATION,
+            "reason": reason,
             "evidence_json": json.dumps(evidence, ensure_ascii=False, sort_keys=True),
         },
     )
@@ -763,7 +798,9 @@ def _mark_events(
     reason: str,
     processed_at: datetime,
     representative_event_ids: list[int],
-) -> None:
+    *, ai_mode: str,
+) -> int:
+    observed_count = 0
     representative_set = set(representative_event_ids)
     for event in group:
         is_representative = int(event["id"]) in representative_set
@@ -772,6 +809,10 @@ def _mark_events(
             if reason == PROCESSING_APPLIED
             else reason
         )
+        if not is_representative and _is_observe_event(event, ai_mode):
+            _record_ai_observation(db, event, processed_at, reason=event_reason)
+            observed_count += 1
+            continue
         db.execute(
             text(
                 """
@@ -789,6 +830,8 @@ def _mark_events(
                 "applied_to_score": 1 if is_representative and reason == PROCESSING_APPLIED else 0,
             },
         )
+
+    return observed_count
 
 
 def _max_optional_id(current: int | None, candidate: int) -> int:

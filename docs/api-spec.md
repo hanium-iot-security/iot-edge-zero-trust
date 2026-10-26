@@ -587,10 +587,22 @@ MVP에서는 중복 endpoint를 줄이기 위해 기기별 feature/event 조회�
 
 예: `/api/mqtt-logs?device_id=esp32_01&limit=100`
 
-`GET /api/mqtt-logs`는 `id DESC`인 DB 수신·적재 순서로 반환합니다. 기존 Subscriber의
+### GET /api/mqtt-logs 원본 기간 조회
+
+기간을 생략한 `GET /api/mqtt-logs`는 기존 `id DESC`인 DB 수신·적재 순서로 반환합니다. 기존 Subscriber의
 KST Local Naive 공백값과 SQLite `CURRENT_TIMESTAMP`의 UTC 공백값은 문자열만으로 구분할 수
 없으므로 이 순서를 실제 Timestamp 순서라고 표현하지 않습니다. 응답의 `received_at` 원문은
 변환하지 않습니다.
+
+- `from`·`to`: timezone이 있는 ISO 8601. 시작 포함·종료 제외 `[from,to)`를 UTC 마이크로초로 비교합니다. 한쪽만 지정할 수 있고 역순·timezone 누락은 422입니다.
+- `limit`: 기본100, 1~500. `offset`: 0~100000. `snapshot_max_id`: 첫 페이지의 전역 원본 최대 ID를 다음 페이지에도 전달합니다.
+- 기간 조회 정렬은 실제 시각 내림차순, 동률이면 ID 내림차순입니다. timezone 없는 과거 원본은 기간에 추정 배치하지 않습니다.
+- 기존 `items,total`에 `snapshot_max_id,offset,limit,has_more`를 추가합니다. `total`에도 동일한 기간·기기·유효성·최대 ID 필터를 적용합니다.
+- `timestamp_unavailable_count`는 첫 페이지에서 요청 기기 스냅샷의 시각 불명 행 수를 반환합니다. 뒤 페이지에서는 null이며 `timestamp_unavailable_count_scope=device_snapshot_first_page`입니다. 이 수는 해당 기간에 누락됐다는 판정이 아닙니다.
+- `source_span_count`는 첫 페이지에서 전체 기간 일치 집합의 최소~최대 ID 사이에 저장된 같은 기기 원본 수를 셉니다. 시각·JSON·Topic 유효 여부로 중간 원본을 빼지 않습니다. 빈 집합은0, 뒤 페이지는 null이며 `source_span_count_scope=selected_source_ids_first_page`입니다.
+- 기간 없는 조회는 위 두 감사 수가 null이고 scope는 `not_evaluated`입니다. `interval_predecessor_policy=within_range_only`이며 기간 밖 선행 메시지는 가져오지 않습니다.
+
+화면은 크기에 원래 `payload_size` 바이트를 사용합니다. 간격은 전체 페이지를 받아 `rows.length=total=source_span_count`이고 시간순 ID가 증가할 때만 같은 기기의 연속 시각 차이를 표시합니다. 첫 메시지·누락·순서 역전은 값 없음이며 임의5초를 넣지 않습니다. 5000건 화면 한도·잘린 페이지·스냅샷 불일치는 불완전으로 표시하고 간격을 숨깁니다. 과거 시각 불명 행은 그대로 보존합니다. ID watermark는 새 삽입을 차단하지만 페이지 사이의 기존 행 수정·삭제를 동결하는 장기 스냅샷은 아닙니다.
 
 ## Health 응답
 
@@ -649,15 +661,21 @@ evidence_json -> evidence object
 
 Input validation errors return `422`. Stored JSON or timestamp conversion errors return `500`; malformed stored rows are server data errors, not user request errors.
 
-AI 관찰 완료 이벤트는 기존 응답 형식으로 `processing_reason=AI_OBSERVATION_ONLY`,
-`processed_at`, `applied_to_score=0`, `score_delta=0`을 반환합니다. 처리 사유는 자유 문자열이며
-같은 값으로 필터링할 수 있습니다. `evidence.trust_decision`에는 `ai_mode=observe`,
-`policy_version=trust-ai-observation-v1`, 원래 저장값 `original_score_delta`, 공통 정책의
-`policy_score_delta`, `actual_delta=0`, 처리 cutoff인 `processed_at`을 보존합니다.
-Event 최상위 `policy_version`은 탐지 정책 버전으로 유지합니다. 이미 관찰 완료한 이벤트는
-모드 전환 후에도 재감점하지 않습니다. `applied_to_score=0`은 처리 완료된 관찰·제외도
-포함하므로 미처리 건수로 해석하지 않습니다. 자세한 적용 절차는
-[AI 관찰 모드 운영 가이드](ai-observation-mode-runbook.md)를 참고합니다.
+AI OBSERVE 처리는 전역 `TRUST_AI_MODE=observe`가 명시적인 enforce 요청보다 우선합니다. 이미 격리됨·늦은 이벤트·등록 제외 등 처리 경로에도 같은 관찰 정책을 기록합니다. Rule의 기존 감점·격리 판단은 유지합니다.
+
+`score_delta`는 원본 저장값이며 새 관찰 처리에서0으로 덮어쓰지 않습니다. 과거 이미0으로 저장된 행도 재작성하지 않습니다. `evidence.trust_decision`에 observe 정책·원래 값·정책 감점·실제0·처리 시각을 기록하며 기존 탐지 근거와 기존 감사 결정도 보존합니다. 최상위 `policy_version`은 탐지 정책 버전입니다.
+
+추가 응답 필드는 다음과 같습니다.
+
+| 필드 | 의미 |
+| --- | --- |
+| `policy_score_delta` | 규칙/AI 정책상의 감점 값. 실제 적용과 구분 |
+| `actual_score_delta` | 관찰·이미 격리·처리 제외는0. 검증된 단일 대표 이력은 실제 점수 차이. 미처리·감사 근거 불명은 null |
+| `score_effect_reason` | 실제 적용·관찰·처리 제외·근거 불명 사유 |
+| `trust_score_history_id` | 연결이 검증된 신뢰점수 이력 ID 또는 null |
+| `window_actual_delta` | 연결 이력의 해당 구간 실제 총변화. 여러 이벤트의 개별 감점으로 분배하지 않음 |
+
+목록은 실제 변화와 미반영 사유를 표시하고 원본·정책 감점은 별도로 보존합니다. 여러 이벤트가 묶인 구간의 총변화를 각 이벤트의 실제 감점으로 주장하지 않습니다. `applied_to_score=0`에는 처리 완료된 관찰·제외도 포함하므로 미처리 건수로 해석하지 않습니다. 과거 조회는 원본 이벤트와 감사 이력을 변경하지 않습니다. 자세한 운영 절차는 [AI 관찰 모드 운영 가이드](ai-observation-mode-runbook.md)를 참고합니다.
 
 ## Trust Score History
 

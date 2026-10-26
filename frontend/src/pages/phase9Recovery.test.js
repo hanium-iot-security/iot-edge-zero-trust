@@ -44,7 +44,7 @@ function recoveryHarness(component, respond = async () => ({ status: 200, data: 
     useRef(initial) { const index = cursor++; return slots[index] ??= { current: initial }; },
     jsx: (type, props, ...children) => ({ type, props: props || {}, children }),
   });
-  runInNewContext(page.code.replace("export default function Isolation", "function Isolation") +
+  runInNewContext(page.code.replace("export default function Isolation", "function Isolation").replace(/\bexport\s*\{[^}]*\};?/g, "") +
     `\nglobalThis.Component = ${component};`, scope);
   const render = () => { cursor = 0; dirty = false; tree = scope.Component({ rule: { id: 12 }, adminKey: "test-admin", deviceId: "sensor_01" }); };
   const walk = (node) => Array.isArray(node) ? node.flatMap(walk)

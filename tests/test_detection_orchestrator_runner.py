@@ -2148,7 +2148,7 @@ def test_packet_rule_and_if_share_ready_session_and_reach_trust_once(
             text(
                 """
                 SELECT dedupe_key, event_type, packet_feature_log_id,
-                       applied_to_score, processing_reason, score_delta, processed_at
+                       applied_to_score, processing_reason, score_delta, processed_at, evidence_json
                 FROM detection_events
                 WHERE dedupe_key LIKE 'packet_rule:%'
                    OR dedupe_key LIKE 'packet_if:%'
@@ -2168,7 +2168,8 @@ def test_packet_rule_and_if_share_ready_session_and_reach_trust_once(
         if ai_mode == "observe":
             assert packet_if_event["processing_reason"] == "AI_OBSERVATION_ONLY"
             assert packet_if_event["applied_to_score"] == 0
-            assert packet_if_event["score_delta"] == 0
+            assert packet_if_event["score_delta"] == -15
+            assert json.loads(packet_if_event["evidence_json"])["trust_decision"]["actual_delta"] == 0
         if packet_count == 980:
             packet_rule_event = events[1]
             assert packet_rule_event["dedupe_key"].startswith(

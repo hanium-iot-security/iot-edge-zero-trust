@@ -1,3 +1,4 @@
+import { formatScoreDelta, formatActualScoreDelta, getScoreEffectDescription, isAppliedToScore, getAppliedStatus, getProcessingReasonLabel } from "../utils/eventScoreEffect";
 import { uiLabel } from "../utils/uiText";
 import {
 
@@ -140,148 +141,6 @@ function normalizeSearchValue(value) {
     .trim()
 
     .toLowerCase();
-
-}
-
-function formatScoreDelta(value) {
-
-  if (
-
-    value === null ||
-
-    value === undefined ||
-
-    value === ""
-
-  ) {
-
-    return "-";
-
-  }
-
-  const number = Number(value);
-
-  if (!Number.isFinite(number)) {
-
-    return "-";
-
-  }
-
-  if (number > 0) {
-
-    return `+${number}`;
-
-  }
-
-  return String(number);
-
-}
-
-function isAppliedToScore(value) {
-
-  return (
-
-    value === true ||
-
-    value === 1 ||
-
-    value === "1" ||
-
-    value === "true"
-
-  );
-
-}
-
-function getAppliedStatus(event) {
-
-  if (
-
-    event.processing_reason ===
-
-    "CAPTURE_GAP_UNSCORED"
-
-  ) {
-
-    return {
-
-      status: "degraded",
-
-      label: "수집 공백 미반영",
-
-    };
-
-  }
-
-  if (isAppliedToScore(
-
-    event.applied_to_score
-
-  )) {
-
-    return {
-
-      status: "scored",
-
-      label: "점수 반영",
-
-    };
-
-  }
-
-  return {
-
-    status: "unscored",
-
-    label: "미반영",
-
-  };
-
-}
-
-function getProcessingReasonLabel(reason) {
-
-  const labels = {
-
-    REPRESENTATIVE_RULE_EVENT:
-
-      "대표 규칙 이벤트",
-
-    AI_SUPPORTING_EVIDENCE:
-
-      "AI 보조 증거",
-
-    CAPTURE_GAP_UNSCORED:
-
-      "수집 공백으로 미반영",
-
-    UNMAPPED_SUBJECT_IP:
-
-      "기기 매핑 없음",
-
-    DUPLICATE_EVENT:
-
-      "중복 이벤트",
-
-    WINDOW_ALREADY_PROCESSED:
-
-      "이미 처리된 분석 구간",
-
-    SCORE_CAP_APPLIED:
-
-      "분석 구간 감점 상한 적용",
-
-  };
-
-  return (
-
-    labels[reason] ||
-
-    reason ||
-
-    "-"
-
-  );
 
 }
 
@@ -1148,15 +1007,15 @@ export default function Events() {
 
     {
 
-      key: "score_delta",
+      key: "actual_score_delta",
 
-      header: "정책상 점수 변화량",
+      header: "실제 점수 변화량",
 
       align: "right",
 
       width: 110,
 
-      render: (value) => (
+      render: (value, event) => (
 
         <span
 
@@ -1172,7 +1031,7 @@ export default function Events() {
 
         >
 
-          {formatScoreDelta(value)}
+          {formatActualScoreDelta(event)}
 
         </span>
 
@@ -2122,6 +1981,22 @@ export default function Events() {
           <div className="detail">
 
             <section className="detail-grid">
+              <div className="detail-item">
+                <span>실제 점수 변화량</span>
+                <strong>{formatActualScoreDelta(selectedEvent)}</strong>
+              </div>
+              {selectedEvent.window_actual_delta !== null && selectedEvent.window_actual_delta !== undefined && (
+                <div className="detail-item">
+                  <span>분석 구간 전체 변화량</span>
+                  <strong>{formatScoreDelta(selectedEvent.window_actual_delta)}</strong>
+                </div>
+              )}
+              {selectedEvent.trust_score_history_id && (
+                <div className="detail-item">
+                  <span>신뢰점수 이력 ID</span>
+                  <strong>#{selectedEvent.trust_score_history_id}</strong>
+                </div>
+              )}
 
               <div className="detail-item">
 
@@ -2135,7 +2010,7 @@ export default function Events() {
 
                   {formatScoreDelta(
 
-                    selectedEvent.score_delta
+                    selectedEvent.policy_score_delta ?? selectedEvent.score_delta
 
                   )}
 
@@ -2260,6 +2135,8 @@ export default function Events() {
             <section className="detail-section">
 
               <h3>처리 정보</h3>
+              <p>{getScoreEffectDescription(selectedEvent)}</p>
+              <p className="text-muted">정책상 점수 변화량은 감점 후보값입니다. 실제 반영량은 처리 기록과 신뢰점수 이력으로 확인합니다.</p>
 
               <dl className="detail-list">
 

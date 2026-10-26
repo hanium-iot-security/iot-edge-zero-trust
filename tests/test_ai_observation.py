@@ -39,7 +39,7 @@ def database(tmp_path, monkeypatch):
         engine.dispose()
 
 
-def _device(db, score=100, status="normal"):
+def _device(db, score=100, status="normal", registration="ACTIVE"):
     registered_at = _utc(START - timedelta(seconds=10))
     db.execute(
         text("INSERT INTO devices (device_id, ip_address, trust_score, status, "
@@ -52,9 +52,9 @@ def _device(db, score=100, status="normal"):
         expected_publish_interval_seconds, publish_count_max,
         payload_size_max_bytes, packet_rate_max_pps,
         byte_rate_max_bytes_per_second, created_at, created_by, reason
-    ) VALUES ('esp32_01', 1, :registered_at, 'ACTIVE', 'periodic-sensor-v1',
+    ) VALUES ('esp32_01', 1, :registered_at, :registration, 'periodic-sensor-v1',
               5, 15, 5120, 10, 2500, :registered_at, 'test', 'AI fixture')"""),
-        {"registered_at": registered_at})
+        {"registered_at": registered_at, "registration": registration})
 
 
 def _event(db, event_type="AI_ANOMALY", *, detector_type="AI", family="AI_ONLY",
@@ -113,7 +113,7 @@ def test_observation_processes_ai_without_score_or_isolation_side_effects(databa
         event_id = _event(db, event_type, family=family, score_delta=-7, evidence=json.dumps(original))
         result = _run(db, ai_mode="observe")
         row = _event_row(db, event_id)
-        assert (row["score_delta"], row["applied_to_score"], row["processing_reason"]) == (0, 0, OBSERVED)
+        assert (row["score_delta"], row["applied_to_score"], row["processing_reason"]) == (-7, 0, OBSERVED)
         assert row["processed_at"] == _utc(START + timedelta(seconds=10))
         evidence = json.loads(row["evidence_json"])
         assert {key: evidence[key] for key in original} == original
@@ -204,18 +204,18 @@ def test_observation_is_not_replayed_when_rerun_or_switched_to_enforcement(datab
         assert _event_row(db, new_id)["processing_reason"] == "APPLIED_TO_TRUST"
         for event_id in previous_ids:
             assert _event_row(db, event_id)["processing_reason"] == OBSERVED
-            assert _event_row(db, event_id)["score_delta"] == 0
+            assert _event_row(db, event_id)["score_delta"] == -15
         assert db.execute(text("SELECT COUNT(*) FROM trust_score_history")).scalar_one() == 1
 
 
-def test_observation_requires_ai_detector_type(database):
+def test_observation_also_guards_mislabeled_ai_event_type(database):
     _, factory = database
     with factory.begin() as db:
         _device(db)
         event_id = _event(db, detector_type="RULE")
         result = _run(db, ai_mode="observe")
-        assert result.changes[0].new_score == 85
-        assert _event_row(db, event_id)["processing_reason"] == "APPLIED_TO_TRUST"
+        assert result.changes == []
+        assert _event_row(db, event_id)["processing_reason"] == OBSERVED
 
 
 @pytest.mark.parametrize("event_type,evidence", [
@@ -235,7 +235,7 @@ def test_phase9_observe_evidence_cannot_be_enforced_by_global_mode(
         row = _event_row(db, event_id)
         assert result.observed_ai_event_count == 1
         assert (row["score_delta"], row["applied_to_score"],
-                row["processing_reason"]) == (0, 0, OBSERVED)
+                row["processing_reason"]) == (-15, 0, OBSERVED)
         assert row["processed_at"] is not None
         _assert_no_enforcement(db, 35, "danger")
 
@@ -311,7 +311,7 @@ def test_observations_remain_queryable_through_existing_api_response_contract(da
         assert {row["id"] for row in response["items"]} == ai_ids
         assert {row["event_type"] for row in response["items"]} == set(AI_TYPES)
         for row in response["items"]:
-            assert (row["score_delta"], row["applied_to_score"], row["processing_reason"]) == (0, 0, OBSERVED)
+            assert (row["score_delta"], row["applied_to_score"], row["processing_reason"]) == (-15, 0, OBSERVED)
             assert row["processed_at"] == _utc(START + timedelta(seconds=10))
             assert row["evidence"]["model_version"] == "fixture-v1"
             assert row["evidence"]["trust_decision"]["ai_mode"] == "observe"
@@ -338,16 +338,19 @@ def test_existing_rejection_reasons_take_priority_over_observation(database, opt
         assert row["processing_reason"] == expected_reason
         assert row["applied_to_score"] == 0
         assert row["score_delta"] == -15
-        assert row["evidence_json"] == original_evidence
+        evidence = json.loads(row["evidence_json"])
+        assert evidence["model_version"] == "unchanged"
+        assert evidence["trust_decision"]["actual_delta"] == 0
+        assert evidence["trust_decision"]["ai_mode"] == "observe"
         assert row["processed_at"] == _utc(START + timedelta(seconds=10))
         _assert_no_enforcement(db, score, status)
 
 
 @pytest.mark.parametrize("configured_mode, explicit_mode, delta", [
     ("enforce", None, -15), ("observe", None, 0),
-    ("observe", "enforce", -15), ("enforce", "observe", 0),
+    ("observe", "enforce", 0), ("enforce", "observe", 0),
 ])
-def test_settings_mode_is_used_unless_explicitly_overridden(database, monkeypatch, configured_mode, explicit_mode, delta):
+def test_global_observe_cannot_be_overridden_by_service_caller(database, monkeypatch, configured_mode, explicit_mode, delta):
     _, factory = database
     monkeypatch.setattr(settings, "trust_ai_mode", configured_mode)
     with factory.begin() as db:
@@ -491,3 +494,55 @@ def test_mixed_mqtt_and_packet_ai_evidence_cannot_hide_partial_or_conflicting_po
         _run(db, ai_mode="enforce")
         _assert_no_enforcement(db, 35, "danger")
         assert _event_row(db, event_id)["processing_reason"] == reason
+
+
+@pytest.mark.parametrize("registration,reason", [("PENDING", "PENDING_AT_WINDOW"),
+                                               ("DISABLED", "DISABLED_AT_WINDOW")])
+@pytest.mark.parametrize("late", [False, True])
+def test_registration_exclusions_also_record_observation_without_rewriting_raw(database, registration, reason, late):
+    _, factory = database
+    with factory.begin() as db:
+        _device(db, registration=registration)
+        original = {"anomaly_score": -0.72, "threshold": -0.51}
+        event_id = _event(db, start=START - timedelta(seconds=10) if late else START,
+                          evidence=json.dumps(original))
+        result = _run(db, ai_mode="observe")
+        row = _event_row(db, event_id)
+        assert row["processing_reason"] == reason
+        assert row["score_delta"] == -15 and row["applied_to_score"] == 0
+        evidence = json.loads(row["evidence_json"])
+        assert all(evidence[key] == value for key, value in original.items())
+        assert evidence["trust_decision"]["actual_delta"] == 0
+        assert result.observed_ai_event_count == 1
+        _assert_no_enforcement(db, 100, "normal")
+
+
+def test_same_window_ai_duplicates_are_each_observed_and_never_replayed(database):
+    _, factory = database
+    with factory.begin() as db:
+        _device(db)
+        ids = [_event(db) for _ in range(3)]
+        result = _run(db, ai_mode="observe")
+        assert result.observed_ai_event_count == 3
+        for event_id in ids:
+            row = _event_row(db, event_id)
+            assert row["score_delta"] == -15
+            assert row["processing_reason"] == OBSERVED
+        before = _snapshot(db)
+        assert _run(db, ai_mode="enforce").processed_event_count == 0
+        assert _snapshot(db) == before
+        _assert_no_enforcement(db, 100, "normal")
+
+
+
+def test_observation_preserves_existing_decision_backup_without_key_collision(database):
+    _, factory = database
+    with factory.begin() as db:
+        _device(db)
+        original = {"trust_decision": {"older": 1}, "original_trust_decision": {"oldest": 2}}
+        event_id = _event(db, evidence=json.dumps(original))
+        _run(db, ai_mode="observe")
+        evidence = json.loads(_event_row(db, event_id)["evidence_json"])
+        assert evidence["original_trust_decision"] == {"oldest": 2}
+        assert {"older": 1} in evidence.values()
+        assert evidence["trust_decision"]["actual_delta"] == 0

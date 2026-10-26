@@ -1,3 +1,4 @@
+import * as eventScoreEffect from "../utils/eventScoreEffect.js";
 import * as uiText from "../utils/uiText.js";
 import * as runtimePresentation from "../utils/runtimeStatus.js";
 import assert from "node:assert/strict";
@@ -42,7 +43,7 @@ async function pageCode(name, folder = "pages") {
     );
     compiledPages.set(key, {
       importedNames,
-      code: result.code.replace(`export default function ${name}`, `function ${name}`) +
+      code: result.code.replace(`export default function ${name}`, `function ${name}`).replace(/\bexport\s*\{[^}]*\};?/g, "") +
         `\nglobalThis.Component = ${name};`,
     });
   }
@@ -132,6 +133,7 @@ async function componentHarness(name, api, clock = createClock()) {
       /^(get|create|execute|recovery)/.test(importedName) ? async () => ({ items: [] }) : importedName])),
     ...mqttTimestamp,
     ...uiText,
+    ...eventScoreEffect,
     ...runtimePresentation,
     ...firewallRuleSelection,
     ...api,
