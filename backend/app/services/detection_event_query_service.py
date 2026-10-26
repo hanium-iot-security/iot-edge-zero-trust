@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import json
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 from edge.packet.pcap_naming import format_utc_iso
@@ -117,7 +117,9 @@ def list_detection_events(
         params,
     ).mappings().all()
 
-    return {"items": _rows_to_items(rows), "total": int(total)}
+    items = _rows_to_items(rows)
+    _add_score_effects(db, items)
+    return {"items": items, "total": int(total)}
 
 
 def _event_item(row: dict[str, Any]) -> dict[str, Any]:
@@ -150,6 +152,101 @@ def _event_item(row: dict[str, Any]) -> dict[str, Any]:
         "processed_at": _format_optional_timestamp(row["processed_at"], "processed_at"),
         "policy_version": row["policy_version"],
     }
+
+
+# Only completed, known non-application decisions prove a zero effect. In
+# particular, legacy migration markers and an unapplied flag alone do not.
+NON_APPLIED_REASONS = frozenset({
+    "NOT_REPRESENTATIVE", "ALREADY_ISOLATED", "UNMAPPED_DEVICE",
+    "UNMAPPED_EVENT_TYPE", "LATE_EVENT", "INVALID_INCIDENT_FAMILY",
+    "NO_SCORE_EVENT", "AI_OBSERVATION_ONLY", "AI_OFF_AT_WINDOW",
+    "INVALID_AI_POLICY_EVIDENCE", "PENDING_AT_WINDOW", "DISABLED_AT_WINDOW",
+    "DISABLE_REQUESTED_OR_DISABLED", "UNREGISTERED_AT_WINDOW",
+    "POLICY_UNAVAILABLE", "INVALID_POLICY_REVISION", "INVALID_REGISTRATION_REVISION",
+})
+
+
+def _add_score_effects(db: Session, items: list[dict[str, Any]]) -> None:
+    histories = _linked_histories(db, [item["id"] for item in items])
+    for item in items:
+        item.update(policy_score_delta=item["score_delta"], actual_score_delta=None,
+                    score_effect_reason="UNKNOWN", trust_score_history_id=None,
+                    window_actual_delta=None)
+        evidence = item.get("evidence")
+        decision = evidence.get("trust_decision") if isinstance(evidence, dict) else None
+        if (isinstance(decision, dict) and decision.get("ai_mode") == "observe"
+                and decision.get("policy_version") == "trust-ai-observation-v1"
+                and type(decision.get("policy_score_delta")) is int):
+            # Older observe writers zeroed the raw field but retained this fact.
+            item["policy_score_delta"] = decision["policy_score_delta"]
+        linked = histories.get(item["id"], [])
+        if not item["processed_at"]:
+            item["score_effect_reason"] = "PENDING" if not item["applied_to_score"] else "UNKNOWN"
+        elif (not linked and item["applied_to_score"] == 0
+              and item["processing_reason"] in NON_APPLIED_REASONS):
+            item.update(actual_score_delta=0, score_effect_reason="NOT_APPLIED")
+        elif (len(linked) == 1 and item["applied_to_score"] == 1
+              and item["processing_reason"] == "APPLIED_TO_TRUST"):
+            history = linked[0]
+            if not _history_matches_event(history, item):
+                continue
+            members = json.loads(history["representative_event_ids_json"])
+            item.update(trust_score_history_id=history["id"],
+                        window_actual_delta=history["actual_delta"])
+            if len(members) == 1:
+                item.update(actual_score_delta=history["actual_delta"], score_effect_reason="EVENT_HISTORY")
+            else:
+                # The window cap / floor has no recorded allocation among events.
+                item["score_effect_reason"] = "GROUP_HISTORY"
+
+
+def _linked_histories(db: Session, event_ids: list[int]) -> dict[int, list[dict[str, Any]]]:
+    required = {"id", "device_id", "analysis_window_start", "analysis_window_end",
+                "previous_score", "new_score", "actual_delta", "representative_event_ids_json"}
+    if not event_ids or not required.issubset(_column_names(db, "trust_score_history")):
+        return {}
+    # Read only audit rows referencing this page, with malformed JSON kept out
+    # of json_each. Exact device/window and arithmetic checks follow below.
+    rows = db.execute(text("""
+        SELECT DISTINCT history.* FROM trust_score_history AS history
+        JOIN json_each(CASE WHEN json_valid(history.representative_event_ids_json)
+            THEN history.representative_event_ids_json ELSE '[]' END) AS member
+        WHERE member.type = 'integer' AND member.value IN :event_ids
+    """).bindparams(bindparam("event_ids", expanding=True)), {"event_ids": event_ids}).mappings()
+    result: dict[int, list[dict[str, Any]]] = {}
+    requested = set(event_ids)
+    for row in rows:
+        history = dict(row)
+        members = json.loads(history["representative_event_ids_json"])
+        # Invalid arrays are still linked, so they cannot prove a zero effect.
+        if isinstance(members, dict):
+            ids = list(members.values())
+        elif isinstance(members, list):
+            ids = members
+        else:
+            ids = [members]
+        for member in {value for value in ids if type(value) is int} & requested:
+            result.setdefault(member, []).append(history)
+    return result
+
+
+def _history_matches_event(history: dict[str, Any], item: dict[str, Any]) -> bool:
+    members = json.loads(history["representative_event_ids_json"])
+    if (not isinstance(members, list) or not members
+            or any(type(value) is not int or value < 1 for value in members)
+            or len(set(members)) != len(members) or item["id"] not in members
+            or history["device_id"] != item["device_id"]):
+        return False
+    if (any(type(history[key]) is not int for key in ("previous_score", "new_score", "actual_delta"))
+            or not 0 <= history["previous_score"] <= 100 or not 0 <= history["new_score"] <= 100
+            or history["new_score"] - history["previous_score"] != history["actual_delta"]):
+        return False
+    try:
+        return all(item[key] is not None and
+                   _format_optional_timestamp(history[key], key) == item[key]
+                   for key in ("analysis_window_start", "analysis_window_end"))
+    except DetectionEventDataError:
+        return False
 
 
 def _normalize_optional_utc(value: datetime | None, field_name: str) -> datetime | None:

@@ -11,7 +11,7 @@ Rule 탐지·감점, 같은 계열의 대표 감점, Window 최대 −30, 격리
 | `enforce` | 기본값. 기존 Rule 우선·AI 단독 대표 최대 −15 정책 유지 |
 | `observe` | 유효한 `AI_ANOMALY`·`AI_PACKET_ANOMALY`를 관찰 완료로 기록하고 감점·격리에서 제외 |
 
-설정은 프로세스가 시작할 때 읽는다. 운영 관찰에는 `TRUST_AI_MODE=observe`를 명시한다.
+설정은 프로세스가 시작할 때 읽는다. 운영 관찰에는 `TRUST_AI_MODE=observe`를 명시한다. 전역 observe는 호출자가 명시한 enforce보다 우선한다. detector_type=AI 또는 알려진 AI event_type은 관찰 대상으로 판단한다.
 현재 운영 중인 IF Stage를 `ORCHESTRATOR_ENABLED_STAGES`와
 `ORCHESTRATOR_REQUIRED_STAGES`에서 제거하지 않는다. 미배포·비활성 모델을 이 설정만으로
 새로 활성화하지도 않는다. Required Stage의 실패·Capture Gap을 통과시키는 옵션이 아니다.
@@ -19,7 +19,7 @@ Rule 탐지·감점, 같은 계열의 대표 감점, Window 최대 −30, 격리
 모드는 **미처리 이벤트를 Trust가 처리할 때** 적용된다. 이벤트가 생성될 때 enforce였어도
 observe에서 처음 처리되면 관찰 대상이다. 이미 처리한 관찰 이벤트는 enforce로 돌아가도
 다시 감점하지 않는다. 지연·미등록·기존 격리·잘못된 정책 등 선행 제외 조건은 기존 사유를
-유지하므로 모든 AI 행이 `AI_OBSERVATION_ONLY`가 되는 것은 아니다.
+유지하므로 모든 AI 행이 `AI_OBSERVATION_ONLY`가 되는 것은 아니다. 이 경로도 observe 실제0의 Trust 근거를 남긴다. 기존 trust_decision이 있으면 별도 원본 키에 보존한다.
 
 ## 2. 저장·조회 계약
 
@@ -27,7 +27,10 @@ observe에서 처음 처리되면 관찰 대상이다. 이미 처리한 관찰 �
 
 ```json
 {
-  "score_delta": 0,
+  "score_delta": -15,
+  "policy_score_delta": -15,
+  "actual_score_delta": 0,
+  "score_effect_reason": "NOT_APPLIED",
   "applied_to_score": 0,
   "processing_reason": "AI_OBSERVATION_ONLY",
   "processed_at": "2026-10-02T00:00:10Z",
@@ -44,16 +47,14 @@ observe에서 처음 처리되면 관찰 대상이다. 이미 처리한 관찰 �
 }
 ```
 
-- `score_delta=0`은 관찰 완료 후의 표시값이다. 원래 저장값은 `original_score_delta`,
-  공통 감점표의 후보값은 `policy_score_delta`에 보존한다. 둘을 같다고 추정하지 않는다.
+- 새 처리에서는 `score_delta` 원본을 유지한다. 원래 저장값은 `original_score_delta`, 공통 감점표의 후보값은 `policy_score_delta`에 보존한다. 기존에0으로 저장된 과거 행도 재작성하지 않는다. 실제 변화는 `actual_score_delta=0`으로 구분한다.
 - 기존 모델·탐지 Evidence는 유지한다. Event의 detector `policy_version`, 원본 참조,
   dedupe 식별자는 바꾸지 않고 Trust의 판단 버전은 `evidence.trust_decision`에 분리한다.
 - `processed_at`은 해당 Trust cycle의 UTC cutoff이며 별도의 벽시계 실행 시각이 아니다.
   처리 완료와 checkpoint는 진행하되 AI 관찰만 있는 Window는 점수 이력·격리 이력·
   신규 Firewall 요청을 만들지 않는다. 같은 Window의 Rule은 기존 정책대로 처리한다.
-- API 형식은 그대로다. Events·Dashboard의 Delta는 0, Trust 반영은 미반영으로 표시된다.
-  Events 상세에서는 처리 사유와 `evidence.trust_decision`을 확인할 수 있다.
-  Trust 처리 전에는 후보 감점이 보일 수 있으므로 관찰 완료 사유와 `processed_at`을 함께 본다.
+- API는 실제 변화·정책 감점·이력 연결 필드를 추가한다. Events 목록은 실제0과 미반영 사유를 표시하며 정책·원본 감점은 별도로 유지한다. 미처리나 감사 근거가 불명인 실제 변화는 null이다.
+  Events 상세에서는 처리 사유와 `evidence.trust_decision`을 확인할 수 있다. 여러 이벤트의 구간 총변화를 개별 이벤트마다 감점한 것으로 표시하지 않는다.
   `applied_to_score=0` 집계는 관찰 완료도 포함하므로 미처리 적체 건수가 아니다.
 - 과거 감점이나 격리는 자동 취소하지 않는다. 관찰 이벤트는 실제 감점된 Event를
   대상으로 하는 [승인형 점수 보상](operator-trust-compensation-runbook.md)의 대상도 아니다.

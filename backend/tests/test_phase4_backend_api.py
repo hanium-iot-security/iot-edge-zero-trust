@@ -60,6 +60,11 @@ def test_detection_events_phase4_fields_filters_and_evidence(api_client) -> None
     assert body["total"] == 1
     item = body["items"][0]
     assert item["packet_feature_log_id"] is None
+    assert item["policy_score_delta"] == -20
+    assert item["actual_score_delta"] == -20
+    assert item["window_actual_delta"] == -20
+    assert item["score_effect_reason"] == "EVENT_HISTORY"
+    assert item["trust_score_history_id"] == 1
     assert item["incident_family"] == "MESSAGE_POLICY"
     assert item["subject_ip"] == "192.168.0.21"
     assert item["evidence"] == {"source_id": 1, "source_type": "feature_logs"}

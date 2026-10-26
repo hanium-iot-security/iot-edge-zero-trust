@@ -15,6 +15,11 @@ class DetectionEventItem(BaseModel):
     event_type: str
     severity: str | None = None
     score_delta: int
+    policy_score_delta: int | None = None
+    actual_score_delta: int | None = None
+    score_effect_reason: str = "UNKNOWN"
+    trust_score_history_id: int | None = None
+    window_actual_delta: int | None = None
     applied_to_score: int
     description: str | None = None
     detected_at: str | None = None

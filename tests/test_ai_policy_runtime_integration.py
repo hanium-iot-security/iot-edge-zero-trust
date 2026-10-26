@@ -340,7 +340,7 @@ def test_stored_observe_event_never_penalizes_but_rule_still_scores(runtime, wit
                                           ai_mode="enforce", decision_at=at(20))
         ai = db.execute(text("SELECT score_delta,applied_to_score,processing_reason "
                              "FROM detection_events WHERE detector_type='AI'")).one()
-        assert tuple(ai) == (0, 0, "AI_OBSERVATION_ONLY")
+        assert tuple(ai) == (-15, 0, "AI_OBSERVATION_ONLY")
         assert result.observed_ai_event_count == 1
         assert db.execute(text("SELECT trust_score FROM devices WHERE device_id='esp32_01'")).scalar_one() == (
             80 if with_rule else 100)
