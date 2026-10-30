@@ -103,6 +103,11 @@ class PacketIsolationForestStage:
         self.ai_device_policy_enabled = ai_device_policy_enabled
         self.ai_window_selector = ai_window_selector
         self.completion_sink = completion_sink
+        self.anomaly_severity = (
+            "low"
+            if (settings.trust_ai_mode if trust_ai_mode is None else trust_ai_mode) == "observe"
+            else "medium"
+        )
         self.policy_version = (
             f"{PACKET_IF_RUNTIME_POLICY_VERSION}:{artifact.model_version}:"
             f"{artifact.bundle_sha256[:12]}"
@@ -340,7 +345,7 @@ class PacketIsolationForestStage:
                 source_id=source_id,
                 detector_type=DETECTOR_AI,
                 event_type=AI_PACKET_ANOMALY,
-                severity="medium",
+                severity=self.anomaly_severity,
                 description=(
                     "Packet Isolation Forest anomaly: "
                     f"score={prediction.anomaly_score:.6f}, "

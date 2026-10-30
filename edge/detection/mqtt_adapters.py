@@ -333,6 +333,11 @@ class MqttIsolationForestStage:
         self.ai_device_policy_enabled = ai_device_policy_enabled
         self.ai_window_selector = ai_window_selector
         self.completion_sink = completion_sink
+        self.anomaly_severity = (
+            "low"
+            if (settings.trust_ai_mode if trust_ai_mode is None else trust_ai_mode) == "observe"
+            else "medium"
+        )
 
     @classmethod
     def from_settings(
@@ -452,7 +457,7 @@ class MqttIsolationForestStage:
                 source_id=source_id,
                 detector_type=DETECTOR_AI,
                 event_type=event_type,
-                severity="medium",
+                severity=self.anomaly_severity,
                 description="Isolation Forest anomaly",
                 policy_version=self.policy_version,
                 detected_at=cutoff,
