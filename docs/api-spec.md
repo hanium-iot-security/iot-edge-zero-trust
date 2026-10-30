@@ -982,9 +982,18 @@ POST와 같은 관리자 헤더가 필요하며 정상 조회는 `200 {item: ...
 ## Recovery Command APIs
 
 Recovery API는 격리된 Device를 `normal`/`100` Baseline으로 되돌리는 관리 Command
-어댑터입니다. 실제 상태 변경은 `edge.trust.baseline_recovery` 코어가 수행하며,
-Backend는 직접 `devices`를 UPDATE하지 않습니다. 이 API는 systemd 제어, iptables
+어댑터입니다. 일반 복구의 실제 상태 변경과 성공 감사 저장은
+`edge.trust.device_recovery.execute_device_recovery`가 같은 SQLite 트랜잭션에서
+수행합니다. Backend 어댑터는 직접 `devices`를 UPDATE하지 않습니다. 이 API는 systemd 제어, iptables
 조회 계층 생성, Firewall Release 실행, Firewall Worker 실행을 하지 않습니다.
+
+일반 복구는 전체 DB 백업·전체 DB 무결성 검사를 실행하지 않습니다. 별도 수동 명령
+`edge.trust.run_baseline_recovery execute`는 기존 전체 백업·검사·복구 경로를 유지하며,
+**백업만 만드는 명령이 아닙니다.** 정기 백업 스케줄은 추가하지 않습니다.
+
+새 API를 사용하기 전에 Migration 017 (`device_recovery_audits`)을 적용해야 합니다.
+운영 DB 변경 전 별도 전체 백업과 사본 적용 검증이 필요합니다. 현재 문서는 PR #146의
+구현 계약이며, 해당 코드·017의 실제 Pi 적용 및 실기 검증이 완료됐다는 의미는 아닙니다.
 
 관리자 헤더:
 
@@ -1003,6 +1012,10 @@ RECOVERY_ADMIN_API_KEY=
 RECOVERY_ADMIN_PRINCIPAL=recovery-admin
 RECOVERY_ARTIFACT_DIR=data/recovery/baseline
 ```
+
+`RECOVERY_ARTIFACT_DIR`는 과거 JSON 이력 조회와 DB에 저장하지 못한 실패·거부 기록의
+파일 저장에 사용합니다. 신규 일반 복구의 성공은 이 디렉터리나 백업 파일 생성에 의존하지 않습니다.
+Preflight·Execute·History 조회 네 경로 모두 동일한 관리자 인증을 요구합니다.
 
 ### POST /api/recovery/preflight
 
@@ -1024,7 +1037,13 @@ Preflight는 읽기 전용이며 Recovery artifact나 backup을 생성하지 않
 - DB의 `PENDING` Firewall Release Request 0건
 - Runtime Firewall verification
 - `processed_at IS NULL` Detection Event 0건
-- Backup artifact 경로 사용 가능성
+- Migration 017의 감사 테이블·필수 컬럼 준비 상태 (`audit_check`)
+
+`audit_check.available`은 읽기 전용 스키마 점검 결과입니다. 실제 INSERT가 성공한다는
+보장은 아니며, Execute에서 성공 감사 저장이 실패하면 기기 상태 변경도 함께 Rollback합니다.
+감사 스키마 문제로 보류된 요청은 `AUDIT_STORAGE_UNAVAILABLE`·`HOLD`로 닫습니다.
+`backup_check` 필드는 이전 호출부와의 호환을 위해 유지하되, 일반 복구에서는
+`required=false`, `available=null`, `status=NOT_REQUIRED`입니다. 백업 경로는 실행 Gate가 아닙니다.
 
 현재 Backend가 소유한 안전한 runtime firewall read verifier가 없으면
 `firewall_runtime_verification.status='UNAVAILABLE'`, `result='HOLD'`,
@@ -1066,7 +1085,12 @@ Response:
   },
   "unprocessed_detection_count": 0,
   "backup_check": {
-    "artifact_dir": "data/recovery/baseline",
+    "required": false,
+    "available": null,
+    "status": "NOT_REQUIRED"
+  },
+  "audit_check": {
+    "storage": "database",
     "available": true,
     "failure_reason": null
   },
@@ -1090,15 +1114,21 @@ Request:
 ```
 
 Execute는 승인·인증 후 preflight를 즉시 다시 수행합니다. 통과하지 못하면
-`409`와 `DENIED` 또는 `HOLD` audit payload를 반환하고 baseline recovery core를
-호출하지 않습니다. 성공 조건에서는 기존 baseline recovery core가 SQLite Backup API,
-SHA256, integrity check, foreign key check, 조건부 UPDATE를 수행합니다.
+`409`와 `DENIED` 또는 `HOLD` audit payload를 `detail`에 반환하고 복구 코어를
+호출하지 않습니다. 통과한 요청은 대상 Device 하나만 조건부 UPDATE하여 `normal`·`100`으로
+바꾸고, 변경 전후 상태·승인자·사유·Runtime 점검 근거가 있는 성공 감사를 함께 저장합니다.
+성공 감사는 `device_recovery_audits`에 저장하며, 기기 변경과 감사 중 하나만 확정하지 않습니다.
 
-Core는 Firewall Worker와 같은 잠금을 먼저 얻고 DB 쓰기 잠금을 획득한 뒤 Runtime
-Snapshot을 재검증합니다. Backup 전과 Commit 직전에 모두 검증하므로 사전검사 통과
-후 새 차단 시도가 생기거나 Snapshot이 만료되면 `409`/`HOLD`로 보류하며 점수·상태
+Core는 수동 Baseline CLI와 같은 DB별 복구 잠금으로 명령을 직렬화합니다. 최초 상태를
+읽은 뒤 읽기 트랜잭션을 해제하고, Firewall Worker와 같은 잠금을 얻은 다음 짧은 DB 쓰기
+트랜잭션을 시작합니다. Firewall 잠금 대기 중에는 DB 쓰기 잠금을 유지하지 않습니다.
+WAL 모드 DB만 실행을 허용하고 원본의 Journal 모드를 바꾸지 않습니다.
+
+최초 검사·최종 잠금 안의 검사·Commit 직전에 Runtime Snapshot을 검증합니다. 현재 IP·미해제
+규칙·미처리 이벤트·관측 최신성 중 실행 조건을 충족하지 못하면 실행을 거부하며 점수·상태
 변경을 Rollback합니다. 이때 응답과 Audit의 `firewall_release_status`는
-`NOT_VERIFIED`입니다. 같은 Core를 사용하는 CLI에도 이 검사가 적용됩니다.
+Runtime 검증 실패인 경우 `NOT_VERIFIED`입니다. 공식 해제된 방화벽 규칙을 자동으로
+다시 추가하는 의미는 아닙니다. 과거 탐지·Trust·격리·방화벽·수집 이력은 보존합니다.
 
 성공 Response:
 
@@ -1116,8 +1146,11 @@ Snapshot을 재검증합니다. Backup 전과 Commit 직전에 모두 검증하�
   "after_status": "normal",
   "after_trust_score": 100,
   "firewall_release_status": "VERIFIED_RELEASED",
-  "backup_reference": "baseline-recovery-20260810T010000Z-abcdef123456.db",
-  "backup_sha256": "..."
+  "backup_reference": null,
+  "backup_sha256": null,
+  "audit_reference": "device_recovery_audits:20260810T010000Z-abcdef123456",
+  "failure_code": null,
+  "failure_reason": null
 }
 ```
 
@@ -1125,18 +1158,40 @@ Snapshot을 재검증합니다. Backup 전과 Commit 직전에 모두 검증하�
 Baseline Recovery 성공은 별도 의미이며, 이 API는 Firewall Release 자체를 실행하지
 않습니다.
 
+실패·결과 불확정의 처리:
+
+| HTTP | `detail.result` | 의미와 재실행 기준 |
+| --- | --- | --- |
+| 409 | `DENIED` / `HOLD` | 확인 문구·상태·점수·미처리 이벤트·Runtime·잠금 등 실행 조건을 충족하지 못함. 원인을 해소하고 새 Preflight 필요 |
+| 500 | `FAILED` | 복구 코어가 저장 확정 전 실패한 경우. 상태 변경·성공 감사는 Rollback되며 실패 기록 저장을 시도 |
+| 500 | `HOLD` | `failure_code=BASELINE_RECOVERY_COMMITTED_UNVERIFIED`. Commit 결과를 감사에서 확인할 수 없어 변경 후 상태를 단정하지 않음 |
+
+Commit 응답이 끊겨도 같은 작업의 확정된 DB 성공 감사를 읽을 수 있으면 그 성공을 반환합니다.
+확정 여부를 확인할 수 없는 경우에는 `after_status`·`after_trust_score`가 `null`이며,
+성공을 `FAILED` 감사로 덮거나 복구 코어를 다시 실행하지 않습니다. 대시보드도 이 오류 코드를
+결과 불확정으로 분류해 실제 기기·남은 방화벽 상태를 조회하고 중복 실행을 차단합니다.
+HTTP 500을 미변경의 증거로 해석하지 말고 `operation_id`로 이력과 실제 상태를 확인해야 합니다.
+
+실패·거부·보류 기록은 DB에 우선 저장하며, 감사 DB 읽기·쓰기가 실패하면 기존 JSON 방식으로
+저장을 시도합니다. 파일 기록까지 실패할 수 있으므로 오류 응답이 모든 실패 증거의 저장을
+보장하지는 않습니다. 저장 결과 불확정 응답은 기존 성공을 보호하기 위해 새 실패 감사를 저장하지 않습니다.
+
 ### GET /api/recovery/history
 
-Baseline Recovery JSON artifact와 Recovery Command denial/failure artifact를 읽어
-정규화한 목록을 반환합니다. 서버 내부 절대 backup path는 노출하지 않고 파일명
-`backup_reference`와 `backup_sha256`만 제공합니다.
+`device_recovery_audits`의 DB 감사와 과거 Baseline Recovery·Recovery Command JSON
+artifact를 함께 읽어 정규화한 목록을 반환합니다. 서버 내부 절대 backup path는 노출하지 않고,
+과거 백업이 있는 이력에만 파일명 `backup_reference`와 `backup_sha256`를 제공합니다.
 
 동일 Recovery 요청에서 `baseline-recovery-*.json`과 `recovery-command-*.json`이
-함께 생성되더라도 두 artifact는 하나의 `operation_id`를 공유해야 합니다.
-History 응답은 `operation_id` 기준으로 정규화하여 Recovery 요청 1건을 operation
-1건으로 노출합니다. DB commit 이후 JSON audit 저장 또는 사후 검증이 실패한 경우
-fallback audit은 실제 DB의 Device 사후 상태와 생성된 backup 파일명/SHA256을
-보존합니다.
+함께 생성됐던 과거 이력도 하나의 `operation_id`로 정규화합니다. 동일 작업의 DB 감사가
+있으면 JSON과 필드별로 합치지 않고 DB 기록을 우선합니다. 신규 일반 복구의 `null` 백업
+필드를 오래된 JSON의 백업 값으로 채우지 않습니다.
+
+항목은 성공 응답 필드와 `log_reference`를 포함합니다. 신규 DB 감사의 `audit_reference`와
+`log_reference`는 `device_recovery_audits:<operation_id>`이며 파일 경로가 아닙니다.
+DB 내부 JSON에 보존한 전체 Preflight·Runtime·기기 스냅샷은 이 API의 평탄한 응답에
+자동으로 노출되지 않습니다. 이전 JSON에 `audit_reference`가 없으면 `null`로 반환합니다.
+정규화한 항목을 `requested_at`·`operation_id` 내림차순으로 정렬하고, 필터 후 페이지를 나눕니다.
 
 Query parameters:
 
@@ -1145,11 +1200,14 @@ Query parameters:
 - `limit`: default `100`, minimum `1`, maximum `500`
 - `offset`: default `0`, minimum `0`
 
+응답은 `{"items": [...], "total": <필터 후 전체 건수>}`입니다.
+
 ### GET /api/recovery/history/{operation_id}
 
 단일 Recovery audit item을 조회합니다. Detection Trust History, Trust Compensation,
 Baseline Recovery는 P0에서 서로 다른 Source로 유지하며 통합 Timeline은 후속 P1
 범위입니다.
+해당 `operation_id`가 없으면 404입니다. DB 감사가 있으면 같은 작업의 JSON보다 우선합니다.
 
 ## 현재 구현 상태
 
