@@ -31,6 +31,7 @@ class RecoveryPreflightResponse(BaseModel):
     firewall_runtime_verification: dict[str, Any]
     unprocessed_detection_count: int | None
     backup_check: dict[str, Any]
+    audit_check: dict[str, Any] | None = None
     failure_code: str | None = None
     failure_reason: str | None = None
     preflight_errors: list[str] = Field(default_factory=list)
@@ -51,6 +52,7 @@ class RecoveryExecuteResponse(BaseModel):
     firewall_release_status: str
     backup_reference: str | None = None
     backup_sha256: str | None = None
+    audit_reference: str | None = None
     failure_code: str | None = None
     failure_reason: str | None = None
 

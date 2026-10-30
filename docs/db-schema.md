@@ -51,6 +51,13 @@ Migration 012 (`device_ai_policy_revisions`)는 기기별 AI 모드(OFF/OBSERVE)
 배포하며, AI 초기 기록이 실패하면 기기·등록 정책을 포함한 전체 등록이 rollback된다.
 012만 적용해서는 기존 동작이 바뀌지 않는다.
 
+Migration 017 (`device_recovery_audits`)은 일반 기기 복구의 불변 DB 감사표를 추가한다.
+배포 전 별도 SQLite online backup을 만들고 **복사본에서 017 적용을 검증한 뒤**, 운영 DB에
+017을 적용하고 새 Recovery API를 배포한다. API는 Migration을 자동 적용하지 않으며,
+감사 저장소가 준비되지 않으면 복구를 허용하지 않는다. 일반 복구마다 전체 DB를 자동
+백업하지 않는다. 기존 JSON 감사는 이관하지 않고 Raw·탐지·Trust·격리 이력을 보존한다.
+코드 rollback 시에도 감사표를 유지하며, 감사 삭제용 down Migration은 제공하지 않는다.
+
 적용과 복구: 007은 컬럼 추가를 포함하며 되돌리는(down) Migration이 없다. 운영 DB에는 먼저
 일관된 백업(SQLite backup API 등, 쓰기 중 파일 하나만 복사하지 않는다)을 만든 뒤 **복사본에서**
 Migration과 backfill dry-run을 확인하고 적용한다. 적용 중 오류가 나면 Migration 전체가 rollback되어
@@ -116,6 +123,33 @@ Readiness는 감사 Row와 Plan·원본 실패 상태·Feature 부재가 일치�
 과거 Window의 IP 귀속이 달라지므로 운영에서 바꾸지 않는다.
 IP는 정규 dotted-decimal 형태만 저장하며(앞자리 0 거부) 비어 있지 않은 IP는 유일 인덱스로 중복을 막는다.
 octet 범위와 사설/LAN 대역 검사는 서비스(`edge/policy`)가 담당한다.
+
+## device_recovery_audits
+
+Migration 017의 일반 기기 복구 감사표다. SQL 컬럼은 다음 네 개뿐이며 승인·결과·검증 근거는
+`payload_json`에 저장한다.
+
+| 컬럼 | 타입 | 설명 |
+| --- | --- | --- |
+| operation_id | TEXT | PRIMARY KEY, NOT NULL. 실행별 고유 작업 ID |
+| device_id | TEXT | NOT NULL, `devices(device_id)` FK, `ON DELETE RESTRICT` |
+| requested_at | TEXT | NOT NULL. API가 기록한 UTC 요청 시각 |
+| payload_json | TEXT | NOT NULL. `json_valid`이고 `json_type = 'object'`인 JSON 객체 |
+
+`idx_device_recovery_audits_device_time`은 `(device_id, requested_at DESC)` 인덱스다.
+Trigger는 UPDATE·DELETE와 기존 `operation_id`를 덮어쓰는 `INSERT OR REPLACE`를 거부한다.
+
+성공 감사 INSERT와 대상 기기의 `status='normal'`, `trust_score=100` 갱신은 같은 트랜잭션에서
+확정한다. 감사 저장이 실패하면 기기 갱신도 rollback된다. 성공 JSON에는 전후 상태·점수와
+기기 Snapshot, 요청자·승인자 principal·사유·요청 시각, Runtime Firewall 검증, 현재 IP와
+미해결 FAILED 규칙의 과거 source IP 목록(`checked_devices`), Preflight를 보존한다.
+일반 복구는 전체 DB 백업을 만들지 않아 JSON의 `backup_reference`와 `backup_sha256`은 `null`이다.
+
+거부·보류·실패 시도도 가능한 경우 DB에 별도 감사로 저장하며, DB 저장 불가 시 JSON 기록으로
+fallback할 수 있다. 이 JSON은 기기 갱신과 원자적으로 확정된 성공 감사가 아니다. 이력 조회는
+기존 JSON도 읽지만 같은 작업 ID의 DB 감사가 전체 기록을 대체한다. DB 감사 JSON의 `null` 백업 값은
+백업 없음이며 기존 JSON의 백업 값으로 채우지 않는다. 과거 감사는 backfill하지 않고 기존
+Raw·탐지·Trust·격리 이력도 변경하지 않는다.
 
 ## device_policy_revisions
 
