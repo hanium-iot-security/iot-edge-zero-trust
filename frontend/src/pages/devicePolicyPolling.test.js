@@ -8,6 +8,9 @@ import test from "node:test";
 import { runInNewContext } from "node:vm";
 import { fileURLToPath } from "node:url";
 import { transformWithOxc } from "vite";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import FirewallTrafficFields from "../components/FirewallTrafficFields.js";
 import * as mqttTimestamp from "../utils/mqttTimestamp.js";
 import * as firewallRuleSelection from "../utils/firewallRuleSelection.js";
 
@@ -556,6 +559,77 @@ test("Isolation leaves a slow live history request running across the 10-second 
   }
   assert.equal(requests.at(-1).signal.aborted, true);
 });
+
+test("Isolation history modal shows MQTT parent and null-trigger IPv4 child with separate scopes and statuses", async () => {
+  const history = { id: 27, device_id: sensor.device_id, trigger_event_id: 45, action: "ISOLATE" };
+  let rules = [
+    { id: 30, device_id: sensor.device_id, source_ip: sensor.ip_address, trigger_event_id: null,
+      source_rule_id: 29, status: "APPLIED", scope: "PI_INPUT_IPV4_ALL", protocol: null, dest_port: null,
+      updated_at: "2026-10-12T00:00:00Z" },
+    { id: 29, device_id: sensor.device_id, source_ip: sensor.ip_address, trigger_event_id: 45,
+      status: "REMOVED", scope: "MQTT_IPV4_TCP_1883", protocol: "tcp", dest_port: 1883,
+      updated_at: "2026-10-12T00:01:00Z" },
+  ];
+  const app = await componentHarness("Isolation", {
+    getIsolationHistory: async () => ({ items: [history], total: 1 }),
+    getIsolatedDevices: async () => ({ items: [] }),
+    getFirewallRules: async () => ({ items: rules }),
+  });
+  try {
+    const table = app.find((node) => node.type === "DataTable" && node.props.tableLabel === "격리 이력");
+    const row = table.props.rows[0];
+    assert.equal(row.firewall_status, "APPLIED", "a removed MQTT parent must not hide its applied IPv4 child");
+    assert.equal(row.firewall_rule.id, 30, "representative compatibility follows unresolved precedence");
+    assert.deepEqual(Array.from(row.firewall_rules, (rule) => rule.id), [29, 30]);
+    await app.act(() => table.props.onRowClick(row));
+    const modal = app.find((node) => node.type === "DetailModal" && node.props.open && node.props.title === "격리 이력 #27");
+    const cards = treeNodes(modal).filter((node) => node.type === "article" && node.props.className === "history-item");
+    assert.equal(cards.length, 2);
+    assert.match(app.textContent(cards[0]), /MQTT IPv4/);
+    assert.match(app.textContent(cards[1]), /전체 IPv4/);
+    assert.deepEqual(cards.map((card) => treeNodes(card).find((node) => node.type === "StatusBadge").props.label), ["차단 해제", "차단 적용"]);
+    assert.deepEqual(cards.map((card) => treeNodes(card).find((node) => node.type === "FirewallTrafficFields").props.rule.id), [29, 30]);
+    const traffic = cards.map((card) => renderToStaticMarkup(createElement(FirewallTrafficFields,
+      treeNodes(card).find((node) => node.type === "FirewallTrafficFields").props)));
+    assert.match(traffic[0], /tcp.*1883/);
+    assert.match(traffic[1], /전체 IPv4.*모든 포트/);
+    assert.doesNotMatch(traffic[1], /1883/);
+    assert.equal(treeNodes(modal).filter((node) => node.type === "button").length, 0, "history rule cards add no management actions");
+    rules = rules.map((rule) => ({ ...rule, status: "REMOVED" }));
+    await app.act(() => app.find((node) => node.type === "PageHeader").props.onRefresh());
+    const refreshedTable = app.find((node) => node.type === "DataTable" && node.props.tableLabel === "격리 이력");
+    assert.equal(refreshedTable.props.rows[0].firewall_status, "REMOVED", "all scopes removed means the history badge is removed");
+    const refreshedModal = app.find((node) => node.type === "DetailModal" && node.props.open && node.props.title === "격리 이력 #27");
+    const refreshedCards = treeNodes(refreshedModal).filter((node) => node.type === "article" && node.props.className === "history-item");
+    assert.deepEqual(refreshedCards.map((card) => treeNodes(card).find((node) => node.type === "StatusBadge").props.label), ["차단 해제", "차단 해제"]);
+  } finally { app.cleanup(); }
+});
+
+for (const [label, rule, expectedTraffic] of [
+  ["direct all-IPv4", { scope: "PI_INPUT_IPV4_ALL", protocol: null, dest_port: null }, /전체 IPv4.*모든 포트/],
+  ["legacy MQTT-only", { protocol: "tcp", dest_port: 1883 }, /tcp.*1883/],
+]) {
+  test(`Isolation history modal preserves a single ${label} rule`, async () => {
+    const app = await componentHarness("Isolation", {
+      getIsolationHistory: async () => ({ items: [{ id: 27, device_id: sensor.device_id, trigger_event_id: 45 }], total: 1 }),
+      getIsolatedDevices: async () => ({ items: [] }),
+      getFirewallRules: async () => ({ items: [{ ...rule, id: 30, device_id: sensor.device_id, source_ip: sensor.ip_address,
+        trigger_event_id: 45, source_rule_id: null, status: "APPLIED" }] }),
+    });
+    try {
+      const table = app.find((node) => node.type === "DataTable" && node.props.tableLabel === "격리 이력");
+      assert.equal(table.props.rows[0].firewall_rules.length, 1);
+      await app.act(() => table.props.onRowClick(table.props.rows[0]));
+      const modal = app.find((node) => node.type === "DetailModal" && node.props.open && node.props.title === "격리 이력 #27");
+      const cards = treeNodes(modal).filter((node) => node.type === "article" && node.props.className === "history-item");
+      assert.equal(cards.length, 1);
+      const fields = treeNodes(cards[0]).find((node) => node.type === "FirewallTrafficFields");
+      const traffic = renderToStaticMarkup(createElement(FirewallTrafficFields, fields.props));
+      assert.match(traffic, expectedTraffic);
+      if (label === "direct all-IPv4") assert.doesNotMatch(traffic, /1883/);
+    } finally { app.cleanup(); }
+  });
+}
 
 test("Isolation refresh preserves release target ID then sequentially releases wide and FAILED MQTT scopes", async () => {
   const clock = createClock();

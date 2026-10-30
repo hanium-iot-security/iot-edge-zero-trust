@@ -382,9 +382,15 @@ def process_pending_rules(
             continue
 
         try:
+            _require_unattested_removals_absent(row, runner=runner, policy=policy)
             already_present = rule_exists(runner, spec)
             if not already_present:
                 insert_rule(runner, spec)
+        except FirewallValidationError as exc:
+            _record_validation_failure(db, rule_id=rule_id, now=now_utc, error=str(exc))
+            result.validation_failed.append(rule_id)
+            logger.error("Direct isolation rejected (rule_id=%s): %s", rule_id, exc)
+            continue
         except FirewallTransientError as exc:
             _record_transient_failure(
                 db,
@@ -626,10 +632,15 @@ def reconcile(
             continue
 
         try:
+            _require_unattested_removals_absent(row, runner=runner, policy=policy)
             if rule_exists(runner, spec):
                 result.verified.append(rule_id)
                 continue
             insert_rule(runner, spec)
+        except FirewallValidationError as exc:
+            result.validation_failed.append(rule_id)
+            logger.error("Direct isolation restoration rejected (rule_id=%s): %s", rule_id, exc)
+            continue
         except FirewallTransientError as exc:
             result.restore_failed.append(rule_id)
             logger.error(
@@ -695,6 +706,23 @@ def plan_pending_rules(
             continue
         planned.append((rule_id, (spec, build_rule_args(spec, operation=INSERT))))
     return planned
+
+
+def _require_unattested_removals_absent(
+    row: dict[str, Any], *, runner: IptablesRunner, policy: FirewallPolicy,
+) -> None:
+    """Prove unaudited removals absent under the caller's Worker lock.
+
+    Authorization supplied these exact historical specs in its fresh snapshot.
+    It released SQLite before this read-only OS check; no audit is fabricated
+    and no old rule is deleted or rewritten.
+    """
+    for historical in row.get("_unattested_removal_checks", ()):
+        spec = validate_rule_row(historical, policy, for_cleanup=True)
+        if rule_exists(runner, spec):
+            raise FirewallValidationError(
+                f"UNATTESTED_REMOVED_RULE_PRESENT: {spec.rule_id}"
+            )
 
 
 def _removed_rule_is_verified_absent(

@@ -13,7 +13,11 @@ DB_PATH = Path("backend/data/iot_security.db")
 MIGRATIONS_DIR = Path("db/migrations")
 SCHEMA_MIGRATIONS_TABLE = "schema_migrations"
 MIGRATION_FILE_PATTERN = re.compile(r"^(?P<version>\d+)_(?P<name>[A-Za-z0-9_]+)\.sql$")
-FOREIGN_KEY_REBUILD_MIGRATIONS = {(3, "phase4_detection"), (11, "pi_input_isolation")}
+FOREIGN_KEY_REBUILD_MIGRATIONS = {
+    (3, "phase4_detection"),
+    (11, "pi_input_isolation"),
+    (18, "direct_ipv4_isolation"),
+}
 LEGACY_001_TABLES = {
     "devices",
     "mqtt_logs",
