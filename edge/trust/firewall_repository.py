@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import ipaddress
+import json
 import sqlite3
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -33,6 +34,7 @@ class AutomaticResponseBlockedError(ValueError):
 
 
 SCOPE_COLUMNS = {"scope", "source_rule_id", "approved_policy_revision", "requested_by", "request_id"}
+DIRECT_ISOLATION_ACTOR = "system:trust-score-v2"
 
 
 def has_scope_schema(db: Session) -> bool:
@@ -60,6 +62,27 @@ def _pending_release(db: Session, rule_id: int) -> bool:
     return connection.execute("SELECT 1 FROM firewall_release_requests WHERE firewall_rule_id=? AND status='PENDING'", (rule_id,)).fetchone() is not None
 
 
+def require_direct_isolation_schema(db: Session) -> None:
+    """018 metadata alone cannot authorize a root rule on the old 011 table."""
+    if not has_scope_schema(db):
+        raise AutomaticResponseBlockedError("MIGRATION_018_REQUIRED")
+    connection = db.connection().connection.driver_connection
+    migration = connection.execute("SELECT name FROM schema_migrations WHERE version=18").fetchone()
+    schema = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='firewall_rules'").fetchone()
+    definition = " ".join(schema[0].lower().split()) if schema and schema[0] else ""
+    root_branch = (
+        "(scope = 'pi_input_ipv4_all' and protocol is null and dest_port is null "
+        "and source_rule_id is null and device_id is not null "
+        "and trigger_event_id is not null and typeof(trigger_event_id) = 'integer' "
+        "and trigger_event_id > 0 "
+        "and requested_by is not null and requested_by = 'system:trust-score-v2' "
+        "and approved_policy_revision is not null and typeof(approved_policy_revision) = 'integer' "
+        "and approved_policy_revision > 0"
+    )
+    if migration is None or migration[0] != "direct_ipv4_isolation" or root_branch not in definition:
+        raise AutomaticResponseBlockedError("MIGRATION_018_REQUIRED")
+
+
 def _audited_removal(connection, row) -> bool:
     # Completion may occur on a later cycle after REMOVED was committed. An
     # older success cannot attest a different, later removal of the same ID.
@@ -73,6 +96,9 @@ def _audited_removal(connection, row) -> bool:
 
 def _require_wide_rule_eligible(db: Session, row: dict[str, Any], *, now: datetime) -> None:
     """Bind a management approval to its original rule and current policy/IP."""
+    if row.get("source_rule_id") is None:
+        _require_direct_rule_eligible(db, row, now=now)
+        return
     if not has_scope_schema(db):
         raise AutomaticResponseBlockedError("MIGRATION_011_REQUIRED")
     connection = db.connection().connection.driver_connection
@@ -114,6 +140,69 @@ def _require_wide_rule_eligible(db: Session, row: dict[str, Any], *, now: dateti
         raise AutomaticResponseBlockedError("POLICY_UNAVAILABLE") from None
     if snapshot.current is None or snapshot.current.revision != revision:
         raise AutomaticResponseBlockedError("APPROVED_POLICY_REVISION_CHANGED")
+
+
+def _require_direct_rule_eligible(db: Session, row: dict[str, Any], *, now: datetime) -> None:
+    """Authorize a root isolation from the Trust transaction and fresh policy."""
+    require_direct_isolation_schema(db)
+    revision, trigger_id = row.get("approved_policy_revision"), row.get("trigger_event_id")
+    if (row.get("requested_by") != DIRECT_ISOLATION_ACTOR
+            or type(revision) is not int or revision <= 0
+            or type(trigger_id) is not int or trigger_id <= 0):
+        raise AutomaticResponseBlockedError("DIRECT_ISOLATION_PROVENANCE_UNAVAILABLE")
+    try:
+        validate_reason(row.get("reason"))
+        _require_request_id(row.get("request_id"))
+    except (ValueError, DevicePolicyError):
+        raise AutomaticResponseBlockedError("DIRECT_ISOLATION_PROVENANCE_UNAVAILABLE") from None
+    connection = db.connection().connection.driver_connection
+    _require_automatic_response_eligible(db, row, now=now)
+    device = connection.execute("SELECT status FROM devices WHERE device_id=?", (row["device_id"],)).fetchone()
+    if device is None or device[0] != "isolated":
+        raise AutomaticResponseBlockedError("DEVICE_NOT_ISOLATED")
+    snapshot = get_policy_snapshot(connection, row["device_id"], server_time=now)
+    if snapshot.current is None or snapshot.current.revision != revision:
+        raise AutomaticResponseBlockedError("APPROVED_POLICY_REVISION_CHANGED")
+    if row.get("id") is not None and _pending_release(db, row["id"]):
+        raise AutomaticResponseBlockedError("FIREWALL_RELEASE_PENDING")
+    history = connection.execute("""SELECT trust.representative_event_ids_json
+        FROM detection_events AS event
+        JOIN isolation_history AS isolation ON isolation.trigger_event_id=event.id
+            AND isolation.device_id=event.device_id AND isolation.action='ISOLATED'
+        JOIN trust_score_history AS trust ON trust.id=isolation.trust_score_history_id
+            AND trust.device_id=event.device_id AND trust.policy_version='trust-score-v2'
+            AND trust.new_score<30 AND trust.new_score=isolation.trust_score
+        WHERE event.id=? AND event.device_id=? AND event.applied_to_score=1
+            AND event.processing_reason='APPLIED_TO_TRUST'""", (trigger_id, row["device_id"])).fetchall()
+    proven = False
+    for (representatives,) in history:
+        try:
+            ids = json.loads(representatives)
+            proven = isinstance(ids, list) and any(type(value) is int and value == trigger_id for value in ids)
+        except (TypeError, ValueError):
+            continue
+        if proven:
+            break
+    if not proven:
+        raise AutomaticResponseBlockedError("DIRECT_ISOLATION_PROVENANCE_UNAVAILABLE")
+    # FAILED may still have OS residue after a crash. Exclude this row so its
+    # retries reuse its identity. Historical and CLI removals may lack release
+    # requests: permit those only with a fresh exact OS absence check by Worker.
+    siblings = db.execute(text("""SELECT * FROM firewall_rules
+        WHERE (device_id=:device_id OR source_ip=:source_ip)
+          AND (:own_id IS NULL OR id<>:own_id)"""),
+        {"device_id": row["device_id"], "source_ip": row["source_ip"], "own_id": row.get("id")}).mappings().all()
+    unattested_removal_checks = []
+    for sibling in siblings:
+        if _pending_release(db, sibling["id"]):
+            raise AutomaticResponseBlockedError("FIREWALL_RELEASE_PENDING")
+        if _audited_removal(connection, sibling):
+            continue
+        if sibling["status"] == REMOVED and row_scope(sibling) in {MQTT_IPV4_TCP_1883, PI_INPUT_IPV4_ALL}:
+            unattested_removal_checks.append(dict(sibling))
+            continue
+        raise AutomaticResponseBlockedError("EXISTING_RULE_REQUIRES_EXACT_RELEASE")
+    row["_unattested_removal_checks"] = unattested_removal_checks
 
 
 def _require_application_eligible(db: Session, row: dict[str, Any], *, now: datetime) -> None:
@@ -266,8 +355,17 @@ def create_pending_rule_for_device(
     source_ip: str,
     reason: str,
     trigger_event_id: int,
+    scope: str = MQTT_IPV4_TCP_1883,
+    now: datetime | None = None,
 ) -> int:
     _validate_ip(source_ip)
+    if scope == PI_INPUT_IPV4_ALL:
+        return _create_pending_direct_isolation(
+            db, device_id=device_id, source_ip=source_ip, reason=reason,
+            trigger_event_id=trigger_event_id, now=now,
+        )
+    if scope != MQTT_IPV4_TCP_1883:
+        raise AutomaticResponseBlockedError("INVALID_FIREWALL_SCOPE")
     existing = db.execute(
         text(
             """
@@ -318,6 +416,45 @@ def create_pending_rule_for_device(
             "trigger_event_id": trigger_event_id,
         },
     )
+    return int(result.lastrowid)
+
+
+def _create_pending_direct_isolation(
+    db: Session, *, device_id: str, source_ip: str, reason: str,
+    trigger_event_id: int, now: datetime | None,
+) -> int:
+    """Join Trust's writer transaction; never acquire the Worker file lock here."""
+    connection = db.connection().connection.driver_connection
+    if not connection.in_transaction:
+        raise RuntimeError("Direct isolation requires an explicit write transaction")
+    require_direct_isolation_schema(db)
+    if now is None:
+        raise ValueError("Direct isolation requires its decision time")
+    now = require_utc_whole_second(now, "now")
+    # A released (or failed) trigger is consumed forever. A replay must never
+    # create a replacement rule or mutate its historical scope/status.
+    previous = db.execute(text("""SELECT * FROM firewall_rules
+        WHERE device_id=:device_id AND trigger_event_id=:trigger_event_id
+          AND scope=:scope AND source_rule_id IS NULL ORDER BY id LIMIT 1"""),
+        {"device_id": device_id, "trigger_event_id": trigger_event_id, "scope": PI_INPUT_IPV4_ALL}).mappings().first()
+    if previous is not None:
+        if previous["source_ip"] != source_ip or previous["reason"] != reason:
+            raise AutomaticResponseBlockedError("DIRECT_ISOLATION_BINDING_MISMATCH")
+        return int(previous["id"])
+    binding = {"device_id": device_id, "source_ip": source_ip, "reason": reason,
+               "trigger_event_id": trigger_event_id, "scope": PI_INPUT_IPV4_ALL,
+               "source_rule_id": None, "requested_by": DIRECT_ISOLATION_ACTOR,
+               "request_id": str(uuid4())}
+    _require_automatic_response_eligible(db, binding, now=now)
+    snapshot = get_policy_snapshot(connection, device_id, server_time=now)
+    binding["approved_policy_revision"] = snapshot.current.revision
+    _require_direct_rule_eligible(db, binding, now=now)
+    result = db.execute(text("""INSERT INTO firewall_rules
+        (device_id,source_ip,scope,protocol,dest_port,action,status,reason,trigger_event_id,
+         source_rule_id,approved_policy_revision,requested_by,request_id,created_at,updated_at)
+        VALUES (:device_id,:source_ip,:scope,NULL,NULL,'DROP','PENDING',:reason,:trigger_event_id,
+                NULL,:approved_policy_revision,:requested_by,:request_id,:now,:now)"""),
+        {**binding, "now": format_db_utc(now)})
     return int(result.lastrowid)
 
 

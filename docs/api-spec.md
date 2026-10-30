@@ -753,11 +753,15 @@ Isolation History는 Trust 정책상 격리 결정을 표현합니다. 실제 �
 Migration 011의 두 scope는 `MQTT_IPV4_TCP_1883`(Pi INPUT의 TCP 1883)와
 `PI_INPUT_IPV4_ALL`(같은 source IPv4의 Pi INPUT 전체 프로토콜·포트)입니다.
 기본 자동 격리는 MQTT 1883이며 기존 ID의 범위를 변경하지 않습니다.
-운영자 설정 `FIREWALL_AUTO_SCOPE=PI_INPUT_IPV4_ALL`에서는 현재 ACTIVE 정책과 동일 IP의
-`isolated` 기기에 적용된 MQTT 원본에서 별도 광역 규칙을 한 번 자동 예약합니다.
-같은 원본의 FAILED·REMOVED 광역 이력도 재생성을 막습니다. 관리자 확장 API와 정확한
-ID별 해제는 유지하며 광역 승인 Frontend는 아직 없습니다. 2026/10/25~26 Pi 코드 적용·
-실물 차단·해제 결과와 미실행 범위는 [최신 검증 기록](phase9-pi-input-isolation-validation-20261026.md)을 참고합니다.
+운영자 설정 `FIREWALL_AUTO_SCOPE=PI_INPUT_IPV4_ALL`과 migration 018에서는 Trust의 최초
+격리 결정으로 광역 규칙 한 개를 예약합니다. MQTT 선행 규칙을 만들지 않으며 기존 MQTT
+규칙을 Worker가 자동 확장하지 않습니다. 직접 생성한 광역 규칙은 `source_rule_id=null`,
+`requested_by=system:trust-score-v2`와 실제 감점의 `trigger_event_id`를 기록합니다.
+관리자 확장 API와 과거 규칙의 정확한 ID별 해제는 유지합니다. 과거 두 규칙이 남아 있으면
+각각 해제해야 하며, 새 방식으로 생성한 규칙은 한 ID를 해제합니다.
+설정은 이후 생성에만 적용되며 기존 규칙의 범위·이력을 바꾸지 않습니다.
+[단일 규칙 운영 절차](direct-ipv4-isolation.md)를 참고합니다. 2026/10/25~26의
+[실물 검증 기록](phase9-pi-input-isolation-validation-20261026.md)은 당시 두 규칙 방식의 결과입니다.
 
 ### GET /api/firewall-rules
 GET /api/firewall-runtime-status

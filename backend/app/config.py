@@ -107,7 +107,7 @@ class Settings(BaseSettings):
     packet_rule_excluded_peer_ips: str = ""
     packet_rule_policy_version: str = "packet-rule-policy-v4"
 
-    # Firewall Worker: operator opt-in, separate from device policy revisions.
+    # Scope of future Trust isolation rules; existing rule identities keep their scope.
     firewall_auto_scope: Literal["MQTT_IPV4_TCP_1883", "PI_INPUT_IPV4_ALL"] = "MQTT_IPV4_TCP_1883"
     firewall_worker_interval_seconds: float = 5.0
     firewall_worker_batch_size: int = 20

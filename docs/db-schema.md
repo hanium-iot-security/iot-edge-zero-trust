@@ -58,6 +58,13 @@ Migration 017 (`device_recovery_audits`)은 일반 기기 복구의 불변 DB �
 백업하지 않는다. 기존 JSON 감사는 이관하지 않고 Raw·탐지·Trust·격리 이력을 보존한다.
 코드 rollback 시에도 감사표를 유지하며, 감사 삭제용 down Migration은 제공하지 않는다.
 
+Migration 018 (`direct_ipv4_isolation`)은 `firewall_rules`의 CHECK 제약에 부모 없는 직접
+광역 격리를 추가한다. 기존 22개 컬럼의 값·ID·sequence·인덱스·자기 참조·Release FK와
+011의 기존 MQTT/확장 조건은 보존한다. 직접 규칙은 NULL source/protocol/port, 양의 정수
+trigger/revision, `system:trust-score-v2` actor와 UUID4를 요구한다. 기존 FK의 SET NULL과
+새 CHECK가 함께 작용하므로 직접 규칙의 기기·대표 이벤트를 삭제할 수 없다. 전체 재구성은
+FK 검사·무결성 검사를 포함한 트랜잭션이며 실패 시 완료 기록도 함께 rollback된다.
+
 적용과 복구: 007은 컬럼 추가를 포함하며 되돌리는(down) Migration이 없다. 운영 DB에는 먼저
 일관된 백업(SQLite backup API 등, 쓰기 중 파일 하나만 복사하지 않는다)을 만든 뒤 **복사본에서**
 Migration과 backfill dry-run을 확인하고 적용한다. 적용 중 오류가 나면 Migration 전체가 rollback되어
@@ -505,8 +512,9 @@ Event와 Source Trust History를 수정하지 않고, 어떤 감점을 어떤 Ba
 
 ## firewall_rules
 
-Firewall 요청/상태 테이블입니다. 격리 진입 시 Trust Score v2 transaction은 기존 MQTT
-scope의 `PENDING` 행을 만들고, Migration 011 관리 API는 기존 isolated/APPLIED MQTT
+Firewall 요청/상태 테이블입니다. 격리 진입 시 Trust Score v2 transaction은 설정한 scope의
+`PENDING` 행 한 개를 만듭니다. Migration 018과 ALL 설정은 MQTT 선행 행 없이 직접 광역
+행을 생성합니다. Migration 011 관리 API는 기존 isolated/APPLIED MQTT
 규칙에 연결된 새 광역 PENDING 행을 만듭니다. Worker가 실제 iptables 적용·해제와
 reconciliation을 담당합니다. Repository는 `PENDING -> APPLIED`, `PENDING -> PENDING/FAILED`,
 `APPLIED/FAILED -> REMOVED`, 관리자 재시도용 `FAILED -> PENDING`을 지원합니다.
@@ -532,9 +540,9 @@ FAILED 정리는 정확한 PENDING 해제 감사 요청과 실제 규칙 부재 
 | next_retry_at | DATETIME | 다음 재시도 가능 시각 |
 | created_at | DATETIME | 요청 생성 시각 |
 | updated_at | DATETIME | 수정 시각 |
-| source_rule_id | INTEGER | 011. 원본 `firewall_rules.id` FK, `ON DELETE RESTRICT`; 광역은 양수 필수, MQTT는 NULL |
+| source_rule_id | INTEGER | 011. 원본 `firewall_rules.id` FK, `ON DELETE RESTRICT`; 확장 광역은 양수, 018 직접 광역과 MQTT는 NULL |
 | approved_policy_revision | INTEGER | 011. 승인한 현재 ACTIVE policy revision; 광역은 양수 필수, MQTT는 NULL |
-| requested_by | TEXT | 011. 광역은 서버 인증 principal, 공백 제외 비어 있지 않아야 함; 기존 행은 NULL |
+| requested_by | TEXT | 011. 확장 광역은 서버 인증 principal, 018 직접 광역은 `system:trust-score-v2`; 기존 MQTT 행은 NULL |
 | request_id | TEXT | 011. UNIQUE nullable; 광역은 소문자 정규 UUID4 필수, MQTT는 NULL |
 
 011 CHECK는 scope별 protocol/port/승인 메타데이터 조합을 강제합니다. MQTT는 `tcp`/`1883`,
@@ -542,10 +550,14 @@ NULL source/revision/request ID이고 광역은 NULL protocol/port, 양의 sourc
 비어 있지 않은 actor/reason이어야 합니다. `approved_policy_revision`은 별도 FK가 아니라
 승인값이며 현재 적용 정책과의 동일성은 API/Worker에서 다시 검사합니다.
 
+018은 직접 광역에 한해 NULL source와 필수 device/trigger를 허용하는 별도 조건을
+추가합니다. 실제 감점 처리·Trust v2·격리 이력의 연결은 Repository가 현재 정책/IP와 함께
+적용·재시도·복원 전에 검사합니다. 이전 MQTT→광역 확장 행의 조건은 그대로입니다.
+
 011부터 `PENDING`/`APPLIED`는 `(source_ip, scope)`가 유일합니다. 같은 IP의 MQTT와 광역
 규칙은 공존할 수 있으나 같은 scope의 활성 중복은 거부합니다. 기존 status/IP 인덱스는
-재생성됩니다. 자동 신규 규칙은 MQTT scope 기본값을 사용하며 기존 ID를 광역으로 바꾸지
-않습니다. 최초 광역에는 source APPLIED·현재 isolated 기기·동일 소유 IPv4·현재 ACTIVE
+재생성됩니다. 자동 신규 규칙은 `FIREWALL_AUTO_SCOPE`를 따르며 기존 ID를 광역으로 바꾸지
+않습니다. 관리자 확장의 최초 광역에는 source APPLIED·현재 isolated 기기·동일 소유 IPv4·현재 ACTIVE
 revision·해제 대기 없음이 필요합니다. source ID/사양/device/IP 연결과 승인 revision은
 실제 적용·재시도·복원 직전 다시 검사합니다.
 

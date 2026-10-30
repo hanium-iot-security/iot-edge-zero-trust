@@ -372,6 +372,8 @@ def apply_trust_score_v2_until(
                 source_ip=str(source_ip),
                 reason=ISOLATION_REASON,
                 trigger_event_id=representative_ids[0],
+                scope=settings.firewall_auto_scope,
+                now=response_time.astimezone(timezone.utc).replace(microsecond=0),
             )
             created_firewall_rule_count += 1
 

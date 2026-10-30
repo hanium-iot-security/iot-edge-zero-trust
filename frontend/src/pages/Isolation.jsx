@@ -8,8 +8,9 @@ import EmptyState from "../components/EmptyState";
 import FirewallTrafficFields from "../components/FirewallTrafficFields";
 import {
     canReleaseFirewallRule,
-    findCurrentFirewallRuleByTriggerEvent,
+    findFirewallRulesByTriggerEvent,
     getCurrentFirewallRuleMap,
+    selectCurrentFirewallRule,
 } from "../utils/firewallRuleSelection";
 import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
@@ -100,6 +101,14 @@ function getFirewallStatusLabel(status) {
     return (labels[normalized] ||
         status ||
         "방화벽 기록 없음");
+}
+function getFirewallScopeLabel(rule) {
+    if (rule.scope === "PI_INPUT_IPV4_ALL") return "전체 IPv4";
+    if (rule.scope === "MQTT_IPV4_TCP_1883" ||
+        (!rule.scope && String(rule.protocol).toLowerCase() === "tcp" && Number(rule.dest_port) === 1883)) {
+        return "MQTT IPv4 · TCP 1883";
+    }
+    return rule.scope || "범위 정보 없음";
 }
 function getFirewallReleaseConfirmation(ruleId) {
     if (ruleId === null ||
@@ -722,7 +731,7 @@ export default function Isolation() {
     const [searchText, setSearchText,] = useState("");
     const [actionFilter, setActionFilter,] = useState("");
     const [firewallFilter, setFirewallFilter,] = useState("");
-    const [selectedHistory, setSelectedHistory,] = useState(null);
+    const [historySelection, setSelectedHistory,] = useState(null);
     const [selectedIsolatedDevice, setSelectedIsolatedDevice,] = useState(null);
     const [loading, setLoading,] = useState(true);
     const [refreshing, setRefreshing,] = useState(false);
@@ -1031,18 +1040,26 @@ export default function Isolation() {
        Isolation History Mapping
        ========================================================= */
     const historyWithFirewall = useMemo(() => history.map((item) => {
-        const firewallRule = findCurrentFirewallRuleByTriggerEvent(firewallRules, item.trigger_event_id);
+        const matchingRules = findFirewallRulesByTriggerEvent(firewallRules, item.trigger_event_id, {
+            deviceId: item.device_id,
+            sourceIp: item.source_ip,
+        });
+        const firewallRule = selectCurrentFirewallRule(matchingRules);
         return {
             ...item,
             firewall_status: firewallRule
                 ?.status ??
                 null,
             firewall_rule: firewallRule,
+            firewall_rules: matchingRules,
         };
     }), [
         history,
         firewallRules,
     ]);
+    const selectedHistory = historySelection
+        ? historyWithFirewall.find((item) => item.id === historySelection.id) ?? historySelection
+        : null;
     const filteredHistory = useMemo(() => {
         const keyword = searchText
             .trim()
@@ -2909,64 +2926,45 @@ export default function Isolation() {
                 방화벽 규칙
               </h3>
 
-              {selectedHistory.firewall_rule ? (<dl className="detail-list">
-                  <div>
-                    <dt>
-                      규칙 ID
-                    </dt>
+              {selectedHistory.firewall_rules?.length ? (<div className="history-list">
+                {selectedHistory.firewall_rules.map((rule) => (<article className="history-item" key={rule.id}>
+                  <strong>규칙 #{rule.id ?? "-"}</strong>
+                  <StatusBadge status={getFirewallStatusTheme(rule.status)} label={getFirewallStatusLabel(rule.status)}/>
+                  <dl className="detail-list" style={{ gridColumn: "1 / -1" }}>
+                    <div>
+                      <dt>규칙 ID</dt>
+                      <dd>{rule.id ?? "-"}</dd>
+                    </div>
 
-                    <dd>
-                      {selectedHistory.firewall_rule.id ??
-                    "-"}
-                    </dd>
-                  </div>
+                    <div>
+                      <dt>출발지 IP</dt>
+                      <dd>{rule.source_ip || "-"}</dd>
+                    </div>
 
-                  <div>
-                    <dt>
-                      출발지 IP
-                    </dt>
+                    <div>
+                      <dt>범위</dt>
+                      <dd>{getFirewallScopeLabel(rule)}</dd>
+                    </div>
 
-                    <dd>
-                      {selectedHistory.firewall_rule.source_ip ||
-                    "-"}
-                    </dd>
-                  </div>
+                    <FirewallTrafficFields rule={rule} />
 
-                  <FirewallTrafficFields rule={selectedHistory.firewall_rule} />
+                    <div>
+                      <dt>동작</dt>
+                      <dd>{rule.action || "-"}</dd>
+                    </div>
 
-                  <div>
-                    <dt>
-                      동작
-                    </dt>
+                    <div>
+                      <dt>재시도 횟수</dt>
+                      <dd>{rule.retry_count ?? 0}</dd>
+                    </div>
 
-                    <dd>
-                      {selectedHistory.firewall_rule.action ||
-                    "-"}
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>
-                      재시도 횟수
-                    </dt>
-
-                    <dd>
-                      {selectedHistory.firewall_rule.retry_count ??
-                    0}
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>
-                      마지막 오류
-                    </dt>
-
-                    <dd className="break-word">
-                      {selectedHistory.firewall_rule.last_error ||
-                    "-"}
-                    </dd>
-                  </div>
-                </dl>) : (<EmptyState title="연결된 방화벽 규칙이 없습니다." description="이 격리 이력의 Trigger Event ID와 일치하는 방화벽 규칙이 없습니다. 다른 기기의 규칙을 임의로 연결하지 않습니다." compact/>)}
+                    <div>
+                      <dt>마지막 오류</dt>
+                      <dd className="break-word">{rule.last_error || "-"}</dd>
+                    </div>
+                  </dl>
+                </article>))}
+              </div>) : (<EmptyState title="연결된 방화벽 규칙이 없습니다." description="이 격리 이력의 Trigger Event ID와 일치하는 방화벽 규칙이 없습니다. 다른 기기의 규칙을 임의로 연결하지 않습니다." compact/>)}
             </section>
           </div>)}
       </DetailModal>
