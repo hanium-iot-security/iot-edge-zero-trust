@@ -18,9 +18,17 @@ const walk = (node) => Array.isArray(node) ? node.flatMap(walk)
   : node && typeof node === "object" ? [node, ...walk(node.children), ...walk(node.props?.footer)] : [];
 const text = (node) => Array.isArray(node) ? node.map(text).join(" ").replace(/\s+/g, " ")
   : node && typeof node === "object" ? text(node.children) : node == null || typeof node === "boolean" ? "" : String(node);
+const detailValue = (node, label) => {
+  const row = walk(node).find((n) => n.type === "div" && n.children.some((child) => child?.type === "dt" && text(child).trim() === label));
+  assert.ok(row, `expected detail row: ${label}`);
+  return text(row.children.find((child) => child?.type === "dd")).trim();
+};
 
 // Render actual page hooks and handlers; only external API/timers are fixtures.
-function workflow({ runtimeStatus: runtime = "VERIFIED_RELEASED", uncertainExecute = false, detailFailure = false, truncatedRules = false, unknownRuleTotal, wrongDeviceDetail = false } = {}) {
+function workflow({ runtimeStatus: runtime = "VERIFIED_RELEASED", uncertainExecute = false, executeError = null, executeCommitted = true, detailFailure = false, truncatedRules = false, unknownRuleTotal, wrongDeviceDetail = false,
+  auditCheck = { available: true, storage: "database", failure_reason: null }, legacyPreflight = false,
+  backupCheck = { required: false, available: null, status: "NOT_REQUIRED" }, priorRecoveries = [],
+  recoveryEvidence = { audit_reference: "device_recovery_audits:recovery-01", backup_reference: null, backup_sha256: null } } = {}) {
   const slots = [], effects = new Set(), timers = new Map(), calls = [];
   let cursor = 0, dirty = false, tree, nextTimer = 1;
   const device = { device_id: "esp32_02", ip_address: "192.168.0.5", status: "isolated", trust_score: 20 };
@@ -28,12 +36,12 @@ function workflow({ runtimeStatus: runtime = "VERIFIED_RELEASED", uncertainExecu
     scope: id === 12 ? "PI_INPUT_IPV4_ALL" : "MQTT_IPV4_TCP_1883", status: "APPLIED", action: "DROP",
     created_at: `2026-10-26T01:00:${id}Z`, updated_at: `2026-10-26T01:00:${id}Z` }));
   const releases = new Map();
-  const history = [];
+  const history = [...priorRecoveries];
   const remember = (kind, value) => { calls.push({ kind, ...value }); };
   const api = {
     async getIsolationHistory() { return { items: [], total: 0 }; },
     async getIsolatedDevices() { return { items: device.status === "isolated" ? [{ ...device }] : [], total: device.status === "isolated" ? 1 : 0 }; },
-    async getFirewallRules() { return { items: device.status === "normal" && unknownRuleTotal !== undefined ? [] : rules.map((r) => ({ ...r })), total: device.status === "normal" && unknownRuleTotal !== undefined ? unknownRuleTotal : truncatedRules && device.status === "normal" ? rules.length + 1 : rules.length }; },
+    async getFirewallRules() { remember("rules", {}); return { items: device.status === "normal" && unknownRuleTotal !== undefined ? [] : rules.map((r) => ({ ...r })), total: device.status === "normal" && unknownRuleTotal !== undefined ? unknownRuleTotal : truncatedRules && device.status === "normal" ? rules.length + 1 : rules.length }; },
     async getDeviceDetail() { remember("detail", {}); if (detailFailure) throw new Error("detail unavailable"); return { ...device, device_id: wrongDeviceDetail ? "other_sensor" : device.device_id }; },
     async getRecoveryHistory(params, key) { remember("history", { params, key }); return { items: [...history], total: history.length }; },
     async createFirewallReleaseRequest(ruleId, body) {
@@ -50,20 +58,24 @@ function workflow({ runtimeStatus: runtime = "VERIFIED_RELEASED", uncertainExecu
       remember("preflight", { body, key });
       return { device_id: device.device_id, current_status: device.status, current_trust_score: device.trust_score,
         can_execute: true, result: "SUCCESS", firewall_runtime_verification: { available: true, passed: runtime === "VERIFIED_RELEASED", status: runtime },
-        firewall_db_state: { passed: true, count: 0 }, firewall_release_request_state: { passed: true, count: 0 } };
+        firewall_db_state: { passed: true, count: 0 }, firewall_release_request_state: { passed: true, count: 0 },
+        ...(legacyPreflight ? {} : { audit_check: auditCheck }), backup_check: backupCheck };
     },
     async executeRecovery(body, key) {
-      remember("execute", { body, key }); device.status = "normal"; device.trust_score = 100;
+      remember("execute", { body, key });
+      if (executeError && !executeCommitted) throw executeError;
+      device.status = "normal"; device.trust_score = 100;
       const item = { operation_id: "recovery-01", device_id: device.device_id, result: "SUCCESS", before_status: "isolated",
-        before_trust_score: 20, after_status: "normal", after_trust_score: 100, firewall_release_status: "VERIFIED_RELEASED" };
+        before_trust_score: 20, after_status: "normal", after_trust_score: 100, firewall_release_status: "VERIFIED_RELEASED", ...recoveryEvidence };
       history.push(item);
       if (uncertainExecute) throw Object.assign(new Error("network lost"), { code: "ERR_NETWORK" });
+      if (executeError) throw executeError;
       return item;
     },
   };
   const same = (a, b) => Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => Object.is(x, b[i]));
   const scope = { ...Object.fromEntries(imported.map((v) => [v, v])), ...uiText, ...runtimeStatus, ...firewallRules, ...api,
-    console, Date, AbortController, Fragment: "Fragment",
+    console, Date, Error, AbortController, Fragment: "Fragment",
     window: {
       setInterval(fn, ms) { const id = nextTimer++; timers.set(id, { fn, ms }); return id; },
       clearInterval(id) { timers.delete(id); },
@@ -151,6 +163,63 @@ test("two exact releases precede runtime preflight and successful recovery refre
   assert.ok(app.nodes().some((n) => n.type === "StatusBadge" && n.props.label === "복구 완료"));
 });
 
+test("current preflight reports database audit readiness rather than a required backup", async () => {
+  const app = await opened(); await releaseAll(app); await app.click("사전 점검 실행");
+  assert.equal(detailValue(app.modal().children, "감사 기록 저장"), "준비됨 (데이터베이스)");
+  assert.ok(!app.text().includes("백업 확인"));
+  assert.ok(!app.text().includes("백업 경로를 다시 검사"));
+});
+
+test("an unavailable database audit does not fall back to an available legacy backup", async () => {
+  const app = await opened({ auditCheck: { available: false, storage: "database", failure_reason: "감사 저장소 점검 실패" },
+    backupCheck: { available: true } });
+  await releaseAll(app); await app.click("사전 점검 실행");
+  assert.match(detailValue(app.modal().children, "감사 기록 저장"), /저장 불가.*감사 저장소 점검 실패/);
+  assert.ok(!app.text().includes("백업 확인"));
+});
+
+test("a present but unreadable audit check does not claim legacy backup readiness", async () => {
+  const app = await opened({ auditCheck: null, backupCheck: { available: true } });
+  await releaseAll(app); await app.click("사전 점검 실행");
+  assert.equal(detailValue(app.modal().children, "감사 기록 저장"), "확인 불가");
+  assert.ok(!app.text().includes("백업 확인"));
+});
+
+for (const [available, label] of [[true, "사용 가능"], [false, "사용 불가"]]) {
+  test(`legacy preflight without an audit field retains backup status ${available}`, async () => {
+    const app = await opened({ legacyPreflight: true, backupCheck: { available } });
+    await releaseAll(app); await app.click("사전 점검 실행");
+    assert.equal(detailValue(app.modal().children, "백업 확인 (구형 응답)"), label);
+    assert.ok(!walk(app.modal().children).some((n) => n.type === "dt" && text(n).trim() === "감사 기록 저장"));
+  });
+}
+
+test("recovery results and history show the audit reference and explicitly explain absent backups", async () => {
+  const app = await opened(); await releaseAll(app); await app.click("사전 점검 실행");
+  await app.change("recovery-reason", "controlled recovery"); await app.change("recovery-confirmation", "RESET-TO-NORMAL-100");
+  await app.click("복구 실행");
+  const result = app.nodes().find((n) => n.props.className === "success-box");
+  const history = app.nodes().find((n) => n.type === "details" && text(n).includes("복구 이력"));
+  for (const node of [result, history]) {
+    assert.equal(detailValue(node, "감사 기록"), "device_recovery_audits:recovery-01");
+    assert.equal(detailValue(node, "백업 위치"), "생성 안 함(필요 시 별도 백업)");
+  }
+});
+
+test("older recovery evidence retains its actual backup reference and digest", async () => {
+  const evidence = { backup_reference: "backups/legacy-recovery.sqlite3", backup_sha256: "a".repeat(64) };
+  const app = await opened({ priorRecoveries: [{ operation_id: "legacy-recovery", result: "SUCCESS", ...evidence }], recoveryEvidence: evidence });
+  await releaseAll(app); await app.click("사전 점검 실행");
+  await app.change("recovery-reason", "controlled recovery"); await app.change("recovery-confirmation", "RESET-TO-NORMAL-100");
+  await app.click("복구 실행");
+  const result = app.nodes().find((n) => n.props.className === "success-box");
+  const oldHistory = app.nodes().find((n) => n.type === "article" && text(n).includes("legacy-recovery"));
+  for (const node of [result, oldHistory]) {
+    assert.equal(detailValue(node, "백업 위치"), evidence.backup_reference);
+    assert.equal(detailValue(node, "백업 SHA256"), evidence.backup_sha256);
+  }
+});
+
 test("preflight success without actual runtime release cannot enable recovery", async () => {
   const app = await opened({ runtimeStatus: "UNVERIFIED" });
   await releaseAll(app); await app.click("사전 점검 실행");
@@ -190,6 +259,40 @@ test("uncertain reset reconciles state without permitting another write", async 
   await app.button("복구 실행").props.onClick(); await app.settle();
   assert.equal(app.calls.filter((x) => x.kind === "execute").length, 1);
   assert.ok(app.calls.some((x) => x.kind === "detail"));
+});
+
+test("a committed recovery with an HTTP500 unverified receipt reconciles without another write", async () => {
+  const executeError = Object.assign(new Error("복구 저장 후 결과 조회에 실패했습니다."), { status: 500, responseData: { detail: {
+    operation_id: "recovery-01", device_id: "esp32_02", result: "HOLD", failure_code: "BASELINE_RECOVERY_COMMITTED_UNVERIFIED",
+    after_status: null, after_trust_score: null,
+  } } });
+  const app = await opened({ executeError }); await releaseAll(app); await app.click("사전 점검 실행");
+  await app.change("recovery-reason", "controlled recovery"); await app.change("recovery-confirmation", "RESET-TO-NORMAL-100");
+  const beforeExecute = app.calls.length;
+  await app.click("복구 실행");
+  assert.match(app.text(), /실행되었을 가능성/);
+  const reconciliation = app.calls.slice(beforeExecute);
+  assert.ok(reconciliation.some((x) => x.kind === "detail"), "query the actual device after the uncertain receipt");
+  assert.ok(reconciliation.some((x) => x.kind === "rules"), "query remaining firewall rules after the uncertain receipt");
+  assert.equal(app.button("복구 실행").props.disabled, true);
+  await app.button("복구 실행").props.onClick(); await app.settle();
+  await app.button("복구 실행").props.onClick(); await app.settle();
+  assert.equal(app.calls.filter((x) => x.kind === "execute").length, 1);
+});
+
+test("an ordinary HTTP500 error keeps its known failure behavior", async () => {
+  const executeError = Object.assign(new Error("감사 기록 저장에 실패했습니다."), { status: 500, responseData: { detail: {
+    failure_code: "RECOVERY_AUDIT_WRITE_FAILED",
+  } } });
+  const app = await opened({ executeError, executeCommitted: false }); await releaseAll(app); await app.click("사전 점검 실행");
+  await app.change("recovery-reason", "controlled recovery"); await app.change("recovery-confirmation", "RESET-TO-NORMAL-100");
+  const beforeExecute = app.calls.length;
+  await app.click("복구 실행");
+  assert.match(app.text(), /감사 기록 저장에 실패했습니다/);
+  assert.ok(!app.text().includes("실행되었을 가능성"));
+  assert.ok(!app.calls.slice(beforeExecute).some((x) => x.kind === "detail" || x.kind === "rules"));
+  assert.equal(app.button("복구 실행").props.disabled, false);
+  assert.equal(app.calls.filter((x) => x.kind === "execute").length, 1);
 });
 
 test("closing and reopening discards the administrator key", async () => {

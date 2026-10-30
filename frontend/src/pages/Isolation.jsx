@@ -273,6 +273,18 @@ function getPreflightCanExecute(data) {
     return (data?.can_execute ===
         true);
 }
+function getAuditCheckLabel(check) {
+    if (check?.available === true) return "준비됨 (데이터베이스)";
+    if (check?.available === false) {
+        return check.failure_reason ? `저장 불가 (${check.failure_reason})` : "저장 불가";
+    }
+    return "확인 불가";
+}
+function getLegacyBackupCheckLabel(check) {
+    if (check?.available === true) return "사용 가능";
+    if (check?.available === false) return "사용 불가";
+    return "-";
+}
 /*
  * expected_trust_score는
  * Recovery 후 목표 Score 100이 아닙니다.
@@ -452,6 +464,9 @@ function isUncertainCommandError(error) {
     }
     if (error.isCanceled) {
         return false;
+    }
+    if (error.responseData?.detail?.failure_code === "BASELINE_RECOVERY_COMMITTED_UNVERIFIED") {
+        return true;
     }
     if (error.code === "ERR_NETWORK" ||
         error.code === "ECONNABORTED" ||
@@ -1772,6 +1787,7 @@ export default function Isolation() {
         !isAdminOperationBusy &&
         !hasUncertainOutcome;
     const runtimeReleaseStatus = getRuntimeReleaseStatus(preflight);
+    const hasRecoveryAuditCheck = Boolean(preflight && Object.prototype.hasOwnProperty.call(preflight, "audit_check"));
     const canRunRecovery = Boolean(preflight) &&
         getRecoveryResult(recoveryResult) !== "SUCCESS" &&
         getPreflightCanExecute(preflight) &&
@@ -2409,7 +2425,7 @@ export default function Isolation() {
               </h3>
 
               <p className="text-muted">
-                방화벽 규칙이 제거 상태로 기록된 뒤 백엔드가 실제 방화벽, 미처리 탐지, 차단 해제 요청 및 백업 경로를 다시 검사합니다.
+                방화벽 규칙이 제거 상태로 기록된 뒤 실제 방화벽, 미처리 탐지, 차단 해제 요청 및 감사 기록 저장 준비를 다시 확인합니다. 전체 백업은 필요 시 별도로 수행합니다.
               </p>
 
               <div className="action-row">
@@ -2536,21 +2552,13 @@ export default function Isolation() {
 
                     <div>
                       <dt>
-                        백업 확인
+                        {hasRecoveryAuditCheck ? "감사 기록 저장" : "백업 확인 (구형 응답)"}
                       </dt>
 
                       <dd>
-                        {preflight
-                    ?.backup_check
-                    ?.available ===
-                    true
-                    ? "사용 가능"
-                    : preflight
-                        ?.backup_check
-                        ?.available ===
-                        false
-                        ? "사용 불가"
-                        : "-"}
+                        {hasRecoveryAuditCheck
+                            ? getAuditCheckLabel(preflight.audit_check)
+                            : getLegacyBackupCheckLabel(preflight.backup_check)}
                       </dd>
                     </div>
                   </dl>
@@ -2693,12 +2701,22 @@ export default function Isolation() {
 
                     <div>
                       <dt>
+                        감사 기록
+                      </dt>
+
+                      <dd className="break-word">
+                        {recoveryResult.audit_reference || "-"}
+                      </dd>
+                    </div>
+
+                    <div>
+                      <dt>
                         백업 위치
                       </dt>
 
                       <dd className="break-word">
                         {recoveryResult.backup_reference ||
-                    "-"}
+                    "생성 안 함(필요 시 별도 백업)"}
                       </dd>
                     </div>
 
@@ -2751,6 +2769,21 @@ export default function Isolation() {
                         item.created_at ??
                         item.completed_at)}
                         </small>
+
+                        <dl className="detail-list" style={{ gridColumn: "1 / -1" }}>
+                          <div>
+                            <dt>감사 기록</dt>
+                            <dd className="break-word">{item.audit_reference || "-"}</dd>
+                          </div>
+                          <div>
+                            <dt>백업 위치</dt>
+                            <dd className="break-word">{item.backup_reference || "생성 안 함(필요 시 별도 백업)"}</dd>
+                          </div>
+                          <div>
+                            <dt>백업 SHA256</dt>
+                            <dd className="break-word">{item.backup_sha256 || "-"}</dd>
+                          </div>
+                        </dl>
                       </article>))}
                 </div>)}
             </details>

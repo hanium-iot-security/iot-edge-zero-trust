@@ -9,15 +9,20 @@ import threading
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session, sessionmaker
 
 from backend.app.config import settings
 from backend.app.database import get_db
 from backend.app.main import app
 from backend.app.services import recovery_command_service
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
-from edge.trust import baseline_recovery
-from edge.trust.baseline_recovery import CONFIRMATION, BaselineRecoveryError
+from edge.trust import baseline_recovery, device_recovery
+from edge.trust.baseline_recovery import (
+    CONFIRMATION,
+    BaselineRecoveryCommittedError,
+    BaselineRecoveryError,
+)
 from edge.trust.firewall_runtime_snapshot import SNAPSHOT_SCHEMA_VERSION
 
 
@@ -115,6 +120,42 @@ def _post_execute(client: TestClient, **payload: object):
     return client.post("/api/recovery/execute", json=body, headers=ADMIN_HEADERS)
 
 
+@pytest.mark.parametrize("failing_statement", ["INSERT INTO", "SELECT payload_json FROM"])
+def test_denied_command_preserves_json_audit_when_database_audit_fails(
+    api_client, monkeypatch, failing_statement,
+) -> None:
+    client, db_path, artifact_dir = api_client
+    execute = Session.execute
+
+    def unavailable_audit(self, statement, *args, **kwargs):
+        if str(statement).startswith(f"{failing_statement} device_recovery_audits"):
+            raise SQLAlchemyError("audit storage failure")
+        return execute(self, statement, *args, **kwargs)
+
+    def unexpected_recovery(**kwargs):
+        pytest.fail("Denied requests must never reset a device")
+
+    monkeypatch.setattr(Session, "execute", unavailable_audit)
+    monkeypatch.setattr(recovery_command_service, "execute_device_recovery", unexpected_recovery)
+    response = _post_execute(client, expected_trust_score=19)
+    assert response.status_code == 409
+    item = response.json()["detail"]
+    assert item["result"] == "DENIED"
+    assert item["failure_code"] == "TRUST_SCORE_MISMATCH"
+    assert item.get("audit_reference") is None
+    assert item["backup_reference"] is None
+    assert _device_state(db_path) == ("isolated", 20)
+    assert _row_count(db_path, "device_recovery_audits") == 0
+    saved = json.loads((artifact_dir / item["log_reference"]).read_text(encoding="utf-8"))
+    assert saved["operation_id"] == item["operation_id"]
+    assert saved["requested_by"] == "operator@example"
+    assert saved["result"] == "DENIED"
+    monkeypatch.setattr(Session, "execute", execute)
+    history = client.get(f"/api/recovery/history/{item['operation_id']}", headers=ADMIN_HEADERS)
+    assert history.status_code == 200
+    assert history.json()["result"] == "DENIED"
+
+
 def test_recovery_preflight_all_gates_pass(api_client) -> None:
     client, _, artifact_dir = api_client
 
@@ -129,12 +170,91 @@ def test_recovery_preflight_all_gates_pass(api_client) -> None:
     assert body["firewall_db_state"]["passed"] is True
     assert body["firewall_runtime_verification"]["status"] == "VERIFIED_RELEASED"
     assert body["unprocessed_detection_count"] == 0
+    assert body["backup_check"] == {
+        "required": False, "available": None, "status": "NOT_REQUIRED",
+    }
+    assert body["audit_check"] == {
+        "storage": "database", "available": True, "failure_reason": None,
+    }
     assert not artifact_dir.exists()
+
+
+def test_admitted_rollback_preserves_json_failure_when_audit_lookup_fails(api_client, monkeypatch):
+    client, db_path, artifact_dir = api_client
+    assert _post_preflight(client).json()["can_execute"] is True
+    execute = Session.execute
+
+    def unavailable_audit(self, statement, *args, **kwargs):
+        if str(statement).startswith("SELECT payload_json FROM device_recovery_audits"):
+            raise SQLAlchemyError("audit read unavailable")
+        return execute(self, statement, *args, **kwargs)
+
+    def rolled_back(**kwargs):
+        raise BaselineRecoveryError("known precommit rollback")
+
+    monkeypatch.setattr(Session, "execute", unavailable_audit)
+    monkeypatch.setattr(recovery_command_service, "execute_device_recovery", rolled_back)
+    response = _post_execute(client)
+    assert response.status_code == 500
+    item = response.json()["detail"]
+    assert item["result"] == "FAILED"
+    assert item["failure_code"] == "BASELINE_RECOVERY_CORE_FAILED"
+    assert _device_state(db_path) == ("isolated", 20)
+    assert _row_count(db_path, "device_recovery_audits") == 0
+    saved = json.loads((artifact_dir / item["log_reference"]).read_text(encoding="utf-8"))
+    assert saved["operation_id"] == item["operation_id"]
+    assert saved["result"] == "FAILED"
+    monkeypatch.setattr(Session, "execute", execute)
+    history = client.get(f"/api/recovery/history/{item['operation_id']}", headers=ADMIN_HEADERS)
+    assert history.json()["result"] == "FAILED"
+
+
+@pytest.mark.parametrize("commit_succeeded", [True, False])
+def test_unknown_commit_never_records_failure_or_retries_when_receipt_is_unreadable(
+    api_client, monkeypatch, commit_succeeded,
+):
+    client, db_path, artifact_dir = api_client
+    execute = Session.execute
+    core_execute = recovery_command_service.execute_device_recovery
+    calls = []
+
+    def unavailable_audit(self, statement, *args, **kwargs):
+        if str(statement).startswith("SELECT payload_json FROM device_recovery_audits"):
+            raise SQLAlchemyError("receipt read unavailable")
+        return execute(self, statement, *args, **kwargs)
+
+    def unknown_commit(**kwargs):
+        calls.append(kwargs["operation_id"])
+        if commit_succeeded:
+            core_execute(**kwargs)
+        raise BaselineRecoveryCommittedError("commit result unavailable")
+
+    monkeypatch.setattr(Session, "execute", unavailable_audit)
+    monkeypatch.setattr(recovery_command_service, "execute_device_recovery", unknown_commit)
+    response = _post_execute(client)
+    assert response.status_code == 500
+    item = response.json()["detail"]
+    assert item["result"] == "HOLD"
+    assert item["failure_code"] == "BASELINE_RECOVERY_COMMITTED_UNVERIFIED"
+    assert item["after_status"] is None and item["after_trust_score"] is None
+    assert item["audit_reference"] is None
+    assert calls == [item["operation_id"]]
+    assert not artifact_dir.exists()
+    assert _device_state(db_path) == (("normal", 100) if commit_succeeded else ("isolated", 20))
+    assert _row_count(db_path, "device_recovery_audits") == int(commit_succeeded)
+    monkeypatch.setattr(Session, "execute", execute)
+    history = client.get(f"/api/recovery/history/{item['operation_id']}", headers=ADMIN_HEADERS)
+    if commit_succeeded:
+        assert history.status_code == 200
+        assert history.json()["result"] == "SUCCESS"
+        assert history.json()["failure_code"] is None
+    else:
+        assert history.status_code == 404
 
 
 def test_recovery_rechecks_new_firewall_attempt_after_preflight(api_client, monkeypatch):
     client, db_path, _ = api_client
-    execute = recovery_command_service.execute_baseline_recovery
+    execute = recovery_command_service.execute_device_recovery
 
     def attempt_after_preflight(**kwargs):
         with sqlite3.connect(db_path) as db:
@@ -145,7 +265,7 @@ def test_recovery_rechecks_new_firewall_attempt_after_preflight(api_client, monk
             )
         return execute(**kwargs)
 
-    monkeypatch.setattr(recovery_command_service, "execute_baseline_recovery", attempt_after_preflight)
+    monkeypatch.setattr(recovery_command_service, "execute_device_recovery", attempt_after_preflight)
     response = _post_execute(client)
     assert response.status_code == 409
     detail = response.json()["detail"]
@@ -379,7 +499,7 @@ def test_recovery_execute_requires_admin_and_does_not_call_core(
 
     monkeypatch.setattr(
         recovery_command_service,
-        "execute_baseline_recovery",
+        "execute_device_recovery",
         fail_if_called,
     )
 
@@ -408,6 +528,9 @@ def test_recovery_execute_requires_explicit_confirmation(api_client) -> None:
     assert detail["failure_code"] == "APPROVAL_CONFIRMATION_MISSING"
     assert _device_state(db_path) == ("isolated", 20)
     assert len(list(artifact_dir.glob("*.db"))) == 0
+    assert _row_count(db_path, "device_recovery_audits") == 1
+    assert detail["audit_reference"] == f"device_recovery_audits:{detail['operation_id']}"
+    assert not artifact_dir.exists()
 
 
 def test_recovery_execute_uses_authenticated_principal_not_body_value(
@@ -426,16 +549,22 @@ def test_recovery_execute_uses_authenticated_principal_not_body_value(
     assert body["before_trust_score"] == 20
     assert body["after_status"] == "normal"
     assert body["after_trust_score"] == 100
-    assert body["backup_sha256"]
+    assert body["backup_reference"] is None
+    assert body["backup_sha256"] is None
+    assert body["audit_reference"] == f"device_recovery_audits:{body['operation_id']}"
     assert _device_state(db_path) == ("normal", 100)
 
-    audit = json.loads(next(artifact_dir.glob("baseline-recovery-*.json")).read_text(encoding="utf-8"))
-    assert audit["audit"]["approved_by"] == "operator@example"
+    with sqlite3.connect(db_path) as connection:
+        audit = json.loads(connection.execute(
+            "SELECT payload_json FROM device_recovery_audits WHERE operation_id = ?",
+            (body["operation_id"],),
+        ).fetchone()[0])
+    assert audit["approved_by"] == "operator@example"
     assert "spoofed-admin" not in json.dumps(audit, ensure_ascii=False)
 
 
-def test_duplicate_recovery_does_not_create_second_backup(api_client) -> None:
-    client, _, artifact_dir = api_client
+def test_duplicate_recovery_does_not_reset_again_or_create_backups(api_client) -> None:
+    client, db_path, artifact_dir = api_client
 
     first = _post_execute(client)
     second = _post_execute(client)
@@ -443,10 +572,16 @@ def test_duplicate_recovery_does_not_create_second_backup(api_client) -> None:
     assert first.status_code == 200
     assert second.status_code == 409
     assert second.json()["detail"]["failure_code"] == "INVALID_DEVICE_STATUS"
-    assert len(list(artifact_dir.glob("baseline-recovery-*.db"))) == 1
+    assert _device_state(db_path) == ("normal", 100)
+    with sqlite3.connect(db_path) as connection:
+        audits = [json.loads(row[0]) for row in connection.execute(
+            "SELECT payload_json FROM device_recovery_audits"
+        )]
+    assert sorted(item["result"] for item in audits) == ["DENIED", "SUCCESS"]
+    assert not artifact_dir.exists()
 
 
-def test_execute_backup_unavailable_returns_hold_without_state_change(
+def test_execute_succeeds_when_legacy_artifact_directory_is_unavailable(
     api_client,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -458,11 +593,19 @@ def test_execute_backup_unavailable_returns_hold_without_state_change(
 
     response = _post_execute(client)
 
-    assert response.status_code == 409
-    detail = response.json()["detail"]
-    assert detail["result"] == "HOLD"
-    assert detail["failure_code"] == "BACKUP_UNAVAILABLE"
-    assert _device_state(db_path) == ("isolated", 20)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["result"] == "SUCCESS"
+    assert body["backup_reference"] is None
+    assert body["backup_sha256"] is None
+    assert body["audit_reference"] == f"device_recovery_audits:{body['operation_id']}"
+    assert _device_state(db_path) == ("normal", 100)
+    assert artifact_file.read_text(encoding="utf-8") == "occupied"
+    history = client.get(
+        f"/api/recovery/history/{body['operation_id']}", headers=ADMIN_HEADERS,
+    )
+    assert history.status_code == 200
+    assert history.json()["result"] == "SUCCESS"
 
 
 def test_execute_core_failure_is_not_reported_as_success(
@@ -476,7 +619,7 @@ def test_execute_core_failure_is_not_reported_as_success(
 
     monkeypatch.setattr(
         recovery_command_service,
-        "execute_baseline_recovery",
+        "execute_device_recovery",
         fail_core,
     )
 
@@ -489,10 +632,12 @@ def test_execute_core_failure_is_not_reported_as_success(
     assert history.status_code == 200
     assert history.json()["items"][0]["result"] == "FAILED"
     assert history.json()["items"][0]["failure_code"] == "BASELINE_RECOVERY_CORE_FAILED"
-    assert list(artifact_dir.glob("recovery-command-*.json"))
+    assert history.json()["items"][0]["audit_reference"].startswith("device_recovery_audits:")
+    assert _row_count(db_path, "device_recovery_audits") == 1
+    assert not artifact_dir.exists()
 
 
-def test_core_failure_history_deduplicates_backend_and_core_artifacts(
+def test_core_failure_history_prefers_database_audit_to_legacy_core_artifact(
     api_client,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -500,7 +645,7 @@ def test_core_failure_history_deduplicates_backend_and_core_artifacts(
 
     def fail_core_with_artifact(**kwargs: object) -> dict[str, object]:
         operation_id = str(kwargs["operation_id"])
-        artifacts = Path(str(kwargs["artifact_dir"]))
+        artifacts = artifact_dir
         artifacts.mkdir(parents=True, exist_ok=True)
         backup_path = artifacts / f"baseline-recovery-{operation_id}.db"
         backup_path.write_bytes(b"core backup")
@@ -523,7 +668,7 @@ def test_core_failure_history_deduplicates_backend_and_core_artifacts(
                         "requested_by": kwargs["requested_by"],
                         "approved_by": kwargs["approved_by"],
                         "requested_at": kwargs["requested_at"],
-                        "firewall_release_status": kwargs["firewall_release_status"],
+                        "firewall_release_status": "VERIFIED_RELEASED",
                         "preflight": kwargs["preflight"],
                     },
                 },
@@ -536,7 +681,7 @@ def test_core_failure_history_deduplicates_backend_and_core_artifacts(
 
     monkeypatch.setattr(
         recovery_command_service,
-        "execute_baseline_recovery",
+        "execute_device_recovery",
         fail_core_with_artifact,
     )
 
@@ -546,7 +691,8 @@ def test_core_failure_history_deduplicates_backend_and_core_artifacts(
     detail = response.json()["detail"]
     assert detail["failure_code"] == "BASELINE_RECOVERY_CORE_FAILED"
     assert _device_state(db_path) == ("isolated", 20)
-    assert len(list(artifact_dir.glob("*.json"))) == 2
+    assert len(list(artifact_dir.glob("*.json"))) == 1
+    assert _row_count(db_path, "device_recovery_audits") == 1
 
     history = client.get("/api/recovery/history", headers=ADMIN_HEADERS)
     assert history.status_code == 200
@@ -557,108 +703,119 @@ def test_core_failure_history_deduplicates_backend_and_core_artifacts(
     assert item["failure_code"] == "BASELINE_RECOVERY_CORE_FAILED"
     assert item["backup_reference"] == detail["backup_reference"]
     assert item["backup_sha256"] == detail["backup_sha256"]
+    assert item["audit_reference"] == f"device_recovery_audits:{detail['operation_id']}"
 
 
-def test_post_commit_json_audit_failure_records_actual_state_and_backup(
+def test_recovery_success_does_not_publish_json_audits_or_make_full_backups(
     api_client,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client, db_path, artifact_dir = api_client
-    original_write_json_log = baseline_recovery._write_json_log
 
-    def fail_success_log(path: Path, payload: dict[str, object]) -> None:
-        if payload.get("result") == "SUCCESS":
-            raise OSError("forced json audit failure")
-        # A stale core artifact must not replace the backend's fresh DB read.
-        stale_payload = dict(payload)
-        stale_payload["devices"] = [{
-            "device_id": "esp32_01",
-            "current": {"status": "isolated", "trust_score": 20},
-        }]
-        original_write_json_log(path, stale_payload)
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("ordinary recovery must not make a full backup or publish JSON")
 
-    monkeypatch.setattr(baseline_recovery, "_write_json_log", fail_success_log)
+    monkeypatch.setattr(baseline_recovery, "_create_backup", forbidden)
+    monkeypatch.setattr(baseline_recovery, "_write_json_log", forbidden)
+    monkeypatch.setattr(recovery_command_service, "_write_json_atomically", forbidden)
+
+    response = _post_execute(client)
+
+    assert response.status_code == 200
+    assert response.json()["result"] == "SUCCESS"
+    assert response.json()["backup_reference"] is None
+    assert response.json()["backup_sha256"] is None
+    assert _device_state(db_path) == ("normal", 100)
+    assert _row_count(db_path, "device_recovery_audits") == 1
+    assert not artifact_dir.exists()
+
+
+def test_recovery_does_not_scan_full_database_before_or_after_commit(
+    api_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, db_path, artifact_dir = api_client
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("ordinary recovery must not run whole-database health scans")
+
+    monkeypatch.setattr(baseline_recovery, "_verify_database_path", forbidden)
+    monkeypatch.setattr(baseline_recovery, "_verify_database_connection", forbidden)
+
+    response = _post_execute(client)
+
+    assert response.status_code == 200
+    assert response.json()["result"] == "SUCCESS"
+    assert _device_state(db_path) == ("normal", 100)
+    assert _row_count(db_path, "device_recovery_audits") == 1
+    assert not artifact_dir.exists()
+
+
+def test_audit_insert_failure_rolls_back_device_reset_and_records_failure(
+    api_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, db_path, artifact_dir = api_client
+
+    def fail_audit_insert(connection: sqlite3.Connection, _payload: object) -> None:
+        # The change is visible inside the transaction before evidence insertion.
+        row = connection.execute(
+            "SELECT status, trust_score FROM devices WHERE device_id = 'esp32_01'"
+        ).fetchone()
+        assert tuple(row) == ("normal", 100)
+        raise sqlite3.IntegrityError("forced audit INSERT failure")
+
+    monkeypatch.setattr(device_recovery, "insert_audit", fail_audit_insert)
 
     response = _post_execute(client)
 
     assert response.status_code == 500
     detail = response.json()["detail"]
-    assert detail["result"] == "FAILED"
-    assert detail["failure_code"] == "BASELINE_RECOVERY_COMMITTED_UNVERIFIED"
-    assert detail["after_status"] == "normal"
-    assert detail["after_trust_score"] == 100
-    assert detail["backup_reference"].startswith("baseline-recovery-")
-    assert detail["backup_sha256"]
-    assert _device_state(db_path) == ("normal", 100)
-    assert len(list(artifact_dir.glob("baseline-recovery-*.db"))) == 1
+    assert detail["failure_code"] == "BASELINE_RECOVERY_CORE_FAILED"
+    assert detail["after_status"] == "isolated"
+    assert detail["after_trust_score"] == 20
+    assert _device_state(db_path) == ("isolated", 20)
+    history = client.get("/api/recovery/history", headers=ADMIN_HEADERS).json()
+    assert history["total"] == 1
+    assert history["items"][0]["result"] == "FAILED"
+    assert history["items"][0]["operation_id"] == detail["operation_id"]
+    assert _row_count(db_path, "device_recovery_audits") == 1
+    assert not artifact_dir.exists()
 
-    history = client.get("/api/recovery/history", headers=ADMIN_HEADERS)
+
+def test_committed_audit_survives_lost_core_response_without_retrying_reset(
+    api_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, db_path, artifact_dir = api_client
+    execute = recovery_command_service.execute_device_recovery
+    calls = 0
+
+    def lose_response(**kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        execute(**kwargs)
+        raise BaselineRecoveryCommittedError("forced response loss after commit")
+
+    monkeypatch.setattr(recovery_command_service, "execute_device_recovery", lose_response)
+
+    response = _post_execute(client)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["result"] == "SUCCESS"
+    assert body["failure_code"] is None
+    assert calls == 1
+    assert _device_state(db_path) == ("normal", 100)
+    assert _row_count(db_path, "device_recovery_audits") == 1
+    history = client.get(
+        f"/api/recovery/history/{body['operation_id']}", headers=ADMIN_HEADERS,
+    )
     assert history.status_code == 200
-    assert history.json()["total"] == 1
-    item = history.json()["items"][0]
-    assert item["result"] == "FAILED"
-    assert item["failure_code"] == "BASELINE_RECOVERY_COMMITTED_UNVERIFIED"
-    assert item["after_status"] == "normal"
-    assert item["after_trust_score"] == 100
-    assert item["backup_reference"] == detail["backup_reference"]
-    assert item["backup_sha256"] == detail["backup_sha256"]
-
-
-def test_post_commit_health_failure_preserves_actual_state_in_api_and_core_history(
-    api_client,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    client, db_path, artifact_dir = api_client
-    original_verify = baseline_recovery._verify_database_path
-    live_health_checks = 0
-
-    def fail_post_commit_health(path: Path):
-        nonlocal live_health_checks
-        if path == db_path:
-            live_health_checks += 1
-            if live_health_checks == 2:
-                assert _device_state(db_path) == ("normal", 100)
-                return "forced post-commit health failure", []
-        return original_verify(path)
-
-    monkeypatch.setattr(baseline_recovery, "_verify_database_path", fail_post_commit_health)
-
-    response = _post_execute(client)
-
-    assert response.status_code == 500
-    detail = response.json()["detail"]
-    assert live_health_checks == 2
-    assert detail["result"] == "FAILED"
-    assert detail["failure_code"] == "BASELINE_RECOVERY_COMMITTED_UNVERIFIED"
-    assert detail["before_status"] == "isolated"
-    assert detail["before_trust_score"] == 20
-    assert detail["after_status"] == "normal"
-    assert detail["after_trust_score"] == 100
-    assert detail["backup_reference"]
-    assert detail["backup_sha256"]
-    assert _device_state(db_path) == ("normal", 100)
-
-    core_path = next(artifact_dir.glob("baseline-recovery-*.json"))
-    core_audit = json.loads(core_path.read_text(encoding="utf-8"))
-    assert core_audit["database_committed"] is True
-    assert core_audit["failure_code"] == "BASELINE_RECOVERY_COMMITTED_UNVERIFIED"
-    assert core_audit["devices"][0]["current"] == {"status": "normal", "trust_score": 100}
-    history = client.get("/api/recovery/history", headers=ADMIN_HEADERS).json()
-    assert history["total"] == 1
-    assert history["items"][0]["failure_code"] == detail["failure_code"]
-    assert history["items"][0]["after_trust_score"] == 100
-
-    # A core-only artifact must retain the same committed-state distinction.
-    next(artifact_dir.glob("recovery-command-*.json")).unlink()
-    history = client.get("/api/recovery/history", headers=ADMIN_HEADERS).json()
-    assert history["total"] == 1
-    item = history["items"][0]
-    assert item["result"] == "FAILED"
-    assert item["failure_code"] == detail["failure_code"]
-    assert item["after_status"] == "normal"
-    assert item["after_trust_score"] == 100
-    assert item["backup_reference"] == detail["backup_reference"]
-    assert item["backup_sha256"] == detail["backup_sha256"]
+    assert history.json()["result"] == "SUCCESS"
+    assert history.json()["audit_reference"] == body["audit_reference"]
+    assert history.json()["backup_reference"] is None
+    assert not artifact_dir.exists()
 
 
 def test_committed_core_history_keeps_current_state_when_previous_is_missing() -> None:
@@ -717,62 +874,20 @@ def test_concurrent_recovery_request_is_blocked_while_first_is_in_flight(
     release = threading.Event()
     calls = {"count": 0}
     first_response: dict[str, object] = {}
+    execute = recovery_command_service.execute_device_recovery
 
     def blocking_core(**kwargs: object) -> dict[str, object]:
         calls["count"] += 1
-        operation_id = str(kwargs["operation_id"])
-        artifacts = Path(str(kwargs["artifact_dir"]))
-        artifacts.mkdir(parents=True, exist_ok=True)
         entered.set()
         assert release.wait(timeout=5)
-        with sqlite3.connect(Path(str(kwargs["db_path"]))) as connection:
-            connection.execute(
-                """
-                UPDATE devices
-                SET status = 'normal', trust_score = 100
-                WHERE device_id = 'esp32_01'
-                """
-            )
-            connection.commit()
-        backup_path = artifacts / f"baseline-recovery-{operation_id}.db"
-        backup_path.write_bytes(b"concurrent backup")
-        backup_sha256 = recovery_command_service._file_sha256(backup_path)
-        log_path = artifacts / f"baseline-recovery-{operation_id}.json"
-        return {
-            "mode": "execute",
-            "result": "SUCCESS",
-            "operation_id": operation_id,
-            "database_path": str(kwargs["db_path"]),
-            "backup_path": str(backup_path),
-            "backup_sha256": backup_sha256,
-            "backup_integrity_check": "ok",
-            "backup_foreign_key_violations": [],
-            "integrity_check": "ok",
-            "foreign_key_violations": [],
-            "devices": [
-                {
-                    "device_id": "esp32_01",
-                    "previous": {"status": "isolated", "trust_score": 20},
-                    "current": {"status": "normal", "trust_score": 100},
-                }
-            ],
-            "log_path": str(log_path),
-            "audit": {
-                "reason": kwargs["reason"],
-                "requested_by": kwargs["requested_by"],
-                "approved_by": kwargs["approved_by"],
-                "requested_at": kwargs["requested_at"],
-                "firewall_release_status": kwargs["firewall_release_status"],
-                "preflight": kwargs["preflight"],
-            },
-        }
+        return execute(**kwargs)
 
     def run_first_request() -> None:
         first_response["response"] = _post_execute(client)
 
     monkeypatch.setattr(
         recovery_command_service,
-        "execute_baseline_recovery",
+        "execute_device_recovery",
         blocking_core,
     )
 
@@ -780,9 +895,11 @@ def test_concurrent_recovery_request_is_blocked_while_first_is_in_flight(
     worker.start()
     assert entered.wait(timeout=5)
 
-    second = _post_execute(client)
-    release.set()
-    worker.join(timeout=5)
+    try:
+        second = _post_execute(client)
+    finally:
+        release.set()
+        worker.join(timeout=5)
 
     assert not worker.is_alive()
     first = first_response["response"]
@@ -790,12 +907,13 @@ def test_concurrent_recovery_request_is_blocked_while_first_is_in_flight(
     assert second.status_code == 409
     assert second.json()["detail"]["failure_code"] == "RECOVERY_IN_PROGRESS"
     assert calls["count"] == 1
-    assert len(list(artifact_dir.glob("baseline-recovery-*.db"))) == 1
+    assert not artifact_dir.exists()
+    assert _row_count(db_path, "device_recovery_audits") == 2
     assert _device_state(db_path) == ("normal", 100)
     assert "esp32_01" not in recovery_command_service._IN_FLIGHT_DEVICES
 
 
-def test_recovery_history_api_returns_success_audit_without_absolute_backup_path(
+def test_recovery_history_api_returns_database_success_with_null_backup(
     api_client,
 ) -> None:
     client, _, _ = api_client
@@ -812,11 +930,167 @@ def test_recovery_history_api_returns_success_audit_without_absolute_backup_path
     item = list_response.json()["items"][0]
     assert item["operation_id"] == operation_id
     assert item["result"] == "SUCCESS"
-    assert item["backup_reference"].startswith("baseline-recovery-")
-    assert "\\" not in item["backup_reference"]
-    assert "/" not in item["backup_reference"]
+    assert item["backup_reference"] is None
+    assert item["backup_sha256"] is None
+    assert item["audit_reference"] == f"device_recovery_audits:{operation_id}"
+    assert item["log_reference"] == item["audit_reference"]
     assert item_response.status_code == 200
     assert item_response.json()["operation_id"] == operation_id
+
+
+def test_database_success_wins_over_conflicting_legacy_audit_without_field_fill(
+    api_client,
+) -> None:
+    client, _, artifact_dir = api_client
+    response = _post_execute(client)
+    assert response.status_code == 200
+    success = response.json()
+    operation_id = success["operation_id"]
+    artifact_dir.mkdir()
+    (artifact_dir / f"baseline-recovery-{operation_id}.json").write_text(
+        json.dumps({
+            "operation_id": operation_id, "result": "FAILED",
+            "device_ids": ["esp32_01"], "backup_path": "/old/full-backup.db",
+            "backup_sha256": "a" * 64, "error": "stale failure",
+            "failure_code": "STALE_FAILURE",
+            "devices": [{
+                "device_id": "esp32_01",
+                "previous": {"status": "isolated", "trust_score": 20},
+                "current": {"status": "isolated", "trust_score": 20},
+            }],
+            "audit": {"requested_at": "2099-01-01T00:00:00Z", "reason": "stale reason"},
+        }), encoding="utf-8",
+    )
+
+    history = client.get("/api/recovery/history", headers=ADMIN_HEADERS).json()
+    detail = client.get(
+        f"/api/recovery/history/{operation_id}", headers=ADMIN_HEADERS,
+    ).json()
+
+    assert history["total"] == 1
+    for item in (history["items"][0], detail):
+        assert item["result"] == "SUCCESS"
+        assert item["after_status"] == "normal"
+        assert item["after_trust_score"] == 100
+        assert item["reason"] == success["reason"]
+        assert item["requested_at"] == success["requested_at"]
+        assert item["failure_code"] is None
+        assert item["failure_reason"] is None
+        assert item["backup_reference"] is None
+        assert item["backup_sha256"] is None
+        assert item["audit_reference"] == success["audit_reference"]
+        assert item["log_reference"] == success["audit_reference"]
+
+
+def test_recovery_history_filters_and_paginates_database_and_legacy_records(
+    api_client,
+) -> None:
+    client, db_path, artifact_dir = api_client
+    artifact_dir.mkdir()
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "INSERT INTO devices(device_id, ip_address, status, trust_score) "
+            "VALUES ('esp32_02', '192.168.0.22', 'normal', 100)"
+        )
+        for operation_id, result, requested_at in (
+            ("database-a", "SUCCESS", "2026-10-30T10:00:00Z"),
+            ("database-z", "SUCCESS", "2026-10-30T10:00:00Z"),
+            ("database-hold", "HOLD", "2026-10-30T11:00:00Z"),
+        ):
+            payload = _history_payload(operation_id, result=result, requested_at=requested_at)
+            payload["audit_reference"] = f"device_recovery_audits:{operation_id}"
+            payload["log_reference"] = payload["audit_reference"]
+            connection.execute(
+                "INSERT INTO device_recovery_audits(operation_id,device_id,requested_at,payload_json) "
+                "VALUES (?, ?, ?, ?)",
+                (operation_id, "esp32_01", requested_at, json.dumps(payload)),
+            )
+    for operation_id, device_id, requested_at in (
+        ("legacy-b", "esp32_01", "2026-10-30T09:00:00Z"),
+        ("legacy-other", "esp32_02", "2026-10-30T12:00:00Z"),
+    ):
+        payload = _history_payload(operation_id, device_id=device_id, requested_at=requested_at)
+        payload["backup_reference"] = f"{operation_id}.db"
+        payload["backup_sha256"] = "b" * 64
+        (artifact_dir / f"recovery-command-{operation_id}.json").write_text(
+            json.dumps(payload), encoding="utf-8",
+        )
+
+    all_records = client.get("/api/recovery/history", headers=ADMIN_HEADERS).json()
+    filtered = client.get(
+        "/api/recovery/history", headers=ADMIN_HEADERS,
+        params={"device_id": "esp32_01", "result": "SUCCESS", "limit": 1, "offset": 1},
+    ).json()
+
+    assert all_records["total"] == 5
+    assert [item["operation_id"] for item in all_records["items"]] == [
+        "legacy-other", "database-hold", "database-z", "database-a", "legacy-b",
+    ]
+    assert filtered["total"] == 3
+    assert [item["operation_id"] for item in filtered["items"]] == ["database-a"]
+    legacy = client.get("/api/recovery/history/legacy-b", headers=ADMIN_HEADERS)
+    assert legacy.status_code == 200
+    assert legacy.json()["backup_reference"] == "legacy-b.db"
+    assert legacy.json()["backup_sha256"] == "b" * 64
+    assert legacy.json()["audit_reference"] is None
+    missing = client.get("/api/recovery/history/unknown", headers=ADMIN_HEADERS)
+    assert missing.status_code == 404
+
+
+def test_recovery_without_audit_migration_is_hold_and_preserves_legacy_history(
+    api_client,
+) -> None:
+    client, db_path, artifact_dir = api_client
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP TABLE device_recovery_audits")
+
+    preflight = _post_preflight(client)
+
+    assert preflight.status_code == 200
+    body = preflight.json()
+    assert body["can_execute"] is False
+    assert body["result"] == "HOLD"
+    assert body["failure_code"] == "AUDIT_STORAGE_UNAVAILABLE"
+    assert body["audit_check"]["available"] is False
+    assert "017" in body["audit_check"]["failure_reason"]
+    assert body["backup_check"]["status"] == "NOT_REQUIRED"
+    assert not artifact_dir.exists()
+
+    execute = _post_execute(client)
+
+    assert execute.status_code == 409
+    detail = execute.json()["detail"]
+    assert detail["result"] == "HOLD"
+    assert detail["failure_code"] == "AUDIT_STORAGE_UNAVAILABLE"
+    assert _device_state(db_path) == ("isolated", 20)
+    assert not list(artifact_dir.glob("*.db"))
+    assert len(list(artifact_dir.glob("recovery-command-*.json"))) == 1
+    history = client.get("/api/recovery/history", headers=ADMIN_HEADERS).json()
+    assert history["total"] == 1
+    assert history["items"][0]["operation_id"] == detail["operation_id"]
+    assert history["items"][0]["result"] == "HOLD"
+    assert history["items"][0]["audit_reference"] is None
+
+
+def _history_payload(
+    operation_id: str,
+    *,
+    result: str = "SUCCESS",
+    device_id: str = "esp32_01",
+    requested_at: str,
+) -> dict[str, object]:
+    return {
+        "operation_id": operation_id, "result": result, "device_id": device_id,
+        "reason": "historical recovery", "requested_by": "operator@example",
+        "approved_by": "operator@example", "requested_at": requested_at,
+        "before_status": "isolated", "before_trust_score": 20,
+        "after_status": "normal" if result == "SUCCESS" else "isolated",
+        "after_trust_score": 100 if result == "SUCCESS" else 20,
+        "firewall_release_status": "VERIFIED_RELEASED",
+        "backup_reference": None, "backup_sha256": None,
+        "failure_code": None if result == "SUCCESS" else "RECOVERY_IN_PROGRESS",
+        "failure_reason": None,
+    }
 
 
 def test_recovery_preserves_existing_history_tables(api_client) -> None:

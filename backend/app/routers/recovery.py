@@ -75,8 +75,10 @@ def recovery_history(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     _admin: RecoveryAdminContext = Depends(require_recovery_admin),
+    db: Session = Depends(get_db),
 ) -> dict:
     return list_recovery_audits(
+        db=db,
         device_id=device_id,
         result=result,
         limit=limit,
@@ -88,8 +90,9 @@ def recovery_history(
 def recovery_history_item(
     operation_id: str,
     _admin: RecoveryAdminContext = Depends(require_recovery_admin),
+    db: Session = Depends(get_db),
 ) -> dict:
-    item = get_recovery_audit(operation_id)
+    item = get_recovery_audit(operation_id, db=db)
     if item is None:
         raise HTTPException(status_code=404, detail="Recovery audit not found")
     return item

@@ -1,6 +1,37 @@
 # Device Baseline Recovery Runbook
 
-## 1. 목적과 범위
+## 대시보드의 일반 기기 복구
+
+일반 `/api/recovery/execute`는 대상 기기의 상태·점수 변경과
+`device_recovery_audits`의 성공 기록을 **같은 SQLite Transaction**에서 확정한다.
+매 요청마다 전체 DB를 복사하거나 전체 DB 무결성 검사를 수행하지 않는다.
+기존 수동 Baseline CLI는 아래 절차대로 전체 Backup과 검사를 수행한다.
+
+- 일반 API 반영 전 `017_device_recovery_audits.sql`까지 적용해야 한다. 미적용이면
+  사전 점검은 `AUDIT_STORAGE_UNAVAILABLE`로 차단한다. 운영 DB Migration 전에는
+  별도 전체 백업을 확보한다. 자동·정기 백업 작업은 추가하지 않는다.
+- 관리자 인증, 명시적 확인 문구, 예상 격리 점수, 대상 IP의 활성 규칙·해제 대기·
+  미처리 탐지 Event, 실제 방화벽 해제 Snapshot의 최신성 검증은 유지한다.
+- 점수 변경·변경 후 검증·최종 Runtime 확인·감사 INSERT 중 저장 확정 전에 실패하면
+  점수 변경과 성공 감사는 함께 Rollback된다. 이미 공식 해제된 Firewall을 자동으로
+  다시 추가하는 의미는 아니다.
+- 감사에는 승인자·사유·변경 전후 기기 상태·실제 점검한 현재/과거 IP와 Runtime
+  근거를 보존한다. `audit_reference`는 `device_recovery_audits:<operation_id>`이다.
+  신규 일반 복구의 `backup_reference`와 `backup_sha256`는 의도적으로 `null`이다.
+- Commit 뒤 HTTP 응답이 유실돼도 성공 감사는 보존된다. 복구를 무조건 재실행하지
+  않고 `/api/recovery/history`와 실제 기기·전체 규칙 상태를 다시 조회한다.
+  이력 API는 DB 감사와 과거 JSON 감사를 함께 읽으며 동일 작업은 DB 기록을 우선한다.
+  Commit 결과를 감사에서 확인할 수 없으면 `BASELINE_RECOVERY_COMMITTED_UNVERIFIED`와
+  확인 불가인 변경 후 상태를 반환한다. 실패 감사로 덮지 않으며 대시보드도 재실행을
+  막고 실제 상태를 다시 조회한다.
+- 전체 백업은 중요한 시험 결과를 확보하거나 큰 변경을 하기 전에 별도 운영 절차로
+  수행한다. 아래 CLI의 `execute`는 **백업 전용 명령이 아니라 상태를 복구하는 명령**이다.
+
+현재 변경은 로컬 검증 대상이다. Pi 반영 전에는 정상 수집 중인 환경에서 복구 시간,
+다른 기기의 수신, Capture 연속성, 여섯 필수 Stage의 전진, Observer 최신성 및
+실제 대시보드의 최종 상태 확인을 별도로 검증한다.
+
+## 1. 수동 CLI의 목적과 범위
 
 이 절차는 Phase 5 Profile 0 Pilot 전에 운영자가 명시한 Device의 현재
 `devices.status='isolated'`와 예상 `trust_score`를 확인하고 다음 두 컬럼만
@@ -18,11 +49,10 @@
 - `detector_checkpoints`
 - MQTT·Feature·Packet Capture·Packet Feature 데이터
 
-이 CLI와 Backend Recovery API는 Firewall Release나 iptables 제거 도구가 아니다.
-Frontend, Migration, 신규 Audit 테이블도 만들지 않는다. 실행 증적은 DB 밖의 Backup과
-JSON 파일로 남긴다.
+이 수동 CLI는 Firewall Release나 iptables 제거 도구가 아니다.
+실행 증적은 DB 밖의 Backup과 JSON 파일로 남긴다. 일반 API의 DB 감사와 구분한다.
 
-Phase 6-A Backend Recovery API는 이 Core를 감싸는 관리 Command Adapter다. Backend는
+Backend Recovery API는 위의 일반 기기 복구 경로를 호출하는 관리 Command Adapter다. Backend는
 `devices.status`나 `devices.trust_score`를 직접 UPDATE하지 않고, systemd 제어,
 iptables 조회 계층 생성, Firewall Release 실행도 하지 않는다. Runtime Firewall
 검증을 수행할 안전한 기존 read helper가 없는 환경에서는 Preflight를 `HOLD`로 닫고
@@ -308,18 +338,17 @@ Backup은 원본의 읽기 Snapshot을 고정한 시점의 일관된 변경 전 
 정상 변경은 Backup에 반영되지 않을 수 있다. Backup과 Commit 시점의 전체 DB가
 완전히 같다는 의미는 아니다. 최종 Transaction에서 대상 상태와 모든 Gate를 재검사한다.
 
-Backend API를 통해 실행한 경우 JSON의 `audit` 객체에 `reason`, `requested_by`,
+이전 Backend API를 통해 실행한 과거 JSON에는 `audit` 객체에 `reason`, `requested_by`,
 `approved_by`, `requested_at`, `firewall_release_status`, 실행 직전 Preflight 요약이
 추가된다. 이 값은 Recovery 관리자 인증 Context에서 파생하며 요청 Body의 임의
 `approved_by` 문자열을 신뢰하지 않는다. 단순 Preflight 호출은 Artifact를 생성하지
 않는다.
 
-Backend API가 Core를 호출하는 경우 Recovery 요청 시작 시 생성한 하나의
-`operation_id`를 Core에도 전달한다. Core artifact와 Backend fallback artifact가
-둘 다 남더라도 History API는 같은 `operation_id`를 하나의 Recovery operation으로
-정규화한다. DB commit 이후 JSON audit 저장 또는 사후 검증이 실패한 경우 fallback
-audit은 DB에서 실제 Device 사후 상태를 다시 조회하고, 생성된 backup 파일명과
-SHA256을 보존해야 한다.
+현재 일반 API는 요청별 `operation_id`를 DB 감사에 저장한다. DB와 과거 JSON이
+함께 남더라도 History API는 같은 작업을 하나로 정규화하며 DB 값을 우선한다.
+신규 성공 기록은 백업 파일이나 JSON 저장에 의존하지 않는다. 실패·거부 기록은
+DB에 우선 저장하고, DB에 저장할 수 없으면 기존 JSON 방식으로 기록을 시도한다.
+과거 JSON에 있는 실제 Backup 파일명·SHA256은 원본대로 보존한다.
 
 ## 7. 실행 후 검증
 

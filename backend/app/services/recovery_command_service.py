@@ -1,8 +1,7 @@
 """Recovery command adapter for the FastAPI backend.
 
-The actual baseline reset remains in ``edge.trust.baseline_recovery``. This
-module validates the management command boundary, normalizes preflight output,
-and reads/writes JSON audit artifacts for the dashboard contract.
+Ordinary resets use a transactional database audit. Historical baseline backup
+artifacts remain readable, and the explicit baseline CLI retains full backups.
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ from uuid import uuid4
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
 
 from backend.app.config import settings
 from backend.app.security import RecoveryAdminContext
@@ -30,9 +30,9 @@ from edge.trust.baseline_recovery import (
     BaselineRecoveryError,
     BaselineRecoveryHoldError,
     BaselineRecoveryInProgressError,
-    execute_baseline_recovery,
     inspect_baseline_recovery,
 )
+from edge.trust.device_recovery import audit_storage_check, execute_device_recovery
 
 
 class RecoveryCommandError(RuntimeError):
@@ -100,8 +100,6 @@ def build_recovery_preflight(
         return _missing_or_core_error_preflight(
             db,
             device_id=device_id,
-            expected_trust_score=expected_trust_score,
-            artifacts=artifacts,
             error=str(exc),
         )
 
@@ -124,20 +122,21 @@ def build_recovery_preflight(
     core_runtime = core["runtime_firewall_check"][device_id]
     if not core_runtime.get("available") or not core_runtime.get("passed"):
         runtime = _normalize_runtime_verification(core_runtime)
-    backup_check = _backup_check(artifacts)
+    audit_check = audit_storage_check(database)
+    backup_check = _ordinary_backup_check()
     preflight_errors = list(core["preflight_errors"])
 
     failure_code, failure_reason, result = _select_failure(
         preflight_errors=preflight_errors,
         release_request_state=firewall_release_request_state,
         runtime=runtime,
-        backup_check=backup_check,
+        audit_check=audit_check,
     )
     can_execute = (
         bool(core["can_execute"])
         and bool(firewall_release_request_state["passed"])
         and bool(runtime["passed"])
-        and bool(backup_check["available"])
+        and bool(audit_check["available"])
     )
     return {
         "device_id": device_id,
@@ -150,6 +149,7 @@ def build_recovery_preflight(
         "firewall_runtime_verification": runtime,
         "unprocessed_detection_count": int(pending_event_check["count"]),
         "backup_check": backup_check,
+        "audit_check": audit_check,
         "failure_code": None if can_execute else failure_code,
         "failure_reason": None if can_execute else failure_reason,
         "preflight_errors": preflight_errors,
@@ -175,7 +175,7 @@ def execute_recovery_command(
 
     if confirm != CONFIRMATION:
         payload = _write_command_audit(
-            artifacts,
+            artifacts, db=db,
             operation_id=operation_id,
             device_id=device_id,
             reason=reason,
@@ -191,7 +191,7 @@ def execute_recovery_command(
 
     if not _try_acquire_device_lock(device_id):
         payload = _write_command_audit(
-            artifacts,
+            artifacts, db=db,
             operation_id=operation_id,
             device_id=device_id,
             reason=reason,
@@ -214,7 +214,7 @@ def execute_recovery_command(
         )
         if not preflight["can_execute"]:
             payload = _write_command_audit(
-                artifacts,
+                artifacts, db=db,
                 operation_id=operation_id,
                 device_id=device_id,
                 reason=reason,
@@ -231,22 +231,45 @@ def execute_recovery_command(
         database = _sqlite_database_path(db)
         db.rollback()
         try:
-            core_result = execute_baseline_recovery(
+            core_result = execute_device_recovery(
                 db_path=database,
                 device_ids=[device_id],
                 expected_trust_scores={device_id: expected_trust_score},
-                artifact_dir=artifacts,
                 confirm=confirm,
                 operation_id=operation_id,
                 reason=reason,
                 requested_by=admin.principal,
                 approved_by=admin.principal,
                 requested_at=requested_at,
-                firewall_release_status="VERIFIED_RELEASED",
                 preflight=preflight,
             )
         except BaselineRecoveryError as exc:
             db.rollback()
+            # A committed database receipt is authoritative even if the response
+            # path subsequently failed. Never overwrite it with a failure log.
+            try:
+                committed = _database_recovery_audit(db, operation_id)
+            except SQLAlchemyError:
+                db.rollback()
+                committed = None
+            if committed is not None and committed.get("result") == "SUCCESS":
+                return committed
+            if isinstance(exc, BaselineRecoveryCommittedError):
+                # The transaction may already be durable. Never record FAILED in
+                # its place or invent an after-state when its receipt is unreadable.
+                raise RecoveryCoreFailedError({
+                    "operation_id": operation_id, "device_id": device_id, "result": "HOLD",
+                    "reason": reason, "requested_by": admin.principal,
+                    "approved_by": admin.principal, "requested_at": requested_at,
+                    "before_status": preflight["current_status"],
+                    "before_trust_score": preflight["current_trust_score"],
+                    "after_status": None, "after_trust_score": None,
+                    "firewall_release_status": _firewall_release_status(preflight),
+                    "backup_reference": None, "backup_sha256": None,
+                    "audit_reference": None, "log_reference": None,
+                    "failure_code": "BASELINE_RECOVERY_COMMITTED_UNVERIFIED",
+                    "failure_reason": "Recovery commit result is unknown; inspect this operation and device state before retrying.",
+                }) from exc
             after = _device_snapshot(db, device_id)
             backup = _backup_artifact_metadata(artifacts, operation_id)
             if isinstance(exc, BaselineRecoveryInProgressError):
@@ -256,14 +279,10 @@ def execute_recovery_command(
                 failure_code = "FIREWALL_RUNTIME_UNVERIFIED"
                 firewall_release_status = "NOT_VERIFIED"
             else:
-                failure_code = (
-                    "BASELINE_RECOVERY_COMMITTED_UNVERIFIED"
-                    if isinstance(exc, BaselineRecoveryCommittedError)
-                    else "BASELINE_RECOVERY_CORE_FAILED"
-                )
+                failure_code = "BASELINE_RECOVERY_CORE_FAILED"
                 firewall_release_status = _firewall_release_status(preflight)
             payload = _write_command_audit(
-                artifacts,
+                artifacts, db=db,
                 operation_id=operation_id,
                 device_id=device_id,
                 reason=reason,
@@ -284,16 +303,14 @@ def execute_recovery_command(
                 raise RecoveryNotExecutableError(payload) from exc
             raise RecoveryCoreFailedError(payload) from exc
 
-        return _normalize_baseline_audit(
-            dict(core_result),
-            log_reference=Path(str(core_result["log_path"])).name,
-        )
+        return dict(core_result)
     finally:
         _release_device_lock(device_id)
 
 
 def list_recovery_audits(
     *,
+    db: Session | None = None,
     artifact_dir: str | Path | None = None,
     device_id: str | None = None,
     result: str | None = None,
@@ -302,6 +319,13 @@ def list_recovery_audits(
 ) -> dict[str, Any]:
     artifacts = _artifact_dir(artifact_dir)
     items = _load_recovery_audits(artifacts)
+    # DB receipts replace, rather than field-merge with, any stale JSON for the
+    # same operation. In particular, None backup metadata means no backup made.
+    by_operation = {item["operation_id"]: item for item in items}
+    for item in _database_recovery_audits(db):
+        by_operation[item["operation_id"]] = item
+    items = sorted(by_operation.values(), key=lambda item: (
+        str(item.get("requested_at") or ""), str(item["operation_id"])), reverse=True)
     if device_id is not None:
         items = [item for item in items if item["device_id"] == device_id]
     if result is not None:
@@ -312,9 +336,13 @@ def list_recovery_audits(
 def get_recovery_audit(
     operation_id: str,
     *,
+    db: Session | None = None,
     artifact_dir: str | Path | None = None,
 ) -> dict[str, Any] | None:
     operation_id = _require_non_empty(operation_id, "operation_id")
+    stored = _database_recovery_audit(db, operation_id)
+    if stored is not None:
+        return stored
     for item in _load_recovery_audits(_artifact_dir(artifact_dir)):
         if item["operation_id"] == operation_id:
             return item
@@ -325,8 +353,6 @@ def _missing_or_core_error_preflight(
     db: Session,
     *,
     device_id: str,
-    expected_trust_score: int,
-    artifacts: Path,
     error: str,
 ) -> dict[str, Any]:
     device = db.execute(
@@ -356,7 +382,8 @@ def _missing_or_core_error_preflight(
             },
             "firewall_runtime_verification": _runtime_verification_unavailable({}),
             "unprocessed_detection_count": None,
-            "backup_check": _backup_check(artifacts),
+            "backup_check": _ordinary_backup_check(),
+            "audit_check": audit_storage_check(_sqlite_database_path(db)),
             "failure_code": "DEVICE_NOT_FOUND",
             "failure_reason": f"Device not found: {device_id}",
             "preflight_errors": [error],
@@ -377,7 +404,8 @@ def _missing_or_core_error_preflight(
         },
         "firewall_runtime_verification": _runtime_verification_unavailable({}),
         "unprocessed_detection_count": None,
-        "backup_check": _backup_check(artifacts),
+        "backup_check": _ordinary_backup_check(),
+        "audit_check": audit_storage_check(_sqlite_database_path(db)),
         "failure_code": "CORE_PREFLIGHT_ERROR",
         "failure_reason": error,
         "preflight_errors": [error],
@@ -419,28 +447,36 @@ def _normalize_runtime_verification(value: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _backup_check(artifacts: Path) -> dict[str, Any]:
-    if artifacts.exists() and not artifacts.is_dir():
-        return {
-            "artifact_dir": str(artifacts),
-            "available": False,
-            "failure_reason": "artifact path exists but is not a directory",
-        }
-
-    parent = artifacts if artifacts.exists() else _nearest_existing_parent(artifacts)
-    available = parent.is_dir() and os.access(parent, os.W_OK)
-    return {
-        "artifact_dir": str(artifacts),
-        "available": bool(available),
-        "failure_reason": None if available else "artifact directory parent is not writable",
-    }
+def _ordinary_backup_check() -> dict[str, Any]:
+    # Kept for older clients; availability is not a condition for device recovery.
+    return {"required": False, "available": None, "status": "NOT_REQUIRED"}
 
 
-def _nearest_existing_parent(path: Path) -> Path:
-    current = path
-    while not current.exists() and current.parent != current:
-        current = current.parent
-    return current
+def _database_recovery_audits(db: Session | None) -> list[dict[str, Any]]:
+    if db is None:
+        return []
+    exists = db.execute(text(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'device_recovery_audits'"
+    )).scalar()
+    if not exists:
+        return []
+    return [json.loads(row[0]) for row in db.execute(text(
+        "SELECT payload_json FROM device_recovery_audits"
+    ))]
+
+
+def _database_recovery_audit(db: Session | None, operation_id: str) -> dict[str, Any] | None:
+    if db is None:
+        return None
+    exists = db.execute(text(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'device_recovery_audits'"
+    )).scalar()
+    if not exists:
+        return None
+    payload = db.execute(text(
+        "SELECT payload_json FROM device_recovery_audits WHERE operation_id = :operation_id"
+    ), {"operation_id": operation_id}).scalar()
+    return json.loads(payload) if payload is not None else None
 
 
 def _select_failure(
@@ -448,7 +484,7 @@ def _select_failure(
     preflight_errors: list[str],
     release_request_state: Mapping[str, Any],
     runtime: Mapping[str, Any],
-    backup_check: Mapping[str, Any],
+    audit_check: Mapping[str, Any],
 ) -> tuple[str | None, str | None, str]:
     if preflight_errors:
         reason = preflight_errors[0]
@@ -477,14 +513,15 @@ def _select_failure(
             else "FIREWALL_RUNTIME_ACTIVE"
         )
         return code, str(runtime.get("details") or status), "HOLD"
-    if not backup_check["available"]:
-        return "BACKUP_UNAVAILABLE", str(backup_check["failure_reason"]), "HOLD"
+    if not audit_check["available"]:
+        return "AUDIT_STORAGE_UNAVAILABLE", str(audit_check["failure_reason"]), "HOLD"
     return None, None, "SUCCESS"
 
 
 def _write_command_audit(
     artifacts: Path,
     *,
+    db: Session | None = None,
     operation_id: str,
     device_id: str,
     reason: str,
@@ -527,6 +564,28 @@ def _write_command_audit(
         "failure_code": failure_code,
         "failure_reason": failure_reason,
     }
+    if db is not None:
+        try:
+            existing = _database_recovery_audit(db, operation_id)
+            if existing is not None:
+                return existing
+            table = db.execute(text(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'device_recovery_audits'"
+            )).scalar()
+            if table:
+                payload["audit_reference"] = f"device_recovery_audits:{operation_id}"
+                payload["log_reference"] = payload["audit_reference"]
+                db.execute(text(
+                    "INSERT INTO device_recovery_audits(operation_id, device_id, requested_at, payload_json) "
+                    "VALUES (:operation_id, :device_id, :requested_at, :payload_json)"
+                ), {"operation_id": operation_id, "device_id": device_id,
+                    "requested_at": requested_at,
+                    "payload_json": json.dumps(payload | {"preflight": preflight}, ensure_ascii=False, allow_nan=False)})
+                db.commit()
+                return payload
+        except SQLAlchemyError:
+            db.rollback()
+            payload.pop("audit_reference", None)
     if artifacts.exists() and not artifacts.is_dir():
         payload["log_reference"] = None
         return payload
