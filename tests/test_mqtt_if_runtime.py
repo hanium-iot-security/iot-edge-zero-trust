@@ -54,6 +54,30 @@ def test_empty_bundle_settings_preserve_legacy_stage():
     assert stage.artifact is None and stage.model_path == DEFAULT_MODEL_PATH
 
 
+@pytest.mark.parametrize(
+    "trust_ai_mode,global_ai_mode,expected_severity",
+    [(None, "enforce", "medium"), ("enforce", "enforce", "medium"),
+     ("observe", "enforce", "low"), (None, "observe", "low")],
+)
+def test_legacy_stage_severity_follows_trust_mode(
+    session_factory, monkeypatch, trust_ai_mode, global_ai_mode, expected_severity,
+):
+    monkeypatch.setattr("edge.detection.mqtt_adapters.settings.trust_ai_mode", global_ai_mode)
+    monkeypatch.setattr("edge.detection.mqtt_adapters.predict_feature_window", lambda *_: {
+        "is_anomaly": True, "event_type": "AI_ANOMALY", "prediction": -1,
+        "anomaly_score": -0.2,
+    })
+    stage = MqttIsolationForestStage(trust_ai_mode=trust_ai_mode)
+    with session_factory.begin() as db:
+        _seed(db, status="ACTIVE")
+        _feature(db)
+        stage.run_until(db, cycle_range_start=T0, cycle_cutoff=T1)
+        event = db.execute(text("SELECT * FROM detection_events")).mappings().one()
+        assert event["severity"] == expected_severity
+        assert event["score_delta"] == -15 and event["applied_to_score"] == 0
+        assert event["policy_version"] == "mqtt-if-v1"
+
+
 @pytest.mark.parametrize("missing", ["mqtt_if_artifact_dir", "mqtt_if_expected_model_version",
                                      "mqtt_if_expected_bundle_sha256"])
 def test_partial_bundle_settings_refuse_legacy_fallback(bundle_dir, missing):
@@ -149,6 +173,9 @@ def test_sqlite_stage_preserves_bundle_evidence_completion_and_event_deduplicati
     assert completion.bundle_sha256 == _pin(bundle_dir)
     with session_factory() as db:
         event = db.execute(text("SELECT * FROM detection_events")).mappings().one()
+        assert event["severity"] == "low"
+        assert event["score_delta"] == -15 and event["applied_to_score"] == 0
+        assert event["policy_version"] == stage.policy_version
         evidence = json.loads(event["evidence_json"])
         assert evidence["model_version"] == completion.model_version
         assert evidence["bundle_sha256"] == completion.bundle_sha256
@@ -236,6 +263,10 @@ def test_bundle_anomaly_remains_observation_without_trust_or_firewall_mutation(
     with session_factory() as db:
         assert db.execute(text("SELECT trust_score FROM devices")).scalar_one() == 40
         assert db.execute(text("SELECT processing_reason FROM detection_events")).scalar_one() == "AI_OBSERVATION_ONLY"
+        event = db.execute(text("SELECT * FROM detection_events")).mappings().one()
+        assert event["severity"] == "low"
+        assert event["score_delta"] == -15 and event["applied_to_score"] == 0
+        assert json.loads(event["evidence_json"])["trust_decision"]["actual_delta"] == 0
         for table in ("trust_score_history", "isolation_history", "firewall_rules"):
             assert db.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar_one() == 0
 

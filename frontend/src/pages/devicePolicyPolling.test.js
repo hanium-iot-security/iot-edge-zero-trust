@@ -428,6 +428,57 @@ function dashboardApi(gateway) {
 }
 function gatewayCard(app) { return app.find((node) => node.type === "MetricCard" && node.props.label === "CPU"); }
 
+test("Events Korean search and raw severity/family filters preserve historical API values", async () => {
+  const events = [
+    { id: 1, event_type: "AI_ANOMALY", detector_type: "AI", severity: "high", incident_family: "AI_ONLY", processing_reason: "AI_OBSERVATION_ONLY" },
+    { id: 2, event_type: "AI_PACKET_ANOMALY", detector_type: "AI", severity: "low", incident_family: "AI_ONLY", processing_reason: "AI_OBSERVATION_ONLY" },
+    { id: 3, event_type: "PACKET_RATE_ANOMALY", detector_type: "RULE", severity: "high", incident_family: "FLOODING" },
+    { id: 4, event_type: "BYTE_RATE_ANOMALY", detector_type: "RULE", severity: "medium", incident_family: "FLOODING" },
+    { id: 5, event_type: "POLICY_UNAVAILABLE", detector_type: "RULE", severity: "low", incident_family: "POLICY" },
+  ].map(Object.freeze);
+  const original = JSON.stringify(events);
+  const queries = [];
+  const app = await componentHarness("Events", {
+    getEvents: async (params) => {
+      queries.push(params);
+      const items = events.filter((event) => (!params.severity || params.severity === event.severity) &&
+        (!params.incident_family || params.incident_family === event.incident_family));
+      return { items, total: items.length };
+    },
+    getAiWarnings: async () => ({ items: [], total: 0 }),
+  });
+  const eventTable = () => app.find((node) => node.type === "DataTable" && node.props.tableLabel === "탐지 이벤트 목록");
+  try {
+    await app.change("event-search", "패킷 전송 빈도 이상");
+    assert.deepEqual(Array.from(eventTable().props.rows, (row) => row.event_type), ["PACKET_RATE_ANOMALY"]);
+    await app.change("event-search", "BYTE_RATE_ANOMALY");
+    assert.deepEqual(Array.from(eventTable().props.rows, (row) => row.event_type), ["BYTE_RATE_ANOMALY"]);
+    assert.equal(queries.length, 1, "local name search must not change API queries");
+    await app.change("event-search", "");
+    for (const severity of ["high", "low", "medium"]) {
+      await app.change("severity-filter", severity);
+      assert.equal(queries.at(-1).severity, severity);
+      const table = eventTable();
+      assert.ok(table.props.rows.length > 0);
+      assert.ok(table.props.rows.every((row) => row.severity === severity));
+      const row = table.props.rows[0];
+      const badge = table.props.columns.find((column) => column.key === "severity").render(row.severity, row);
+      assert.equal(badge.props.status, severity);
+      await app.act(() => table.props.onRowClick(row));
+      const detail = app.find((node) => node.type === "DetailModal" && node.props.open && node.props.title === `탐지 이벤트 #${row.id}`);
+      assert.ok(app.textContent(detail).includes(row.event_type), "detail must retain the original event code");
+      await app.act(() => detail.props.onClose());
+    }
+    await app.change("severity-filter", "");
+    const family = app.input("incident-family-filter");
+    assert.ok(treeNodes(family).some((node) => node.type === "option" && node.props.value === "POLICY" && app.textContent(node).includes("분석·설정 상태")));
+    await app.change("incident-family-filter", "POLICY");
+    assert.equal(queries.at(-1).incident_family, "POLICY");
+    assert.equal(eventTable().props.rows[0].event_type, "POLICY_UNAVAILABLE");
+    assert.equal(JSON.stringify(events), original);
+  } finally { app.cleanup(); }
+});
+
 test("slow Dashboard gateway completes at 12 seconds without 10-second poll abort starvation", async () => {
   const clock = createClock();
   const calls = [];

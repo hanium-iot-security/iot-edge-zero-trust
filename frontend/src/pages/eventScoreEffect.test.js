@@ -155,3 +155,85 @@ test("Dashboard and Events render identical processing results for the same even
     assert.equal(homepage.props.title, list.props.title, "raw processing reason is preserved");
   }
 });
+
+const approvedEventLabels = [
+  ["ABNORMAL_PUBLISH_RATE", "메시지 전송 빈도 이상"],
+  ["PACKET_RATE_ANOMALY", "패킷 전송 빈도 이상"],
+  ["BYTE_RATE_ANOMALY", "데이터 전송량 이상"],
+  ["LARGE_PAYLOAD", "메시지 크기 초과"],
+  ["MALFORMED_PAYLOAD", "메시지 형식 오류"],
+  ["ABNORMAL_TOPIC", "허용 토픽 위반"],
+  ["DEVICE_ID_MISMATCH", "기기 식별정보 불일치"],
+  ["UNKNOWN_DEVICE", "미등록 기기 감지"],
+  ["PORT_SCAN", "포트 스캔 의심"],
+  ["BROKER_DOS_SUSPECTED", "MQTT 브로커 과부하 의심"],
+  ["POLICY_UNAVAILABLE", "탐지 정책 확인 불가"],
+  ["BROKER_DOS_EVIDENCE_UNAVAILABLE", "브로커 탐지 근거 부족"],
+  ["NON_MQTT_TRAFFIC", "MQTT 외 통신"],
+];
+
+test("approved Korean event names are shared by Events and Dashboard without changing raw codes", async () => {
+  const event = { ...base, event_type: "PACKET_RATE_ANOMALY", severity: "high" };
+  for (const [pageName, getTable] of [["Events", eventTable], ["Dashboard", dashboardTable]]) {
+    const columns = getTable(await render(event, pageName)).props.columns;
+    const column = columns.find((item) => item.key === "event_type");
+    for (const [code, label] of approvedEventLabels) {
+      assert.equal(uiText.uiLabel(code), label);
+      const cell = column.render(code);
+      assert.equal(text(cell), label, `${pageName}: ${code}`);
+      assert.equal(cell.props.title, code, "the original code remains available in the list");
+    }
+    assert.equal(text(column.render("FUTURE_EVENT_TYPE")), "FUTURE_EVENT_TYPE");
+  }
+});
+
+test("event details show the Korean event name and the original English event_type separately", async () => {
+  const event = { ...base, event_type: "PACKET_RATE_ANOMALY", severity: "high" };
+  const tree = await render(event);
+  const detail = [...nodes(tree)].find((node) => node.type === "DetailModal" && node.props.open);
+  assert.match(detail.props.description, /패킷 전송 빈도 이상/);
+  const fields = [...nodes(detail)].filter((node) => node.props.className === "detail-item");
+  assert.ok(fields.some((field) => text(field) === "탐지 유형 패킷 전송 빈도 이상"));
+  assert.ok(fields.some((field) => text(field) === "원본 이벤트 코드 PACKET_RATE_ANOMALY"));
+  assert.equal(event.event_type, "PACKET_RATE_ANOMALY");
+});
+
+test("Events and Dashboard preserve stored severities for old AI and rule events", async () => {
+  const cases = [
+    { event_type: "AI_ANOMALY", detector_type: "AI", processing_reason: "AI_OBSERVATION_ONLY", severity: "high" },
+    { event_type: "AI_PACKET_ANOMALY", detector_type: "AI", processing_reason: "AI_OBSERVATION_ONLY", severity: "low" },
+    { event_type: "PACKET_RATE_ANOMALY", detector_type: "RULE", severity: "medium" },
+    { event_type: "PACKET_RATE_ANOMALY", detector_type: "RULE", severity: "high" },
+    { event_type: "BYTE_RATE_ANOMALY", detector_type: "RULE", severity: "medium" },
+    { event_type: "BYTE_RATE_ANOMALY", detector_type: "RULE", severity: "high" },
+  ];
+  for (const extra of cases) {
+    const event = Object.freeze({ ...base, ...extra });
+    for (const [pageName, getTable] of [["Events", eventTable], ["Dashboard", dashboardTable]]) {
+      const tree = await render(event, pageName);
+      const column = getTable(tree).props.columns.find((item) => item.key === "severity");
+      const badge = column.render(event.severity, event);
+      assert.equal(badge.props.status, event.severity);
+      assert.equal(badge.props.label, event.severity.toUpperCase());
+      if (pageName === "Events") {
+        const detail = [...nodes(tree)].find((node) => node.type === "DetailModal" && node.props.open);
+        const field = [...nodes(detail)].find((node) => node.props.className === "detail-item" && text(node).trim() === "심각도");
+        const detailBadge = [...nodes(field)].find((node) => node.type === "StatusBadge");
+        assert.equal(detailBadge.props.status, event.severity);
+        assert.equal(detailBadge.props.label, event.severity.toUpperCase());
+      }
+    }
+  }
+});
+
+test("policy evidence states retain the analysis/config family in list and detail", async () => {
+  for (const event_type of ["POLICY_UNAVAILABLE", "BROKER_DOS_EVIDENCE_UNAVAILABLE"]) {
+    const event = Object.freeze({ ...base, event_type, incident_family: "POLICY", detector_type: "RULE", severity: "low" });
+    const tree = await render(event);
+    const column = eventTable(tree).props.columns.find((item) => item.key === "incident_family");
+    assert.equal(column.render("POLICY", event).props.label, "분석·설정 상태");
+    const detail = [...nodes(tree)].find((node) => node.type === "DetailModal" && node.props.open);
+    assert.match(text(detail), /사건 분류 분석·설정 상태/);
+    assert.equal(event.incident_family, "POLICY");
+  }
+});

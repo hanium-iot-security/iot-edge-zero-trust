@@ -17,6 +17,7 @@ from edge.detection.packet_ai_detector import PacketIsolationForestStage
 from edge.detection.runtime_checkpoint_repository import get_detector_checkpoint
 from edge.packet.capture_policy import CapturePolicy
 from edge.policy.ai_window_decision import AIRevision, AIWindowDecision, decide_ai_window
+from edge.trust.trust_score_v2 import apply_trust_score_v2_until
 
 
 RANGE_START = datetime(2026, 7, 26, 10, 0, 0, tzinfo=timezone.utc)
@@ -63,9 +64,15 @@ def SessionLocal(tmp_path: Path):
         engine.dispose()
 
 
+@pytest.mark.parametrize(
+    "trust_ai_mode,global_ai_mode,expected_severity",
+    [(None, "enforce", "medium"), ("enforce", "enforce", "medium"),
+     ("observe", "enforce", "low"), (None, "observe", "low")],
+)
 def test_packet_if_stage_writes_anomaly_and_checkpoint_in_one_transaction(
-    SessionLocal,
+    SessionLocal, monkeypatch, trust_ai_mode, global_ai_mode, expected_severity,
 ) -> None:
+    monkeypatch.setattr(packet_ai_detector.settings, "trust_ai_mode", global_ai_mode)
     with SessionLocal() as db:
         _insert_device(db)
         session_pk = _insert_capture_session(db)
@@ -77,7 +84,7 @@ def test_packet_if_stage_writes_anomaly_and_checkpoint_in_one_transaction(
         )
         db.commit()
 
-    stage = _stage(raw_scores=[-0.2], threshold=0.1)
+    stage = _stage(raw_scores=[-0.2], threshold=0.1, trust_ai_mode=trust_ai_mode)
     with SessionLocal() as db:
         with db.begin():
             result = stage.run_until(
@@ -108,7 +115,7 @@ def test_packet_if_stage_writes_anomaly_and_checkpoint_in_one_transaction(
         assert event["packet_feature_log_id"] == 1
         assert event["detector_type"] == "AI"
         assert event["event_type"] == "AI_PACKET_ANOMALY"
-        assert event["severity"] == "medium"
+        assert event["severity"] == expected_severity
         assert event["score_delta"] == -15
         assert event["applied_to_score"] == 0
         assert event["incident_family"] == "AI_ONLY"
@@ -180,14 +187,27 @@ def test_phase9_packet_ai_off_then_observe_uses_source_windows(SessionLocal) -> 
             (RANGE_START, 0, {"AI_OFF_AT_WINDOW": 1}, 1, "OFF"),
             (CUTOFF, 1, {}, 2, "OBSERVE"),
         ]
-        evidence = json.loads(db.execute(text(
-            "SELECT evidence_json FROM detection_events WHERE event_type='AI_PACKET_ANOMALY'"
-        )).scalar_one())
+        event = db.execute(text(
+            "SELECT severity, evidence_json FROM detection_events WHERE event_type='AI_PACKET_ANOMALY'"
+        )).mappings().one()
+        assert event["severity"] == "low"
+        evidence = json.loads(event["evidence_json"])
         assert evidence["model"]["device_ai_revision"] == 2
         checkpoint = get_detector_checkpoint(
             db, detector_name="packet_if", source_table="packet_feature_logs",
         )
         assert checkpoint["last_completed_window_end"] == "2026-07-26T10:00:20Z"
+        trust = apply_trust_score_v2_until(
+            db, cycle_range_start=RANGE_START, cycle_cutoff=NEXT_CUTOFF,
+            ai_mode="enforce", decision_at=THIRD_CUTOFF,
+        )
+        assert trust.observed_ai_event_count == 1
+        assert trust.created_history_count == trust.created_firewall_rule_count == 0
+        assert db.execute(text("SELECT trust_score FROM devices")).scalar_one() == 100
+        observed = db.execute(text("SELECT * FROM detection_events")).mappings().one()
+        assert observed["severity"] == "low"
+        assert observed["score_delta"] == -15 and observed["applied_to_score"] == 0
+        assert json.loads(observed["evidence_json"])["trust_decision"]["actual_delta"] == 0
 
 
 def test_phase9_disabled_reason_precedes_capture_quality_exclusion(SessionLocal) -> None:
@@ -354,7 +374,7 @@ def test_packet_if_stage_is_idempotent_for_the_same_range(SessionLocal) -> None:
         )
         db.commit()
 
-    stage = _stage(raw_scores=[-0.2], threshold=0.1)
+    stage = _stage(raw_scores=[-0.2], threshold=0.1, trust_ai_mode="observe")
     with SessionLocal() as db:
         with db.begin():
             first = stage.run_until(
@@ -362,6 +382,10 @@ def test_packet_if_stage_is_idempotent_for_the_same_range(SessionLocal) -> None:
                 cycle_range_start=RANGE_START,
                 cycle_cutoff=CUTOFF,
             )
+            assert db.execute(text("SELECT severity FROM detection_events")).scalar_one() == "low"
+            # A stored event from the earlier labeling policy must survive replay.
+            db.execute(text("UPDATE detection_events SET severity='medium'"))
+            historical_event = dict(db.execute(text("SELECT * FROM detection_events")).mappings().one())
         with db.begin():
             second = stage.run_until(
                 db,
@@ -372,6 +396,7 @@ def test_packet_if_stage_is_idempotent_for_the_same_range(SessionLocal) -> None:
         assert first.created_event_count == 1
         assert second.created_event_count == 0
         assert db.execute(text("SELECT COUNT(*) FROM detection_events")).scalar_one() == 1
+        assert dict(db.execute(text("SELECT * FROM detection_events")).mappings().one()) == historical_event
 
 
 def test_packet_if_stage_processes_lower_id_in_a_future_window(SessionLocal) -> None:
@@ -696,6 +721,7 @@ def _stage(
     raw_scores: list[float] | None = None,
     threshold: float = 0.1,
     model: FakeIsolationForest | FailingIsolationForest | None = None,
+    trust_ai_mode: str | None = None,
 ) -> PacketIsolationForestStage:
     resolved_model = model or FakeIsolationForest(raw_scores or [])
     return PacketIsolationForestStage(
@@ -705,6 +731,7 @@ def _stage(
         ),
         expected_model_version="packet-if-test-v1",
         capture_policy=CapturePolicy(),
+        trust_ai_mode=trust_ai_mode,
     )
 
 

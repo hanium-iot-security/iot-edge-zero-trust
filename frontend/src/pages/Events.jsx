@@ -164,6 +164,8 @@ function getIncidentFamilyLabel(
 
     AI_ONLY: "AI 단독 이상탐지",
 
+    POLICY: uiLabel("POLICY"),
+
   };
 
   return (
@@ -540,11 +542,15 @@ export default function Events() {
 
           ).includes(keyword) ||
 
+          normalizeSearchValue(uiLabel(event.event_type)).includes(keyword) ||
+
           normalizeSearchValue(
 
             event.incident_family
 
           ).includes(keyword) ||
+
+          normalizeSearchValue(getIncidentFamilyLabel(event.incident_family)).includes(keyword) ||
 
           normalizeSearchValue(
 
@@ -1472,7 +1478,7 @@ export default function Events() {
 
               type="search"
 
-              placeholder="기기, IP, Event Type, 설명"
+              placeholder="기기, IP, 탐지 유형, 원본 코드, 설명"
 
               value={searchText}
 
@@ -1666,6 +1672,10 @@ export default function Events() {
 
               </option>
 
+              <option value="POLICY">
+                {uiLabel("POLICY")}
+              </option>
+
             </select>
 
           </div>
@@ -1778,7 +1788,7 @@ export default function Events() {
 
             title="검색 조건에 맞는 탐지 이벤트가 없습니다."
 
-            description="현재 페이지에서 다른 기기, IP 또는 Event Type을 검색해 주세요."
+            description="현재 페이지에서 다른 기기, IP 또는 탐지 유형을 검색해 주세요."
 
             actionLabel="검색 초기화"
 
@@ -1981,6 +1991,14 @@ export default function Events() {
           <div className="detail">
 
             <section className="detail-grid">
+              <div className="detail-item">
+                <span>탐지 유형</span>
+                <strong>{uiLabel(selectedEvent.event_type)}</strong>
+              </div>
+              <div className="detail-item">
+                <span>원본 이벤트 코드</span>
+                <strong className="break-word">{selectedEvent.event_type || "-"}</strong>
+              </div>
               <div className="detail-item">
                 <span>실제 점수 변화량</span>
                 <strong>{formatActualScoreDelta(selectedEvent)}</strong>

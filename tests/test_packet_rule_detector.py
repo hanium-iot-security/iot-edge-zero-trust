@@ -13,6 +13,7 @@ from sqlalchemy.orm import sessionmaker
 from ai.predict_packet_isolation_forest import PacketIFArtifact, PacketIFPrediction
 from db.migration_runner import MIGRATIONS_DIR, apply_migrations
 from edge.detection.packet_ai_detector import PacketIsolationForestStage
+from edge.detection.mqtt_adapters import MqttFeatureRuleStage
 from edge.detection.packet_rule_detector import (
     PacketRuleDetectorStage,
     PacketRulePolicy,
@@ -336,6 +337,56 @@ def test_phase8_pending_packet_if_receives_input_but_trust_excludes_response(
         assert event["processed_at"] is not None
 
 
+@pytest.mark.parametrize("mqtt_first", [True, False])
+def test_rate_severity_ties_keep_one_flooding_penalty(SessionLocal, mqtt_first) -> None:
+    with SessionLocal.begin() as db:
+        _insert_device(db)
+        session_pk = _insert_capture_session(db)
+        _insert_packet_source(
+            db, session_pk=session_pk, feature_id=1, segment_id=1,
+            packet_count=1000, total_bytes=2_000_000,
+        )
+        db.execute(text("""INSERT INTO feature_logs (
+            device_id, window_start, window_end, publish_count, avg_payload_size,
+            max_payload_size, avg_message_interval, min_message_interval
+        ) VALUES ('esp32_01', '2026-07-26T10:00:00Z', '2026-07-26T10:00:10Z',
+                  100, 100, 100, 0.1, 0.1)"""))
+    packet_stage, mqtt_stage = _stage(), MqttFeatureRuleStage()
+    stages = (mqtt_stage, packet_stage) if mqtt_first else (packet_stage, mqtt_stage)
+    with SessionLocal.begin() as db:
+        for stage in stages:
+            stage.run_until(db, cycle_range_start=RANGE_START, cycle_cutoff=CUTOFF)
+        events = db.execute(text("SELECT * FROM detection_events ORDER BY id")).mappings().all()
+        assert {event["event_type"] for event in events} == {
+            "ABNORMAL_PUBLISH_RATE", "PACKET_RATE_ANOMALY", "BYTE_RATE_ANOMALY",
+        }
+        assert all(event["severity"] == "high" for event in events)
+        assert all(event["score_delta"] == -20 for event in events)
+        assert all(event["incident_family"] == "FLOODING" for event in events)
+        expected_representative = events[0]["id"]
+        trust = apply_trust_score_v2_until(
+            db, cycle_range_start=RANGE_START, cycle_cutoff=CUTOFF,
+            ai_mode="observe", decision_at=NEXT_CUTOFF,
+        )
+        assert trust.created_history_count == 1
+        assert trust.created_firewall_rule_count == 0
+        assert trust.changes[0].representative_event_ids == [expected_representative]
+        assert trust.changes[0].actual_delta == -20
+        assert db.execute(text("SELECT trust_score FROM devices")).scalar_one() == 80
+        assert db.execute(text("SELECT SUM(applied_to_score) FROM detection_events")).scalar_one() == 1
+    with SessionLocal.begin() as db:
+        for stage in stages:
+            assert stage.run_until(
+                db, cycle_range_start=RANGE_START, cycle_cutoff=CUTOFF,
+            ).created_event_count == 0
+        retry = apply_trust_score_v2_until(
+            db, cycle_range_start=RANGE_START, cycle_cutoff=CUTOFF,
+            ai_mode="observe", decision_at=NEXT_CUTOFF,
+        )
+        assert retry.created_history_count == 0
+        assert db.execute(text("SELECT trust_score FROM devices")).scalar_one() == 80
+
+
 class TestEffectiveRateFormulas:
     def test_packets_per_second_uses_raw_captured_duration_not_ten_second_normalization(self) -> None:
         # Packet IF의 normalize_to_ten_second_rate(=count*10/duration)와 다른 공식이다.
@@ -409,11 +460,13 @@ class TestDetectPacketRules:
         row = self._row(packet_count=1000, captured_duration_seconds=10.0)  # 100 pps > 50
         events = detect_packet_rules(row, TEST_POLICY)
         assert [e["event_type"] for e in events] == ["PACKET_RATE_ANOMALY"]
+        assert events[0]["severity"] == "high"
 
     def test_byte_rate_anomaly(self) -> None:
         row = self._row(total_bytes=2_000_000, captured_duration_seconds=10.0)  # 200000 Bps > 100000
         events = detect_packet_rules(row, TEST_POLICY)
         assert [e["event_type"] for e in events] == ["BYTE_RATE_ANOMALY"]
+        assert events[0]["severity"] == "high"
 
     def test_port_scan_requires_both_distinct_ports_and_syn(self) -> None:
         """다수 목적지 Port와 높은 SYN이 함께 존재하면 PORT_SCAN이 생성된다."""

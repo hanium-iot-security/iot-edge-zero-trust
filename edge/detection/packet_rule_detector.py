@@ -47,8 +47,8 @@ PACKET_RULE_DETECTOR_NAME = "packet_rule"
 PACKET_RULE_SOURCE_TABLE = "packet_feature_logs"
 
 _SEVERITY_BY_EVENT = {
-    PACKET_RATE_ANOMALY: "medium",
-    BYTE_RATE_ANOMALY: "medium",
+    PACKET_RATE_ANOMALY: "high",
+    BYTE_RATE_ANOMALY: "high",
     PORT_SCAN: "high",
     BROKER_DOS_SUSPECTED: "high",
     BROKER_DOS_EVIDENCE_UNAVAILABLE: "low",
