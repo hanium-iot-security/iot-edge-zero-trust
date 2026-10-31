@@ -596,10 +596,13 @@ KST Local Naive 공백값과 SQLite `CURRENT_TIMESTAMP`의 UTC 공백값은 문�
 
 - `from`·`to`: timezone이 있는 ISO 8601. 시작 포함·종료 제외 `[from,to)`를 UTC 마이크로초로 비교합니다. 한쪽만 지정할 수 있고 역순·timezone 누락은 422입니다.
 - `limit`: 기본100, 1~500. `offset`: 0~100000. `snapshot_max_id`: 첫 페이지의 전역 원본 최대 ID를 다음 페이지에도 전달합니다.
+- `is_json_valid`·`is_topic_valid`: 선택 boolean. 생략하면 해당 조건 전체, `true`는 정상, `false`는 오류 원본만 조회합니다. 두 조건은 AND로 결합하며 `items`와 `total`에 함께 적용합니다.
+- `valid_only`: 기존 기본값 `false`를 유지합니다. `true`이면 JSON·Topic 모두 정상인 원본만 조회합니다. 개별 오류 조건과 함께 주면 조건을 덮어쓰지 않고 교집합인 빈 결과를 반환합니다.
+- 응답의 `applied_validity_filters`는 적용한 `is_json_valid`·`is_topic_valid`(boolean 또는 null)와 `valid_only`(boolean)를 반환합니다. 대시보드는 개별 필터를 선택했는데 이 값이 없거나 요청과 다르면 이전 목록을 숨기고 API 업데이트 안내를 표시합니다. 조건 없는 조회는 이전 서버와도 호환됩니다.
 - 기간 조회 정렬은 실제 시각 내림차순, 동률이면 ID 내림차순입니다. timezone 없는 과거 원본은 기간에 추정 배치하지 않습니다.
 - 기존 `items,total`에 `snapshot_max_id,offset,limit,has_more`를 추가합니다. `total`에도 동일한 기간·기기·유효성·최대 ID 필터를 적용합니다.
-- `timestamp_unavailable_count`는 첫 페이지에서 요청 기기 스냅샷의 시각 불명 행 수를 반환합니다. 뒤 페이지에서는 null이며 `timestamp_unavailable_count_scope=device_snapshot_first_page`입니다. 이 수는 해당 기간에 누락됐다는 판정이 아닙니다.
-- `source_span_count`는 첫 페이지에서 전체 기간 일치 집합의 최소~최대 ID 사이에 저장된 같은 기기 원본 수를 셉니다. 시각·JSON·Topic 유효 여부로 중간 원본을 빼지 않습니다. 빈 집합은0, 뒤 페이지는 null이며 `source_span_count_scope=selected_source_ids_first_page`입니다.
+- `timestamp_unavailable_count`는 첫 페이지에서 요청 기기·유효성 조건·ID 스냅샷에 맞는 시각 불명 행 수를 반환합니다. 뒤 페이지에서는 null이며 `timestamp_unavailable_count_scope=device_snapshot_first_page`입니다. 이 수는 해당 기간에 누락됐다는 판정이 아닙니다.
+- `source_span_count`는 첫 페이지에서 전체 기간·유효성 일치 집합의 최소~최대 ID 사이에 저장된 같은 기기 원본 수를 셉니다. 시각·JSON·Topic 유효 여부로 중간 원본을 빼지 않습니다. 빈 집합은0, 뒤 페이지는 null이며 `source_span_count_scope=selected_source_ids_first_page`입니다.
 - 기간 없는 조회는 위 두 감사 수가 null이고 scope는 `not_evaluated`입니다. `interval_predecessor_policy=within_range_only`이며 기간 밖 선행 메시지는 가져오지 않습니다.
 
 화면은 크기에 원래 `payload_size` 바이트를 사용합니다. 간격은 전체 페이지를 받아 `rows.length=total=source_span_count`이고 시간순 ID가 증가할 때만 같은 기기의 연속 시각 차이를 표시합니다. 첫 메시지·누락·순서 역전은 값 없음이며 임의5초를 넣지 않습니다. 5000건 화면 한도·잘린 페이지·스냅샷 불일치는 불완전으로 표시하고 간격을 숨깁니다. 과거 시각 불명 행은 그대로 보존합니다. ID watermark는 새 삽입을 차단하지만 페이지 사이의 기존 행 수정·삭제를 동결하는 장기 스냅샷은 아닙니다.

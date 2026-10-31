@@ -312,6 +312,19 @@ function getPreflightTrustScore(preflight, device) {
         ? number
         : null;
 }
+function getRecoveryDeviceStateKey(device) {
+    return JSON.stringify([
+        device?.device_id ?? null,
+        device?.status ?? null,
+        device?.trust_score ?? null,
+        device?.ip_address ?? null,
+        device?.firewall_status ?? null,
+        device?.firewall_rule?.id ?? null,
+        device?.firewall_rule?.status ?? null,
+        device?.firewall_rule?.source_ip ?? null,
+        device?.firewall_rule?.scope ?? null,
+    ]);
+}
 function getRecoveryResult(data) {
     return String(data?.result || "")
         .trim()
@@ -393,7 +406,7 @@ function getRecoveryUiStatus(device, releaseRequest, preflight, recoveryResult =
         return {
             status: "pending",
             label: "사전 점검 필요",
-            description: "방화벽 규칙이 REMOVED 상태입니다. 백엔드 사전 점검로 실행 상태와 나머지 안전 조건을 확인해 주세요.",
+            description: "방화벽 규칙이 REMOVED 상태입니다. 백엔드 사전 점검으로 실행 상태와 나머지 안전 조건을 확인해 주세요.",
         };
     }
     const runtimeStatus = getRuntimeReleaseStatus(preflight);
@@ -777,6 +790,9 @@ export default function Isolation() {
     });
     const activeCriteriaRef = useRef("");
     const recoveryModalGenerationRef = useRef(0);
+    const preflightStateGenerationRef = useRef(0);
+    const selectedRecoveryPresenceRef = useRef(false);
+    const recoveryHistoryRequestRef = useRef({ id: 0, controller: null });
     /* =========================================================
        Main Data
        ========================================================= */
@@ -932,34 +948,24 @@ export default function Isolation() {
      */
     useEffect(() => {
         if (!selectedIsolatedDevice) {
+            selectedRecoveryPresenceRef.current = false;
             return;
         }
         const latest = isolatedDevicesWithFirewall.find((device) => device.device_id ===
             selectedIsolatedDevice.device_id);
-        if (!latest) {
+        const isPresent = Boolean(latest);
+        const presenceChanged = selectedRecoveryPresenceRef.current !== isPresent;
+        selectedRecoveryPresenceRef.current = isPresent;
+        if (!presenceChanged && !isPresent) return;
+        if (!presenceChanged && latest &&
+            getRecoveryDeviceStateKey(selectedIsolatedDevice) === getRecoveryDeviceStateKey(latest)) {
             return;
         }
-        const currentFirewallStatus = String(selectedIsolatedDevice
-            .firewall_status ||
-            "");
-        const latestFirewallStatus = String(latest
-            .firewall_status ||
-            "");
-        const currentTrustScore = Number(selectedIsolatedDevice
-            .trust_score);
-        const latestTrustScore = Number(latest
-            .trust_score);
-        if (currentFirewallStatus ===
-            latestFirewallStatus &&
-            currentTrustScore ===
-                latestTrustScore &&
-            selectedIsolatedDevice
-                .firewall_rule?.id ===
-                latest
-                    .firewall_rule?.id) {
-            return;
-        }
-        setSelectedIsolatedDevice(latest);
+        preflightStateGenerationRef.current += 1;
+        setPreflight(null);
+        setPreflightError("");
+        setRecoveryConfirmation("");
+        if (latest) setSelectedIsolatedDevice(latest);
     }, [
         isolatedDevicesWithFirewall,
         selectedIsolatedDevice,
@@ -1318,6 +1324,13 @@ export default function Isolation() {
             return;
         }
         const generation = recoveryModalGenerationRef.current;
+        const previous = recoveryHistoryRequestRef.current;
+        previous.controller?.abort();
+        const controller = new AbortController();
+        const requestId = previous.id + 1;
+        recoveryHistoryRequestRef.current = { id: requestId, controller };
+        const isCurrentRequest = () => generation === recoveryModalGenerationRef.current &&
+            requestId === recoveryHistoryRequestRef.current.id && !controller.signal.aborted;
         setRecoveryHistoryLoading(true);
         setRecoveryHistoryError("");
         try {
@@ -1325,9 +1338,8 @@ export default function Isolation() {
                 device_id: deviceId,
                 limit: 5,
                 offset: 0,
-            }, currentAdminKey);
-            if (generation !==
-                recoveryModalGenerationRef.current) {
+            }, currentAdminKey, { signal: controller.signal });
+            if (!isCurrentRequest()) {
                 return;
             }
             const items = Array.isArray(response?.items)
@@ -1344,8 +1356,7 @@ export default function Isolation() {
             setRecoveryHistory(items);
         }
         catch (err) {
-            if (generation !==
-                recoveryModalGenerationRef.current) {
+            if (!isCurrentRequest()) {
                 return;
             }
             setRecoveryHistory([]);
@@ -1354,8 +1365,8 @@ export default function Isolation() {
                 : "복구 이력을 불러오지 못했습니다.");
         }
         finally {
-            if (generation ===
-                recoveryModalGenerationRef.current) {
+            if (isCurrentRequest()) {
+                recoveryHistoryRequestRef.current.controller = null;
                 setRecoveryHistoryLoading(false);
             }
         }
@@ -1369,11 +1380,14 @@ export default function Isolation() {
      */
     const selectedDeviceId = selectedIsolatedDevice?.device_id ??
         null;
+    const selectedDeviceIsPresent = isolatedDevicesWithFirewall.some((device) =>
+        device.device_id === selectedDeviceId);
     useEffect(() => {
+        setRecoveryHistory([]);
+        setRecoveryHistoryError("");
+        setRecoveryHistoryLoading(false);
         if (!selectedDeviceId ||
             !adminKey.trim()) {
-            setRecoveryHistory([]);
-            setRecoveryHistoryError("");
             return undefined;
         }
         const timer = window.setTimeout(() => {
@@ -1381,6 +1395,11 @@ export default function Isolation() {
         }, 300);
         return () => {
             window.clearTimeout(timer);
+            recoveryHistoryRequestRef.current.controller?.abort();
+            recoveryHistoryRequestRef.current = {
+                id: recoveryHistoryRequestRef.current.id + 1,
+                controller: null,
+            };
         };
     }, [
         selectedDeviceId,
@@ -1473,6 +1492,10 @@ export default function Isolation() {
        Recovery Preflight
        ========================================================= */
     async function handlePreflight() {
+        if (!selectedDeviceIsPresent) {
+            setPreflightError("현재 격리 목록에서 기기를 확인할 수 없습니다. 목록을 새로고침해 주세요.");
+            return;
+        }
         const device = selectedIsolatedDevice;
         if (!device?.device_id) {
             return;
@@ -1494,6 +1517,7 @@ export default function Isolation() {
         }
         const targetDeviceId = device.device_id;
         const generation = recoveryModalGenerationRef.current;
+        const stateGeneration = preflightStateGenerationRef.current;
         setPreflightLoading(true);
         setPreflightError("");
         setPreflight(null);
@@ -1511,6 +1535,10 @@ export default function Isolation() {
             }, adminKey);
             if (generation !==
                 recoveryModalGenerationRef.current) {
+                return;
+            }
+            if (stateGeneration !== preflightStateGenerationRef.current) {
+                setPreflightError("기기 상태가 변경되어 사전 점검을 다시 실행해 주세요.");
                 return;
             }
             const response = validateCommandResponse(rawResponse, {
@@ -1538,7 +1566,7 @@ export default function Isolation() {
        Recovery Execute
        ========================================================= */
     async function handleExecuteRecovery() {
-        if (recoveryExecuting || getRecoveryResult(recoveryResult) === "SUCCESS" || hasUncertainOutcome) {
+        if (!selectedDeviceIsPresent || recoveryExecuting || getRecoveryResult(recoveryResult) === "SUCCESS" || hasUncertainOutcome) {
             return;
         }
         const device = selectedIsolatedDevice;
@@ -1805,7 +1833,7 @@ export default function Isolation() {
         !hasUncertainOutcome;
     const runtimeReleaseStatus = getRuntimeReleaseStatus(preflight);
     const hasRecoveryAuditCheck = Boolean(preflight && Object.prototype.hasOwnProperty.call(preflight, "audit_check"));
-    const canRunRecovery = Boolean(preflight) &&
+    const canRunRecovery = selectedDeviceIsPresent && Boolean(preflight) &&
         getRecoveryResult(recoveryResult) !== "SUCCESS" &&
         getPreflightCanExecute(preflight) &&
         runtimeReleaseStatus ===
@@ -2446,7 +2474,7 @@ export default function Isolation() {
               </p>
 
               <div className="action-row">
-                <button type="button" className="button button-secondary" onClick={handlePreflight} disabled={isAdminOperationBusy ||
+                <button type="button" className="button button-secondary" onClick={handlePreflight} disabled={!selectedDeviceIsPresent || isAdminOperationBusy ||
                 hasUncertainOutcome ||
                 currentSelectedFirewallStatus !==
                     "REMOVED"}>

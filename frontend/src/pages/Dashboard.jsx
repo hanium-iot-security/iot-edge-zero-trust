@@ -2739,7 +2739,7 @@ export default function Dashboard() {
 
                   <div className="section-unavailable">
 
-                    {loading ? "게이트웨이 지표을 조회하는 중입니다." : "게이트웨이 지표을 확인할 수 없습니다."}
+                    {loading ? "게이트웨이 지표를 조회하는 중입니다." : "게이트웨이 지표를 확인할 수 없습니다."}
 
                   </div>
 

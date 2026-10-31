@@ -264,7 +264,7 @@ function MetricsChart({ data, lines, title, unit, isPacket, range }) {
       </ResponsiveContainer>
       {isPacket && (
         <small className="traffic-trends-help">
-          실제 수집시간 기준 전송률입니다. 10초로 나눈 명목 전송률나 패킷 AI 입력값으로 해석하지 않습니다.
+          실제 수집시간 기준 전송률입니다. 10초로 나눈 명목 전송률이나 패킷 AI 입력값으로 해석하지 않습니다.
         </small>
       )}
     </div>
@@ -586,7 +586,7 @@ export default function DeviceTrafficTrends() {
             <div className="traffic-trends-charts">
               <MetricsChart range={result.criteria} isPacket data={chart} title="실제 초당 패킷 수" unit="pps" lines={[{ key: "packets_per_second", label: "실제 PPS", color: "#2563eb" }]} />
               <MetricsChart range={result.criteria} isPacket data={chart} title="실제 초당 전송량" unit="B/s" lines={[{ key: "bytes_per_second", label: "실제 B/s", color: "#16a34a" }]} />
-              <p className="traffic-trends-qualification">분석 제외·FAILED·품질 미확인 분석 구간는 수치를 연결하지 않습니다. 수집 세션 변화와 10초 초과 공백도 선을 끊습니다.</p>
+              <p className="traffic-trends-qualification">분석 제외·FAILED·품질 미확인 분석 구간은 수치를 연결하지 않습니다. 수집 세션 변화와 10초 초과 공백도 선을 끊습니다.</p>
             </div>
           )}
           {result.kind === "packet" && (

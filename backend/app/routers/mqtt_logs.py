@@ -17,6 +17,8 @@ def get_mqtt_logs(
     offset: Annotated[int, Query(ge=0, le=MAX_MQTT_OFFSET)] = 0,
     device_id: str | None = None,
     valid_only: bool = False,
+    is_json_valid: bool | None = None,
+    is_topic_valid: bool | None = None,
     from_at: Annotated[datetime | None, Query(alias="from")] = None,
     to_at: Annotated[datetime | None, Query(alias="to")] = None,
     snapshot_max_id: Annotated[int | None, Query(ge=0, le=SQLITE_MAX_ID)] = None,
@@ -26,6 +28,7 @@ def get_mqtt_logs(
         return list_mqtt_logs(
             db=db, limit=limit, offset=offset, device_id=device_id, valid_only=valid_only,
             from_at=from_at, to_at=to_at, snapshot_max_id=snapshot_max_id,
+            is_json_valid=is_json_valid, is_topic_valid=is_topic_valid,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

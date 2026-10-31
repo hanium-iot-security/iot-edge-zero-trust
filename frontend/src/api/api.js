@@ -120,6 +120,12 @@ function createApiErrorMessage(error) {
   const detail = body?.detail;
 
   if (typeof detail === "string") {
+    if (status === 401 && detail === "RECOVERY_ADMIN_UNAUTHORIZED") {
+      return "관리자 인증에 실패했습니다. 입력한 관리자 인증키를 확인해 주세요.";
+    }
+    if (status === 503 && detail === "RECOVERY_ADMIN_NOT_CONFIGURED") {
+      return "서버에 관리자 인증키가 설정되지 않아 관리자 기능을 사용할 수 없습니다. 서버 설정을 확인해 주세요.";
+    }
     if (status === 404 && detail.trim() === "Not Found") {
       return "요청한 API 또는 자료를 찾을 수 없습니다. 서버 API 버전을 확인해 주세요. (404)";
     }
