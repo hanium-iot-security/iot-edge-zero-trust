@@ -1790,6 +1790,13 @@ export default function Devices() {
             message={error}
             onRetry={() => loadData(true)}
           />
+        ) : searchText.trim() && rows.length > 0 && filteredRows.length === 0 ? (
+          <EmptyState
+            title="검색 조건에 맞는 기기가 없습니다."
+            description="현재 페이지에서 다른 기기 ID 또는 IP 주소를 검색해 주세요."
+            actionLabel="검색 초기화"
+            onAction={() => setSearchText("")}
+          />
         ) : (
           <div className="table-scroll">
             <DataTable
