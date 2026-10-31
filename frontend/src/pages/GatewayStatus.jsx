@@ -195,11 +195,11 @@ function getGatewayStatus(
 function gatewayDescription(status) {
   const descriptions = {
     ONLINE:
-      "최근 수집 주기 내에 게이트웨이 지표이 수신되었습니다.",
+      "최근 수집 주기 내에 게이트웨이 지표가 수신되었습니다.",
     STALE:
       "마지막 Metric 수집 이후 허용 시간이 지났습니다.",
     NO_DATA:
-      "API 요청은 성공했지만 저장된 게이트웨이 지표이 없습니다.",
+      "API 요청은 성공했지만 저장된 게이트웨이 지표가 없습니다.",
     API_ERROR:
       "게이트웨이 지표 API에 연결할 수 없습니다.",
   };
