@@ -194,8 +194,8 @@ export default function Logs() {
   const [lastUpdated, setLastUpdated] =
     useState("");
 
-  const isFetchingRef =
-    useRef(false);
+  const requestRef =
+    useRef(null);
 
   const hasDataRef =
     useRef(false);
@@ -204,11 +204,15 @@ export default function Logs() {
     async (
       isManualRefresh = false
     ) => {
-      if (isFetchingRef.current) {
+      if (requestRef.current) {
         return;
       }
 
-      isFetchingRef.current = true;
+      const request = {
+        controller: new AbortController(),
+      };
+      requestRef.current = request;
+      const isCurrent = () => requestRef.current === request;
 
       if (isManualRefresh) {
         setRefreshing(true);
@@ -249,7 +253,26 @@ export default function Logs() {
         }
 
         const data =
-          await getMqttLogs(params);
+          await getMqttLogs(params, {
+            signal: request.controller.signal,
+          });
+
+        if (!isCurrent()) return;
+
+        const applied = data?.applied_validity_filters;
+        if (
+          (params.is_json_valid !== undefined || params.is_topic_valid !== undefined) &&
+          (applied?.is_json_valid !== (params.is_json_valid ?? null) ||
+            applied?.is_topic_valid !== (params.is_topic_valid ?? null) ||
+            applied?.valid_only !== false)
+        ) {
+          setLogs([]);
+          setTotal(0);
+          hasDataRef.current = false;
+          setPollWarning("");
+          setError("현재 연결된 서버가 JSON·토픽 유효성 필터를 지원하지 않습니다. 서버 API를 업데이트한 뒤 다시 조회해 주세요.");
+          return;
+        }
 
         const items =
           Array.isArray(data?.items)
@@ -278,6 +301,8 @@ export default function Logs() {
         setError("");
         setPollWarning("");
       } catch (err) {
+        if (!isCurrent() || err?.isCanceled) return;
+
         if (IS_DEV) {
           console.error(
             "MQTT logs load failed:",
@@ -296,11 +321,11 @@ export default function Logs() {
           setError(message);
         }
       } finally {
-        setLoading(false);
-        setRefreshing(false);
-
-        isFetchingRef.current =
-          false;
+        if (isCurrent()) {
+          setLoading(false);
+          setRefreshing(false);
+          requestRef.current = null;
+        }
       }
     },
     [
@@ -311,6 +336,12 @@ export default function Logs() {
   );
 
   useEffect(() => {
+    hasDataRef.current = false;
+    setLogs([]);
+    setTotal(0);
+    setError("");
+    setPollWarning("");
+    setLoading(true);
     loadData();
 
     const timer =
@@ -320,6 +351,8 @@ export default function Logs() {
 
     return () => {
       window.clearInterval(timer);
+      requestRef.current?.controller.abort();
+      requestRef.current = null;
     };
   }, [loadData]);
 
@@ -704,7 +737,7 @@ export default function Logs() {
               value={formatNumber(
                 logSummary.largePayloadCount
               )}
-              description="메시지 내용가 5KB를 초과한 로그"
+              description="메시지 내용이 5KB를 초과한 로그"
               status="danger"
             />
 
@@ -826,7 +859,7 @@ export default function Logs() {
             <h2>MQTT 로그 목록</h2>
 
             <p className="panel-description">
-              메시지 내용는 표에서 일부만
+              메시지 내용은 표에서 일부만
               표시하고 상세 모달에서 전체
               내용을 확인합니다.
             </p>
@@ -847,7 +880,7 @@ export default function Logs() {
           filteredLogs.length === 0 ? (
           <EmptyState
             title="검색 조건에 맞는 MQTT 로그가 없습니다."
-            description="다른 기기 ID, 토픽 또는 메시지 내용를 검색해 주세요."
+            description="다른 기기 ID, 토픽 또는 메시지 내용을 검색해 주세요."
             actionLabel="검색 초기화"
             onAction={() =>
               setSearchText("")

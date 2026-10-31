@@ -22,6 +22,8 @@ def list_mqtt_logs(
     device_id: str | None = None,
     valid_only: bool = False,
     *,
+    is_json_valid: bool | None = None,
+    is_topic_valid: bool | None = None,
     from_at: datetime | None = None,
     to_at: datetime | None = None,
     snapshot_max_id: int | None = None,
@@ -30,6 +32,9 @@ def list_mqtt_logs(
         raise ValueError("limit must be an integer between 1 and 500")
     if type(offset) is not int or not 0 <= offset <= MAX_MQTT_OFFSET:
         raise ValueError(f"offset must be an integer between 0 and {MAX_MQTT_OFFSET}")
+    for name, value in (("is_json_valid", is_json_valid), ("is_topic_valid", is_topic_valid)):
+        if value is not None and type(value) is not bool:
+            raise ValueError(f"{name} must be a boolean or omitted")
     start = optional_utc(from_at, "from")
     end = optional_utc(to_at, "to")
     if start is not None and end is not None and start > end:
@@ -45,6 +50,10 @@ def list_mqtt_logs(
         source_where = " AND ".join(filters)
         if valid_only:
             filters.extend(["is_json_valid = 1", "is_topic_valid = 1"])
+        for column, value in (("is_json_valid", is_json_valid), ("is_topic_valid", is_topic_valid)):
+            if value is not None:
+                filters.append(f"{column} = :{column}")
+                params[column] = int(value)
         where = " AND ".join(filters)
         unavailable = None
         source_span = None
@@ -114,6 +123,10 @@ def list_mqtt_logs(
         return {
             "items": items, "total": total, "snapshot_max_id": maximum,
             "offset": offset, "limit": limit, "has_more": offset + len(items) < total,
+            "applied_validity_filters": {
+                "is_json_valid": is_json_valid, "is_topic_valid": is_topic_valid,
+                "valid_only": valid_only,
+            },
             "source_span_count": source_span,
             "source_span_count_scope": "selected_source_ids_first_page" if ranged else "not_evaluated",
             "timestamp_unavailable_count": unavailable,
