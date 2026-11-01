@@ -33,6 +33,10 @@ const POLLING_INTERVAL_MS =
 
 const STATUS_UPDATE_INTERVAL_MS = 1000;
 
+// Keep diagnostics available normally; set false only for the demo server.
+const SHOW_GATEWAY_DIAGNOSTICS =
+  import.meta.env.VITE_SHOW_GATEWAY_DIAGNOSTICS !== "false";
+
 /* =========================================================
    Formatting
 ========================================================= */
@@ -451,7 +455,7 @@ function runtimeTitle(item, index) {
       "detector_type",
       "pipeline",
       "component",
-    ]) ?? `Runtime ${index + 1}`
+    ]) ?? `처리 단계 ${index + 1}`
   );
 }
 
@@ -477,7 +481,7 @@ function runtimeTheme(value) {
   const normalized = String(value).toUpperCase();
 
   if (
-    ["RUNNING", "ACTIVE", "HEALTHY", "READY", "ONLINE"].includes(normalized)
+    ["RUNNING", "ACTIVE", "HEALTHY", "READY", "INITIALIZED", "COMPLETED", "ONLINE"].includes(normalized)
   ) {
     return "normal";
   }
@@ -503,9 +507,16 @@ function runtimeTheme(value) {
   return "unknown";
 }
 
+function runtimeLabel(value) {
+  if (value === "INITIALIZED") return "준비 완료";
+  if (value === "NO_INPUT") return "입력 대기";
+  return uiLabel(value);
+}
+
 function RuntimeCard({ item, index }) {
   const desired = getRuntimeField(item, "desired");
   const actual = getRuntimeField(item, "actual");
+  const actualLabel = runtimeLabel(actual);
 
   const model = item.model_version;
   const updatedAt = item.observed_at;
@@ -514,10 +525,10 @@ function RuntimeCard({ item, index }) {
   return (
     <article className="ai-runtime-card">
       <div className="ai-runtime-card-header">
-        <strong>{runtimeTitle(item, index)}</strong>
+        <strong>{runtimeDisplayName(runtimeTitle(item, index))}</strong>
         <StatusBadge
           status={runtimeTheme(actual)}
-          label={actual == null ? "UNKNOWN" : uiLabel(actual)}
+          label={actualLabel}
           size="small"
         />
       </div>
@@ -530,13 +541,15 @@ function RuntimeCard({ item, index }) {
 
         <div>
           <dt>실제 관측 상태</dt>
-          <dd>{uiLabel(actual)}</dd>
+          <dd>{actualLabel}</dd>
         </div>
 
-        <div>
-          <dt>모델</dt>
-          <dd>{displayValue(model)}</dd>
-        </div>
+        {model != null && String(model).trim() !== "" && (
+          <div>
+            <dt>모델</dt>
+            <dd>{displayValue(model)}</dd>
+          </div>
+        )}
 
         <div>
           <dt>관측 시각</dt>
@@ -551,7 +564,7 @@ function RuntimeCard({ item, index }) {
         {item.freshness !== "FRESH" && (
           <div>
             <dt>마지막 관측 상태</dt>
-            <dd>{uiLabel(item.last_observation_status)}</dd>
+            <dd>{runtimeLabel(item.last_observation_status)}</dd>
           </div>
         )}
 
@@ -712,17 +725,19 @@ function RuntimeOverview({ runtimeItems, completionItems, runtimeData, runtimeEr
           {runtimeItems.map((item, index) => <RuntimeCard key={`${item.name}-${index}`} item={item} index={index} />)}
         </div>
       </details>
-      <details className="ai-runtime-raw ai-runtime-diagnostics">
-        <summary>진단 정보 · 완료 기록 {completionItems.length}건과 원본 응답</summary>
-        <p className="ai-runtime-note">모델, 분석 제외 사유와 기기명이 없는 과거 기록을 포함한 전체 완료 근거입니다.</p>
-        <div className="ai-runtime-grid">
-          {completionItems.map((item, index) => <CompletionCard key={`${item.run_id}-${item.detector_name}-${index}`} item={item} />)}
-        </div>
-        <details className="ai-runtime-raw">
-          <summary>실행 상태 원본 응답 확인</summary>
-          <pre>{JSON.stringify(runtimeData, null, 2)}</pre>
+      {SHOW_GATEWAY_DIAGNOSTICS && (
+        <details className="ai-runtime-raw ai-runtime-diagnostics">
+          <summary>진단 정보 · 완료 기록 {completionItems.length}건과 원본 응답</summary>
+          <p className="ai-runtime-note">모델, 분석 제외 사유와 기기명이 없는 과거 기록을 포함한 전체 완료 근거입니다.</p>
+          <div className="ai-runtime-grid">
+            {completionItems.map((item, index) => <CompletionCard key={`${item.run_id}-${item.detector_name}-${index}`} item={item} />)}
+          </div>
+          <details className="ai-runtime-raw">
+            <summary>실행 상태 원본 응답 확인</summary>
+            <pre>{JSON.stringify(runtimeData, null, 2)}</pre>
+          </details>
         </details>
-      </details>
+      )}
     </>
   );
 }

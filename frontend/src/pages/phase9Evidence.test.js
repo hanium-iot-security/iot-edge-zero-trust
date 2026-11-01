@@ -17,7 +17,10 @@ async function page(name, exports, states = {}, directory = "pages") {
     .flatMap((match) => match[1] ? match[1].split(",").map((name) => name.trim()).filter(Boolean) : [match[2]]);
   const { code } = await transformWithOxc(source.replace(/^import\b[\s\S]*?;\r?\n/gm, ""), `${name}.jsx`, {
     jsx: { runtime: "classic", pragma: "jsx", pragmaFrag: "Fragment" },
-    define: { "import.meta.env.DEV": "false" },
+    define: {
+      "import.meta.env.DEV": "false",
+      "import.meta.env.VITE_SHOW_GATEWAY_DIAGNOSTICS": "undefined",
+    },
   });
   let state = 0;
   const scope = {
