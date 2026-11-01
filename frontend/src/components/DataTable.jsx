@@ -177,12 +177,34 @@ export default function DataTable({
                     ]
                       .filter(Boolean)
                       .join(" ")}
+                    tabIndex={clickable ? 0 : undefined}
                     onClick={
                       clickable
-                        ? () =>
-                            onRowClick(
-                              row
-                            )
+                        ? (event) => {
+                            const control = event.target.closest?.(
+                              'a, button, input, select, textarea, summary, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="link"], [tabindex]'
+                            );
+                            if (event.defaultPrevented || (control && control !== event.currentTarget)) {
+                              return;
+                            }
+                            event.currentTarget.focus({ preventScroll: true });
+                            onRowClick(row);
+                          }
+                        : undefined
+                    }
+                    onKeyDown={
+                      clickable
+                        ? (event) => {
+                            if (event.defaultPrevented || event.target !== event.currentTarget ||
+                                (event.key !== "Enter" && event.key !== " ")) {
+                              return;
+                            }
+                            event.preventDefault();
+                            if (!event.repeat) {
+                              event.currentTarget.focus({ preventScroll: true });
+                              onRowClick(row);
+                            }
+                          }
                         : undefined
                     }
                   >

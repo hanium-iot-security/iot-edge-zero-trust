@@ -96,6 +96,11 @@
     cursor: pointer;
   }
 
+  .clickable:focus-visible {
+    outline: 2px solid var(--color-primary);
+    outline-offset: -2px;
+  }
+
   @media (max-width: 640px) {
     .inline-error {
       align-items: flex-start;

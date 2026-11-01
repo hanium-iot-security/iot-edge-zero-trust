@@ -508,7 +508,7 @@ function getFirewallStatusLabel(status) {
 
 
 
-function getGatewayStatus(metric) {
+function getGatewayStatus(metric, now = Date.now()) {
 
   if (!metric) {
 
@@ -530,7 +530,7 @@ function getGatewayStatus(metric) {
 
   }
 
-  const elapsedSeconds = (Date.now() - collectedAt) / 1000;
+  const elapsedSeconds = (now - collectedAt) / 1000;
 
   return elapsedSeconds <= ONLINE_THRESHOLD_SECONDS ? "ONLINE" : "STALE";
 
@@ -1375,9 +1375,9 @@ export default function Dashboard() {
 
   const gatewayStatus = useMemo(
 
-    () => getGatewayStatus(gatewayMetric),
+    () => getGatewayStatus(gatewayMetric, observationNow),
 
-    [gatewayMetric]
+    [gatewayMetric, observationNow]
 
   );
 

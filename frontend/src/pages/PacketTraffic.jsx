@@ -666,6 +666,7 @@ export default function PacketTraffic() {
 
   const featureRequestRef = useRef(null);
   const featureRequestIdRef = useRef(0);
+  const featureQueryKeyRef = useRef(null);
 
   const hasDataRef = useRef(false);
 
@@ -675,6 +676,18 @@ export default function PacketTraffic() {
         !previous.controller.signal.aborted) return;
 
     previous?.controller.abort();
+    const queryKey = JSON.stringify([offset, direction]);
+    if (featureQueryKeyRef.current !== queryKey) {
+      setPacketFeatures([]);
+      setTotal(0);
+      setLastUpdated("");
+      setError("");
+      setPollWarning("");
+      setLoading(true);
+      setRefreshing(false);
+      hasDataRef.current = false;
+      featureQueryKeyRef.current = queryKey;
+    }
     const controller = new AbortController();
     const requestId = ++featureRequestIdRef.current;
     featureRequestRef.current = { controller, offset, direction };
@@ -863,15 +876,23 @@ export default function PacketTraffic() {
 
           }
 
+          const rawEffectivePps = item.effective_packets_per_second;
+
           const effectivePps =
 
             Number(
 
-              item.effective_packets_per_second
+              rawEffectivePps
 
             );
 
           if (
+
+            rawEffectivePps !== null &&
+
+            rawEffectivePps !== undefined &&
+
+            rawEffectivePps !== "" &&
 
             Number.isFinite(
 
@@ -980,8 +1001,6 @@ export default function PacketTraffic() {
   ) {
 
     setCaptureStatus(value);
-
-    setOffset(0);
 
   }
 
@@ -2072,7 +2091,7 @@ export default function PacketTraffic() {
 
         </div>
 
-        {searchText &&
+        {(searchText.trim() || captureStatus) &&
 
           !loading &&
 
@@ -2084,13 +2103,13 @@ export default function PacketTraffic() {
 
           <EmptyState
 
-            title="검색 조건에 맞는 데이터가 없습니다."
+            title="조회 조건에 맞는 패킷 분석 지표가 없습니다."
 
-            description="현재 페이지에서 다른 기기 ID, IP 또는 수집 세션 ID를 검색해 주세요."
+            description="현재 페이지에서 검색어나 수집 분석 상태를 변경하거나 필터를 초기화해 주세요."
 
-            actionLabel="검색 초기화"
+            actionLabel="필터 초기화"
 
-            onAction={() => setSearchText("")}
+            onAction={() => { setSearchText(""); setCaptureStatus(""); }}
 
           />
 

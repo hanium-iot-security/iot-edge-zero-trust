@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "oxlint",
-    "test": "node --test src/components/DateTimePicker.test.js src/utils/mqttTimestamp.test.js src/utils/packetCaptureStatus.test.js src/utils/firewallTrafficFields.test.js src/utils/trafficQuery.test.js src/pages/devicePolicyPolling.test.js src/pages/packetCaptureWindows.test.js src/pages/phase9Recovery.test.js src/pages/phase9Evidence.test.js src/pages/eventScoreEffect.test.js src/pages/recoveryWorkflow.test.js src/utils/rawMqttTraffic.test.js src/pages/recoveryStateRaces.test.js src/api/apiErrors.test.js src/pages/mqttValidityFilters.test.js",
+    "test": "node --test src/components/DateTimePicker.test.js src/utils/mqttTimestamp.test.js src/utils/packetCaptureStatus.test.js src/utils/firewallTrafficFields.test.js src/utils/trafficQuery.test.js src/pages/devicePolicyPolling.test.js src/pages/packetCaptureWindows.test.js src/pages/phase9Recovery.test.js src/pages/phase9Evidence.test.js src/pages/eventScoreEffect.test.js src/pages/recoveryWorkflow.test.js src/utils/rawMqttTraffic.test.js src/pages/recoveryStateRaces.test.js src/api/apiErrors.test.js src/pages/mqttValidityFilters.test.js src/pages/readFlowRegression.test.js src/components/tableModalAccessibility.test.js",
     "preview": "vite preview"
   },
   "dependencies": {
