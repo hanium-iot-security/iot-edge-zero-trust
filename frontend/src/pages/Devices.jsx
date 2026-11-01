@@ -953,6 +953,7 @@ export default function Devices() {
   const hasDataRef = useRef(false);
   const listIdRef = useRef(0);
   const listControllerRef = useRef(null);
+  const listQueryKeyRef = useRef(null);
   const detailIdRef = useRef(0);
   const detailControllerRef = useRef(null);
   const policyDraftBaselineRef = useRef(null);
@@ -960,7 +961,24 @@ export default function Devices() {
   const policyLock = useRef(false);
 
   const loadData = useCallback(async (manual = false) => {
-    listControllerRef.current?.abort();
+    const queryKey = JSON.stringify([offset, statusFilter]);
+    const previous = listControllerRef.current;
+    if (!manual && previous && !previous.signal.aborted &&
+        listQueryKeyRef.current === queryKey) return;
+
+    previous?.abort();
+    if (listQueryKeyRef.current !== queryKey) {
+      setDevices([]);
+      setFirewallRules([]);
+      setTotal(0);
+      setLastUpdated("");
+      setError("");
+      setPollWarning("");
+      setLoading(true);
+      setRefreshing(false);
+      hasDataRef.current = false;
+      listQueryKeyRef.current = queryKey;
+    }
     const controller = new AbortController();
     listControllerRef.current = controller;
     const id = ++listIdRef.current;
@@ -1012,6 +1030,7 @@ export default function Devices() {
       if (id === listIdRef.current) {
         setLoading(false);
         setRefreshing(false);
+        listControllerRef.current = null;
       }
     }
   }, [offset, statusFilter]);
