@@ -5,6 +5,8 @@ from datetime import datetime
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from backend.app.services.detection_event_query_service import list_detection_events
+
 
 def _scalar_count(db: Session, query: str, params: dict | None = None) -> int:
     return int(db.execute(text(query), params or {}).scalar_one())
@@ -39,27 +41,7 @@ def get_dashboard_summary(db: Session) -> dict:
         ),
     }
 
-    latest_detection_events = db.execute(
-        text(
-            """
-            SELECT
-                id,
-                device_id,
-                feature_log_id,
-                mqtt_log_id,
-                detector_type,
-                event_type,
-                severity,
-                score_delta,
-                applied_to_score,
-                description,
-                detected_at
-            FROM detection_events
-            ORDER BY detected_at DESC, id DESC
-            LIMIT 5
-            """
-        )
-    ).mappings().all()
+    recent_detections = list_detection_events(db, limit=5, offset=0)
     latest_isolation_events = db.execute(
         text(
             """
@@ -78,7 +60,7 @@ def get_dashboard_summary(db: Session) -> dict:
         )
     ).mappings().all()
 
-    total_detection_events = _scalar_count(db, "SELECT COUNT(*) FROM detection_events")
+    total_detection_events = recent_detections["total"]
 
     return {
         **status_counts,
@@ -96,6 +78,6 @@ def get_dashboard_summary(db: Session) -> dict:
             {"event_type": "UNKNOWN_DEVICE"},
         ),
         "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "latest_detection_events": _rows_to_dicts(latest_detection_events),
+        "latest_detection_events": recent_detections["items"],
         "latest_isolation_events": _rows_to_dicts(latest_isolation_events),
     }

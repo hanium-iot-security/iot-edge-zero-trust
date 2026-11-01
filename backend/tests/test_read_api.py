@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import sqlite3
 
 import pytest
@@ -330,6 +331,93 @@ def test_dashboard_summary_counts_rows(api_client) -> None:
     assert isinstance(body["last_updated"], str)
     assert len(body["latest_detection_events"]) == 3
     assert len(body["latest_isolation_events"]) == 1
+
+
+def test_dashboard_recent_events_preserve_event_provenance_and_score_effects(api_client) -> None:
+    client, db_path = api_client
+    seed_api_rows(db_path)
+    start, end = "2026-05-11T10:00:00Z", "2026-05-11T10:00:10Z"
+    with sqlite3.connect(db_path) as connection:
+        capture_id = connection.execute(
+            """INSERT INTO packet_capture_sessions
+                (session_id, capture_interface, started_at, first_window_start, ended_at, status)
+                VALUES ('11111111-1111-4111-8111-111111111111', 'test0', ?, ?, ?, 'COMPLETED')""",
+            (start, start, end),
+        ).lastrowid
+        segment_id = connection.execute(
+            """INSERT INTO packet_capture_segments
+                (capture_session_id, file_name, capture_interface, window_start, window_end,
+                 status, packet_count, start_delay_seconds, captured_duration_seconds)
+                VALUES (?, 'summary-fixture.pcap', 'test0', ?, ?, 'PROCESSED', 1, 0, 9.9)""",
+            (capture_id, start, end),
+        ).lastrowid
+        packet_id = connection.execute(
+            """INSERT INTO packet_feature_logs
+                (capture_segment_id, device_id, peer_ip, direction, window_start, window_end,
+                 packet_count, total_bytes, avg_packet_size, max_packet_size,
+                 mean_inter_arrival_time, distinct_dest_port_count)
+                VALUES (?, 'esp32_01', '192.168.0.21', 'INBOUND', ?, ?, 1, 128, 128, 128, 0, 1)""",
+            (segment_id, start, end),
+        ).lastrowid
+        evidence = {"source_table": "packet_feature_logs", "source_id": packet_id,
+                    "trust_decision": {"ai_mode": "observe",
+                                       "policy_version": "trust-ai-observation-v1",
+                                       "policy_score_delta": -15}}
+        connection.execute(
+            """UPDATE detection_events SET feature_log_id = NULL, packet_feature_log_id = ?,
+                event_type = 'AI_PACKET_ANOMALY', analysis_window_start = ?, analysis_window_end = ?,
+                incident_family = 'AI_ONLY', subject_ip = '192.168.0.21', evidence_json = ?,
+                evidence_schema_version = 1, processing_reason = 'AI_OBSERVATION_ONLY',
+                processed_at = '2026-05-11T10:05:00Z', policy_version = 'packet-if-fixture'
+                WHERE detector_type = 'AI'""",
+            (packet_id, start, end, json.dumps(evidence)),
+        )
+        state_before = list(connection.iterdump())
+
+    events_response = client.get("/api/detection-events", params={"limit": 5, "offset": 0})
+    summary_response = client.get("/api/dashboard/summary")
+    assert events_response.status_code == summary_response.status_code == 200
+    events = events_response.json()["items"]
+    observed = next(item for item in events if item["detector_type"] == "AI")
+    assert observed["packet_feature_log_id"] == packet_id
+    assert observed["analysis_window_start"] == start
+    assert observed["analysis_window_end"] == end
+    assert observed["evidence"] == evidence
+    assert observed["processing_reason"] == "AI_OBSERVATION_ONLY"
+    assert observed["processed_at"] == "2026-05-11T10:05:00Z"
+    assert observed["score_delta"] == observed["policy_score_delta"] == -15
+    assert observed["actual_score_delta"] == 0
+    assert observed["score_effect_reason"] == "NOT_APPLIED"
+    # A legacy applied flag without a completed, matching audit remains unknown.
+    legacy = next(item for item in events if item["detector_type"] == "RULE")
+    assert legacy["actual_score_delta"] is None
+    assert legacy["score_effect_reason"] == "UNKNOWN"
+    assert summary_response.json()["latest_detection_events"] == events
+    with sqlite3.connect(db_path) as connection:
+        assert list(connection.iterdump()) == state_before
+
+
+def test_dashboard_recent_events_keep_five_item_limit_and_detection_order(api_client) -> None:
+    client, db_path = api_client
+    seed_api_rows(db_path)
+    with sqlite3.connect(db_path) as connection:
+        for second in (12, 14, 13, 14, 12):
+            connection.execute(
+                """INSERT INTO detection_events
+                    (device_id, detector_type, event_type, score_delta, applied_to_score, detected_at)
+                    VALUES ('esp32_01', 'AI', 'AI_ANOMALY', -15, 0, ?)""",
+                (f"2026-05-11T10:00:{second:02d}Z",),
+            )
+
+    events_response = client.get("/api/detection-events", params={"limit": 5, "offset": 0})
+    summary_response = client.get("/api/dashboard/summary")
+    assert events_response.status_code == summary_response.status_code == 200
+    body = summary_response.json()
+    assert body["total_detection_events"] == body["recent_events_count"] == 7
+    assert body["unapplied_detection_events"] == 6
+    assert len(body["latest_detection_events"]) == 5
+    assert [item["id"] for item in body["latest_detection_events"]] == [6, 4, 5, 7, 3]
+    assert body["latest_detection_events"] == events_response.json()["items"]
 
 
 def test_trust_score_summary_returns_current_device_scores(api_client) -> None:
