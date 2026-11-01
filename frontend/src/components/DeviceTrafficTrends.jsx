@@ -41,6 +41,10 @@ const formatNumber = (value, digits = 2) =>
   value === null || value === undefined
     ? "-"
     : Number(value).toLocaleString("ko-KR", { maximumFractionDigits: digits });
+const mqttWarningText = (warning) => String(warning).replace(
+  /이 기기의 스냅샷에 시간대·시각 미확인 원본 (\d+)건이 있어 기간 배치는 미확인입니다\. 선택한 메시지의 연속성은 원본 ID 구간으로 별도 확인합니다\./,
+  "이 기기의 기록 중 수신 시각이 불명확한 $1건은 선택 기간 포함 여부를 확인할 수 없습니다.",
+);
 const toKSTInput = (date) =>
   new Date(date.getTime() + KST_OFFSET_MS).toISOString().slice(0, 16);
 const kstInputToISO = (value) => {
@@ -555,16 +559,11 @@ export default function DeviceTrafficTrends() {
           )}
           <p className="traffic-trends-qualification">
             시작 포함·종료 제외의 고정 기간을 KST로 표시합니다. 발행 수는 기존 10초 분석 구간의 값이며 크기·간격은 수신 원본을 사용합니다.
-            각 조회는 첫 페이지의 snapshot_max_id를 유지합니다. 그래프의 시간축은 같은 선택 기간입니다.
           </p>
-          {result.kind === "mqtt" && (
-            <>
-              <p className="traffic-trends-qualification">
-                원본 조회 {result.raw?.rows.length ?? 0}건 / 시각 확인 원본 {result.raw?.total ?? "미확인"}건 · 연속성 확인 범위 {result.raw?.sourceSpanCount ?? "미확인"}건 · 기기 스냅샷의 시각 미확인 원본 {result.raw?.timestampUnavailableCount ?? "미확인"}건.
-                원본의 JSON·Topic 유효 여부로 메시지를 제외하지 않습니다.
-              </p>
-              {result.raw?.warning && <p role="alert" className="traffic-trends-error">{result.raw.warning} {result.raw.incomplete ? "일부 원본만으로 전체 기간을 판단하지 마세요. 간격은 표시하지 않습니다." : ""}</p>}
-            </>
+          {result.kind === "mqtt" && result.raw?.warning && (
+            <p role="alert" className="traffic-trends-error">
+              {mqttWarningText(result.raw.warning)} {result.raw.incomplete ? "일부 원본만으로 전체 기간을 판단하지 마세요. 간격은 표시하지 않습니다." : ""}
+            </p>
           )}
           {result.rows.length === 0 && (result.kind !== "mqtt" || !result.raw?.rows.length) ? (
             <div className="traffic-trends-empty">분석 지표 행이 없습니다. 무통신이나 정상 상태로 단정할 수 없습니다.</div>
