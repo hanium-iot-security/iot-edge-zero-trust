@@ -223,16 +223,21 @@ def _candidate_rows(db, start, cutoff):
     return source, failed, current
 
 
-def prepare_partial_capture(db, start, cutoff, checkpoints):
-    """Hash closed failed files before the caller acquires SQLite's writer."""
+def prepare_partial_capture_proof(db, start, cutoff):
+    """Read-only file proof, without checkpoint provenance or gap authorization.
+
+    Call before opening a transaction. The mutation caller must revalidate the
+    returned rows and file identities under its writer before using the proof.
+    """
     try:
+        raw = db if isinstance(db, sqlite3.Connection) else db.connection().connection.driver_connection
+        _require(not raw.in_transaction)
         found = _candidate_rows(db, start, cutoff)
         if found is None:
             return None
         source, failed, healthy = found
         # A caller holding an earlier write transaction must not hash files
         # while Capture/Subscriber are blocked. Runtime calls this after reads.
-        _require(not db.connection().connection.driver_connection.in_transaction)
         from backend.app.config import settings
         from edge.packet.capture_runtime import _pcap_file_error
         policy = CapturePolicy.from_env()
@@ -265,9 +270,15 @@ def prepare_partial_capture(db, start, cutoff, checkpoints):
             'source':{key:source[key] for key in SESSION_FIELDS}, 'target':{key:source[key] for key in SESSION_FIELDS},
             'failed_segments':entries, 'target_first_segment':healthy,
             'target_features_sha256':digest(features), 'target_feature_count':len(features),
-            'capture_policy':asdict(policy), 'checkpoints_before':checkpoints}
+            'capture_policy':asdict(policy)}
     except ERRORS:
         return None
+
+
+def prepare_partial_capture(db, start, cutoff, checkpoints):
+    """Attach the actual runtime pair; its provenance is validated before write."""
+    proof = prepare_partial_capture_proof(db, start, cutoff)
+    return None if proof is None else {**proof, 'checkpoints_before':checkpoints}
 
 
 def validate_partial_evidence(db, audit, *, verify_files=False):
@@ -281,8 +292,6 @@ def validate_partial_evidence(db, audit, *, verify_files=False):
             and evidence['window_start'] == audit['window_start'] and evidence['window_end'] == audit['window_end']
             and evidence['source'] == evidence['target']
             and evidence['source']['session_id'] == audit['source_session_id'] == audit['target_session_id'])
-        source = rows(db, 'SELECT * FROM packet_capture_sessions WHERE session_id=:id', {'id':audit['source_session_id']})
-        _require(len(source) == 1 and {key:source[0][key] for key in SESSION_FIELDS} == evidence['source'])
         pair = evidence['checkpoints_before']
         _require(len(pair) == 2 and {item['detector_name'] for item in pair} == {'packet_rule', 'packet_if'}
             and all(set(item) == {'detector_name', 'source_table', 'last_processed_id',
@@ -293,6 +302,20 @@ def validate_partial_evidence(db, audit, *, verify_files=False):
                 and (item['last_processed_id'] is None or (isinstance(item['last_processed_id'], int)
                     and not isinstance(item['last_processed_id'], bool) and item['last_processed_id'] >= 0))
                 for item in pair))
+        return validate_partial_capture_proof(db, evidence, verify_files=verify_files)
+    except ERRORS:
+        return None
+
+
+def validate_partial_capture_proof(db, evidence, *, verify_files=False):
+    """Revalidate capture evidence only; this does not authorize a CP transition."""
+    try:
+        _require(evidence['version'] in (2, 3) and evidence['loss_kind'] == 'PARTIAL_CAPTURE'
+            and evidence['status'] == 'UNINSPECTED' and evidence['reason'] == 'RECORDED_CAPTURE_GAP'
+            and evidence['source'] == evidence['target'])
+        source = rows(db, 'SELECT * FROM packet_capture_sessions WHERE session_id=:id',
+                      {'id':evidence['source']['session_id']})
+        _require(len(source) == 1 and {key:source[0][key] for key in SESSION_FIELDS} == evidence['source'])
         boundary, finish = _window(evidence['window_start']), _window(evidence['window_end'])
         failed = []
         _require(bool(evidence['failed_segments']))
