@@ -406,6 +406,56 @@ class MaintenanceRunner:
             raise MaintenanceHold("explicit prefix recovery operator and reason are required")
         return f"root/uid=0; declared={approved_by.strip()}", reason.strip()
 
+    def prepare_partial_prefix(self, conn, request):
+        """Hash selected closed evidence outside every SQLite transaction."""
+        from edge.packet.confirmed_partial_capture import prepare_partial_capture_proof
+        if self.running_session(conn) != request["target_session_id"]:
+            raise MaintenanceHold("the explicit partial-prefix target must be uniquely RUNNING")
+        row = conn.execute("SELECT seg.window_start FROM packet_capture_segments seg "
+                           "JOIN packet_capture_sessions ses ON ses.id=seg.capture_session_id "
+                           "WHERE seg.id=? AND ses.session_id=?", (request["failed_segment_id"],
+                           request["target_session_id"])).fetchone()
+        if row is None:
+            raise MaintenanceHold("selected partial Capture does not belong to the target Session")
+        proof = prepare_partial_capture_proof(conn, row[0], self.now())
+        if proof is None:
+            raise MaintenanceHold("selected partial Capture lacks complete filesystem proof and healthy successor")
+        return {**request, "capture_proof": proof}
+
+    def partial_retry_audit(self, conn, record, request):
+        audit = self.core.get_resume_audit(conn, record["operation_id"])
+        plan = json.loads(audit["plan_json"])
+        recovery = plan.get("partial_prefix_recovery", {})
+        if (plan["target_session_id"] != request["target_session_id"] or
+                plan["target_boot_id"] != self.system.boot_id() or
+                any(recovery.get(key) != request[key] for key in ("approved_by", "reason", "failed_segment_id"))):
+            raise ConsumedApprovalHold("consumed approval belongs to another partial-prefix recovery")
+        return audit
+
+    def dry_run_partial_prefix(self, *, operation_id, target_session_id, failed_segment_id,
+                               approved_by, reason):
+        approved_by, reason = self.prefix_identity(approved_by, reason)
+        request = dict(target_session_id=target_session_id, failed_segment_id=failed_segment_id,
+                       approved_by=approved_by, reason=reason)
+        with connection(self.database, readonly=True) as conn:
+            record = self.core.get_operation(conn, operation_id)
+            if record["status"] == "RESUMED":
+                if self.running_session(conn) != target_session_id:
+                    raise MaintenanceHold("partial-prefix target is no longer uniquely RUNNING")
+                return {"result": "ALREADY_RESUMED", "audit": self.partial_retry_audit(conn, record, request),
+                        "verification": "read-only preview; live progress is not checked"}
+            prepared = self.prepare_partial_prefix(conn, request)
+            conn.execute("BEGIN")
+            return self.core.inspect_partial_prefix(conn, operation_id, **prepared,
+                current_boot_id=self.system.boot_id(), time_synchronized=self.system.synchronized(), now=self.now())
+
+    def recover_partial_prefix(self, *, operation_id, target_session_id, failed_segment_id,
+                               approved_by, reason, artifact_dir, timeout=30, verify_timeout=120):
+        approved_by, reason = self.prefix_identity(approved_by, reason)
+        return self.resume(operation_id=operation_id, artifact_dir=artifact_dir, timeout=timeout,
+            verify_timeout=verify_timeout, _partial_prefix=dict(target_session_id=target_session_id,
+                failed_segment_id=failed_segment_id, approved_by=approved_by, reason=reason))
+
     def dry_run_prefix(self, *, operation_id, target_session_id, successor_session_id,
                        approved_by, reason):
         """Preview the explicit failed-prefix recovery without consuming approval."""
@@ -640,7 +690,7 @@ class MaintenanceRunner:
                     raise
                 raise MaintenanceHold(f"{exc}; {'; '.join(failures) or 'original active services restored'}") from exc
 
-    def progress_snapshot(self, target_session_id, required):
+    def progress_snapshot(self, target_session_id, required, *, partial_plan=None):
         with connection(self.database, readonly=True) as conn:
             conn.execute("BEGIN")
             if self.running_session(conn) != target_session_id:
@@ -649,7 +699,15 @@ class MaintenanceRunner:
                 "SELECT COUNT(*) FROM packet_capture_segments seg JOIN packet_capture_sessions ses "
                 "ON ses.id=seg.capture_session_id WHERE ses.session_id=? AND seg.status='FAILED'",
                 (target_session_id,)).fetchone()[0]
-            if failed:
+            progress = None
+            if partial_plan is not None:
+                if self.system.boot_id() != partial_plan["target_boot_id"]:
+                    raise MaintenanceHold("boot changed during partial-prefix verification")
+                audit = self.core.get_resume_audit(conn, partial_plan["operation_id"])
+                if audit["plan_sha256"] != partial_plan["plan_sha256"]:
+                    raise MaintenanceHold("partial-prefix verification plan differs from the committed audit")
+                progress = self.core.partial_prefix_progress(conn, partial_plan)
+            elif failed:
                 raise MaintenanceHold("new failed capture segment requires incident recovery")
             snapshot = {}
             for name, source in required:
@@ -658,31 +716,47 @@ class MaintenanceRunner:
                 if not row or not row[1]:
                     raise MaintenanceHold(f"checkpoint is not initialized: {name}+{source}")
                 snapshot[name + "+" + source] = {"id": row[0], "boundary": row[1]}
-            return snapshot
+            return (snapshot, progress) if partial_plan is not None else snapshot
 
-    def verify_progress(self, target_session_id, required, *, timeout=120):
-        before = self.progress_snapshot(target_session_id, required)
+    def verify_progress(self, target_session_id, required, *, timeout=120, partial_plan=None):
+        def read():
+            if partial_plan is None:
+                return self.progress_snapshot(target_session_id, required), None
+            return self.progress_snapshot(target_session_id, required, partial_plan=partial_plan)
+
+        before, progress = read()
+        coverage = progress["coverage_sha256"] if progress else None
         evidence, deadline = [], self.system.monotonic() + timeout
         while self.system.monotonic() <= deadline:
             if not all(self.system.active(unit) for unit in (CAPTURE, SUBSCRIBER, *DRAIN_SERVICES)):
                 raise MaintenanceHold("required runtime service stopped during post-resume verification")
-            after = self.progress_snapshot(target_session_id, required)
+            after, progress = read()
+            pending = progress is not None and progress["pending"]
+            if progress is not None and (pending or progress["coverage_sha256"] != coverage):
+                # A previous pass cannot count toward a later loss frontier,
+                # even when its audit appears between two polling snapshots.
+                evidence, before, coverage = [], after, progress["coverage_sha256"]
+                self.system.sleep(1)
+                continue
             advanced = all(after[key]["boundary"] > prior["boundary"] and
                            (prior["id"] is None or
                             (after[key]["id"] is not None and after[key]["id"] >= prior["id"]))
                            for key, prior in before.items())
             fresh = all(0 <= (self.now() - parse_db_utc(row["boundary"])).total_seconds() <= 45
                         for row in after.values())
-            if advanced and fresh:
+            past_partial = progress is None or all(row["boundary"] > progress["required_boundary"] for row in after.values())
+            if advanced and fresh and not pending and past_partial:
                 evidence.append(after)
                 before = after
                 if len(evidence) == 2:
-                    return {"result": "PASS", "snapshots": evidence}
+                    return {"result": "PASS", "snapshots": evidence, **({"gap_verification": progress} if progress else {})}
             self.system.sleep(1)
-        return {"result": "WAIT", "reason": "required checkpoints have not advanced twice",
-                "snapshots": evidence}
+        pending = progress is not None and progress["pending"]
+        return {"result": "WAIT", "reason": ("healthy prefix and real016 partial-gap audit are pending" if pending
+                                               else "required checkpoints have not advanced twice"),
+                "snapshots": evidence, **({"gap_verification": progress} if progress else {})}
 
-    def resume(self, *, operation_id=None, artifact_dir, timeout=120, verify_timeout=120):
+    def resume(self, *, operation_id=None, artifact_dir, timeout=120, verify_timeout=120, _partial_prefix=None):
         self.system.require_admin()
         self.require_deployment()
         required = self.required_checkpoints()
@@ -690,6 +764,12 @@ class MaintenanceRunner:
             deadline, last_reason, prior = self.system.monotonic() + timeout, "preparing", False
             while True:
                 try:
+                    partial_inspect = None
+                    if _partial_prefix is not None:
+                        with connection(self.database, readonly=True) as preparation:
+                            record = self.core.get_operation(preparation, operation_id)
+                            if record["status"] == "READY":
+                                partial_inspect = self.prepare_partial_prefix(preparation, _partial_prefix)
                     with connection(self.database, readonly=True) as conn:
                         conn.execute("BEGIN")
                         record = self.latest(conn, operation_id)
@@ -705,11 +785,20 @@ class MaintenanceRunner:
                                 self.running_session(conn) != record["target_session_id"]):
                                 raise ConsumedApprovalHold("consumed approval belongs to another boot or Session; strict recovery required")
                             audit = self.core.get_resume_audit(conn, operation_id)
+                            if _partial_prefix is not None:
+                                audit = self.partial_retry_audit(conn, record, _partial_prefix)
+                            elif "partial_prefix_recovery" in json.loads(audit["plan_json"]):
+                                raise ConsumedApprovalHold("use the explicit partial-prefix recovery command to verify this approval")
                             prior_target = record["target_session_id"]
                             prior = True
                             break
-                        plan = self.core.inspect_resume(
-                            conn, operation_id, target_session_id=self.running_session(conn),
+                        inspect = self.core.inspect_resume if _partial_prefix is None else self.core.inspect_partial_prefix
+                        arguments = ({"target_session_id": self.running_session(conn)} if _partial_prefix is None
+                                     else partial_inspect)
+                        if arguments is None:
+                            raise MaintenanceHold("partial-prefix approval changed while preparing evidence")
+                        plan = inspect(
+                            conn, operation_id, **arguments,
                             current_boot_id=self.system.boot_id(),
                             time_synchronized=self.system.synchronized(), now=self.now())
                     break
@@ -722,7 +811,8 @@ class MaintenanceRunner:
                     self.system.sleep(1)
             if prior:
                 try:
-                    progress = self.verify_progress(prior_target, required, timeout=verify_timeout)
+                    progress = self.verify_progress(prior_target, required, timeout=verify_timeout,
+                        partial_plan=json.loads(audit["plan_json"]) if _partial_prefix is not None else None)
                 except Exception as exc:
                     progress = {"result": "HOLD", "reason": str(exc)}
                 return {"result": "ALREADY_RESUMED" if progress["result"] == "PASS" else "COMMITTED_HOLD",
@@ -733,8 +823,8 @@ class MaintenanceRunner:
             evidence = self.backup(self.database, Path(artifact_dir))
             with connection(Path(evidence["backup_path"]), readonly=True) as saved:
                 saved.execute("BEGIN")
-                saved_plan = self.core.inspect_resume(
-                    saved, operation_id, target_session_id=plan["target_session_id"],
+                saved_plan = inspect(
+                    saved, operation_id, **arguments,
                     current_boot_id=plan["target_boot_id"], time_synchronized=True, now=self.now())
                 if saved_plan["plan_sha256"] != plan["plan_sha256"]:
                     raise MaintenanceHold("backup does not match the bound resume plan")
@@ -750,7 +840,8 @@ class MaintenanceRunner:
                         raise MaintenanceHold("boot identity or time synchronization changed before apply")
                     with connection(self.database) as conn:
                         conn.execute("BEGIN IMMEDIATE")
-                        result = self.core.apply_resume(conn, plan, now=self.now(), **evidence)
+                        apply = self.core.apply_resume if _partial_prefix is None else self.core.apply_partial_prefix
+                        result = apply(conn, plan, now=self.now(), **evidence)
                         conn.commit()
                         committed = True
             except BaseException as exc:
@@ -779,7 +870,8 @@ class MaintenanceRunner:
             # A verification HOLD after commit must never cancel/reapply the pair.
             try:
                 progress = self.verify_progress(plan["target_session_id"], required,
-                                                timeout=verify_timeout)
+                                                timeout=verify_timeout,
+                                                partial_plan=plan if _partial_prefix is not None else None)
             except Exception as exc:
                 progress = {"result": "HOLD", "reason": str(exc)}
             return {"result": "RESUMED" if progress["result"] == "PASS" else "COMMITTED_HOLD",
@@ -798,14 +890,17 @@ def build_parser():
             child.add_argument("--artifact-dir", type=Path, default=Path("output/planned-maintenance"))
             child.add_argument("--timeout", type=float, default=120)
             child.add_argument("--verify-timeout", type=float, default=120)
-    for name in ("dry-run-prefix", "recover-prefix"):
+    for name in ("dry-run-prefix", "recover-prefix", "dry-run-partial-prefix", "recover-partial-prefix"):
         child = commands.add_parser(name)
         child.add_argument("--operation-id", required=True)
         child.add_argument("--target-session-id", required=True)
-        child.add_argument("--successor-session-id", required=True)
+        if "partial" in name:
+            child.add_argument("--failed-segment-id", required=True, type=int)
+        else:
+            child.add_argument("--successor-session-id", required=True)
         child.add_argument("--approved-by", required=True)
         child.add_argument("--reason", required=True)
-        if name == "recover-prefix":
+        if name.startswith("recover-"):
             child.add_argument("--artifact-dir", type=Path, default=Path("output/planned-maintenance"))
             child.add_argument("--timeout", type=float, default=30)
             child.add_argument("--verify-timeout", type=float, default=120)
@@ -821,7 +916,7 @@ def build_parser():
 
 def main(argv: Sequence[str] | None = None):
     args = build_parser().parse_args(argv)
-    if args.command in ("prepare-stop", "resume", "recover-prefix", "cancel") and os.name == "posix":
+    if args.command in ("prepare-stop", "resume", "recover-prefix", "recover-partial-prefix", "cancel") and os.name == "posix":
         def interrupted(_signal, _frame):
             raise KeyboardInterrupt("maintenance command interrupted; inspect approval and audit")
         signal.signal(signal.SIGTERM, interrupted)
@@ -838,6 +933,14 @@ def main(argv: Sequence[str] | None = None):
                                    timeout=args.timeout, verify_timeout=args.verify_timeout)
         elif args.command == "dry-run":
             result = runner.dry_run(args.operation_id)
+        elif args.command in ("dry-run-partial-prefix", "recover-partial-prefix"):
+            arguments = dict(operation_id=args.operation_id, target_session_id=args.target_session_id,
+                             failed_segment_id=args.failed_segment_id, approved_by=args.approved_by, reason=args.reason)
+            if args.command == "dry-run-partial-prefix":
+                result = runner.dry_run_partial_prefix(**arguments)
+            else:
+                result = runner.recover_partial_prefix(**arguments, artifact_dir=args.artifact_dir,
+                    timeout=args.timeout, verify_timeout=args.verify_timeout)
         elif args.command == "dry-run-prefix":
             result = runner.dry_run_prefix(
                 operation_id=args.operation_id, target_session_id=args.target_session_id,

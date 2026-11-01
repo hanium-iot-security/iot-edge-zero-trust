@@ -78,6 +78,37 @@ sudo venv/bin/python -m edge.maintenance.run_planned_maintenance recover-prefix 
 
 커밋 후 drain 시간 초과·서비스 복귀 실패·새 부팅/Session/원본 변경은 `COMMITTED_HOLD`다. 적용한 승인을 취소하거나 다시 적용하지 않는다. 같은 대상·후속 Session·복구 승인자·사유로 재실행하면 기존 감사 검증과 read-only drain 확인만 수행하며 새로운 전이를 만들지 않는다. 실패 tail에 대한 수동 승인이나 확인된 자동 공백 감사 없이 Checkpoint를 그 이후로 이동하지 않는다.
 
+## RUNNING 재개 Session의 후속 부분 수집 복구
+
+첫 부팅 Session이 계속 RUNNING이고 정상 prefix 이후 `FAILED/PARTIAL_CAPTURE`가 발생한 경우에는 다음 명시적 경로를 사용한다. 일반 `resume`과 부팅 Unit의 실패 거부 조건은 그대로 유지한다. 종료 승인·새 Boot·현재 RUNNING Session·선택한 Segment ID·관리자와 사유를 함께 지정한다. admission 범위는 **새 Session 첫 Window 시작 T부터 선택한 실패의 즉시 정상 후속 Window 끝 H까지**로 고정한다. 이 범위에는 선택한 실패 하나만 허용하며, 첫 정상 트래픽 Window보다 앞선 실패나 범위 안 추가 실패는 허용하지 않는다.
+
+**새 부분 prefix 감사를 쓰기 전에 배포와 처리 프로세스 reload를 완료한다.** `planned.py`, `run_planned_maintenance.py`, `confirmed_partial_capture.py`를 같은 검증 버전으로 배포하고 READY가 유지된 상태에서 MQTT Feature Builder와 Orchestrator를 각각 정상 정지 후 시작한다. 두 프로세스가 새 코드로 시작했고 필수 서비스가 활성인지 확인한 뒤 아래 dry-run과 적용을 진행한다. 이전 RAM의 감사 검증기는 새 `partial_prefix_recovery` 필드를 검증하지 않을 수 있으므로 파일 배포만 하고 계속 실행하는 혼합 버전을 허용하지 않는다. CLI의 적용 중 Orchestrator stop/start는 Feature Builder를 reload하지 않는다. 이 배포 절차에서 Capture와 Subscriber는 재시작하지 않는다.
+
+```bash
+venv/bin/python -m edge.maintenance.run_planned_maintenance dry-run-partial-prefix \
+  --operation-id <READY-승인-ID> --target-session-id <현재-RUNNING-Session-UUID> \
+  --failed-segment-id <검토한-PARTIAL_CAPTURE-ID> \
+  --approved-by woomin --reason "Drain the healthy prefix before the confirmed partial window"
+
+sudo venv/bin/python -m edge.maintenance.run_planned_maintenance recover-partial-prefix \
+  --operation-id <같은-READY-승인-ID> --target-session-id <같은-RUNNING-Session-UUID> \
+  --failed-segment-id <같은-PARTIAL_CAPTURE-ID> \
+  --approved-by woomin --reason "Drain the healthy prefix before the confirmed partial window" \
+  --artifact-dir output/planned-maintenance --timeout 30 --verify-timeout 120
+```
+
+사전 검증은 닫힌 실패 PCAP·진단 파일의 실제 SHA256, 정상 PCAP 형식, Session·인터페이스·파일명·정확한 timing, 원본 Window의 연속성과 중복 부재를 확인한다. 바로 다음 Window가 품질을 만족하는 `EMPTY` 또는 `PROCESSED`여야 한다. 실패 Window에 Feature가 있거나 후속 Window가 없거나 아직 `READY`이면 대기한다. H와 `[T,H)` 전체 Segment·Feature SHA/count를 계획에 봉인하며 범위 안 정상 Window도 `EMPTY/PROCESSED` 완료 상태여야 한다. 파일 해시는 DB 쓰기 트랜잭션 전에 계산하고, 적용 시 DB 증명과 파일 identity를 다시 확인한다. 선택한 원본이나 봉인 범위가 백업 이후 달라지면 승인 소비 전에 HOLD한다.
+
+H 이후 append·실패는 이 admission 계획의 SHA를 바꾸지 않는다. 백업 중 후속 실패가 발생해도 기존 종료 승인은 S→T 전이에만 사용하며, 그 후속 손실을 유지보수 시간으로 포함하거나 승인한 것으로 취급하지 않는다. 이후 실패와 미완료 입력은 실제 처리기가 기존 readiness·confirmed-gap 정책에 따라 경계에서 처리한다. 따라서 새 실패가 있어도 검증된 prefix 처리를 시작할 수 있지만, 미해결 손실이 있으면 정상 복귀 완료를 보고하지 않는다.
+
+이 명령이 승인하는 경계 변경은 **봉인된 종료 경계에서 새 Session의 첫 Window 시작까지**뿐이다. 정상 prefix나 부분 수집 Window를 건너뛰지 않으며 두 Packet 처리 ID, MQTT/Trust 경계, 점수·격리·원본은 직접 변경하지 않는다. 계획에 보존한 파일 증명에는 가상의 Checkpoint를 넣지 않고, `packet_detection_gaps` 감사도 미리 만들지 않는다. FAILED 상태·품질 기준·학습 및 평가 제외 조건을 유지한다.
+
+Orchestrator가 정상 prefix를 실제 처리한 뒤 두 Packet 경계가 선택한 실패 시작에 도달하면 기존 confirmed-gap 경로가 실제 처리 ID를 포함한 Migration 016 `UNINSPECTED/RECORDED_CAPTURE_GAP` 감사를 작성한다. 자동 처리를 사용하려면 기존 `PACKET_CONFIRMED_GAP_POLICY_ENABLED=true` 설정이 필요하다. 이 명령은 해당 설정을 변경하지 않는다. 정책이 비활성이라면 기존 복구 검토가 필요하며, 새 명령으로 정상 완료를 가장하지 않는다.
+
+선택한 실패는 실제 016 감사·처음 파일 SHA·정상 prefix 처리 ID가 모두 일치해야 한다. H 이후 모든 `FAILED/PARTIAL_CAPTURE`도 각각 기존 검증기로 유효한 실제 016 또는 명시적 008 gap 감사를 확인한다. 감사가 아직 없고 두 Packet 경계가 그 실패 시작을 넘지 않았다면 `WAIT` 검증과 `COMMITTED_HOLD` 결과를 반환한다. 알 수 없는 실패 유형, 손상·중복 감사, 감사 없이 실패 시작을 지난 Checkpoint는 HOLD한다.
+
+실패 목록·감사 집합·필수 Checkpoint는 같은 DB snapshot에서 확인한다. **모든 손실 감사 검증 후 모든 필수 Checkpoint가 가장 늦은 gap 끝을 지나 최근 45초 이내에서 두 차례 전진해야만** `RESUMED`를 반환한다. 도중에 pending 손실 또는 새 실패·감사 집합이 관찰되면 이전 성공 snapshot을 폐기하고 다시 두 차례 전진을 요구한다. 이 결과도 부분 수집 Window의 QC·학습 승인을 뜻하지 않는다. 같은 승인·Session·실패 ID·관리자·사유로 재실행하면 기존 감사를 확인하고 처리 진행만 검증하며, 새 백업·파일 해시·Checkpoint 변경·감사를 만들지 않는다. 재실행 완료는 `ALREADY_RESUMED`, 미완료는 `COMMITTED_HOLD`다.
+
 ## 조회와 대기
 
 조회는 root 권한 없이 가능하며 DB를 변경하지 않는다.

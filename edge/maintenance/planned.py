@@ -434,7 +434,8 @@ def calculate_plan_sha256(plan):
     return _digest({key: value for key, value in plan.items() if key not in ("plan_sha256", "generated_at")})
 
 
-def _target_evidence(db, operation, target_id, policy, *, prefix_rows=None, successor_session_id=None):
+def _target_evidence(db, operation, target_id, policy, *, prefix_rows=None, successor_session_id=None,
+                     deferred_partial=None, admission_end=None):
     target = _session(db, target_id)
     source = _session(db, operation["source_session_id"])
     running = _rows(db, "SELECT session_id FROM packet_capture_sessions WHERE status='RUNNING'")
@@ -458,13 +459,21 @@ def _target_evidence(db, operation, target_id, policy, *, prefix_rows=None, succ
              "Target begins before completed planned shutdown.")
     _require(target["capture_gap_start"] == operation["source_final_boundary"]
              and target["capture_gap_end"] == boundary, "Target gap does not bind the planned shutdown boundary.")
-    segments = _segments(db, target, policy, allow_ready=prefix_rows is None, segment_rows=prefix_rows)
+    bounded = (_rows(db, "SELECT * FROM packet_capture_segments WHERE capture_session_id=:id "
+                     "AND window_start<:end ORDER BY window_start,id", {"id": target["id"], "end": admission_end})
+               if admission_end is not None else prefix_rows)
+    segments = _segments(db, target, policy, allow_ready=prefix_rows is None and admission_end is None, segment_rows=bounded,
+                         approved_gaps=deferred_partial)
     empty_prefix = []
     for first in segments:
         if first["status"] != "EMPTY":
             break
         empty_prefix.append(first)
     _require(first["status"] == "PROCESSED", "The first full new Packet Feature is not ready.")
+    if deferred_partial:
+        _require(all(parse_db_utc(item["window_start"]) >= parse_db_utc(first["window_end"])
+                     for item in segments if item["id"] in deferred_partial),
+                 "A partial Capture cannot replace the initial healthy prefix.")
     features = _rows(db, "SELECT * FROM packet_feature_logs WHERE capture_segment_id=:id ORDER BY id",
                      {"id": first["id"]})
     _require(any(item["packet_count"] > 0 for item in features), "The first new Packet Feature has no traffic.")
@@ -486,6 +495,13 @@ def _target_evidence(db, operation, target_id, policy, *, prefix_rows=None, succ
 def inspect_resume(conn, operation_id, *, target_session_id, current_boot_id, time_synchronized, now,
                    verify_source_hashes=True):
     """Read-only, append-tolerant plan; no blind skip and no approval for crashes."""
+    return _inspect_resume(conn, operation_id, target_session_id=target_session_id,
+                           current_boot_id=current_boot_id, time_synchronized=time_synchronized,
+                           now=now, verify_source_hashes=verify_source_hashes)
+
+
+def _inspect_resume(conn, operation_id, *, target_session_id, current_boot_id, time_synchronized, now,
+                    verify_source_hashes=True, partial_prefix=None):
     row = get_operation(conn, operation_id)
     now = _time(now)
     _require(row["status"] == "READY", "A sealed, unconsumed READY approval is required.")
@@ -497,7 +513,16 @@ def inspect_resume(conn, operation_id, *, target_session_id, current_boot_id, ti
     snapshot, sealed, policy = _bound_source(conn, row, verify_hashes=verify_source_hashes)
     current = _unchanged_checkpoints(conn, sealed)
     _fully_drained(conn, current, row["source_final_boundary"], exact_boundaries=False)
-    first = _target_evidence(conn, row, target_session_id, policy)
+    deferred = None
+    if partial_prefix is not None:
+        proof = _partial_prefix_proof(conn, partial_prefix)
+        _require(proof["source"]["session_id"] == target_session_id
+                 and proof["capture_policy"] == asdict(policy), "Partial prefix policy or Session differs.")
+        _require(parse_db_utc(proof["target_first_segment"]["window_end"]) <= parse_db_utc(now),
+                 "Partial successor is from the future.")
+        deferred = {partial_prefix["failed_segment_id"]: proof}
+    first = _target_evidence(conn, row, target_session_id, policy, deferred_partial=deferred,
+                             admission_end=partial_prefix["admission_horizon_end"] if partial_prefix else None)
     boundary = first["session"]["first_window_start"]
     _no_gap_events(conn, row["source_final_boundary"], boundary)
     _require(parse_db_utc(first["segment"]["window_end"]) <= parse_db_utc(now), "First target Feature is from the future.")
@@ -510,8 +535,158 @@ def inspect_resume(conn, operation_id, *, target_session_id, current_boot_id, ti
             "checkpoints": {name: {"before": current[name], "after": {
                 **current[name], "last_completed_window_end": boundary, "updated_at": boundary}}
                 for name in PACKET_DETECTORS}, "generated_at": now}
+    if partial_prefix is not None:
+        plan["partial_prefix_recovery"] = partial_prefix
     plan["plan_sha256"] = calculate_plan_sha256(plan)
     return plan
+
+
+def _partial_prefix_proof(db, recovery, *, verify_files=False):
+    from edge.packet.confirmed_partial_capture import validate_partial_capture_proof
+    _require(isinstance(recovery, Mapping) and set(recovery) ==
+             {"approved_by", "reason", "failed_segment_id", "capture_proof", "admission_horizon_end", "prefix_snapshot"},
+             "Explicit partial-prefix recovery binding is required.")
+    _require(all(isinstance(recovery[key], str) and recovery[key].strip()
+                 for key in ("approved_by", "reason")), "Explicit recovery operator and reason are required.")
+    proof = recovery["capture_proof"]
+    _require(isinstance(proof, Mapping) and "checkpoints_before" not in proof,
+             "Admission proof must not assert checkpoint provenance.")
+    _require(validate_partial_capture_proof(db, proof, verify_files=verify_files) == proof,
+             "Partial-prefix Capture proof changed or is invalid.")
+    _require(len(proof["failed_segments"]) == 1
+             and isinstance(recovery["failed_segment_id"], int)
+             and not isinstance(recovery["failed_segment_id"], bool)
+             and proof["failed_segments"][0]["segment"]["id"] == recovery["failed_segment_id"],
+             "Exactly the explicitly selected partial Capture may be admitted.")
+    _require(recovery["admission_horizon_end"] == proof["target_first_segment"]["window_end"],
+             "Partial admission horizon must end at the selected healthy successor.")
+    current = _partial_prefix_snapshot(db, proof)
+    recorded = recovery["prefix_snapshot"]
+    _require(isinstance(recorded, Mapping) and current == recorded,
+             "Bounded partial-prefix Segment or Feature evidence changed.")
+    return proof
+
+
+def _partial_prefix_snapshot(db, proof):
+    """Seal exactly [target first start, selected healthy successor end)."""
+    from edge.packet.confirmed_partial_capture import _unobstructed
+    target = _session(db, proof["source"]["session_id"])
+    end = _window(proof["target_first_segment"]["window_end"])
+    segments = _rows(db, "SELECT * FROM packet_capture_segments WHERE capture_session_id=:id "
+                     "AND window_start<:end ORDER BY window_start,id", {"id": target["id"], "end": end})
+    features = _rows(db, "SELECT f.* FROM packet_feature_logs f JOIN packet_capture_segments s "
+                     "ON s.id=f.capture_segment_id WHERE s.capture_session_id=:id AND s.window_start<:end ORDER BY f.id",
+                     {"id": target["id"], "end": end})
+    selected = proof["failed_segments"][0]["segment"]["id"]
+    _segments(db, target, CapturePolicy(**proof["capture_policy"]), segment_rows=segments, feature_rows=features,
+              approved_gaps={selected: proof})
+    _require(segments[-1]["window_end"] == end, "Partial admission horizon is not fully covered.")
+    try:
+        _unobstructed(db, parse_db_utc(target["first_window_start"]), parse_db_utc(end), segments,
+                      features_allowed=features, require_no_features=False)
+    except ValueError as exc:
+        raise PlannedMaintenanceError("Another Capture or Feature overlaps the bounded prefix.") from exc
+    return {"segment_count": len(segments), "segment_sha256": _digest(segments),
+            "feature_count": len(features), "feature_sha256": _digest(features)}
+
+
+def inspect_partial_prefix(conn, operation_id, *, failed_segment_id, capture_proof,
+                           approved_by, reason, admission_horizon_end=None, prefix_snapshot=None, **kwargs):
+    """Explicitly admit one proved later partial; no loss audit or jump over it."""
+    recovery = {"approved_by": approved_by, "reason": reason,
+                "failed_segment_id": failed_segment_id, "capture_proof": capture_proof,
+                "admission_horizon_end": (admission_horizon_end if admission_horizon_end is not None
+                                          else capture_proof["target_first_segment"]["window_end"]),
+                "prefix_snapshot": prefix_snapshot if prefix_snapshot is not None else _partial_prefix_snapshot(conn, capture_proof)}
+    return _inspect_resume(conn, operation_id, partial_prefix=recovery, **kwargs)
+
+
+def apply_partial_prefix(conn, plan, *, now, backup_path, backup_sha256):
+    _require("failed_prefix_recovery" not in plan and "partial_prefix_recovery" in plan,
+             "An explicit partial-prefix plan is required.")
+    recovery = plan["partial_prefix_recovery"]
+
+    def inspect(db, operation_id, **kwargs):
+        # Closed files were hashed before the writer; only identity checks here.
+        _partial_prefix_proof(db, recovery, verify_files=True)
+        return inspect_partial_prefix(db, operation_id, **recovery, **kwargs)
+
+    return _apply_resume(conn, plan, now=now, backup_path=backup_path,
+                         backup_sha256=backup_sha256, inspect=inspect)
+
+
+def partial_prefix_progress(db, plan):
+    """Read loss coverage and the completion frontier in the caller's snapshot."""
+    from edge.packet.confirmed_partial_capture import approved_partial_capture_gaps
+    from edge.packet.segment_gap_recovery import approved_segment_gaps
+    _verify_plan(plan)
+    recovery = plan["partial_prefix_recovery"]
+    proof = _partial_prefix_proof(db, recovery)
+    target = _session(db, plan["target_session_id"])
+    failed = _rows(db, "SELECT * FROM packet_capture_segments WHERE capture_session_id=:id "
+                   "AND (status='FAILED' OR error_code IS NOT NULL) ORDER BY window_start,id", {"id": target["id"]})
+    _require(any(row == proof["failed_segments"][0]["segment"] for row in failed),
+             "Selected failed Capture changed or disappeared.")
+    _require(all(row["status"] == "FAILED" and row["error_code"] == "PARTIAL_CAPTURE" for row in failed),
+             "An unknown failed Capture requires separate recovery.")
+    typed, legacy = approved_partial_capture_gaps(db, failed), approved_segment_gaps(db, failed)
+    pair = _checkpoints(db)
+    pending, coverage, frontier = [], [], proof["window_end"]
+    for segment, current, prior in zip(failed, typed, legacy):
+        selected = segment["id"] == recovery["failed_segment_id"]
+        _require(selected or segment["window_start"] >= recovery["admission_horizon_end"],
+                 "An unselected failure is inside the sealed admission horizon.")
+        frontier = max(frontier, _window(segment["window_end"]))
+        raw_current = _rows(db, "SELECT id FROM packet_detection_gaps WHERE unixepoch(window_start)<unixepoch(:end) "
+                            "AND unixepoch(window_end)>unixepoch(:start)",
+                            {"start": segment["window_start"], "end": segment["window_end"]})
+        raw_prior = _rows(db, "SELECT id FROM packet_segment_gap_recoveries WHERE failed_segment_id=:id",
+                          {"id": segment["id"]})
+        audit = current or prior
+        if audit is None:
+            _require(not raw_current and not raw_prior, "Partial Capture has an invalid or ambiguous gap audit.")
+            _require(all(parse_db_utc(pair[name]["last_completed_window_end"]) <=
+                         parse_db_utc(segment["window_start"]) for name in PACKET_DETECTORS),
+                     "Packet checkpoints passed partial Capture without a valid016 or approved gap audit.")
+            pending.append(segment["id"])
+            coverage.append({"segment": segment, "audit": None})
+            continue
+        _require(len(raw_current) + len(raw_prior) == 1 and not (current and prior),
+                 "Partial Capture has ambiguous duplicate gap approvals.")
+        if current:
+            audited_pair = {row["detector_name"]: row for row in json.loads(current["evidence_json"])["checkpoints_before"]}
+            for name in PACKET_DETECTORS:
+                consumed = audited_pair[name]["last_processed_id"]
+                _require(parse_db_utc(pair[name]["last_completed_window_end"]) >= parse_db_utc(current["window_end"])
+                         and (consumed is None or (pair[name]["last_processed_id"] is not None
+                                                  and pair[name]["last_processed_id"] >= consumed)),
+                         "Packet checkpoints rewound behind a confirmed partial-gap audit.")
+        if selected:
+            _require(current is not None, "Selected loss requires its real016 partial Capture audit.")
+            _validate_selected_partial_audit(db, plan, proof, current, target)
+        frontier = max(frontier, _window(audit["window_end"]))
+        coverage.append({"segment": segment, "audit_table": "packet_detection_gaps" if current else "packet_segment_gap_recoveries",
+                         "audit_id": audit["id"], "plan_sha256": audit["plan_sha256"]})
+    return {"pending": bool(pending), "pending_segment_ids": pending, "required_boundary": frontier,
+            "coverage_sha256": _digest(coverage)}
+
+
+def _validate_selected_partial_audit(db, plan, proof, audit, target):
+    _require(audit["window_start"] == proof["window_start"] and audit["window_end"] == proof["window_end"],
+             "Partial Capture audit interval differs from the selected loss.")
+    entry = proof["failed_segments"][0]
+    _require(all(audit[key] == entry[key] for key in ("pcap_sha256", "diagnostics_sha256")),
+             "Partial Capture audit file hashes differ from the admitted evidence.")
+    actual = {row["detector_name"]: row for row in json.loads(audit["evidence_json"])["checkpoints_before"]}
+    for name in PACKET_DETECTORS:
+        direction = " AND direction='INBOUND'" if name == "packet_rule" else ""
+        last = _one(db, "SELECT MAX(f.id) AS last_id FROM packet_feature_logs f "
+                    "JOIN packet_capture_segments s ON s.id=f.capture_segment_id "
+                    "WHERE s.capture_session_id=:id AND f.window_end<=:end" + direction,
+                    {"id": target["id"], "end": proof["window_start"]})["last_id"]
+        expected = last if last is not None else plan["checkpoints"][name]["before"]["last_processed_id"]
+        _require(actual[name]["last_processed_id"] == expected,
+                 "Partial Capture audit does not prove the healthy prefix source IDs were consumed.")
 
 
 def _verify_plan(plan):
@@ -529,6 +704,7 @@ def _verify_plan(plan):
 
 def apply_resume(conn, plan, *, now, backup_path, backup_sha256):
     _require("failed_prefix_recovery" not in plan, "Use the explicit failed-prefix recovery command.")
+    _require("partial_prefix_recovery" not in plan, "Use the explicit partial-prefix recovery command.")
     return _apply_resume(conn, plan, now=now, backup_path=backup_path,
                          backup_sha256=backup_sha256, inspect=inspect_resume)
 
@@ -626,6 +802,13 @@ def _validated_audit(db, operation, *, check_current_checkpoints=False):
     if "failed_prefix_recovery" in plan:
         from edge.maintenance.prefix_recovery import validate_prefix_audit
         validate_prefix_audit(db, operation, plan)
+    if "partial_prefix_recovery" in plan:
+        _require("failed_prefix_recovery" not in plan, "Conflicting prefix recovery modes.")
+        proof = _partial_prefix_proof(db, plan["partial_prefix_recovery"])
+        _require(proof["source"]["session_id"] == plan["target_session_id"]
+                 and proof["capture_policy"] == source["capture_policy"]
+                 and parse_db_utc(proof["window_start"]) >= parse_db_utc(segment["window_end"]),
+                 "Partial-prefix audit differs from the healthy target prefix.")
     current = (_checkpoints(db, tuple((name, row["source_table"]) for name, row in sealed.items()))
                if check_current_checkpoints else None)
     for name in PACKET_DETECTORS:
