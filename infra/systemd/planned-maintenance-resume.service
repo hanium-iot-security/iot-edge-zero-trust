@@ -16,10 +16,12 @@ Environment=GIT_CONFIG_VALUE_0=/home/pi/iot-edge-zero-trust
 UMask=0077
 Nice=10
 IOSchedulingClass=idle
-ExecStart=/home/pi/iot-edge-zero-trust/venv/bin/python -m edge.maintenance.run_planned_maintenance resume --timeout 120 --verify-timeout 120 --artifact-dir output/planned-maintenance
-# Preflight 120 + backup 600 + verification 120 + service/lock handling 240.
-TimeoutStartSec=1080
-# Failure/WAIT is logged and requires inspection; never loop automatic approvals.
+ExecStart=/home/pi/iot-edge-zero-trust/venv/bin/python -m edge.maintenance.run_planned_maintenance boot-resume --timeout 120 --verify-timeout 120 --artifact-dir output/planned-maintenance
+# Preflight 120 + at most two fresh backups 1200 + verification 120 +
+# two apply/restore budgets (190 each) and 100 seconds of explicit headroom.
+TimeoutStartSec=1920
+# Verified partial capture uses the configured UNINSPECTED policy. Unknown
+# failures still require inspection; never loop automatic approvals.
 Restart=no
 NoNewPrivileges=true
 StandardOutput=journal

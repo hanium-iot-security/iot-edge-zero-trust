@@ -537,8 +537,14 @@ def test_boot_unit_never_powers_off_or_restarts_approval_loop():
     assert "User=root" in unit and "Restart=no" in unit
     assert "--timeout 120 --verify-timeout 120" in unit
     assert inspect.signature(cli.online_backup).parameters["timeout"].default == 600
-    # The additional 240 seconds cover bounded service and lock operations.
-    assert "TimeoutStartSec=1080" in unit
+    # Boot fallback may require a second fresh backup before consuming READY.
+    # Keep headroom for bounded preflight, verification and service operations.
+    budget = int(next(line.split("=", 1)[1] for line in unit.splitlines()
+                      if line.startswith("TimeoutStartSec=")))
+    backup_budget = inspect.signature(cli.online_backup).parameters["timeout"].default
+    apply_restore_budget = 80 + 35 + 60 + 10 + 5
+    assert budget >= 120 + 2 * backup_budget + 120 + 2 * apply_restore_budget + 100
+    assert "run_planned_maintenance boot-resume " in unit
     assert "poweroff" not in unit and "reboot" not in unit
 
 
