@@ -61,6 +61,13 @@ def recover(case, **kwargs):
                                          timeout=0, verify_timeout=0, **kwargs)
 
 
+def boot_recover(case, *, policy=True, timeout=0, verify_timeout=0):
+    instance = case[0]
+    instance.settings = instance.settings.model_copy(update={"packet_confirmed_gap_policy_enabled": policy})
+    return instance.boot_resume(artifact_dir=case[2] / "boot-artifacts", timeout=timeout,
+                                verify_timeout=verify_timeout)
+
+
 def add_late_partial(case, start, *, successor=True):
     """Another independently retained timing failure after the fixed horizon."""
     instance, _, directory, _, template, _ = case
@@ -317,6 +324,7 @@ def test_maintenance_exclusion_survives_retention_and_later_session_lifecycle(ca
     assert recover(case)["result"] == "HOLD"
 
 
+@pytest.mark.parametrize("automatic", [False, True])
 @pytest.mark.parametrize("changed_diagnostics,outbound_prefix,later_failure", [
     (False, False, None), (False, True, None), (True, False, None),
     (False, False, "preexisting"), (False, False, "preexisting_corrupt"),
@@ -325,7 +333,7 @@ def test_maintenance_exclusion_survives_retention_and_later_session_lifecycle(ca
     (False, False, "preexisting_rewind_boundary"),
     (False, False, "between_passes_pending"), (False, False, "between_passes_audited")])
 def test_real_pipeline_consumes_prefix_then_records_only_partial_loss_and_fresh_progress(
-        case, monkeypatch, changed_diagnostics, outbound_prefix, later_failure):
+        case, monkeypatch, changed_diagnostics, outbound_prefix, later_failure, automatic):
     from edge.detection.mqtt_adapters import MqttFeatureRuleStage, MqttMessageRuleStage
     from edge.detection.packet_rule_detector import PacketRuleDetectorStage
     from edge.features.run_mqtt_feature_builder import run_producer_cycle
@@ -348,7 +356,7 @@ def test_real_pipeline_consumes_prefix_then_records_only_partial_loss_and_fresh_
         tail_id = conn.execute("SELECT id FROM packet_feature_logs WHERE capture_segment_id=?", (healthy,)).fetchone()[0]
         if outbound_prefix:
             conn.execute("UPDATE packet_feature_logs SET direction='OUTBOUND' WHERE id=?", (prefix_id,))
-    result = recover(case)
+    result = boot_recover(case) if automatic else recover(case)
     plan = json.loads(result["audit"]["plan_json"])
     engine = create_engine(f"sqlite:///{instance.database}")
     factory = sessionmaker(bind=engine)
@@ -489,6 +497,11 @@ def test_real_pipeline_consumes_prefix_then_records_only_partial_loss_and_fresh_
             assert conn.execute("SELECT status,error_code FROM packet_capture_segments WHERE id=?", (arguments["failed_segment_id"],)).fetchone() == ("FAILED", "PARTIAL_CAPTURE")
             assert conn.execute("SELECT COUNT(*) FROM packet_feature_logs WHERE capture_segment_id=?", (arguments["failed_segment_id"],)).fetchone()[0] == 0
         assert predicted
+        if automatic:
+            retried = boot_recover(case, verify_timeout=40)
+            assert retried["result"] == "ALREADY_RESUMED"
+            with sqlite3.connect(instance.database) as conn:
+                assert conn.execute("SELECT COUNT(*) FROM planned_maintenance_resumes").fetchone()[0] == 1
     finally:
         engine.dispose()
 
@@ -497,3 +510,393 @@ def test_parser_requires_explicit_partial_identity_and_operator():
     args = cli.build_parser().parse_args(["recover-partial-prefix", "--operation-id", "operation",
         "--target-session-id", TARGET, "--failed-segment-id", "99890", "--approved-by", "woomin", "--reason", "reviewed"])
     assert args.failed_segment_id == 99890 and args.command == "recover-partial-prefix"
+
+
+@pytest.mark.parametrize("diagnostic_version", ["v1-kernel-loss", "v2-timing"])
+def test_boot_admits_proven_partial_without_fabricating_loss_provenance(case, diagnostic_version):
+    if diagnostic_version == "v1-kernel-loss":
+        sidecar = case[4].with_suffix(".pcap.capture.json")
+        value = json.loads(sidecar.read_text())
+        value.update(schema_version="packet-capture-diagnostics-v1", packets_dropped=24,
+                     drop_status="observed_loss")
+        sidecar.write_text(json.dumps(value))
+    before = snapshot(case[0])
+    result = boot_recover(case)
+    assert result["result"] == "COMMITTED_HOLD"
+    plan = json.loads(result["audit"]["plan_json"])
+    recovery = plan["partial_prefix_recovery"]
+    assert recovery["approved_by"] == cli.BOOT_GAP_APPROVED_BY
+    assert recovery["reason"] == cli.BOOT_GAP_REASON
+    assert recovery["failed_segment_id"] == case[3]["failed_segment_id"]
+    assert plan["maintenance_end"] == utc(60)
+    assert "checkpoints_before" not in recovery["capture_proof"]
+    after = snapshot(case[0])
+    assert before[0] == after[0] and after[4] == []
+    for row, prior in zip(after[1], before[1]):
+        assert row[2] == prior[2]
+        assert row[3] == (utc(60) if row[0] in p.PACKET_DETECTORS else prior[3])
+
+
+def test_boot_policy_off_and_strict_resume_never_admit_partial(case):
+    instance = case[0]
+    before = snapshot(instance)
+    strict = instance.resume(artifact_dir=case[2] / "strict", timeout=0, verify_timeout=0)
+    assert strict["result"] == "WAIT" and snapshot(instance) == before
+    assert boot_recover(case, policy=False)["result"] == "HOLD"
+    assert snapshot(instance) == before
+
+
+def test_boot_policy_off_still_allows_ordinary_healthy_admission(runner):
+    instance, system, directory = runner
+    ready_target(instance, system)
+    instance.settings = instance.settings.model_copy(update={"packet_confirmed_gap_policy_enabled": False})
+    result = instance.boot_resume(artifact_dir=directory / "ordinary", timeout=0, verify_timeout=0)
+    assert result["result"] == "COMMITTED_HOLD"
+    assert "partial_prefix_recovery" not in json.loads(result["audit"]["plan_json"])
+
+
+@pytest.mark.parametrize("error_code", [None, "LATE_CAPTURE", "UNKNOWN_FAILURE"])
+def test_boot_never_selects_unknown_or_late_capture(case, error_code):
+    with sqlite3.connect(case[0].database) as conn:
+        if error_code == "LATE_CAPTURE":
+            conn.execute("UPDATE packet_capture_segments SET error_code=?,file_name=NULL,actual_capture_started_at=NULL,"
+                         "capture_stop_requested_at=NULL,capture_process_exited_at=NULL,captured_duration_seconds=0 WHERE id=?",
+                         (error_code, case[3]["failed_segment_id"]))
+        else:
+            conn.execute("UPDATE packet_capture_segments SET error_code=? WHERE id=?",
+                         (error_code, case[3]["failed_segment_id"]))
+    before = snapshot(case[0])
+    assert boot_recover(case)["result"] == "HOLD"
+    assert snapshot(case[0]) == before
+
+
+@pytest.mark.parametrize("mutation", ["missing_pcap", "pending_successor", "failed_successor", "initial_failure", "intervening_session"])
+def test_boot_incomplete_or_ambiguous_admission_keeps_ready(case, mutation):
+    instance = case[0]
+    if mutation == "missing_pcap":
+        case[4].unlink()
+    else:
+        with sqlite3.connect(instance.database) as conn:
+            if mutation in ("pending_successor", "failed_successor"):
+                conn.execute("DELETE FROM packet_feature_logs WHERE capture_segment_id=?", (case[5],))
+                conn.execute("UPDATE packet_capture_segments SET status=?,error_code=? WHERE id=?",
+                             ("READY" if mutation == "pending_successor" else "FAILED",
+                              None if mutation == "pending_successor" else "PARTIAL_CAPTURE", case[5]))
+            elif mutation == "initial_failure":
+                conn.execute("DELETE FROM packet_feature_logs WHERE window_start=?", (utc(60),))
+                conn.execute("UPDATE packet_capture_segments SET status='FAILED',error_code='UNKNOWN_FAILURE' WHERE window_start=?", (utc(60),))
+            else:
+                conn.execute("UPDATE packet_capture_sessions SET id=3 WHERE session_id=?", (TARGET,))
+                conn.execute("UPDATE packet_capture_segments SET capture_session_id=3 WHERE capture_session_id=2")
+                conn.execute("INSERT INTO packet_capture_sessions(id,session_id,capture_interface,status,started_at) "
+                             "VALUES (2,'55555555-5555-4555-8555-555555555555','eth0','COMPLETED',?)", (utc(50),))
+    before = snapshot(instance)
+    assert boot_recover(case)["result"] in ("WAIT", "HOLD")
+    assert snapshot(instance) == before and raw_status(instance) == "READY"
+
+
+def test_boot_retry_uses_bound_audit_without_backup_rehash_or_reapply(case, monkeypatch):
+    first = boot_recover(case)
+    before = snapshot(case[0])
+    monkeypatch.setattr(case[0], "backup", lambda *_: pytest.fail("committed retry cannot back up/reapply"))
+    monkeypatch.setattr(partial, "_file_proof", lambda *_: pytest.fail("committed retry cannot rehash retained evidence"))
+    retry = boot_recover(case)
+    assert retry["result"] == "COMMITTED_HOLD" and retry["audit"]["operation_id"] == first["audit"]["operation_id"]
+    assert snapshot(case[0]) == before
+    assert boot_recover(case, policy=False)["result"] == "HOLD"
+    case[1].identity = "55555555-5555-4555-8555-555555555555"
+    assert boot_recover(case)["result"] == "HOLD"
+    assert snapshot(case[0]) == before
+
+
+def test_boot_does_not_relabel_a_manual_partial_audit(case):
+    recover(case)
+    before = snapshot(case[0])
+    assert boot_recover(case)["result"] == "HOLD"
+    assert snapshot(case[0]) == before
+
+
+def test_boot_corrupt_committed_audit_is_not_reapplied(case):
+    boot_recover(case)
+    with sqlite3.connect(case[0].database) as conn:
+        # Simulate damaged storage; normal SQL mutation is separately forbidden.
+        conn.execute("DROP TRIGGER trg_planned_maintenance_resumes_no_update")
+        conn.execute("UPDATE planned_maintenance_resumes SET plan_sha256=?", ("f" * 64,))
+    before = snapshot(case[0])
+    assert boot_recover(case)["result"] == "HOLD"
+    assert snapshot(case[0]) == before
+
+
+def test_boot_parser_is_explicit_and_strict_resume_stays_available():
+    args = cli.build_parser().parse_args(["boot-resume"])
+    assert args.command == "boot-resume" and args.timeout == 120 and args.verify_timeout == 120
+    assert cli.build_parser().parse_args(["resume"]).command == "resume"
+
+
+def hide_partial_until_append(case):
+    """Retain actual fixture rows/files, append the new loss at a chosen boundary."""
+    with sqlite3.connect(case[0].database) as conn:
+        conn.row_factory = sqlite3.Row
+        segments = [dict(row) for row in conn.execute("SELECT * FROM packet_capture_segments WHERE capture_session_id=2 AND window_start>=?", (utc(70),))]
+        features = [dict(row) for row in conn.execute("SELECT * FROM packet_feature_logs WHERE window_start>=?", (utc(70),))]
+        conn.execute("DELETE FROM packet_feature_logs WHERE window_start>=?", (utc(70),))
+        conn.execute("DELETE FROM packet_capture_segments WHERE capture_session_id=2 AND window_start>=?", (utc(70),))
+    def append():
+        with sqlite3.connect(case[0].database) as conn:
+            for table, rows in (("packet_capture_segments", segments), ("packet_feature_logs", features)):
+                for row in rows:
+                    conn.execute(f"INSERT INTO {table}({','.join(row)}) VALUES ({','.join('?' for _ in row)})", tuple(row.values()))
+    return append
+
+
+@pytest.mark.parametrize("timing", ["before-backup", "after-backup"])
+@pytest.mark.parametrize("changed_prefix", [False, True])
+def test_boot_first_partial_during_normal_backup_uses_fresh_bound_plan_and_backup(case, timing, changed_prefix):
+    instance = case[0]
+    append, original_backup, backups = hide_partial_until_append(case), instance.backup, []
+    def backup(database, root):
+        def add_loss():
+            append()
+            if changed_prefix:
+                with sqlite3.connect(database) as conn:
+                    conn.execute("UPDATE packet_feature_logs SET packet_count=packet_count+1 WHERE window_start=?", (utc(60),))
+        first = not backups
+        if first and timing == "before-backup": add_loss()
+        evidence = original_backup(database, root)
+        backups.append(evidence)
+        if first and timing == "after-backup": add_loss()
+        # Backup duration does not consume the separate startup-wait budget.
+        if first: case[1].elapsed += 130
+        return evidence
+    instance.backup = backup
+    result = boot_recover(case)
+    if changed_prefix:
+        assert result["result"] == "HOLD" and raw_status(instance) == "READY"
+        assert len(backups) == 1
+    else:
+        assert result["result"] == "COMMITTED_HOLD" and raw_status(instance) == "RESUMED"
+        assert len(backups) == 2 and backups[0]["backup_path"] != backups[1]["backup_path"]
+        assert result["audit"]["backup_path"] == backups[1]["backup_path"]
+        assert json.loads(result["audit"]["plan_json"])["maintenance_end"] == utc(60)
+    with sqlite3.connect(instance.database) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM packet_detection_gaps").fetchone()[0] == 0
+
+
+def test_boot_lost_partial_commit_response_never_falls_back_or_reapplies(case, monkeypatch):
+    original, calls = p.apply_partial_prefix, []
+    def lost(conn, *args, **kwargs):
+        original(conn, *args, **kwargs)
+        conn.commit()
+        calls.append("commit")
+        raise RuntimeError("controlled lost commit response")
+    monkeypatch.setattr(p, "apply_partial_prefix", lost)
+    first = boot_recover(case)
+    assert first["result"] == "COMMITTED_HOLD" and calls == ["commit"]
+    before = snapshot(case[0])
+    monkeypatch.setattr(case[0], "backup", lambda *_: pytest.fail("no second backup after commit"))
+    assert boot_recover(case)["result"] == "COMMITTED_HOLD"
+    assert snapshot(case[0]) == before and calls == ["commit"]
+
+
+@pytest.mark.parametrize("successor_completes", [False, True])
+def test_boot_new_loss_waits_for_healthy_successor_then_makes_only_one_fresh_backup(case, successor_completes):
+    instance, system = case[:2]
+    with sqlite3.connect(instance.database) as conn:
+        conn.row_factory = sqlite3.Row
+        features = [dict(row) for row in conn.execute("SELECT * FROM packet_feature_logs WHERE capture_segment_id=?", (case[5],))]
+    append, original_backup, backups = hide_partial_until_append(case), instance.backup, []
+    def backup(database, root):
+        evidence = original_backup(database, root)
+        backups.append(evidence)
+        if len(backups) == 1:
+            append()
+            with sqlite3.connect(database) as conn:
+                conn.execute("DELETE FROM packet_feature_logs WHERE capture_segment_id=?", (case[5],))
+                conn.execute("UPDATE packet_capture_segments SET status='READY' WHERE id=?", (case[5],))
+        return evidence
+    instance.backup = backup
+    finished = False
+    def complete_successor():
+        nonlocal finished
+        if finished or not successor_completes: return
+        finished = True
+        with sqlite3.connect(instance.database) as conn:
+            conn.execute("UPDATE packet_capture_segments SET status='PROCESSED' WHERE id=?", (case[5],))
+            for row in features:
+                conn.execute(f"INSERT INTO packet_feature_logs({','.join(row)}) VALUES ({','.join('?' for _ in row)})", tuple(row.values()))
+    system.on_sleep = complete_successor
+    assert boot_recover(case, timeout=3)["result"] == ("COMMITTED_HOLD" if successor_completes else "WAIT")
+    assert finished == successor_completes and len(backups) == (2 if successor_completes else 1)
+    assert raw_status(instance) == ("RESUMED" if successor_completes else "READY")
+
+
+def test_boot_backup_failure_is_not_retried_as_gap_admission(case):
+    instance = case[0]
+    append = hide_partial_until_append(case)
+    before = snapshot(instance)
+    calls = []
+    def failed_backup(*_):
+        calls.append("backup")
+        append()
+        raise OSError("controlled storage failure")
+    instance.backup = failed_backup
+    with pytest.raises(OSError, match="storage failure"):
+        boot_recover(case)
+    assert calls == ["backup"] and raw_status(instance) == "READY"
+    after = snapshot(instance)
+    assert before[1:] == after[1:]
+
+
+@pytest.mark.parametrize("boundary", ["actual_partial_inspect", "preview_not_ready", "transient_clock"])
+def test_boot_fallback_uses_actual_attempt_binding_and_waits_for_readiness(case, monkeypatch, boundary):
+    instance = case[0]
+    append, backup, backups = hide_partial_until_append(case), instance.backup, []
+    before = snapshot(instance)
+    def during_backup(database, root):
+        evidence = backup(database, root)
+        backups.append(evidence)
+        if len(backups) == 1: append()
+        return evidence
+    monkeypatch.setattr(instance, "backup", during_backup)
+    if boundary == "preview_not_ready":
+        def not_ready(*_):
+            raise p.PlannedMaintenanceError("first input not yet ready")
+        monkeypatch.setattr(instance, "dry_run", not_ready)
+    elif boundary == "actual_partial_inspect":
+        resume = instance.resume
+        def change_at_actual_attempt(**kwargs):
+            if kwargs.get("_partial_prefix") is not None:
+                with sqlite3.connect(instance.database) as conn:
+                    conn.execute("UPDATE packet_feature_logs SET packet_count=packet_count+1 WHERE window_start=?", (utc(60),))
+            return resume(**kwargs)
+        monkeypatch.setattr(instance, "resume", change_at_actual_attempt)
+    else:
+        inspect, calls = p.inspect_partial_prefix, []
+        def temporary_unsynchronized(*args, **kwargs):
+            calls.append(True)
+            if len(calls) == 1:
+                kwargs["time_synchronized"] = False
+            return inspect(*args, **kwargs)
+        monkeypatch.setattr(p, "inspect_partial_prefix", temporary_unsynchronized)
+    result = boot_recover(case, timeout=3)
+    if boundary == "actual_partial_inspect":
+        assert result["result"] == "HOLD" and raw_status(instance) == "READY"
+        assert len(backups) == 1
+        assert snapshot(instance)[1:] == before[1:]
+    else:
+        assert result["result"] == "COMMITTED_HOLD" and raw_status(instance) == "RESUMED"
+        assert len(backups) == 2
+
+
+@pytest.mark.parametrize("changed_binding", [False, True])
+def test_boot_fallback_concurrent_commit_verifies_original_binding_without_reapply(case, monkeypatch, changed_binding):
+    instance = case[0]
+    append, backup, backups = hide_partial_until_append(case), instance.backup, []
+    def during_backup(database, root):
+        evidence = backup(database, root)
+        backups.append(evidence)
+        if len(backups) == 1: append()
+        return evidence
+    monkeypatch.setattr(instance, "backup", during_backup)
+    resume, committed = instance.resume, []
+    def concurrent_commit(**kwargs):
+        if kwargs.get("_partial_prefix") is not None:
+            if changed_binding:
+                with sqlite3.connect(instance.database) as conn:
+                    conn.execute("UPDATE packet_feature_logs SET packet_count=packet_count+1 WHERE window_start=?", (utc(60),))
+            other = {key: value for key, value in kwargs.items() if key != "_expected_binding"}
+            assert resume(**other)["result"] == "COMMITTED_HOLD"
+            committed.append(snapshot(instance))
+        return resume(**kwargs)
+    monkeypatch.setattr(instance, "resume", concurrent_commit)
+    result = boot_recover(case)
+    assert result["result"] == ("HOLD" if changed_binding else "COMMITTED_HOLD")
+    assert raw_status(instance) == "RESUMED" and len(backups) == 2
+    assert snapshot(instance) == committed[0]
+
+
+@pytest.mark.parametrize("outcome", ["pending", "unknown", "invalid_audit", "no_audit_cp_jump", "rewound", "pass", "chain_pass"])
+def test_boot_normal_commit_then_loss_requires_real_gap_audit_and_fresh_progress(case, monkeypatch, outcome):
+    from edge.detection.mqtt_adapters import MqttFeatureRuleStage, MqttMessageRuleStage
+    from edge.detection.packet_rule_detector import PacketRuleDetectorStage
+    from edge.features.run_mqtt_feature_builder import run_producer_cycle
+    from edge.orchestration.packet_stage_readiness import PacketFeatureReadyStage
+    from edge.orchestration import run_detection_orchestrator as orchestrator
+    from edge.orchestration.stage_registry import StageRegistry, ConfiguredStage
+    from tests.test_planned_maintenance_processing import real_packet_if_with_normal_predictions
+    from tests.device_policy_support import insert_revision_raw
+    instance, system = case[:2]
+    append = hide_partial_until_append(case)
+    first = boot_recover(case)
+    assert first["result"] == "COMMITTED_HOLD"
+    plan = json.loads(first["audit"]["plan_json"])
+    assert "partial_prefix_recovery" not in plan
+    append()
+    if outcome == "chain_pass":
+        with sqlite3.connect(instance.database) as conn:
+            conn.execute("DELETE FROM packet_feature_logs WHERE capture_segment_id=?", (case[5],))
+            conn.execute("DELETE FROM packet_capture_segments WHERE id=?", (case[5],))
+        add_late_partial(case, 80)
+    if outcome in ("unknown", "invalid_audit", "no_audit_cp_jump"):
+        with sqlite3.connect(instance.database) as conn:
+            if outcome == "unknown":
+                conn.execute("UPDATE packet_capture_segments SET error_code='UNKNOWN_FAILURE' WHERE id=?", (case[3]["failed_segment_id"],))
+            elif outcome == "invalid_audit":
+                conn.execute("INSERT INTO packet_detection_gaps(source_session_id,target_session_id,window_start,window_end,"
+                             "status,reason,evidence_json,plan_sha256) VALUES (?,?,?,?,'UNINSPECTED','RECORDED_CAPTURE_GAP','{}',?)",
+                             (TARGET, TARGET, utc(70), utc(80), "a" * 64))
+            else:
+                conn.execute("UPDATE detector_checkpoints SET last_completed_window_end=? WHERE source_table='packet_feature_logs'", (utc(80),))
+    initial = boot_recover(case)
+    assert initial["result"] == "COMMITTED_HOLD"
+    assert initial["verification"]["result"] == ("HOLD" if outcome in ("unknown", "invalid_audit", "no_audit_cp_jump") else "WAIT")
+    if outcome not in ("pass", "rewound", "chain_pass"):
+        return
+    engine = create_engine(f"sqlite:///{instance.database}")
+    factory = sessionmaker(bind=engine)
+    with sqlite3.connect(instance.database) as conn:
+        insert_revision_raw(conn, device_id="esp32_01", registration_state="ACTIVE", effective_from=utc(-10))
+    packet_if, _ = real_packet_if_with_normal_predictions()
+    stages = (MqttFeatureRuleStage(), MqttMessageRuleStage(),
+              PacketFeatureReadyStage(PacketRuleDetectorStage(capture_policy=CapturePolicy())),
+              PacketFeatureReadyStage(packet_if))
+    registry = StageRegistry(tuple(ConfiguredStage(stage.detector_name, stage, True) for stage in stages))
+    monkeypatch.setattr(orchestrator, "settings", orchestrator.settings.model_copy(update={"packet_confirmed_gap_policy_enabled": True}))
+    def cycle():
+        return orchestrator.run_orchestration_cycle(session_factory=factory, registry=registry)
+    try:
+        end = 100 if outcome == "chain_pass" else 90
+        run_producer_cycle(session_factory=factory, now=BASE + timedelta(seconds=end + 1))
+        for boundary in ((60, 70, 90, 100) if outcome == "chain_pass" else (60, 70, 80, 90)):
+            assert cycle().cutoff == BASE + timedelta(seconds=boundary)
+        if outcome == "rewound":
+            with sqlite3.connect(instance.database) as conn:
+                conn.execute("UPDATE detector_checkpoints SET last_completed_window_end=? WHERE source_table='packet_feature_logs'", (utc(70),))
+            assert boot_recover(case)["verification"]["result"] == "HOLD"
+            return
+        # Existing strict resume still refuses FAILED rows, even after auditing.
+        strict = instance.resume(artifact_dir=case[2] / "strict", timeout=0, verify_timeout=0)
+        assert strict["result"] == "COMMITTED_HOLD" and strict["verification"]["result"] == "HOLD"
+        monkeypatch.setattr(instance, "backup", lambda *_: pytest.fail("committed verification cannot reapply"))
+        frame = end
+        def advance():
+            nonlocal frame
+            with sqlite3.connect(instance.database) as conn:
+                add_segment(conn, 2, frame)
+            frame += 10
+            system.elapsed = max(system.elapsed + 1, frame - 14)
+            run_producer_cycle(session_factory=factory, now=BASE + timedelta(seconds=frame + 1))
+            cycle()
+        system.on_sleep = advance
+        result = boot_recover(case, verify_timeout=40)
+        assert result["result"] == "ALREADY_RESUMED" and len(result["verification"]["snapshots"]) == 2
+        with sqlite3.connect(instance.database) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM planned_maintenance_resumes").fetchone()[0] == 1
+            assert conn.execute("SELECT COUNT(*) FROM packet_detection_gaps").fetchone()[0] == 1
+            if outcome == "chain_pass":
+                evidence = json.loads(conn.execute("SELECT evidence_json FROM packet_detection_gaps").fetchone()[0])
+                assert len(evidence["failed_segments"]) == 2
+            assert conn.execute("SELECT status,error_code FROM packet_capture_segments WHERE id=?",
+                                (case[3]["failed_segment_id"],)).fetchone() == ("FAILED", "PARTIAL_CAPTURE")
+    finally:
+        engine.dispose()

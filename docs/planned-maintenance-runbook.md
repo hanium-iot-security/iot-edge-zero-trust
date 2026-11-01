@@ -78,9 +78,26 @@ sudo venv/bin/python -m edge.maintenance.run_planned_maintenance recover-prefix 
 
 커밋 후 drain 시간 초과·서비스 복귀 실패·새 부팅/Session/원본 변경은 `COMMITTED_HOLD`다. 적용한 승인을 취소하거나 다시 적용하지 않는다. 같은 대상·후속 Session·복구 승인자·사유로 재실행하면 기존 감사 검증과 read-only drain 확인만 수행하며 새로운 전이를 만들지 않는다. 실패 tail에 대한 수동 승인이나 확인된 자동 공백 감사 없이 Checkpoint를 그 이후로 이동하지 않는다.
 
+## 부팅 중 확인된 부분 수집의 자동 재개
+
+부팅 Unit은 다음 `boot-resume` 명령을 사용한다. 기존 `resume` 명령의 실패 거부 조건과 명시적 수동 복구 명령은 유지한다.
+
+```bash
+sudo venv/bin/python -m edge.maintenance.run_planned_maintenance boot-resume \
+  --artifact-dir output/planned-maintenance --timeout 120 --verify-timeout 120
+```
+
+정상 부팅은 기존 계획 재개 절차를 따른다. `PACKET_CONFIRMED_GAP_POLICY_ENABLED=true`이고 첫 RUNNING 재개 Session에 검증 가능한 `FAILED/PARTIAL_CAPTURE`가 있으면, 자동 경로가 아래 부분 prefix 복구의 증거 검사·백업·원자적 적용·실제 처리 확인을 재사용한다. 종료 승인은 이전 종료 경계에서 새 Session의 첫 Window 시작까지의 계획 종료 공백에만 사용한다. 정상 prefix나 부분 수집 구간은 유지보수 시간에 포함하지 않는다.
+
+부분 수집의 닫힌 PCAP·진단·정확한 시간과 정상 후속 Window가 확인돼야 한다. 정상 prefix를 실제로 처리한 뒤 기존 공백 정책이 실패 구간을 `UNINSPECTED`로 기록하며 탐지를 이어간다. 실패 상태·원본·학습 제외 조건을 보존하고, 미검사 구간에 추론 완료 기록을 만들지 않는다. 옵션이 꺼져 있거나 원본·승인·Session이 불일치하거나 알 수 없는 실패가 있으면 자동으로 넘기지 않는다.
+
+자동 경로의 식별자와 사유는 감사에 저장한다. 적용 후 재실행은 같은 Boot·Session·원래 감사의 재검증만 하며 승인·백업·경계 변경을 중복하지 않는다. `COMMITTED_HOLD`는 일부 변경이 반영됐으나 현재 탐지 전진이 확인되지 않은 상태다. 실패한 명령을 무조건 반복하거나 승인·Checkpoint를 직접 수정하지 않는다.
+
+수동으로 `boot-resume`을 실행할 때도 아래 배포·처리기 reload 사전 조건을 적용한다. 기존 부분 prefix 감사 형식을 읽을 수 있는 검증 버전인지 확인하고, 해당 검증기를 새로 배포했다면 MQTT Feature Builder와 Orchestrator의 정상 재시작을 먼저 완료한다. Capture와 Subscriber는 계속 실행한다. 같은 버전의 이미 적용된 감사를 재검증할 때는 재배포나 재시작을 반복하지 않는다.
+
 ## RUNNING 재개 Session의 후속 부분 수집 복구
 
-첫 부팅 Session이 계속 RUNNING이고 정상 prefix 이후 `FAILED/PARTIAL_CAPTURE`가 발생한 경우에는 다음 명시적 경로를 사용한다. 일반 `resume`과 부팅 Unit의 실패 거부 조건은 그대로 유지한다. 종료 승인·새 Boot·현재 RUNNING Session·선택한 Segment ID·관리자와 사유를 함께 지정한다. admission 범위는 **새 Session 첫 Window 시작 T부터 선택한 실패의 즉시 정상 후속 Window 끝 H까지**로 고정한다. 이 범위에는 선택한 실패 하나만 허용하며, 첫 정상 트래픽 Window보다 앞선 실패나 범위 안 추가 실패는 허용하지 않는다.
+첫 부팅 Session이 계속 RUNNING이고 정상 prefix 이후 `FAILED/PARTIAL_CAPTURE`가 발생한 경우에는 다음 명시적 수동 경로를 사용할 수 있다. 일반 `resume`은 실패 거부 조건을 유지하며, 부팅 Unit의 `boot-resume`은 위 자동 재개 조건을 만족할 때만 같은 검증 절차를 사용한다. 수동 경로는 종료 승인·새 Boot·현재 RUNNING Session·선택한 Segment ID·관리자와 사유를 함께 지정한다. admission 범위는 **새 Session 첫 Window 시작 T부터 선택한 실패의 즉시 정상 후속 Window 끝 H까지**로 고정한다. 이 범위에는 선택한 실패 하나만 허용하며, 첫 정상 트래픽 Window보다 앞선 실패나 범위 안 추가 실패는 허용하지 않는다.
 
 **새 부분 prefix 감사를 쓰기 전에 배포와 처리 프로세스 reload를 완료한다.** `planned.py`, `run_planned_maintenance.py`, `confirmed_partial_capture.py`를 같은 검증 버전으로 배포하고 READY가 유지된 상태에서 MQTT Feature Builder와 Orchestrator를 각각 정상 정지 후 시작한다. 두 프로세스가 새 코드로 시작했고 필수 서비스가 활성인지 확인한 뒤 아래 dry-run과 적용을 진행한다. 이전 RAM의 감사 검증기는 새 `partial_prefix_recovery` 필드를 검증하지 않을 수 있으므로 파일 배포만 하고 계속 실행하는 혼합 버전을 허용하지 않는다. CLI의 적용 중 Orchestrator stop/start는 Feature Builder를 reload하지 않는다. 이 배포 절차에서 Capture와 Subscriber는 재시작하지 않는다.
 
@@ -136,11 +153,11 @@ sudo venv/bin/python -m edge.maintenance.run_planned_maintenance cancel \
 
 실패 전 관측한 단계만 포함하므로 누락된 값은 0초나 성공을 뜻하지 않는다. `elapsed_seconds`와 600초 예산은 이 마지막 진단 출력 시간을 포함하지 않으며, 출력에는 별도 stderr I/O가 추가된다. 일반 출력 오류는 백업 결과를 바꾸지 않고 취소 신호는 전파한다. 단계별 시간만으로 수집 지연의 인과관계나 성능 개선을 확정하지 않는다.
 
-부팅 Unit의 TimeoutStartSec=1080은 준비 120초·백업 600초·진행 검증 120초와 추가 240초를 포함한다. 추가 시간은 Orchestrator 정지 최대 80초(명령 35·활성 확인 10·종료 결과 확인 35), 재시작 35초, 공유 Lock 네 개 대기 60초, 시간 동기화 확인 10초, SQLite 쓰기 Lock 대기 5초 및 여유 50초로 산정했다. 저장장치 I/O와 각 SQLite 단계는 협력적으로 제한을 확인하므로 Unit 제한이 바깥 경계를 제공한다.
+부팅 Unit의 `TimeoutStartSec=1920`은 준비 120초·개별 백업 600초 두 번·진행 검증 120초와 적용·서비스 복귀 예산 240초 두 번을 포함한다. 적용 한 번의 추가 시간은 Orchestrator 정지 최대 80초(명령 35·활성 확인 10·종료 결과 확인 35), 재시작 35초, 공유 Lock 네 개 대기 60초, 시간 동기화 확인 10초, SQLite 쓰기 Lock 대기 5초 및 여유 50초로 산정했다. 저장장치 I/O와 각 SQLite 단계는 협력적으로 제한을 확인하므로 Unit 제한이 바깥 경계를 제공한다.
 
 CLI와 실제 Pi 검증을 완료한 후 `infra/systemd/planned-maintenance-resume.service`를 설치·활성화한다. 단순 `After=` 대신 명령이 시간 동기화·새 Session·Feature 준비 상태를 직접 검사한다. 실패하면 Journal에 남기고 자동 반복하지 않는다. 운영 설정 경로가 다르면 Unit 경로부터 수정한다. 전체 Unit을 설치했다고 실장비 검증이 완료된 것은 아니다.
 
-부팅 재개 Unit은 `Nice=10`, `IOSchedulingClass=idle`로 온라인 백업·무결성 검사의 CPU·저장장치 경합을 줄인다. 이는 Capture 지연 방지를 보장하지 않으며, 새 FAILED Segment 확인과 기존 재개 검증·중단 조건은 그대로 적용한다.
+부팅 재개 Unit은 `Nice=10`, `IOSchedulingClass=idle`로 온라인 백업·무결성 검사의 CPU·저장장치 경합을 줄인다. 이는 Capture 지연 방지를 보장하지 않으며, 새 FAILED Segment 확인과 기존 재개 검증·중단 조건은 그대로 적용한다. 최초 정상 재개 검사 뒤 백업 중 확인된 부분 수집이 생기면 미커밋 READY 상태와 원래 입력을 다시 검증하고 새 부분 prefix 계획·백업으로 한 번만 전환한다. Unit의 1920초 제한은 최대 두 번의 개별 600초 백업과 준비·처리 확인·두 번의 적용·서비스 복귀 시간을 포함한다. 이미 적용된 승인은 새 전이로 재사용하지 않는다.
 
 root로 실행되는 부팅 Unit은 `sudo`의 원래 사용자 소유권 정보가 없으므로, Unit의 Git 환경 설정에서 배포 저장소 한 경로만 `safe.directory`로 지정한다. 전역 Git 설정이나 소유권·Git-ignore 검사는 변경하지 않는다. 배포 경로를 바꾸면 WorkingDirectory·ExecStart·환경 파일 경로와 함께 `GIT_CONFIG_VALUE_0`도 일치시킨다.
 
