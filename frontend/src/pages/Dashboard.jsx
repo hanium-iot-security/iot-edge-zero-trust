@@ -2463,20 +2463,6 @@ export default function Dashboard() {
 
             />
 
-            <div className="registration-state-guide" role="note">
-
-              <strong>등록 상태와 신뢰 상태는 별개입니다.</strong>
-
-              <span>
-
-                등록 대기 상태의 초기 신뢰점수 100은 보안 검증 완료를 의미하지 않으며,
-
-                자동 감점·차단은 적용되지 않습니다.
-
-              </span>
-
-            </div>
-
 
 
             {/* Phase 9: 새 API는 Trust/Firewall 운영 판정과 분리하여 표시 */}

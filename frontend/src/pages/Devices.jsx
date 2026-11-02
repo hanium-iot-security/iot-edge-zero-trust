@@ -2016,30 +2016,14 @@ export default function Devices() {
         closeDisabled={policySaving}
         size="large"
         footer={
-          <>
-            <button
-              type="button"
-              className="button button-secondary"
-              onClick={closeDetail}
-              disabled={policySaving}
-            >
-              닫기
-            </button>
-            <button
-              type="button"
-              className="button"
-              onClick={saveRulePolicy}
-              disabled={
-                policySaving ||
-                policyLoading ||
-                !currentPolicy ||
-                Boolean(pendingPolicy) ||
-                policyVerify
-              }
-            >
-              {policySaving ? "규칙 정책 저장 중..." : "규칙 정책 변경 저장"}
-            </button>
-          </>
+          <button
+            type="button"
+            className="button button-secondary"
+            onClick={closeDetail}
+            disabled={policySaving}
+          >
+            닫기
+          </button>
         }
       >
         {selectedDevice && (
@@ -2251,6 +2235,22 @@ export default function Devices() {
                   <p>{policyMessage}</p>
                 </div>
               )}
+              <div className="policy-actions">
+                <button
+                  type="button"
+                  className="button"
+                  onClick={saveRulePolicy}
+                  disabled={
+                    policySaving ||
+                    policyLoading ||
+                    !currentPolicy ||
+                    Boolean(pendingPolicy) ||
+                    policyVerify
+                  }
+                >
+                  {policySaving ? "규칙 정책 저장 중..." : "규칙 정책 변경 저장"}
+                </button>
+              </div>
             </section>
 
             {/* Phase 9 - AI Policy / Warnings */}
