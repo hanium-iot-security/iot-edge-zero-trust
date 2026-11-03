@@ -63,7 +63,7 @@ def test_migration_preserves_history_and_leaves_three_nulls(tmp_path):
             before = db.execute("SELECT * FROM packet_feature_logs").fetchone()
             indexes = db.execute("SELECT name,sql FROM sqlite_master WHERE type='index' "
                                  "AND tbl_name='packet_feature_logs' ORDER BY name").fetchall()
-        assert apply_migrations(path, MIGRATIONS_DIR).applied_versions == [13, 14, 15, 16]
+        assert apply_migrations(path, MIGRATIONS_DIR).applied_versions == list(range(13, 20))
         with sqlite3.connect(path) as db:
             row = db.execute("SELECT * FROM packet_feature_logs").fetchone()
             assert row[:-3] == before

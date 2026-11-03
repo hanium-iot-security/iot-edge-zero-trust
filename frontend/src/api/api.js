@@ -372,6 +372,10 @@ export function getDevices(params = {}, options = {}) {
     ? [...mockDevices.items]
     : [];
 
+  if (queryParams.include_hidden !== true && queryParams.include_hidden !== "true") {
+    items = items.filter((item) => !item.hidden_at);
+  }
+
   if (queryParams.status) {
     items = items.filter(
       (item) => item.status === queryParams.status
@@ -445,6 +449,36 @@ export function getDevicePolicy(deviceId, options = {}) {
     {},
     options
   );
+}
+
+export function getDeviceManagement(deviceId, options = {}) {
+  return request(
+    `/devices/${encodeId(deviceId, "Device ID")}/management`,
+    null,
+    {},
+    options
+  );
+}
+
+export async function executeDeviceManagement(deviceId, payload, adminKey, options = {}) {
+  const id = encodeId(deviceId, "Device ID");
+  if (!["DELETE_UNUSED", "HIDE", "RESTORE"].includes(payload?.action)) {
+    throw new Error("기기 관리 작업을 선택해 주세요.");
+  }
+  if (![payload?.expected_revision, payload?.expected_ai_revision]
+    .every((revision) => Number.isInteger(revision) && revision > 0) ||
+      !(payload?.expected_instance_id === null || typeof payload?.expected_instance_id === "string") ||
+      !(payload?.expected_hidden_at === null || typeof payload?.expected_hidden_at === "string")) {
+    throw new Error("기기 관리 상태를 먼저 조회해 주세요.");
+  }
+  requireReason(payload?.reason);
+  requireAdminKey(adminKey);
+  return commandRequest("POST", `/devices/${id}/management`, {
+    data: payload,
+    adminKey,
+    signal: options.signal,
+    timeout: options.timeout ?? 15000,
+  });
 }
 
 export async function createDevicePolicyRevision(

@@ -79,11 +79,13 @@ def test_upgrade_012_preserves_data_and_second_apply_is_noop(tmp_path):
     apply_migrations(path, old)
     with sqlite3.connect(path) as db:
         db.execute("INSERT INTO devices(device_id) VALUES('sensor1')")
-        before = db.execute("SELECT * FROM devices").fetchall()
-    assert apply_migrations(path, MIGRATIONS).applied_versions == [13, 14, 15, 16]
+        device_columns = ", ".join(row[1] for row in db.execute("PRAGMA table_info(devices)"))
+        before = db.execute(f"SELECT {device_columns} FROM devices").fetchall()
+    assert apply_migrations(path, MIGRATIONS).applied_versions == list(range(13, 20))
     assert apply_migrations(path, MIGRATIONS).applied_versions == []
     with sqlite3.connect(path) as db:
-        assert db.execute("SELECT * FROM devices").fetchall() == before
+        assert db.execute(f"SELECT {device_columns} FROM devices").fetchall() == before
+        assert db.execute("SELECT hidden_at, registration_instance_id FROM devices").fetchall() == [(None, None)]
         assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
         assert read_runtime_snapshot(db) is None

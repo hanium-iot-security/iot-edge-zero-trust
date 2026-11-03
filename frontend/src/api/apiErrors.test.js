@@ -30,7 +30,7 @@ function rejectedApi(status, data, errorCode = "ERR_BAD_REQUEST") {
   runInNewContext(
     code.replace(/\bexport\s+(?=(?:async\s+)?function\b)/g, "")
       .replace(/\bexport\s*\{[^}]*\};?/g, "") +
-      "\nglobalThis.api = { createDevice, getSummary };",
+      "\nglobalThis.api = { createDevice, getSummary, getDeviceManagement, executeDeviceManagement };",
     scope,
   );
   return { ...scope.api, requests };
@@ -113,5 +113,43 @@ test("status fallback messages still apply when the server provides no detail", 
   ]) {
     const api = rejectedApi(status, {});
     await assert.rejects(api.getSummary(), (error) => error.message === message);
+  }
+});
+
+const managementCommand = {
+  action: "DELETE_UNUSED", expected_revision: 1, expected_ai_revision: 1,
+  expected_instance_id: "fixture-registration", expected_hidden_at: null,
+  reason: "remove unused test",
+};
+
+test("device management sends the observed instance and revisions while keeping the admin key out of its body", async () => {
+  const api = rejectedApi(401, { detail: "RECOVERY_ADMIN_UNAUTHORIZED" });
+  await assert.rejects(api.executeDeviceManagement("fixture-device", managementCommand, "test-only-key"),
+    (error) => error.status === 401 && error.message.includes("관리자 인증"));
+  assert.equal(api.requests.length, 1);
+  const request = api.requests[0];
+  assert.equal(request.method, "post");
+  assert.equal(request.url.endsWith("/devices/fixture-device/management"), true);
+  assert.equal(request.headers.get("X-Recovery-Admin-Key"), "test-only-key");
+  const body = JSON.parse(request.data);
+  assert.equal(body.expected_instance_id, "fixture-registration");
+  assert.equal(body.expected_revision, 1);
+  assert.equal(body.expected_ai_revision, 1);
+  assert.equal(body.expected_hidden_at, null);
+  assert.equal(request.data.includes("test-only-key"), false);
+});
+
+test("management cannot submit without a valid action, observed instance, revisions, reason and administrator key", async () => {
+  for (const [payload, key] of [
+    [{ ...managementCommand, action: "OTHER" }, "fixture-key"],
+    [{ ...managementCommand, expected_revision: 0 }, "fixture-key"],
+    [{ ...managementCommand, expected_instance_id: undefined }, "fixture-key"],
+    [{ ...managementCommand, expected_hidden_at: undefined }, "fixture-key"],
+    [{ ...managementCommand, reason: " " }, "fixture-key"],
+    [managementCommand, " "],
+  ]) {
+    const api = rejectedApi(500, {});
+    await assert.rejects(api.executeDeviceManagement("fixture-device", payload, key));
+    assert.equal(api.requests.length, 0);
   }
 });

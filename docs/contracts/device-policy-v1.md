@@ -46,6 +46,7 @@ NaN/Infinity와 묵시적 잘라내기·보정은 허용하지 않는다. JSON �
 | `policy.byte_rate_max_bytes_per_second` | 유한 number, 0 초과~125000000 | **bytes/s**, 기본 2500.0; bit/s 아님 |
 | `reason` | string, trim 후 1~500자 | 등록·변경 사유, 제어 문자 금지 |
 | `expected_revision` | integer, 1~2147483647 | 정책 변경 시 필수, 최신 저장 revision과 비교 |
+| `expected_instance_id` | string 1~128자 또는 null | Migration 019 추가. 정책 조회 값 전달. 삭제 후 같은 ID로 재등록한 경우 필수 대조 |
 | `registration_state` | `PENDING`, `ACTIVE`, `DISABLED` | 변경 요청에서만 허용 |
 
 위 최대값은 첫 구현의 **관리 입력 검증 상한**이다. 권장 탐지 임계값이나 Pi 처리 성능을
@@ -66,6 +67,10 @@ Device ID·IP·Principal·Device Type 수정, 삭제, DISABLED 재활성화, 임
 AI 설정과 점수 직접 입력은 이번 명령 API 범위 밖이다. Topic은 서버가
 `iot/{device_id}/sensor`로 산출한다. 비밀번호·관리자 키는 본문·정책·감사에 저장하지 않는다.
 
+Migration 019의 미사용 등록 삭제·목록 숨김은 별도 [기기 관리 계약](device-management-v1.md)을
+따른다. 정책 조회·변경 응답의 `expected_instance_id`와 이를 사용한 이전 등록 초안 거부,
+기존 클라이언트의 생략 호환 조건도 해당 계약에서 정한다.
+
 ## 3. API 요청·응답
 
 `device-policy-v1.examples.json`은 프론트 개발용 **가상 응답**이다.
@@ -76,8 +81,8 @@ AI 설정과 점수 직접 입력은 이번 명령 API 범위 밖이다. Topic�
 | `POST /api/devices` | ID/IP/type/principal, 완전한 `policy`, reason 입력. 서버가 PENDING·revision 1·Topic·효력 시점 생성. 201 `{device,policy}` 반환; policy는 아래 정책 조회와 같은 구조 |
 | `GET /api/devices` | 기존 `{items,total}`·status/limit/offset 유지. 기존 필드 삭제/이름 변경 없음 |
 | `GET /api/devices/{device_id}` | 기존 DeviceItem 확장. Trust `status`와 등록 상태 분리 |
-| `GET /api/devices/{device_id}/policy` | `device_id`, `server_time`, `latest_revision`, `current`, `pending` 반환. current/pending은 revision 객체 또는 null |
-| `POST /api/devices/{device_id}/policy-revisions` | expected_revision·reason·registration_state·완전한 policy 입력. 201로 정책 조회와 같은 구조 반환; pending이 새 revision |
+| `GET /api/devices/{device_id}/policy` | `device_id`, `server_time`, `latest_revision`, `expected_instance_id`, `current`, `pending` 반환. current/pending은 revision 객체 또는 null |
+| `POST /api/devices/{device_id}/policy-revisions` | expected_revision·조회한 expected_instance_id·reason·registration_state·완전한 policy 입력. 201로 정책 조회와 같은 구조 반환; pending이 새 revision |
 
 부분 PATCH를 도입하지 않는다. 상태만 바꾸더라도 전체 정책을 보내고 서버는 잠금 안에서
 expected_revision과 대조한다. 등록 초기 상태·revision·Topic·효력 시점·작성자는

@@ -410,6 +410,43 @@
     margin-top: 14px;
   }
 
+  .device-list-options,
+  .management-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .device-list-options label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--color-slate-600);
+    font-size: 12px;
+  }
+
+  .hidden-device-label {
+    color: var(--color-slate-700);
+    font-weight: 700;
+  }
+
+  .management-confirmation {
+    margin-top: 14px;
+    padding: 14px;
+    border: 1px solid var(--border-color);
+    border-radius: 9px;
+    background: var(--color-slate-50);
+
+    > p { font-size: 12px; line-height: 1.6; }
+    .management-actions { margin-top: 14px; }
+  }
+
+  .button-management-delete {
+    background: var(--color-danger);
+    color: white;
+  }
+
   .policy-card {
     min-width: 0;
     padding: 14px;

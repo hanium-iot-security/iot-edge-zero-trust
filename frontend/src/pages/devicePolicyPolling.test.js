@@ -95,7 +95,7 @@ function createClock() {
   };
 }
 
-async function componentHarness(name, api, clock = createClock()) {
+async function componentHarness(name, api, clock = createClock(), options = {}) {
   const { importedNames, code } = await pageCode(name);
   const slots = [];
   let cursor = 0;
@@ -150,11 +150,13 @@ async function componentHarness(name, api, clock = createClock()) {
     jsx: (type, properties, ...children) => ({ type, props: properties || {}, children }),
   };
   runInNewContext(code, scope, { filename: `${name}.jsx` });
+  const Component = options.componentName ? scope[options.componentName] : scope.Component;
+  assert.equal(typeof Component, "function", "requested production component must exist");
   function render() {
     cursor = 0;
     dirty = false;
     effects = [];
-    root = scope.Component();
+    root = Component(options.props || {});
     effects.forEach((effect) => effect());
   }
   async function settle() {
@@ -263,6 +265,59 @@ async function openSensor(app) {
   const table = app.find((node) => node.type === "DataTable" && node.props.onRowClick);
   await app.act(() => table.props.onRowClick(table.props.rows[0]));
 }
+
+test("rule refresh cannot attach a replacement registration token to an old draft", async () => {
+  const clock = createClock();
+  const server = deviceServer(clock);
+  let instance = "old-rule-instance";
+  const originalRead = server.api.getDevicePolicy;
+  server.api.getDevicePolicy = async () => ({ ...await originalRead(), expected_instance_id: instance });
+  const app = await componentHarness("Devices", server.api, clock);
+  try {
+    await openSensor(app);
+    await app.change("rule-key", "old-key");
+    await app.change("rule-payload_size_max", "6200");
+    await app.change("rule-reason", "old registration draft");
+    instance = "replacement-rule-instance";
+    await app.click("정책 새로고침");
+    assert.equal(app.input("rule-payload_size_max").props.value, "5120");
+    assert.equal(app.input("rule-reason").props.value, "");
+    assert.equal(app.input("rule-key").props.value, "");
+    await app.change("rule-key", "new-key");
+    await app.change("rule-payload_size_max", "6200");
+    await app.change("rule-reason", "fresh registration draft");
+    await app.click("규칙 정책 변경 저장");
+    assert.equal(server.writes.length, 1);
+    assert.equal(server.writes[0].payload.expected_instance_id, instance);
+  } finally { app.cleanup(); }
+});
+
+test("AI refresh clears an old draft before using a replacement registration token", async () => {
+  let instance = "old-ai-instance";
+  const writes = [];
+  const app = await componentHarness("Devices", {
+    getDeviceAiPolicy: async () => ({ current: { revision: 1, mode: "OFF" }, pending: null,
+      latest_revision: 1, expected_instance_id: instance }),
+    getAiWarnings: async () => ({ items: [], total: 0 }),
+    createDeviceAiPolicyRevision: async (_id, payload) => writes.push(payload),
+  }, createClock(), { componentName: "DeviceAiManagement", props: { deviceId: sensor.device_id, registration: "ACTIVE" } });
+  try {
+    await app.change("ai-mode", "OBSERVE");
+    await app.change("ai-reason", "old AI draft");
+    await app.change("ai-admin-key", "old-key");
+    instance = "replacement-ai-instance";
+    await app.click("AI 정책 새로고침");
+    assert.equal(app.input("ai-mode").props.value, "OFF");
+    assert.equal(app.input("ai-reason").props.value, "");
+    assert.equal(app.input("ai-admin-key").props.value, "");
+    await app.change("ai-mode", "OBSERVE");
+    await app.change("ai-reason", "fresh AI draft");
+    await app.change("ai-admin-key", "new-key");
+    await app.click("AI 정책 변경 저장");
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].expected_instance_id, instance);
+  } finally { app.cleanup(); }
+});
 
 // The saved change first remains pending; the timer must load the applied policy
 // into unchanged draft fields so the next unrelated save cannot revert it.
@@ -1079,5 +1134,193 @@ test("trust history settles after same-device first-page detail error retry", as
     assert.equal(trustPager(app).props.currentPage, 1);
     assert.equal(app.nodes().some((node) => node.type === "LoadingState" && node.props.title === "Trust 이력 조회 중"), false);
     assert.equal(app.nodes().some((node) => node.type === "ErrorState" && node.props.message === "temporary detail outage"), false);
+  } finally { app.cleanup(); }
+});
+
+function managementSnapshot(overrides = {}) {
+  return { device_id: "test_pico", expected_revision: 1, expected_ai_revision: 1,
+    expected_instance_id: "fixture-instance-1",
+    hidden_at: null, can_delete: true, can_hide: false, can_restore: false,
+    delete_blockers: [], hide_blockers: ["NOT_DISABLED"], ...overrides };
+}
+async function managementApp(api, props = {}) {
+  return componentHarness("Devices", api, createClock(), {
+    componentName: "DeviceRegistrationManagement",
+    props: { deviceId: "test_pico", onBusy() {}, onCompleted() {}, ...props },
+  });
+}
+async function confirmManagement(app, label = "테스트 등록 삭제") {
+  await app.click(label);
+  await app.change("device-management-reason", "remove unused test registration");
+  await app.change("device-management-key", "fixture-admin-key");
+  await app.change("device-management-confirm", "test_pico");
+}
+
+test("unused registration management requires explicit ID confirmation and sends observed revisions", async () => {
+  const writes = [], completed = [], busy = [];
+  const app = await managementApp({
+    getDeviceManagement: async () => managementSnapshot(),
+    executeDeviceManagement: async (id, body, key) => {
+      writes.push({ id, body, key });
+      return { device_id: id, action: body.action, operation_id: "fixture-deletion", hidden_at: null, deleted: true };
+    },
+  }, { onBusy: (value) => busy.push(value), onCompleted: (value) => completed.push(value) });
+  try {
+    await app.click("테스트 등록 삭제");
+    assert.equal(app.button("삭제 실행").props.disabled, true);
+    await app.change("device-management-reason", "remove unused test registration");
+    await app.change("device-management-key", "fixture-admin-key");
+    await app.change("device-management-confirm", "wrong-device");
+    assert.equal(app.button("삭제 실행").props.disabled, true);
+    await app.change("device-management-confirm", "test_pico");
+    await app.click("삭제 실행");
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].id, "test_pico");
+    assert.equal(writes[0].body.action, "DELETE_UNUSED");
+    assert.equal(writes[0].body.expected_revision, 1);
+    assert.equal(writes[0].body.expected_ai_revision, 1);
+    assert.equal(writes[0].body.expected_instance_id, "fixture-instance-1");
+    assert.equal(writes[0].body.expected_hidden_at, null);
+    assert.equal(writes[0].key, "fixture-admin-key");
+    assert.equal(app.input("device-management-key").props.value, "");
+    assert.equal(completed.length, 1);
+    assert.deepEqual(busy, [true, false]);
+  } finally { app.cleanup(); }
+});
+
+test("management rejects duplicate clicks and does not resend an uncertain deletion", async () => {
+  let rejectWrite, writes = 0, reads = 0;
+  const app = await managementApp({
+    getDeviceManagement: async () => { reads++; return managementSnapshot(); },
+    executeDeviceManagement: () => { writes++; return new Promise((_resolve, reject) => { rejectWrite = reject; }); },
+  });
+  try {
+    await confirmManagement(app);
+    const click = app.button("삭제 실행").props.onClick;
+    await app.act(() => { click(); click(); });
+    assert.equal(writes, 1);
+    rejectWrite(Object.assign(new Error("request timed out"), { status: 504 }));
+    await app.settle();
+    assert.equal(writes, 1);
+    assert.ok(reads >= 2);
+    assert.ok(app.textContent(app.nodes()).includes("결과가 불확실"));
+    assert.equal(app.nodes().some((node) => node.props.value === "fixture-admin-key"), false);
+    assert.equal(app.button("테스트 등록 삭제").props.disabled, true);
+    await app.click("관리 상태 새로고침");
+    assert.equal(app.button("테스트 등록 삭제").props.disabled, false);
+  } finally { app.cleanup(); }
+});
+
+test("used-device management renders Korean retention guidance and restores visibility without activation", async () => {
+  const writes = [];
+  const app = await managementApp({
+    getDeviceManagement: async () => managementSnapshot({ hidden_at: "2026-11-03T00:00:00Z", can_delete: false,
+      can_restore: true, delete_blockers: ["DEVICE_ACTIVITY"], hide_blockers: [] }),
+    executeDeviceManagement: async (id, body) => {
+      writes.push(body);
+      return { device_id: id, action: body.action, operation_id: "fixture-restore", hidden_at: null, deleted: false };
+    },
+  });
+  try {
+    assert.ok(app.textContent(app.nodes()).includes("기록은 보존"));
+    assert.equal(app.nodes().some((node) => node.type === "button" && app.textContent(node) === "테스트 등록 삭제"), false);
+    await confirmManagement(app, "목록에 다시 표시");
+    await app.click("다시 표시 실행");
+    assert.equal(writes[0].action, "RESTORE");
+    assert.equal(writes[0].expected_hidden_at, "2026-11-03T00:00:00Z");
+    assert.equal("registration_state" in writes[0], false);
+  } finally { app.cleanup(); }
+});
+
+test("management read failure is closed and late responses after unmount cannot update actions", async () => {
+  let resolve;
+  const app = await managementApp({ getDeviceManagement: () => new Promise((yes) => { resolve = yes; }) });
+  app.cleanup();
+  resolve(managementSnapshot());
+  await app.settle();
+  assert.equal(app.nodes().some((node) => node.type === "button" && app.textContent(node) === "테스트 등록 삭제"), false);
+  const invalid = await managementApp({ getDeviceManagement: async () => ({ items: [] }) });
+  try {
+    assert.ok(invalid.textContent(invalid.nodes()).includes("관리 정보를 확인할 수 없습니다"));
+    assert.equal(invalid.nodes().some((node) => node.type === "button" && invalid.textContent(node) === "테스트 등록 삭제"), false);
+  } finally { invalid.cleanup(); }
+});
+
+test("management read supersession ignores an older eligibility response", async () => {
+  const requests = [];
+  const app = await managementApp({ getDeviceManagement: (_id, options) => new Promise((resolve) => {
+    requests.push({ resolve, signal: options.signal });
+  }) });
+  try {
+    await app.click("관리 상태 새로고침");
+    assert.equal(requests[0].signal.aborted, true);
+    requests[1].resolve(managementSnapshot({ hidden_at: "2026-11-03T00:01:00Z", can_delete: false, can_restore: true }));
+    await app.settle();
+    requests[0].resolve(managementSnapshot());
+    await app.settle();
+    assert.equal(app.nodes().some((node) => node.type === "button" && app.textContent(node) === "테스트 등록 삭제"), false);
+    assert.equal(app.button("목록에 다시 표시").props.disabled, false);
+  } finally { app.cleanup(); }
+});
+
+test("management conflict after re-registration requires fresh confirmation and the new instance and revisions", async () => {
+  let revision = 2;
+  const writes = [];
+  const app = await managementApp({
+    getDeviceManagement: async () => managementSnapshot({ expected_revision: revision,
+      expected_instance_id: revision === 2 ? "old-registration-instance" : "new-registration-instance",
+      can_delete: false, can_hide: true, delete_blockers: ["DEVICE_ACTIVITY"], hide_blockers: [] }),
+    executeDeviceManagement: async (id, body) => {
+      writes.push(body);
+      if (writes.length === 1) { revision = 3; throw Object.assign(new Error("changed"), { status: 409 }); }
+      return { device_id: id, action: body.action, operation_id: "fixture-hide", hidden_at: "2026-11-03T00:00:00Z", deleted: false };
+    },
+  });
+  try {
+    await confirmManagement(app, "목록에서 숨기기");
+    await app.click("숨김 실행");
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].expected_instance_id, "old-registration-instance");
+    assert.equal(app.nodes().some((node) => node.props.value === "fixture-admin-key"), false);
+    assert.equal(app.nodes().some((node) => node.type === "button" && app.textContent(node) === "숨김 실행"), false);
+    await confirmManagement(app, "목록에서 숨기기");
+    await app.click("숨김 실행");
+    assert.equal(writes.length, 2);
+    assert.equal(writes[1].expected_revision, 3);
+    assert.equal(writes[1].expected_instance_id, "new-registration-instance");
+  } finally { app.cleanup(); }
+});
+
+test("hidden-device filter is part of the device list server query and reset", async () => {
+  const server = deviceServer(createClock()), queries = [];
+  server.api.getDevices = async (params) => { queries.push(params); return { items: [sensor], total: 1 }; };
+  const app = await componentHarness("Devices", server.api);
+  try {
+    assert.equal(queries[0].include_hidden, false);
+    await app.act(() => app.input("device-include-hidden").props.onChange({ target: { checked: true } }));
+    assert.equal(queries.at(-1).include_hidden, true);
+    await app.click("필터 초기화");
+    assert.equal(queries.at(-1).include_hidden, false);
+  } finally { app.cleanup(); }
+});
+
+test("registration management blocks parent close, device switch and rule save until its command ends", async () => {
+  const server = deviceServer(createClock());
+  const app = await componentHarness("Devices", server.api);
+  try {
+    await openSensor(app);
+    const management = () => app.find((node) => typeof node.type === "function" && node.type.name === "DeviceRegistrationManagement");
+    const modal = () => app.find((node) => node.type === "DetailModal" && node.props.title === `${sensor.device_id} 상세 상태`);
+    await app.act(() => management().props.onBusy(true));
+    assert.equal(modal().props.closeDisabled, true);
+    assert.equal(modal().props.footer.props.disabled, true);
+    assert.equal(app.button("규칙 정책 변경 저장").props.disabled, true);
+    await app.act(() => modal().props.onClose());
+    await app.act(() => app.find((node) => node.type === "DataTable").props.onRowClick({ device_id: "another_device" }));
+    await app.act(() => app.button("규칙 정책 변경 저장").props.onClick());
+    assert.equal(management().props.deviceId, sensor.device_id);
+    assert.equal(server.writes.length, 0);
+    await app.act(() => management().props.onBusy(false));
+    assert.equal(modal().props.closeDisabled, false);
   } finally { app.cleanup(); }
 });

@@ -16,6 +16,8 @@ import {
   getDeviceDetail,
   getDevicePolicy,
   getDeviceAiPolicy,
+  getDeviceManagement,
+  executeDeviceManagement,
   getAiWarnings,
   getDevices,
   getFirewallRules,
@@ -232,6 +234,7 @@ function normalizePolicy(data) {
     pending: root.pending ?? null,
     latest_revision: root.latest_revision ?? null,
     server_time: root.server_time ?? null,
+    expected_instance_id: root.expected_instance_id,
   };
 }
 
@@ -370,7 +373,7 @@ function displayValue(value) {
    Phase 9 - AI Policy and AI Warnings
 ========================================================= */
 
-function DeviceAiManagement({ deviceId, registration }) {
+function DeviceAiManagement({ deviceId, registration, disabled = false }) {
   const [policy, setPolicy] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -392,6 +395,7 @@ function DeviceAiManagement({ deviceId, registration }) {
   const lastRequest = useRef(0);
   const warningsRequest = useRef(0);
   const draftDirty = useRef(false);
+  const aiInstance = useRef({ loaded: false, value: undefined });
   const LIMIT_WARNINGS = 10;
 
   const refreshPolicy = useCallback(async (signal) => {
@@ -405,9 +409,20 @@ function DeviceAiManagement({ deviceId, registration }) {
           id !== lastRequest.current) return null;
 
       const data = normalizePolicy(result);
+      const instanceChanged = aiInstance.current.loaded &&
+        aiInstance.current.value !== data.expected_instance_id;
+      aiInstance.current = { loaded: true, value: data.expected_instance_id };
       setPolicy(data);
 
-      if (!draftDirty.current) {
+      if (instanceChanged) {
+        draftDirty.current = false;
+        setReason("");
+        setAdminKey("");
+        setNeedsVerification(false);
+        setWriteMessage("");
+        setWriteError("같은 ID의 등록 정보가 바뀌었습니다. 새 기기 상태를 확인하고 다시 입력해 주세요.");
+      }
+      if (instanceChanged || !draftDirty.current) {
         setMode(data.current?.mode ?? "");
       }
       return data;
@@ -504,6 +519,7 @@ function DeviceAiManagement({ deviceId, registration }) {
   }, [pendingTime, saving, refreshPolicy]);
 
   async function saveAiPolicy() {
+    if (disabled) return;
     if (writeLock.current || saving) return;
 
     if (!current || revision === null) {
@@ -538,6 +554,8 @@ function DeviceAiManagement({ deviceId, registration }) {
         deviceId,
         {
           expected_revision: revision,
+          ...(policy.expected_instance_id !== undefined
+            ? { expected_instance_id: policy.expected_instance_id } : {}),
           mode,
           reason: reason.trim(),
         },
@@ -593,7 +611,7 @@ function DeviceAiManagement({ deviceId, registration }) {
             type="button"
             className="button button-ghost"
             onClick={() => refreshPolicy()}
-            disabled={loading || saving}
+            disabled={disabled || loading || saving}
           >
             AI 정책 새로고침
           </button>
@@ -669,7 +687,7 @@ function DeviceAiManagement({ deviceId, registration }) {
                     setMode(e.target.value);
                     setWriteError("");
                   }}
-                  disabled={saving || !current || Boolean(pending)}
+                  disabled={disabled || saving || !current || Boolean(pending)}
                 >
                   <option value="">선택</option>
                   <option value="OFF">사용 안 함</option>
@@ -693,7 +711,7 @@ function DeviceAiManagement({ deviceId, registration }) {
                   id="ai-reason"
                   value={reason}
                   onChange={(e) => setReason(e.target.value)}
-                  disabled={saving || !current || Boolean(pending)}
+                  disabled={disabled || saving || !current || Boolean(pending)}
                   placeholder="AI 정책 변경 사유를 입력해 주세요."
                 />
               </div>
@@ -706,7 +724,7 @@ function DeviceAiManagement({ deviceId, registration }) {
                   autoComplete="off"
                   value={adminKey}
                   onChange={(e) => setAdminKey(e.target.value)}
-                  disabled={saving}
+                  disabled={saving || disabled}
                   placeholder="관리자 인증키 입력"
                 />
                 <small className="help-text">
@@ -753,7 +771,7 @@ function DeviceAiManagement({ deviceId, registration }) {
               type="button"
               className="button"
               disabled={
-                saving ||
+                disabled || saving ||
                 loading ||
                 !current ||
                 Boolean(pending) ||
@@ -909,12 +927,228 @@ function DeviceAiManagement({ deviceId, registration }) {
    Devices Main Page
 ========================================================= */
 
+function validManagementSnapshot(value, deviceId) {
+  return value?.device_id === deviceId &&
+    [value.expected_revision, value.expected_ai_revision].every((item) => Number.isInteger(item) && item > 0) &&
+    (value.expected_instance_id === null || typeof value.expected_instance_id === "string") &&
+    (value.hidden_at === null || (typeof value.hidden_at === "string" && Number.isFinite(Date.parse(value.hidden_at)))) &&
+    [value.can_delete, value.can_hide, value.can_restore].every((item) => typeof item === "boolean") &&
+    [value.delete_blockers, value.hide_blockers].every((items) => Array.isArray(items) && items.every((item) => typeof item === "string"));
+}
+
+function managementBlocker(code) {
+  if (code === "NOT_DISABLED") {
+    return "사용한 기기는 위 규칙 정책에서 ‘관리 비활성’을 저장하고 적용된 뒤 숨길 수 있습니다.";
+  }
+  if (code === "PENDING_POLICY" || code === "PENDING_AI_POLICY") return "적용 예정 정책의 처리가 끝난 뒤 다시 확인해 주세요.";
+  if (code === "FIREWALL_NOT_RELEASED") return "방화벽 차단·해제 상태를 먼저 확인해 주세요.";
+  if (code === "ALREADY_HIDDEN") return "현재 기본 목록에서 숨겨진 기기입니다.";
+  if (code === "DEVICE_ACTIVITY" || code.startsWith("HISTORY_")) {
+    return "수신·분석·보안 이력이 있어 삭제할 수 없습니다. 기록은 보존하며 목록에서 숨길 수 있습니다.";
+  }
+  return "초기 테스트 등록 상태와 사용 이력이 확인된 경우에만 삭제할 수 있습니다.";
+}
+
+function DeviceRegistrationManagement({ deviceId, blocked = false, refreshKey, onBusy, onCompleted }) {
+  const [snapshot, setSnapshot] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [action, setAction] = useState(null);
+  const [reason, setReason] = useState("");
+  const [adminKey, setAdminKey] = useState("");
+  const [confirmation, setConfirmation] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState("");
+  const [needsVerification, setNeedsVerification] = useState(false);
+  const mounted = useRef(false);
+  const readId = useRef(0);
+  const controllerRef = useRef(null);
+  const writeLock = useRef(false);
+
+  const cancelRead = useCallback(() => {
+    readId.current++;
+    controllerRef.current?.abort();
+  }, []);
+
+  const refresh = useCallback(async (manual = false) => {
+    controllerRef.current?.abort();
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    const id = ++readId.current;
+    setLoading(true);
+    setError("");
+    setSnapshot(null);
+    setAction(null);
+    setAdminKey("");
+    setConfirmation("");
+    try {
+      const data = await getDeviceManagement(deviceId, { signal: controller.signal });
+      if (!mounted.current || controller.signal.aborted || id !== readId.current) return;
+      if (!validManagementSnapshot(data, deviceId)) throw new Error("invalid management response");
+      setSnapshot(data);
+      if (manual) {
+        setNeedsVerification(false);
+        setMessage("");
+      }
+    } catch (err) {
+      if (!mounted.current || controller.signal.aborted || id !== readId.current) return;
+      setError(err?.status === 503
+        ? "서버의 기기 관리 기능이 준비되지 않았습니다. 서버 업데이트 상태를 확인해 주세요."
+        : "관리 정보를 확인할 수 없습니다. 서버 상태를 다시 조회해 주세요.");
+    } finally {
+      if (mounted.current && id === readId.current) setLoading(false);
+    }
+  }, [deviceId]);
+
+  useEffect(() => {
+    mounted.current = true;
+    refresh();
+    return () => {
+      mounted.current = false;
+      cancelRead();
+    };
+  }, [refresh, refreshKey, cancelRead]);
+
+  const actions = [
+    ["DELETE_UNUSED", "테스트 등록 삭제", "삭제 실행", snapshot?.can_delete],
+    ["HIDE", "목록에서 숨기기", "숨김 실행", snapshot?.can_hide],
+    ["RESTORE", "목록에 다시 표시", "다시 표시 실행", snapshot?.can_restore],
+  ];
+  const selected = actions.find(([value]) => value === action);
+  const disabled = blocked || loading || saving || needsVerification;
+
+  function chooseAction(value) {
+    if (disabled || writeLock.current) return;
+    setAction(value);
+    setAdminKey("");
+    setConfirmation("");
+    setError("");
+    setMessage("");
+  }
+
+  async function execute() {
+    if (writeLock.current || disabled || !selected?.[3] ||
+        confirmation !== deviceId || !reason.trim() || !adminKey.trim()) return;
+    const payload = {
+      action,
+      expected_revision: snapshot.expected_revision,
+      expected_ai_revision: snapshot.expected_ai_revision,
+      expected_instance_id: snapshot.expected_instance_id,
+      expected_hidden_at: snapshot.hidden_at,
+      reason: reason.trim(),
+    };
+    writeLock.current = true;
+    if (onBusy?.(true) === false) { writeLock.current = false; return; }
+    setSaving(true);
+    setError("");
+    setMessage("");
+    let completed = null;
+    try {
+      const result = await executeDeviceManagement(deviceId, payload, adminKey);
+      const valid = result?.device_id === deviceId && result.action === action &&
+        typeof result.operation_id === "string" && result.operation_id.length > 0 &&
+        (action === "DELETE_UNUSED" ? result.deleted === true && result.hidden_at === null :
+          result.deleted === false && (action === "HIDE"
+            ? typeof result.hidden_at === "string" && Number.isFinite(Date.parse(result.hidden_at))
+            : result.hidden_at === null));
+      if (!valid) throw new Error("invalid command response");
+      completed = result;
+    } catch (err) {
+      if (!mounted.current) return;
+      if (err?.status === 409) {
+        setMessage("기기 상태가 바뀌었거나 현재 작업이 제한됩니다. 다시 조회한 뒤 확인해 주세요.");
+        await refresh();
+      } else if (uncertainError(err) || err?.status >= 500) {
+        setNeedsVerification(true);
+        setMessage("요청 결과가 불확실합니다. 자동으로 다시 실행하지 않습니다. 목록과 관리 상태를 새로고침해 확인해 주세요.");
+        await refresh();
+      } else {
+        setError(err?.status === 401
+          ? "관리자 인증에 실패했습니다. 관리자 인증키를 확인해 주세요."
+          : "기기 관리 요청을 처리하지 못했습니다. 상태를 확인한 뒤 다시 시도해 주세요.");
+      }
+    } finally {
+      writeLock.current = false;
+      onBusy?.(false);
+      if (mounted.current) { setSaving(false); setAdminKey(""); }
+    }
+    if (completed && mounted.current) onCompleted?.(completed);
+  }
+
+  const blockers = snapshot ? [...new Set([
+    ...(!snapshot.can_delete ? snapshot.delete_blockers : []),
+    ...(!snapshot.can_hide && !snapshot.hidden_at ? snapshot.hide_blockers : []),
+  ].map(managementBlocker))] : [];
+
+  return (
+    <section className="detail-section device-management-section">
+      <div className="section-heading">
+        <div>
+          <h3>등록 정리</h3>
+          <p>사용하지 않은 테스트 등록만 삭제합니다. 사용한 기기의 기록은 보존합니다.</p>
+        </div>
+        <button type="button" className="button button-ghost" disabled={saving || blocked}
+          onClick={() => refresh(true)}>관리 상태 새로고침</button>
+      </div>
+      {loading && <p className="text-muted">등록 정리 조건을 확인하는 중입니다.</p>}
+      {blockers.map((text) => <p className="help-text" key={text}>{text}</p>)}
+      {snapshot?.hidden_at && <p className="policy-note">기본 목록에서 숨겨져 있습니다. 다시 표시해도 관리 비활성 상태는 유지됩니다.</p>}
+      <div className="management-actions">
+        {actions.filter(([, , , available]) => available).map(([value, label]) => (
+          <button key={value} type="button" className={`button ${value === "DELETE_UNUSED" ? "button-management-delete" : "button-secondary"}`}
+            disabled={disabled} onClick={() => chooseAction(value)}>{label}</button>
+        ))}
+      </div>
+      {selected && (
+        <div className="management-confirmation">
+          <strong>{selected[1]} 확인</strong>
+          <p>{action === "DELETE_UNUSED"
+            ? "사용 이력이 없는 초기 등록 정보를 삭제하며 관리자 감사 기록은 보존합니다. 수신·사용 이력이 없다면 같은 기기 ID로 다시 등록할 수 있습니다."
+            : action === "HIDE"
+              ? "기본 목록에서만 숨깁니다. 수신·탐지·정책·복구 기록은 보존됩니다."
+              : "기본 목록에 다시 표시합니다. 등록 활성이나 MQTT 권한은 변경하지 않습니다."}</p>
+          <div className="policy-form-grid">
+            <div className="filter-item full-width">
+              <label htmlFor="device-management-reason">정리 사유</label>
+              <textarea id="device-management-reason" value={reason} disabled={saving}
+                onChange={(event) => setReason(event.target.value)} />
+            </div>
+            <div className="filter-item">
+              <label htmlFor="device-management-key">관리자 인증키</label>
+              <input id="device-management-key" type="password" autoComplete="off" value={adminKey}
+                disabled={saving} onChange={(event) => setAdminKey(event.target.value)} />
+            </div>
+            <div className="filter-item">
+              <label htmlFor="device-management-confirm">확인용 기기 ID</label>
+              <input id="device-management-confirm" value={confirmation} disabled={saving}
+                placeholder={deviceId} autoComplete="off" onChange={(event) => setConfirmation(event.target.value)} />
+            </div>
+          </div>
+          <div className="management-actions">
+            <button type="button" className="button" onClick={execute}
+              disabled={disabled || confirmation !== deviceId || !reason.trim() || !adminKey.trim()}>
+              {saving ? "처리 중..." : selected[2]}
+            </button>
+            <button type="button" className="button button-ghost" disabled={saving}
+              onClick={() => { setAction(null); setAdminKey(""); setConfirmation(""); }}>취소</button>
+          </div>
+        </div>
+      )}
+      {error && <p className="inline-error" role="alert">{error}</p>}
+      {message && <p className="verification-box verification-checking" role="status">{message}</p>}
+    </section>
+  );
+}
+
 export default function Devices() {
   const [devices, setDevices] = useState([]);
   const [firewallRules, setFirewallRules] = useState([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
   const [statusFilter, setStatusFilter] = useState("");
+  const [includeHidden, setIncludeHidden] = useState(false);
+  const [managementBusy, setManagementBusy] = useState(false);
+  const [managementMessage, setManagementMessage] = useState("");
   const [searchText, setSearchText] = useState("");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -957,11 +1191,13 @@ export default function Devices() {
   const detailIdRef = useRef(0);
   const detailControllerRef = useRef(null);
   const policyDraftBaselineRef = useRef(null);
+  const policyInstanceRef = useRef(undefined);
   const registrationLock = useRef(false);
   const policyLock = useRef(false);
+  const managementLock = useRef(false);
 
   const loadData = useCallback(async (manual = false) => {
-    const queryKey = JSON.stringify([offset, statusFilter]);
+    const queryKey = JSON.stringify([offset, statusFilter, includeHidden]);
     const previous = listControllerRef.current;
     if (!manual && previous && !previous.signal.aborted &&
         listQueryKeyRef.current === queryKey) return;
@@ -992,6 +1228,7 @@ export default function Devices() {
             limit: LIMIT,
             offset,
             status: statusFilter || undefined,
+            include_hidden: includeHidden,
           },
           { signal: controller.signal }
         ),
@@ -1033,7 +1270,7 @@ export default function Devices() {
         listControllerRef.current = null;
       }
     }
-  }, [offset, statusFilter]);
+  }, [offset, statusFilter, includeHidden]);
 
   useEffect(() => {
     loadData();
@@ -1148,9 +1385,12 @@ export default function Devices() {
   const applyPolicyResponse = useCallback((data, device, preserveDraft) => {
     const nextDraft = draftFromPolicy(data.current, device);
     const previousBaseline = policyDraftBaselineRef.current;
+    const instanceChanged = previousBaseline !== null &&
+      policyInstanceRef.current !== data.expected_instance_id;
+    policyInstanceRef.current = data.expected_instance_id;
     setPolicyInfo(data);
 
-    if (!preserveDraft || !previousBaseline) {
+    if (!preserveDraft || !previousBaseline || instanceChanged) {
       setPolicyDraft(nextDraft);
     } else {
       setPolicyDraft((current) => {
@@ -1162,6 +1402,12 @@ export default function Devices() {
         });
         return next;
       });
+    }
+    if (instanceChanged) {
+      setPolicyKey("");
+      setPolicyVerify(false);
+      setPolicyMessage("");
+      setPolicyWriteError("같은 ID의 등록 정보가 바뀌었습니다. 새 기기 상태를 확인하고 다시 입력해 주세요.");
     }
     policyDraftBaselineRef.current = nextDraft;
   }, []);
@@ -1221,7 +1467,7 @@ export default function Devices() {
   }
 
   async function openDetail(device) {
-    if (!device?.device_id || policySaving) return;
+    if (!device?.device_id || policySaving || managementLock.current) return;
 
     detailControllerRef.current?.abort();
     const controller = new AbortController();
@@ -1300,7 +1546,7 @@ export default function Devices() {
   }
 
   function closeDetail() {
-    if (policySaving) return;
+    if (policySaving || managementLock.current) return;
     detailIdRef.current++;
     detailControllerRef.current?.abort();
     setSelectedDevice(null);
@@ -1407,7 +1653,7 @@ export default function Devices() {
   }
 
   async function saveRulePolicy() {
-    if (policyLock.current || !selectedDevice?.device_id) return;
+    if (policyLock.current || managementLock.current || !selectedDevice?.device_id) return;
 
     const errors = validatePolicyValues(policyDraft);
     const revision = policyRevision(policyInfo);
@@ -1429,6 +1675,8 @@ export default function Devices() {
     const deviceId = selectedDevice.device_id;
     const payload = {
       expected_revision: revision,
+      ...(policyInfo.expected_instance_id !== undefined
+        ? { expected_instance_id: policyInfo.expected_instance_id } : {}),
       registration_state: policyDraft.registration_state,
       reason: policyDraft.reason.trim(),
       policy: {
@@ -1526,6 +1774,7 @@ export default function Devices() {
               size="small"
             />
             <small>{automationLabel(state)}</small>
+            {device.hidden_at && <small className="hidden-device-label">목록 숨김</small>}
           </div>
         );
       },
@@ -1752,6 +2001,7 @@ export default function Devices() {
             onClick={() => {
               setSearchText("");
               setStatusFilter("");
+              setIncludeHidden(false);
               setOffset(0);
             }}
           >
@@ -1790,6 +2040,8 @@ export default function Devices() {
         </div>
       </section>
 
+      {managementMessage && <p className="verification-box verification-checked" role="status">{managementMessage}</p>}
+
       <section className="panel table-panel">
         <div className="panel-header">
           <div>
@@ -1798,7 +2050,14 @@ export default function Devices() {
               행을 선택하면 규칙/AI 정책 및 보안 상태를 확인합니다.
             </p>
           </div>
-          <span className="data-count">{filteredRows.length}건 표시</span>
+          <div className="device-list-options">
+            <label htmlFor="device-include-hidden">
+              <input id="device-include-hidden" type="checkbox" checked={includeHidden}
+                onChange={(event) => { setIncludeHidden(event.target.checked); setOffset(0); }} />
+              숨긴 기기 포함
+            </label>
+            <span className="data-count">{filteredRows.length}건 표시</span>
+          </div>
         </div>
 
         {loading && rows.length === 0 ? (
@@ -2013,14 +2272,14 @@ export default function Devices() {
           ? `${selectedDevice.ip_address || "IP 없음"} · 규칙/AI/신뢰점수/방화벽`
           : undefined}
         onClose={closeDetail}
-        closeDisabled={policySaving}
+        closeDisabled={policySaving || managementBusy}
         size="large"
         footer={
           <button
             type="button"
             className="button button-secondary"
             onClick={closeDetail}
-            disabled={policySaving}
+            disabled={managementBusy || policySaving}
           >
             닫기
           </button>
@@ -2089,7 +2348,7 @@ export default function Devices() {
                 <button
                   type="button"
                   className="button button-ghost"
-                  disabled={policyLoading || policySaving}
+                  disabled={managementBusy || policyLoading || policySaving}
                   onClick={() => refreshPolicy(selectedDevice.device_id, true)}
                 >
                   정책 새로고침
@@ -2155,7 +2414,7 @@ export default function Devices() {
                     value={policyDraft.registration_state}
                     onChange={(e) =>
                       policyField("registration_state", e.target.value)}
-                    disabled={policySaving || Boolean(pendingPolicy)}
+                    disabled={managementBusy || policySaving || Boolean(pendingPolicy)}
                   >
                     {!policyDraft.registration_state && (
                       <option value="">확인 불가</option>
@@ -2185,7 +2444,7 @@ export default function Devices() {
                         step={step}
                         value={policyDraft[key]}
                         onChange={(e) => policyField(key, e.target.value)}
-                        disabled={policySaving || Boolean(pendingPolicy)}
+                        disabled={managementBusy || policySaving || Boolean(pendingPolicy)}
                       />
                       <span>{unit}</span>
                     </div>
@@ -2198,7 +2457,7 @@ export default function Devices() {
                     id="rule-reason"
                     value={policyDraft.reason}
                     onChange={(e) => policyField("reason", e.target.value)}
-                    disabled={policySaving || Boolean(pendingPolicy)}
+                    disabled={managementBusy || policySaving || Boolean(pendingPolicy)}
                     placeholder="규칙 정책 변경 사유"
                   />
                 </div>
@@ -2211,7 +2470,7 @@ export default function Devices() {
                     autoComplete="off"
                     value={policyKey}
                     onChange={(e) => setPolicyKey(e.target.value)}
-                    disabled={policySaving}
+                    disabled={managementBusy || policySaving}
                     placeholder="관리자 인증키"
                   />
                 </div>
@@ -2241,7 +2500,7 @@ export default function Devices() {
                   className="button"
                   onClick={saveRulePolicy}
                   disabled={
-                    policySaving ||
+                    managementBusy || policySaving ||
                     policyLoading ||
                     !currentPolicy ||
                     Boolean(pendingPolicy) ||
@@ -2258,6 +2517,28 @@ export default function Devices() {
               key={selectedDevice.device_id}
               deviceId={selectedDevice.device_id}
               registration={currentRegistration}
+              disabled={managementBusy}
+            />
+
+            <DeviceRegistrationManagement
+              key={`management-${selectedDevice.device_id}`}
+              deviceId={selectedDevice.device_id}
+              blocked={policySaving}
+              refreshKey={`${policyInfo.expected_instance_id}:${policyRevision(policyInfo)}:${currentRegistration}`}
+              onBusy={(value) => {
+                if (value && policyLock.current) return false;
+                managementLock.current = value;
+                setManagementBusy(value);
+                return true;
+              }}
+              onCompleted={(result) => {
+                closeDetail();
+                setManagementMessage(result.deleted ? "테스트 기기 등록을 삭제했습니다. 관리자 감사 기록은 보존됩니다."
+                  : result.hidden_at ? "기기를 기본 목록에서 숨겼습니다. 기존 기록은 보존됩니다."
+                    : "기기를 목록에 다시 표시했습니다. 등록 상태는 변경하지 않았습니다.");
+                if (offset > 0) setOffset(0);
+                else loadData(true);
+              }}
             />
 
             {/* Firewall */}
