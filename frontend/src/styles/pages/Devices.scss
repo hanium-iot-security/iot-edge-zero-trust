@@ -410,6 +410,70 @@
     margin-top: 14px;
   }
 
+  .device-list-options,
+  .management-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .data-table .device-action-cell {
+    position: sticky;
+    right: 0;
+    z-index: 1;
+    width: 172px;
+    min-width: 172px;
+    background: var(--surface);
+    box-shadow: -5px 0 8px -7px rgba(15, 23, 42, 0.45);
+
+    .button { white-space: nowrap; }
+  }
+
+  .data-table thead .device-action-cell {
+    z-index: 3;
+    background: var(--color-slate-50);
+  }
+
+  .device-list-options label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--color-slate-600);
+    font-size: 12px;
+  }
+
+  .hidden-device-label {
+    color: var(--color-slate-700);
+    font-weight: 700;
+  }
+
+  .management-confirmation {
+    margin-top: 14px;
+    padding: 14px;
+    border: 1px solid var(--border-color);
+    border-radius: 9px;
+    background: var(--color-slate-50);
+
+    > p { font-size: 12px; line-height: 1.6; }
+    .management-actions { margin-top: 14px; }
+  }
+
+  .button-management-delete {
+    background: var(--color-danger);
+    color: white;
+  }
+
   .policy-card {
     min-width: 0;
     padding: 14px;

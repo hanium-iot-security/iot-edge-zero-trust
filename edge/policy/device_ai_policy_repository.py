@@ -39,7 +39,7 @@ from edge.policy.device_policy import (
     validate_reason,
     validate_revision_number,
 )
-from edge.policy.device_policy_repository import Clock, device_exists, write_transaction
+from edge.policy.device_policy_repository import Clock, check_registration_instance_locked, device_exists, write_transaction
 
 
 _COLUMNS = "device_id, revision, mode, effective_from, created_at, created_by, reason"
@@ -246,6 +246,7 @@ def append_ai_policy_revision(
     mode: Any,
     reason: Any,
     created_by: Any,
+    expected_instance_id: Any = None,
     clock: Clock = utc_now,
 ) -> AiPolicyRevision:
     """AI 모드를 새 revision으로 추가한다. 효력은 엄격히 다음 UTC 10초 경계다.
@@ -263,6 +264,7 @@ def append_ai_policy_revision(
     with write_transaction(connection):
         now = require_aware(clock(), "clock()")
         snapshot = get_ai_policy_snapshot(connection, device_id, server_time=now)
+        check_registration_instance_locked(connection, device_id, expected_instance_id)
         current, pending = snapshot.current, snapshot.pending
         latest = pending if pending is not None else current
         if latest is None:

@@ -161,7 +161,8 @@ def test_registration_commits_initial_revision_and_preserves_read_envelopes(api_
     assert device["auto_response_eligible"] is False
     assert device["auto_response_exclusion_reason"] == "REGISTRATION_NOT_EFFECTIVE"
     snapshot = body["policy"]
-    assert set(snapshot) == {"device_id", "server_time", "latest_revision", "current", "pending"}
+    assert set(snapshot) == {"device_id", "server_time", "latest_revision", "current", "pending", "expected_instance_id"}
+    assert snapshot["expected_instance_id"] == rows(db_path, "SELECT registration_instance_id FROM devices")[0][0]
     assert snapshot["device_id"] == "pico_01"
     assert datetime.fromisoformat(snapshot["server_time"].replace("Z", "+00:00")) == T0
     assert snapshot["latest_revision"] == 1
@@ -342,7 +343,8 @@ def test_pending_activation_uses_strict_next_boundary_and_then_becomes_current(a
     response = change_policy(client)
     assert response.status_code == 201, response.text
     body = response.json()
-    assert set(body) == {"device_id", "server_time", "latest_revision", "current", "pending"}
+    assert set(body) == {"device_id", "server_time", "latest_revision", "current", "pending", "expected_instance_id"}
+    assert body["expected_instance_id"] == initial["expected_instance_id"]
     assert body["latest_revision"] == 2
     assert body["current"]["revision"] == 1
     assert body["current"]["registration_state"] == "PENDING"

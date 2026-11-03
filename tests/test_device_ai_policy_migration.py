@@ -58,7 +58,7 @@ class TestApply:
         connection.commit()
         connection.close()
 
-        assert apply_migrations(database, MIGRATIONS_DIR).applied_versions == [12, 13, 14, 15, 16]
+        assert apply_migrations(database, MIGRATIONS_DIR).applied_versions == list(range(12, 20))
 
         connection = connect_database(database)
         try:
