@@ -52,7 +52,6 @@ class PolicyRevisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     expected_revision: Annotated[int, Field(ge=1, le=REVISION_MAX)]
-    expected_instance_id: Annotated[str, Field(min_length=1, max_length=128)] | None = None
     registration_state: Literal["PENDING", "ACTIVE", "DISABLED"]
     policy: PolicyInput
     reason: str
@@ -77,7 +76,6 @@ class PolicySnapshotResponse(BaseModel):
     latest_revision: int
     current: PolicyRevisionItem | None
     pending: PolicyRevisionItem | None
-    expected_instance_id: str | None = None
 
 
 class DeviceRegistrationResponse(BaseModel):

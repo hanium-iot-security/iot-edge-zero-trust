@@ -122,8 +122,6 @@ Readiness는 감사 Row와 Plan·원본 실패 상태·Feature 부재가 일치�
 | device_type | TEXT | Migration 007. 표시용 `SENSOR`/`CAMERA`/`ACTUATOR`/`OTHER`. NULL 허용 |
 | mqtt_principal | TEXT | Migration 007. Broker Principal 이름(1~128자). 비밀번호는 저장하지 않음. NULL 허용 |
 | registration_effective_from | TEXT | Migration 007. 등록 효력 시작 시각(UTC `Z`, 10초 경계). NULL은 정책 도입 전부터 있던 기존 기기 |
-| hidden_at | TEXT | Migration 019. 기본 기기 목록에서 숨긴 UTC 시각. NULL이면 표시 |
-| registration_instance_id | TEXT | Migration 019. 서버 내부 등록 단위 식별자. 기존 행은 NULL 허용, 새 등록은 새 값 생성. ID 재등록과 과거 삭제 감사를 구분 |
 
 `devices.status`는 Trust 상태(`normal/warning/danger/isolated`)이며 등록 상태(PENDING/ACTIVE/DISABLED)와
 별개다. 등록 상태는 `device_policy_revisions`에만 저장한다. `registration_effective_from`은 한 번
@@ -132,15 +130,6 @@ Readiness는 감사 Row와 Plan·원본 실패 상태·Feature 부재가 일치�
 과거 Window의 IP 귀속이 달라지므로 운영에서 바꾸지 않는다.
 IP는 정규 dotted-decimal 형태만 저장하며(앞자리 0 거부) 비어 있지 않은 IP는 유일 인덱스로 중복을 막는다.
 octet 범위와 사설/LAN 대역 검사는 서비스(`edge/policy`)가 담당한다.
-
-## device_management_audits
-
-Migration 019의 기기 등록 정리 감사표입니다. `operation_id`(PK), `device_id`, `action`,
-`requested_at`, `requested_by`, `reason`, `payload_json`을 저장합니다. action은
-`DELETE_UNUSED`·`HIDE`·`RESTORE`이며 원래 기기·등록 단위·정책과 변경 후 상태를 보존합니다.
-기기가 삭제돼도 감사가 남도록 device FK를 두지 않습니다. UPDATE·DELETE·REPLACE는
-거부합니다. 미사용 등록의 최초 정책을 삭제하는 트리거 예외는 현재 등록 단위와 일치하는
-감사 증거에만 적용하며 실제 통신·보안 이력에 CASCADE를 추가하지 않습니다.
 
 ## device_recovery_audits
 
@@ -171,9 +160,7 @@ Raw·탐지·Trust·격리 이력도 변경하지 않는다.
 
 ## device_policy_revisions
 
-기기별 정책 Revision을 쌓는 불변 이력이다. 변경은 새 revision으로만 한다.
-Migration 019는 감사 증거가 있는 최초 미사용 PENDING 등록 정리에만 삭제 예외를 허용한다.
-그 외 수정·삭제 금지는 유지한다. [기기 관리 계약](contracts/device-management-v1.md)을 따른다.
+기기별 정책 Revision을 쌓는 불변 이력이다. 행을 수정하거나 삭제할 수 없고(트리거), 변경은 새 revision으로만 한다.
 
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |
@@ -208,8 +195,7 @@ ACTIVE revision 1을 만든다. 이때 `registration_effective_from`은 NULL로 
 ## device_ai_policy_revisions
 
 기기별 AI 모드 Revision을 쌓는 불변 이력이다. 등록 상태·정책 값(`device_policy_revisions`)과 별개의
-설정이며 변경은 새 revision으로만 한다. 수정·삭제는 트리거가 거부하며, Migration 019의
-감사 증거가 있는 최초 미사용 등록과 자동 생성 OFF 정책 정리에만 삭제 예외를 허용한다.
+설정이며 행을 수정하거나 삭제할 수 없다(트리거). 변경은 새 revision으로만 한다.
 
 | 컬럼 | 타입 | 설명 |
 | --- | --- | --- |

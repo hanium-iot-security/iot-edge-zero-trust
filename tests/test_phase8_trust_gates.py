@@ -664,12 +664,15 @@ def test_registration_boundary_mismatch_is_known_but_never_authorizes_response(
     start = T0 if registration == START else T1
     cutoff = start + timedelta(seconds=10)
     with session_factory() as db:
-        # Construct the intended imported boundary before the immutable
-        # registration exists; deleting a fixture is now audit protected.
-        db.execute(text("""INSERT INTO devices (
-            device_id, ip_address, status, trust_score, registration_effective_from
-        ) VALUES ('esp32_01', '192.0.2.1', 'normal', 40, :start)"""),
-            {"start": registration})
+        _seed(db, status="ACTIVE", with_policy=False)
+        # Registration time is set once by _seed; a new device fixture allows
+        # both mismatches without weakening any migration constraints.
+        if registration != START:
+            db.execute(text("DELETE FROM devices WHERE device_id='esp32_01'"))
+            db.execute(text("""INSERT INTO devices (
+                device_id, ip_address, status, trust_score, registration_effective_from
+            ) VALUES ('esp32_01', '192.0.2.1', 'normal', 40, :start)"""),
+                {"start": registration})
         _revision(db, effective=first_policy)
         _event(db)
         db.execute(text("""UPDATE detection_events SET
@@ -708,15 +711,15 @@ def test_legacy_null_registration_keeps_identity_before_valid_backfill(session_f
 @pytest.mark.parametrize("bad_kind", ["profile", "registration", "policy_time", "missing"])
 def test_invalid_device_cannot_drop_another_devices_raw(session_factory, bad_kind):
     with session_factory() as db:
+        _seed(db, status="ACTIVE", with_policy=False)
         if bad_kind == "registration":
             # Imported invalid timestamp, isolated to this disposable DB.
+            db.execute(text("DELETE FROM devices WHERE device_id='esp32_01'"))
             db.execute(text("PRAGMA ignore_check_constraints=ON"))
             db.execute(text("""INSERT INTO devices
                 (device_id, ip_address, registration_effective_from)
                 VALUES ('esp32_01', '192.0.2.1', 'invalid-time')"""))
-        else:
-            _seed(db, status="ACTIVE", with_policy=False)
-        if bad_kind == "profile":
+        elif bad_kind == "profile":
             _revision(db, profile="unsupported-profile")
         elif bad_kind == "policy_time":
             db.execute(text("PRAGMA ignore_check_constraints=ON"))
@@ -795,11 +798,6 @@ def test_missing_post_phase8_policy_table_cannot_enable_legacy_trust(
     with session_factory() as db:
         _seed(db, status="ACTIVE")
         _event(db)
-        if not keep_columns:
-            # Build an incomplete imported schema in this disposable database.
-            # Remove dependent management triggers before dropping their columns.
-            db.execute(text("DROP TRIGGER trg_device_ai_policy_revisions_no_delete"))
-            db.execute(text("DROP TRIGGER devices_management_delete_guard"))
         db.execute(text("DROP TABLE device_policy_revisions"))
         if not keep_version:
             db.execute(text("DELETE FROM schema_migrations WHERE version=7"))

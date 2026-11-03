@@ -64,8 +64,7 @@ def test_public_get_exposes_initial_off_pending_then_current(api_client):
     response = client.get(READ_PATH)
     assert response.status_code == 200, response.text
     body = response.json()
-    assert set(body) == {"device_id", "server_time", "latest_revision", "current", "pending", "expected_instance_id"}
-    assert body["expected_instance_id"] == rows(db_path, "SELECT registration_instance_id FROM devices")[0][0]
+    assert set(body) == {"device_id", "server_time", "latest_revision", "current", "pending"}
     assert body["device_id"] == "pico_01" and body["latest_revision"] == 1
     assert datetime.fromisoformat(body["server_time"].replace("Z", "+00:00")) == T0
     assert body["current"] is None
@@ -88,8 +87,7 @@ def test_post_schedules_strict_next_boundary_with_server_actor(api_client, secon
     response = submit(client)
     assert response.status_code == 201, response.text
     body = response.json()
-    assert set(body) == {"device_id", "server_time", "latest_revision", "current", "pending", "expected_instance_id"}
-    assert body["expected_instance_id"] == rows(db_path, "SELECT registration_instance_id FROM devices")[0][0]
+    assert set(body) == {"device_id", "server_time", "latest_revision", "current", "pending"}
     assert body["latest_revision"] == 2
     assert body["current"]["revision"] == 1 and body["current"]["mode"] == "OFF"
     assert body["pending"]["revision"] == 2 and body["pending"]["mode"] == "OBSERVE"

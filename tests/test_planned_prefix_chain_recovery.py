@@ -341,7 +341,7 @@ def test_old_chain_seals_survive_real_migration_and_both_confirmed_tails(chain_b
     plan = inspect(conn, operation)
     audit = apply(conn, plan, directory)
     result = apply_migrations(directory / "iot.db", MIGRATIONS_DIR)
-    assert result.applied_versions == list(range(13, 20))
+    assert result.applied_versions == [13, 14, 15, 16]
     assert planned.get_resume_audit(conn, operation["operation_id"]) == audit
     confirm_chain(conn)
     before = conn.total_changes

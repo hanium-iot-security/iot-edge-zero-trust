@@ -34,7 +34,6 @@ from edge.policy.device_policy import (
     PolicyUnavailableError,
     PolicyWriteBusyError,
     RevisionConflictError,
-    RegistrationInstanceConflictError,
     StateTransitionBlockedError,
     floor_to_second,
     format_utc_millis,
@@ -439,31 +438,6 @@ def create_device_locked(
             """,
             (device_id, ip_address, created_at, device_type, mqtt_principal, effective_text),
         )
-        # A removed test registration can be recreated only while its entire
-        # identity is still unused. The tentative row lets the shared history
-        # view check ID/topic/payload and the new IP inside this write lock.
-        if connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='device_management_audits'"
-        ).fetchone():
-            prior_ips = connection.execute(
-                "SELECT DISTINCT json_extract(payload_json, '$.before_device.ip_address') "
-                "FROM device_management_audits WHERE device_id = ? AND action = 'DELETE_UNUSED'",
-                (device_id,),
-            ).fetchall()
-            if prior_ips:
-                history = connection.execute(
-                    "SELECT 1 FROM device_management_history WHERE device_id = ? LIMIT 1", (device_id,),
-                ).fetchone()
-                old_ip_history = any(connection.execute(
-                    "SELECT 1 FROM packet_feature_logs WHERE peer_ip = ? "
-                    "UNION ALL SELECT 1 FROM detection_events WHERE subject_ip = ? "
-                    "UNION ALL SELECT 1 FROM firewall_rules WHERE source_ip = ? LIMIT 1",
-                    (row[0], row[0], row[0]),
-                ).fetchone() for row in prior_ips if row[0])
-                if history or old_ip_history:
-                    raise DeviceIdConflictError(
-                        f"Device {device_id!r} has evidence after removal; its identity cannot be reused"
-                    )
         revision = _insert_revision(
             connection,
             device_id=device_id,
@@ -552,48 +526,6 @@ def register_device(
         )
 
 
-def get_registration_instance(connection: sqlite3.Connection, device_id: str) -> str | None:
-    columns = {row[1] for row in connection.execute("PRAGMA table_info(devices)")}
-    if "registration_instance_id" not in columns:
-        return None
-    row = connection.execute(
-        "SELECT registration_instance_id FROM devices WHERE device_id = ?", (device_id,),
-    ).fetchone()
-    return row[0] if row else None
-
-
-def check_registration_instance_locked(connection, device_id, expected_instance_id):
-    """Check inside the policy write transaction, including same-ID replacement.
-
-    Pre-019 databases and existing clients remain usable for IDs never removed.
-    Once an ID is reused, an observed instance is required on every policy write.
-    """
-    if expected_instance_id is not None and (
-        not isinstance(expected_instance_id, str) or not 1 <= len(expected_instance_id) <= 128
-    ):
-        raise DevicePolicyValidationError("Invalid registration instance", field="expected_instance_id")
-    columns = {row[1] for row in connection.execute("PRAGMA table_info(devices)")}
-    current = None
-    reused = False
-    if "registration_instance_id" in columns:
-        row = connection.execute(
-            "SELECT registration_instance_id FROM devices WHERE device_id = ?", (device_id,),
-        ).fetchone()
-        current = row[0] if row else None
-        if not connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='device_management_audits'",
-        ).fetchone():
-            raise PolicyUnavailableError("Device-management schema is incomplete")
-        reused = connection.execute(
-            "SELECT 1 FROM device_management_audits WHERE device_id = ? AND action = 'DELETE_UNUSED' LIMIT 1",
-            (device_id,),
-        ).fetchone() is not None
-    if (expected_instance_id is None and reused) or (
-        expected_instance_id is not None and expected_instance_id != current
-    ):
-        raise RegistrationInstanceConflictError("The registration changed; refresh before saving its policy")
-
-
 def append_policy_revision(
     connection: sqlite3.Connection,
     *,
@@ -603,7 +535,6 @@ def append_policy_revision(
     policy: Mapping[str, Any] | DevicePolicy,
     reason: Any,
     created_by: Any,
-    expected_instance_id: Any = None,
     clock: Clock = utc_now,
     state_change_guard: StateChangeGuard | None = None,
 ) -> PolicyRevision:
@@ -628,7 +559,6 @@ def append_policy_revision(
         now = require_aware(clock(), "clock()")
         if not device_exists(connection, device_id):
             raise DeviceNotFoundError(f"Device {device_id!r} is not registered")
-        check_registration_instance_locked(connection, device_id, expected_instance_id)
         # Validate existing metadata and policy inside the write transaction,
         # before inserting anything or returning an error after a commit.
         snapshot = get_policy_snapshot(connection, device_id, server_time=now)
@@ -685,14 +615,12 @@ __all__ = [
     "RegisteredDevice",
     "StateChangeGuard",
     "append_policy_revision",
-    "check_registration_instance_locked",
     "create_device_locked",
     "device_exists",
     "diagnose_device_ip_conflicts",
     "get_latest_revision",
     "get_pending_revision",
     "get_policy_snapshot",
-    "get_registration_instance",
     "get_revision_effective_at",
     "list_revisions",
     "register_device",

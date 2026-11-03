@@ -14,7 +14,6 @@ from backend.app.services.device_policy_service import (
 from edge.policy.device_ai_policy import AiPolicyUnavailableError
 from edge.policy.device_ai_policy_repository import append_ai_policy_revision, get_ai_policy_snapshot
 from edge.policy.device_policy import DeviceNotFoundError, utc_now
-from edge.policy.device_policy_repository import get_registration_instance
 
 
 def _require_ai_schema(connection: sqlite3.Connection) -> None:
@@ -29,8 +28,7 @@ def get_device_ai_policy(db: Session, device_id: str) -> dict:
         if _device_row(connection, device_id) is None:
             raise DeviceNotFoundError(f"Device {device_id!r} is not registered")
         _require_ai_schema(connection)
-        return {**get_ai_policy_snapshot(connection, device_id, server_time=utc_now()).as_dict(),
-                "expected_instance_id": get_registration_instance(connection, device_id)}
+        return get_ai_policy_snapshot(connection, device_id, server_time=utc_now()).as_dict()
 
 
 def revise_device_ai_policy(
@@ -48,5 +46,4 @@ def revise_device_ai_policy(
         # retaining the shared command lock, as for existing Rule-policy writes.
         connection.execute("BEGIN")
         now = datetime.fromisoformat(created.created_at.replace("Z", "+00:00"))
-        return {**get_ai_policy_snapshot(connection, device_id, server_time=now).as_dict(),
-                "expected_instance_id": get_registration_instance(connection, device_id)}
+        return get_ai_policy_snapshot(connection, device_id, server_time=now).as_dict()

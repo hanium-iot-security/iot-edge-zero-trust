@@ -11,7 +11,6 @@ class AiPolicyRevisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     expected_revision: Annotated[int, Field(ge=1, le=REVISION_MAX)]
-    expected_instance_id: Annotated[str, Field(min_length=1, max_length=128)] | None = None
     mode: Literal["OFF", "OBSERVE"]
     reason: str
 
@@ -34,4 +33,3 @@ class AiPolicySnapshotResponse(BaseModel):
     latest_revision: int
     current: AiPolicyRevisionItem | None
     pending: AiPolicyRevisionItem | None
-    expected_instance_id: str | None = None

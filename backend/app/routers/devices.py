@@ -10,10 +10,6 @@ from sqlalchemy.orm import Session
 from backend.app.database import get_db
 from backend.app.schemas.device_ai_policy_schema import AiPolicyRevisionRequest, AiPolicySnapshotResponse
 from backend.app.schemas.device_schema import DeviceItem, DeviceListResponse
-from backend.app.schemas.device_management_schema import (
-    DeviceManagementRequest, DeviceManagementState, DeviceManagementResponse,
-)
-from backend.app.services.device_management_service import get_device_management, manage_device
 from backend.app.schemas.device_policy_schema import (
     DeviceRegistrationRequest,
     DeviceRegistrationResponse,
@@ -116,25 +112,9 @@ def get_devices(
     status: Literal["normal", "warning", "danger", "isolated"] | None = None,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    include_hidden: bool = False,
     db: Session = Depends(get_db),
 ) -> dict:
-    return list_devices(db, status=status, limit=limit, offset=offset, include_hidden=include_hidden)
-
-
-@router.get("/{device_id}/management", response_model=DeviceManagementState)
-def get_management(device_id: DeviceIdPath, db: Session = Depends(get_db)) -> dict:
-    return get_device_management(db, device_id)
-
-
-@router.post("/{device_id}/management", response_model=DeviceManagementResponse)
-def management_command(
-    device_id: DeviceIdPath,
-    request: DeviceManagementRequest,
-    admin: RecoveryAdminContext = Depends(require_recovery_admin),
-    db: Session = Depends(get_db),
-) -> dict:
-    return manage_device(db, device_id, request, admin)
+    return list_devices(db, status=status, limit=limit, offset=offset)
 
 
 @router.get("/{device_id}", response_model=DeviceItem)

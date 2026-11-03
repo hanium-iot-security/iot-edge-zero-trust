@@ -280,7 +280,7 @@ def test_upgrade_014_preserves_runtime_evidence_and_is_idempotent(tmp_path):
     with sqlite3.connect(path) as db:
         db.execute("INSERT INTO ai_runtime_snapshot VALUES(1,'{}')")
         before = db.execute("SELECT * FROM ai_runtime_snapshot").fetchall()
-    assert apply_migrations(path, MIGRATIONS).applied_versions == list(range(15, 20))
+    assert apply_migrations(path, MIGRATIONS).applied_versions == [15, 16]
     assert apply_migrations(path, MIGRATIONS).applied_versions == []
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT * FROM ai_runtime_snapshot").fetchall() == before

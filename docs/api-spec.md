@@ -20,8 +20,6 @@ GET /api/devices/{device_id}/policy
 POST /api/devices/{device_id}/policy-revisions
 GET /api/devices/{device_id}/ai-policy
 POST /api/devices/{device_id}/ai-policy-revisions
-GET /api/devices/{device_id}/management
-POST /api/devices/{device_id}/management
 GET /api/mqtt-logs
 GET /api/feature-logs
 GET /api/packet-feature-logs
@@ -54,8 +52,8 @@ Devices 조회와 동일한 읽기 경로이며 관리자 키를 요구하지 �
 | 경로 | 요청·응답 |
 | --- | --- |
 | `POST /api/devices` | `device_id`, `ip_address`, `device_type`, `mqtt_principal`, 완전한 `policy`, `reason` 입력. 201 `{device,policy}` 반환 |
-| `GET /api/devices/{device_id}/policy` | 200 `{device_id,server_time,latest_revision,expected_instance_id,current,pending}`. current/pending은 revision 객체 또는 null |
-| `POST /api/devices/{device_id}/policy-revisions` | `expected_revision`, 조회한 `expected_instance_id`, `registration_state`, 완전한 `policy`, `reason` 입력. 201로 정책 GET과 같은 구조 반환 |
+| `GET /api/devices/{device_id}/policy` | 200 `{device_id,server_time,latest_revision,current,pending}`. current/pending은 revision 객체 또는 null |
+| `POST /api/devices/{device_id}/policy-revisions` | `expected_revision`, `registration_state`, 완전한 `policy`, `reason` 입력. 201로 정책 GET과 같은 구조 반환 |
 
 `policy`의 여섯 필드는 `policy_profile`, `expected_publish_interval_seconds`,
 `publish_count_max`, `payload_size_max_bytes`, `packet_rate_max_pps`,
@@ -76,16 +74,9 @@ Payload는 원본 바이트, Packet/Byte Rate는 유효 캡처 초당 수치입�
 전체 등록이 rollback됩니다.
 
 상태는 PENDING→ACTIVE, PENDING/ACTIVE→DISABLED만 전환할 수 있습니다.
-DISABLED 재활성화·편집, ID/IP/type/principal 변경, 부분 PATCH는 지원하지 않습니다.
-미사용 테스트 등록의 삭제는 아래 별도 관리 API만 허용합니다. 적용 예정 revision이 있거나
-값이 동일하면 409이며 자동 재전송하지 않습니다.
+DISABLED 재활성화·편집, 기기 삭제, ID/IP/type/principal 변경, 부분 PATCH는 지원하지
+않습니다. 적용 예정 revision이 있거나 값이 동일하면 409이며 자동 재전송하지 않습니다.
 Broker 계정·ACL 생성과 센서 설정은 별도 운영 작업입니다.
-
-Migration 019 이후 정책 조회·변경 응답에는 `expected_instance_id`가 추가됩니다.
-규칙·AI 정책 변경은 조회한 값을 요청에 포함해 같은 ID의 이전 등록에서 작성한 초안이
-새 등록에 적용되지 않도록 합니다. 삭제 후 재등록한 ID는 이 값이 누락되거나 다르면
-409 `REGISTRATION_INSTANCE_CONFLICT`로 거부합니다. 재사용 이력이 없는 기존 클라이언트는
-생략할 수 있습니다. 자세한 호환 조건은 [기기 관리 계약](contracts/device-management-v1.md)을 따릅니다.
 
 기존 `GET /api/devices`의 `{items,total}` 및 Trust status 필터, 상세 DeviceItem의 기존
 필드는 유지합니다. DeviceItem에는 다음 필드가 추가됩니다.
@@ -93,7 +84,7 @@ Migration 019 이후 정책 조회·변경 응답에는 `expected_instance_id`�
 ```text
 device_type, mqtt_principal, mqtt_topic, registration_state,
 registration_effective_from, current_policy_revision, pending_policy_revision,
-auto_response_eligible, auto_response_exclusion_reason, hidden_at
+auto_response_eligible, auto_response_exclusion_reason
 ```
 
 `auto_response_eligible`은 등록 정책상 자격만 표시하며 실제 차단 권한이나 통신 정상성의
@@ -127,19 +118,6 @@ auto_response_eligible, auto_response_exclusion_reason, hidden_at
 loopback 또는 HTTPS 경로에서 전송합니다. 세부 절차는
 [기기 정책 API 운영 확인](device-policy-api-runbook.md)을 따릅니다.
 
-## 기기 등록 삭제·목록 숨김
-
-Migration 019 이후 `GET /api/devices/{device_id}/management`에서 서버가 판정한 삭제·숨김·
-다시 표시 가능 여부와 현재 등록 식별자·규칙/AI 버전·숨김 시각을 조회합니다. 같은 경로의
-관리자 `POST`는 해당 값을 재확인하고 `DELETE_UNUSED`, `HIDE`, `RESTORE` 중 명시한 동작만
-실행합니다. 요청·응답·충돌·이력 보존 조건은 [기기 관리 계약](contracts/device-management-v1.md)을
-따릅니다. 삭제한 테스트 ID의 재등록은 새 PENDING이며, 이전 감사가 새 등록에 재사용되지
-않도록 등록 단위를 구분합니다.
-
-`GET /api/devices?include_hidden=true`로 숨긴 기기를 포함합니다. 기본 목록은 제외하며
-상세·통신·정책·보안 이력 조회는 유지합니다. 숨김을 해제해도 관리 비활성 상태는 유지합니다.
-이 API는 Broker 계정·ACL 생성/삭제나 실제 방화벽 해제를 수행하지 않습니다.
-
 ## Device AI 설정 APIs
 
 Migration 012의 기기별 AI 설정을 읽고 새 revision으로 변경합니다. 기존 등록·Rule 정책
@@ -148,8 +126,8 @@ Checkpoint 적용, 추론·Trust·방화벽 실행은 하지 않습니다. 실�
 
 | 경로 | 요청·응답 |
 | --- | --- |
-| `GET /api/devices/{device_id}/ai-policy` | 관리자 키 없이 200 `{device_id,server_time,latest_revision,expected_instance_id,current,pending}` |
-| `POST /api/devices/{device_id}/ai-policy-revisions` | 기존 `X-Recovery-Admin-Key` 인증. 아래 필드와 조회한 `expected_instance_id`를 입력하고 저장 후 201로 GET과 같은 구조 반환 |
+| `GET /api/devices/{device_id}/ai-policy` | 관리자 키 없이 200 `{device_id,server_time,latest_revision,current,pending}` |
+| `POST /api/devices/{device_id}/ai-policy-revisions` | 기존 `X-Recovery-Admin-Key` 인증. 아래 세 필드만 입력하고 저장 후 201로 GET과 같은 구조 반환 |
 
 ```json
 {
@@ -182,7 +160,7 @@ OFF 변경과 GET은 전역 enforce에서도 허용합니다. OFF 저장 역시 
 | --- | --- |
 | 401 | 관리자 키 누락·불일치 |
 | 404 | 미등록 기기 |
-| 409 | `REVISION_CONFLICT`, `REGISTRATION_INSTANCE_CONFLICT`, `PENDING_REVISION_EXISTS`, `NO_POLICY_CHANGE`, `STATE_TRANSITION_BLOCKED`, `POLICY_WRITE_BUSY` |
+| 409 | `REVISION_CONFLICT`, `PENDING_REVISION_EXISTS`, `NO_POLICY_CHANGE`, `STATE_TRANSITION_BLOCKED`, `POLICY_WRITE_BUSY` |
 | 422 | 잘못된 경로 ID·자료형·사유·모드 또는 추가 필드. ENFORCE 거부 |
 | 503 | 관리자 인증 설정 없음, AI Migration·이관·설정 불가/손상 또는 OBSERVE의 전역 모드 조건 불충족 |
 

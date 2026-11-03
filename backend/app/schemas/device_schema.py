@@ -10,7 +10,6 @@ class DeviceItem(BaseModel):
     trust_score: int
     last_seen_at: str | None = None
     created_at: str | None = None
-    hidden_at: str | None = None
     device_type: str | None = None
     mqtt_principal: str | None = None
     mqtt_topic: str | None = None
