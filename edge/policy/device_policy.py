@@ -102,6 +102,10 @@ class DeviceIpConflictError(DevicePolicyError):
     code = "DEVICE_IP_CONFLICT"
 
 
+class RegistrationInstanceConflictError(DevicePolicyError):
+    code = "REGISTRATION_INSTANCE_CONFLICT"
+
+
 class RevisionConflictError(DevicePolicyError):
     code = "REVISION_CONFLICT"
 

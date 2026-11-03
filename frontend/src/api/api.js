@@ -372,6 +372,10 @@ export function getDevices(params = {}, options = {}) {
     ? [...mockDevices.items]
     : [];
 
+  if (queryParams.include_hidden !== true && queryParams.include_hidden !== "true") {
+    items = items.filter((item) => !item.hidden_at);
+  }
+
   if (queryParams.status) {
     items = items.filter(
       (item) => item.status === queryParams.status
@@ -447,6 +451,37 @@ export function getDevicePolicy(deviceId, options = {}) {
   );
 }
 
+export function getDeviceManagement(deviceId, options = {}) {
+  return request(
+    `/devices/${encodeId(deviceId, "Device ID")}/management`,
+    null,
+    {},
+    { ...options, timeout: options.timeout ?? 15000 }
+  );
+}
+
+export async function executeDeviceManagement(deviceId, payload, adminKey, options = {}) {
+  const id = encodeId(deviceId, "Device ID");
+  if (!["DELETE_UNUSED", "HIDE", "RESTORE"].includes(payload?.action)) {
+    throw new Error("기기 관리 작업을 선택해 주세요.");
+  }
+  if (![payload?.expected_revision, payload?.expected_ai_revision]
+    .every((revision) => Number.isInteger(revision) && revision > 0) ||
+      !(payload?.expected_instance_id === null || typeof payload?.expected_instance_id === "string") ||
+      !(payload?.expected_hidden_at === null || typeof payload?.expected_hidden_at === "string") ||
+      !(payload?.expected_management_operation_id === null || (typeof payload?.expected_management_operation_id === "string" &&
+        payload.expected_management_operation_id.length > 0 && payload.expected_management_operation_id.length <= 128))) {
+    throw new Error("기기 관리 상태를 먼저 조회해 주세요.");
+  }
+  requireAdminKey(adminKey);
+  return commandRequest("POST", `/devices/${id}/management`, {
+    data: payload,
+    adminKey,
+    signal: options.signal,
+    timeout: options.timeout ?? 15000,
+  });
+}
+
 export async function createDevicePolicyRevision(
   deviceId,
   payload,
@@ -487,6 +522,7 @@ export function getIsolatedDevices(
   return getDevices(
     {
       status: "isolated",
+      include_hidden: true,
       ...params,
     },
     options
@@ -554,6 +590,8 @@ export async function createDeviceAiPolicyRevision(
     {
       data: {
         expected_revision: payload.expected_revision,
+        ...(payload.expected_instance_id !== undefined
+          ? { expected_instance_id: payload.expected_instance_id } : {}),
         mode: payload.mode,
         reason,
       },

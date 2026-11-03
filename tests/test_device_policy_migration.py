@@ -132,7 +132,7 @@ class TestApply:
 
         result = apply_migrations(path, MIGRATIONS_DIR)
 
-        assert result.applied_versions == [7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        assert result.applied_versions == list(range(7, 20))
         with connect_database(path) as connection:
             after = {
                 name: [tuple(row) for row in connection.execute(sql)]
@@ -382,8 +382,10 @@ class TestRevisionConstraints:
     def test_device_with_revisions_cannot_be_deleted(self, db: sqlite3.Connection) -> None:
         insert_revision_raw(db)
 
-        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        with pytest.raises(sqlite3.IntegrityError, match="device deletion requires an audited unused registration"):
             db.execute("DELETE FROM devices WHERE device_id = 'dev_a'")
+        assert count(db, "device_policy_revisions") == 1
+        assert db.execute("SELECT device_id FROM devices WHERE device_id = 'dev_a'").fetchone()[0] == "dev_a"
 
     def test_revision_numbers_must_be_sequential_per_device(self, db: sqlite3.Connection) -> None:
         with pytest.raises(sqlite3.IntegrityError, match="previous revision plus one"):

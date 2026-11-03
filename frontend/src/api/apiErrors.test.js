@@ -26,11 +26,11 @@ function rejectedApi(status, data, errorCode = "ERR_BAD_REQUEST") {
     },
   });
   transport.isCancel = axios.isCancel;
-  const scope = { axios: transport, mockSummary: {}, Error };
+  const scope = { axios: transport, mockSummary: {}, mockDevices: [], Error };
   runInNewContext(
     code.replace(/\bexport\s+(?=(?:async\s+)?function\b)/g, "")
       .replace(/\bexport\s*\{[^}]*\};?/g, "") +
-      "\nglobalThis.api = { createDevice, getSummary };",
+      "\nglobalThis.api = { createDevice, getSummary, getDeviceManagement, executeDeviceManagement, createDeviceAiPolicyRevision, getIsolatedDevices };",
     scope,
   );
   return { ...scope.api, requests };
@@ -113,5 +113,92 @@ test("status fallback messages still apply when the server provides no detail", 
   ]) {
     const api = rejectedApi(status, {});
     await assert.rejects(api.getSummary(), (error) => error.message === message);
+  }
+});
+
+const managementCommand = {
+  action: "DELETE_UNUSED", expected_revision: 1, expected_ai_revision: 1,
+  expected_instance_id: "fixture-registration", expected_hidden_at: null,
+  expected_management_operation_id: null,
+  reason: "remove unused test",
+};
+
+test("device management sends the observed instance and revisions while keeping the admin key out of its body", async () => {
+  const api = rejectedApi(401, { detail: "RECOVERY_ADMIN_UNAUTHORIZED" });
+  await assert.rejects(api.executeDeviceManagement("fixture-device", managementCommand, "test-only-key"),
+    (error) => error.status === 401 && error.message.includes("관리자 인증"));
+  assert.equal(api.requests.length, 1);
+  const request = api.requests[0];
+  assert.equal(request.method, "post");
+  assert.equal(request.url.endsWith("/devices/fixture-device/management"), true);
+  assert.equal(request.headers.get("X-Recovery-Admin-Key"), "test-only-key");
+  const body = JSON.parse(request.data);
+  assert.equal(body.expected_instance_id, "fixture-registration");
+  assert.equal(body.expected_revision, 1);
+  assert.equal(body.expected_ai_revision, 1);
+  assert.equal(body.expected_hidden_at, null);
+  assert.equal(body.expected_management_operation_id, null);
+  assert.equal(request.data.includes("test-only-key"), false);
+});
+
+test("management cannot submit without a valid action, observed instance, revisions, operation token and administrator key", async () => {
+  for (const [payload, key] of [
+    [{ ...managementCommand, action: "OTHER" }, "fixture-key"],
+    [{ ...managementCommand, expected_revision: 0 }, "fixture-key"],
+    [{ ...managementCommand, expected_instance_id: undefined }, "fixture-key"],
+    [{ ...managementCommand, expected_hidden_at: undefined }, "fixture-key"],
+    [{ ...managementCommand, expected_management_operation_id: undefined }, "fixture-key"],
+    [managementCommand, " "],
+  ]) {
+    const api = rejectedApi(500, {});
+    await assert.rejects(api.executeDeviceManagement("fixture-device", payload, key));
+    assert.equal(api.requests.length, 0);
+  }
+});
+
+test("all cleanup actions send optional empty reasons through the real API wrapper", async () => {
+  for (const action of ["DELETE_UNUSED", "HIDE", "RESTORE"]) {
+    for (const reason of [undefined, null, "", " "]) {
+      const payload = { ...managementCommand, action, reason };
+      if (reason === undefined) delete payload.reason;
+      const api = rejectedApi(401, { detail: "RECOVERY_ADMIN_UNAUTHORIZED" });
+      await assert.rejects(api.executeDeviceManagement("fixture-device", payload, "fixture-key"),
+        (error) => error.status === 401);
+      assert.equal(api.requests.length, 1, "optional reasons must reach the server rather than fail locally");
+      assert.equal(JSON.parse(api.requests[0].data).expected_management_operation_id, null);
+    }
+  }
+});
+
+test("AI policy transport preserves an observed instance while legacy callers can omit it", async () => {
+  for (const instance of [undefined, null, "replacement-registration"]) {
+    const payload = { expected_revision: 1, mode: "OBSERVE", reason: "verified reception" };
+    if (instance !== undefined) payload.expected_instance_id = instance;
+    const api = rejectedApi(401, { detail: "RECOVERY_ADMIN_UNAUTHORIZED" });
+    await assert.rejects(api.createDeviceAiPolicyRevision("fixture-device", payload, "fixture-key"),
+      (error) => error.status === 401);
+    const body = JSON.parse(api.requests[0].data);
+    assert.equal(Object.hasOwn(body, "expected_instance_id"), instance !== undefined);
+    if (instance !== undefined) assert.equal(body.expected_instance_id, instance);
+  }
+});
+
+test("management reads have a finite timeout and preserve explicit request overrides", async () => {
+  for (const timeout of [undefined, 25]) {
+    const api = rejectedApi(504, {}, "ECONNABORTED");
+    const controller = new AbortController();
+    await assert.rejects(api.getDeviceManagement("fixture-device", { signal: controller.signal, ...(timeout ? { timeout } : {}) }),
+      (error) => error.code === "ECONNABORTED");
+    assert.equal(api.requests[0].timeout, timeout ?? 15000);
+    assert.equal(api.requests[0].signal, controller.signal);
+  }
+});
+
+test("security device queries include hidden devices unless explicitly filtered", async () => {
+  for (const params of [{}, { include_hidden: false }]) {
+    const api = rejectedApi(503, {});
+    await assert.rejects(api.getIsolatedDevices(params));
+    assert.equal(api.requests[0].params.status, "isolated");
+    assert.equal(api.requests[0].params.include_hidden, params.include_hidden ?? true);
   }
 });

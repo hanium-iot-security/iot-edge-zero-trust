@@ -340,7 +340,7 @@ export default function DeviceTrafficTrends() {
     const controller = new AbortController();
     (async () => {
       try {
-        const root = unpackList(await getDevices({ limit: 500, offset: 0 }, { signal: controller.signal }), "기기");
+        const root = unpackList(await getDevices({ limit: 500, offset: 0, include_hidden: true }, { signal: controller.signal }), "기기");
         const ids = [...new Set(root.items.map((item) => item?.device_id).filter(Boolean))];
         if (controller.signal.aborted) return;
         setDeviceOptions(ids);

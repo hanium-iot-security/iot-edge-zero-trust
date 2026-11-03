@@ -23,7 +23,7 @@ from edge.policy.device_policy import (
     StateTransitionBlockedError, utc_now, validate_actor,
 )
 from edge.policy.device_policy_repository import (
-    append_policy_revision, auto_response_exclusion_reason, get_policy_snapshot, register_device,
+    append_policy_revision, auto_response_exclusion_reason, get_policy_snapshot, get_registration_instance, register_device,
 )
 from edge.runtime_lock import RuntimeLockError, single_instance_lock
 from edge.trust.run_firewall_worker import firewall_lock_path
@@ -75,6 +75,11 @@ def _snapshot(connection: sqlite3.Connection, device_id: str, now: datetime):
     return get_policy_snapshot(connection, device_id, server_time=now)
 
 
+def _snapshot_response(connection, device_id, now):
+    return {**_snapshot(connection, device_id, now).as_dict(),
+            "expected_instance_id": get_registration_instance(connection, device_id)}
+
+
 def _device_row(connection: sqlite3.Connection, device_id: str) -> dict | None:
     cursor = connection.execute("SELECT * FROM devices WHERE device_id = ?", (device_id,))
     row = cursor.fetchone()
@@ -110,16 +115,18 @@ def _enrich_device(connection, row: dict, now: datetime, schema_available: bool)
     return result
 
 
-def list_devices(db: Session, status=None, limit=100, offset=0) -> dict:
+def list_devices(db: Session, status=None, limit=100, offset=0, include_hidden=False) -> dict:
     with _connection(db, read=True) as connection:
         now = utc_now()
         available = _schema_available(connection)
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(devices)")}
+        visibility = " AND hidden_at IS NULL" if "hidden_at" in columns and not include_hidden else ""
         total = connection.execute(
-            "SELECT count(*) FROM devices WHERE (? IS NULL OR status = ?)", (status, status),
+            "SELECT count(*) FROM devices WHERE (? IS NULL OR status = ?)" + visibility, (status, status),
         ).fetchone()[0]
         cursor = connection.execute(
-            "SELECT * FROM devices WHERE (? IS NULL OR status = ?) "
-            "ORDER BY device_id LIMIT ? OFFSET ?", (status, status, limit, offset),
+            "SELECT * FROM devices WHERE (? IS NULL OR status = ?) " + visibility +
+            " ORDER BY device_id LIMIT ? OFFSET ?", (status, status, limit, offset),
         )
         columns = [item[0] for item in cursor.description]
         rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
@@ -141,7 +148,7 @@ def get_device_policy(db: Session, device_id: str) -> dict:
         if _device_row(connection, device_id) is None:
             raise DeviceNotFoundError(f"Device {device_id!r} is not registered")
         _require_schema(connection)
-        return _snapshot(connection, device_id, utc_now()).as_dict()
+        return _snapshot_response(connection, device_id, utc_now())
 
 
 def _ip_policy() -> IpRegistrationPolicy:
@@ -237,7 +244,7 @@ def create_device(db: Session, request: DeviceRegistrationRequest, admin: Recove
         now = datetime.fromisoformat(created.revision.created_at.replace("Z", "+00:00"))
         return {
             "device": _enrich_device(connection, _device_row(connection, request.device_id), now, True),
-            "policy": _snapshot(connection, request.device_id, now).as_dict(),
+            "policy": _snapshot_response(connection, request.device_id, now),
         }
 
 
@@ -251,4 +258,4 @@ def revise_device_policy(db: Session, device_id: str, request: PolicyRevisionReq
         )
         connection.execute("BEGIN")
         now = datetime.fromisoformat(created.created_at.replace("Z", "+00:00"))
-        return _snapshot(connection, device_id, now).as_dict()
+        return _snapshot_response(connection, device_id, now)

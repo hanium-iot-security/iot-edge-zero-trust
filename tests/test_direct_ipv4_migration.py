@@ -51,7 +51,7 @@ def _insert_direct_rule(connection: sqlite3.Connection, **overrides) -> int:
 def test_direct_root_ipv4_rule_is_accepted_without_mqtt_parent(tmp_path: Path) -> None:
     db_path = tmp_path / "direct.db"
     result = apply_migrations(db_path, MIGRATIONS_DIR)
-    assert result.applied_versions == list(range(1, 19))
+    assert result.applied_versions == list(range(1, 20))
     with connect_database(db_path) as connection:
         _seed_device_and_event(connection)
         rule_id = _insert_direct_rule(connection)
@@ -208,7 +208,7 @@ def test_018_preserves_legacy_rows_links_audits_indexes_and_sequence(tmp_path: P
         _seed_historical_rows(connection)
         before = _snapshot(connection)
 
-    assert apply_migrations(db_path, MIGRATIONS_DIR).applied_versions == [18]
+    assert apply_migrations(db_path, MIGRATIONS_DIR).applied_versions == [18, 19]
     with connect_database(db_path) as connection:
         assert _snapshot(connection) == before
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
@@ -239,7 +239,7 @@ def test_018_preserves_legacy_rows_links_audits_indexes_and_sequence(tmp_path: P
 
     repeated = apply_migrations(db_path, MIGRATIONS_DIR)
     assert repeated.applied_versions == []
-    assert repeated.skipped_versions == list(range(1, 19))
+    assert repeated.skipped_versions == list(range(1, 20))
     with connect_database(db_path) as connection:
         assert _snapshot(connection) == after
 
@@ -251,11 +251,12 @@ def test_direct_root_evidence_cannot_be_removed_by_set_null(tmp_path: Path, stat
     with connect_database(db_path) as connection:
         _seed_device_and_event(connection)
         rule_id = _insert_direct_rule(connection, status=status)
-        for statement in (
-            "DELETE FROM detection_events WHERE id = 7",
-            "DELETE FROM devices WHERE device_id = 'esp32_direct'",
+        for statement, expected_error in (
+            ("DELETE FROM detection_events WHERE id = 7", "CHECK"),
+            ("DELETE FROM devices WHERE device_id = 'esp32_direct'",
+             "device deletion requires an audited unused registration"),
         ):
-            with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+            with pytest.raises(sqlite3.IntegrityError, match=expected_error):
                 connection.execute(statement)
         row = connection.execute("SELECT * FROM firewall_rules WHERE id = ?", (rule_id,)).fetchone()
         assert row["device_id"] == "esp32_direct"
@@ -272,7 +273,7 @@ def test_018_constraint_failure_rolls_back_rebuild_and_restores_foreign_keys(tmp
         if path.name == "018_direct_ipv4_isolation.sql":
             sql = sql.replace("id INTEGER PRIMARY KEY AUTOINCREMENT,", "id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(id < 100),", 1)
         (migrations_dir / path.name).write_text(sql, encoding="utf-8")
-    migration = discover_migrations(migrations_dir)[-1]
+    migration = next(item for item in discover_migrations(migrations_dir) if item.version == 18)
     with connect_database(db_path) as connection:
         _seed_historical_rows(connection)
         before = _snapshot(connection)
@@ -293,4 +294,4 @@ def test_018_constraint_failure_rolls_back_rebuild_and_restores_foreign_keys(tmp
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
-    assert apply_migrations(db_path, MIGRATIONS_DIR).applied_versions == [18]
+    assert apply_migrations(db_path, MIGRATIONS_DIR).applied_versions == [18, 19]

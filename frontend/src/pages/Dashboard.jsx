@@ -916,7 +916,7 @@ export default function Dashboard() {
 
         label: "기기 등록 상태",
 
-        request: getDevices({ limit: 500, offset: 0 }, options),
+        request: getDevices({ limit: 500, offset: 0, include_hidden: true }, options),
 
       },
 
